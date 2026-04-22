@@ -261,7 +261,10 @@ export function mountProjects(root, api) {
       // Trim, drop trailing sep. Defensive: if stdout is multi-line OR looks
       // like a PowerShell / shell error banner, ignore it instead of pasting
       // garbage into the input.
-      const raw = (res?.stdout || "").trim();
+      // Strip a leading UTF-8 BOM (\uFEFF) — PS under some locales emits one
+      // even with our UTF-8 OutputEncoding prelude, and it defeats the
+      // path-starts-with regex check below.
+      const raw = (res?.stdout || "").replace(/^\uFEFF/, "").trim();
       const out = raw.replace(/[\\/]+$/, "");
       const looksLikePath =
         out && !/\r?\n/.test(out) && /^(?:[A-Za-z]:[\\/]|[\\/]|~)/.test(out);

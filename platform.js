@@ -92,8 +92,15 @@ function toUtf16LEBase64(s) {
 // Build a `powershell -EncodedCommand <base64>` invocation. Arg tokens are all
 // bare ASCII, so no parent-shell can break them. Use for anything that would
 // otherwise need embedded " inside -Command.
+//
+// The UTF-8 prelude forces PowerShell to emit stdout as UTF-8 instead of the
+// console code page (often cp437/1252), so non-ASCII characters (em-dashes,
+// emoji, localized paths) round-trip through the host shell intact.
 export function psEncodedCmd(psScript) {
-  const b64 = toUtf16LEBase64(psScript);
+  const prelude =
+    `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ` +
+    `$OutputEncoding = [System.Text.Encoding]::UTF8; `;
+  const b64 = toUtf16LEBase64(prelude + psScript);
   return `powershell -NoProfile -NonInteractive -EncodedCommand ${b64}`;
 }
 
@@ -137,16 +144,18 @@ export function killDaemonOnPortCmd(port) {
   const p = parseInt(port, 10);
   if (!Number.isFinite(p)) return `echo skip`;
   if (IS_WINDOWS) {
-    // Match on process name + command-line substring via CIM; Stop-Process -Force.
+    // Match on process name + command-line regex via CIM; Stop-Process -Force.
+    // Use a negative-lookahead so `--port 787` doesn't match `--port 7878`.
     // Sleep 600ms after the kill so the port is fully released.
     const ps =
       `$procs = Get-CimInstance Win32_Process -Filter "Name='${BINARY_NAME}'" | ` +
-      `Where-Object { $_.CommandLine -like '*--port ${p}*' }; ` +
+      `Where-Object { $_.CommandLine -match '--port\\s+${p}(?!\\d)' }; ` +
       `if ($procs) { $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }; ` +
       `Start-Sleep -Milliseconds 600`;
     return psEncodedCmd(ps);
   }
-  const pat = `${BINARY_NAME}.*--port ${p}`;
+  // POSIX: same word-boundary guard — `--port 787` must not kill `--port 7878`.
+  const pat = `${BINARY_NAME}.*--port ${p}([^0-9]|$)`;
   return (
     `pkill -f ${posixQuote(pat)} 2>/dev/null ; ` +
     `sleep 0.4 ; ` +
@@ -221,7 +230,9 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
   // spaces and metachars are preserved. Pre-flight: if the binary doesn't
   // exist, short-circuit with an ERROR sentinel the widget parses.
   const quotedArgs = args.map(posixQuote).join(" ");
-  const grepPat = `${BINARY_NAME}.*--port ${port}`;
+  // Match `--port N` with a non-digit (or end) after N so `--port 787` can't
+  // accidentally resolve to a PID on `--port 7878`.
+  const grepPat = `${BINARY_NAME}.*--port ${port}([^0-9]|$)`;
   return (
     `if [ ! -x "${binaryPath}" ] ; then ` +
     `  echo "---" ; ` +
@@ -283,10 +294,12 @@ export function pluginInstallCmd({ srcFile, destDir, destName, staleName }) {
 // Ensure a folder exists, then open it in the system file explorer.
 export function openFolderEnsuredCmd(dir) {
   if (IS_WINDOWS) {
+    // Wrap $dest in embedded double-quotes so explorer.exe sees a single path
+    // argument even when it contains spaces (e.g. `C:\Users\My Name\...`).
     const ps =
       `$dest = [Environment]::ExpandEnvironmentVariables(${psQuote(dir)}); ` +
       `if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }; ` +
-      `Start-Process explorer.exe -ArgumentList $dest`;
+      `Start-Process explorer.exe -ArgumentList ('"' + $dest + '"')`;
     return psEncodedCmd(ps);
   }
   const dq = posixQuote(dir);
@@ -344,9 +357,12 @@ export function writeFileFromB64Cmd(absPath, b64) {
 // Read a text file's full contents to stdout (empty if missing).
 export function readFileCmd(absPath) {
   if (IS_WINDOWS) {
+    // -Encoding UTF8 is essential: PS 5.1's default `Default` encoding is the
+    // system ANSI code page, which mangles any JSON/config file written as UTF-8
+    // (project configs, writes.log, anything we authored ourselves).
     return psEncodedCmd(
       `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(absPath)}); ` +
-      `if (Test-Path $p) { Get-Content -Raw $p }`
+      `if (Test-Path $p) { Get-Content -Raw -Encoding UTF8 $p }`
     );
   }
   return `cat ${posixQuote(absPath)} 2>/dev/null || true`;
@@ -369,8 +385,14 @@ export function checkBinaryCmd() {
 // Probe whether a `cargo` toolchain is on PATH. Stdout is "yes" or "no".
 export function checkCargoCmd() {
   if (IS_WINDOWS) {
+    // rustup's Windows installer puts cargo under %USERPROFILE%\.cargo\bin and
+    // updates the User PATH, but the host shell may have been launched before
+    // PATH refreshed. Fall back to the canonical install path so a fresh
+    // rustup install doesn't require a logout/login to be visible.
     return psEncodedCmd(
-      `if (Get-Command cargo -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }`
+      `if (Get-Command cargo -ErrorAction SilentlyContinue) { 'yes' } ` +
+      `elseif (Test-Path (Join-Path $env:USERPROFILE '.cargo\\bin\\cargo.exe')) { 'yes' } ` +
+      `else { 'no' }`
     );
   }
   // POSIX login shells often don't inherit the cargo path, so also look in

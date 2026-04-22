@@ -105,12 +105,18 @@ async function pidAlive(pid) {
 
 async function pruneDeadSessions() {
   const list = await loadSessions();
-  if (!list.length) return [];
   const alive = [];
   for (const s of list) {
     if (await pidAlive(s && s.pid)) alive.push(s);
   }
   if (alive.length !== list.length) await saveSessions(alive);
+  // If we still hold a daemonPid in widget state but its process is gone (the
+  // user rebooted, killed it manually, widget reloaded after Studio crashed),
+  // clear it so ensureDaemon doesn't try to reuse a dead pid on relaunch.
+  const pid = app.state && app.state.daemonPid;
+  if (pid && !alive.some((s) => s.pid === pid)) {
+    setState({ daemonPid: null });
+  }
   return alive;
 }
 
@@ -205,6 +211,14 @@ async function launchDaemon(projectPath, port) {
       try {
         const logRes = await t64("t64:exec", { command: tailLogCmd(logPath) });
         logTail = (logRes && logRes.stdout) ? logRes.stdout.trim() : "";
+      } catch {}
+      // On Windows launchDaemonCmd redirects stderr to `<logPath>.err`, so
+      // daemon startup crashes never land in the main .log. Tail the .err
+      // file too — it's where panics / dll-load failures actually surface.
+      try {
+        const errRes = await t64("t64:exec", { command: tailLogCmd(logPath + ".err") });
+        const errTail = (errRes && errRes.stdout) ? errRes.stdout.trim() : "";
+        if (errTail) logTail = logTail ? `${logTail}\n${errTail}` : errTail;
       } catch {}
       let portOwner = "";
       try {
