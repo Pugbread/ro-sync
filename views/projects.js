@@ -1,5 +1,6 @@
 // views/projects.js — saved project list with add/edit/remove + status dots.
 import { daemonJson } from "../bridge.js";
+import { pickFolderCmd } from "../platform.js";
 
 export function mountProjects(root, api) {
   root.innerHTML = `
@@ -253,15 +254,16 @@ export function mountProjects(root, api) {
   }
 
   async function pickFolder() {
-    const script = 'tell application "System Events" to activate\nPOSIX path of (choose folder with prompt "Pick Ro Sync project folder")';
-    const b64 = btoa(script);
-    const cmd = `echo ${b64} | base64 -d | osascript`;
     try {
-      const res = await api.t64("t64:exec", { command: cmd });
-      const out = (res?.stdout || "").trim().replace(/\/+$/, "");
+      const res = await api.t64("t64:exec", {
+        command: pickFolderCmd("Pick Ro Sync project folder"),
+      });
+      // Strip trailing slash/backslash; osascript and PS both round-trip with
+      // a trailing sep on some paths.
+      const out = (res?.stdout || "").trim().replace(/[\\/]+$/, "");
       if (out) {
         $path.value = out;
-      } else if (res?.stderr && !/User canceled/i.test(res.stderr)) {
+      } else if (res?.stderr && !/User canceled|cancelled/i.test(res.stderr)) {
         api.toast("Folder picker failed");
       }
     } catch (e) {

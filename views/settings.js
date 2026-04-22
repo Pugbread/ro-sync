@@ -1,28 +1,26 @@
 // views/settings.js — install helper, daemon info, controls.
 
+import {
+  PLATFORM,
+  BINARY_REL, WIDGET_DIR_SHELL,
+  PLUGIN_DIR_DISPLAY, PLUGIN_DIR_SHELL,
+  pluginInstallCmd, openFolderEnsuredCmd,
+  writeFileFromB64Cmd, readFileCmd,
+  joinShell,
+} from "../platform.js";
+
 const DEFAULT_PORT = 7878;
-const PLUGIN_FOLDER_DISPLAY = "~/Documents/Roblox/Plugins";
-const PLUGIN_FOLDER_SHELL = "$HOME/Documents/Roblox/Plugins";
-const WIDGET_DIR_SHELL = "$HOME/.terminal64/widgets/ro-sync";
-const BINARY_REL = "daemon/rosync-darwin-arm64";
 const PLUGIN_REL = "plugin/Plugin.luau";
 
-// POSIX single-quote shell escape.
-function shQuote(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'";
-}
-
-// Write arbitrary text to a path via `echo <b64> | base64 -d > path`.
-// Avoids quoting headaches for JSON payloads containing newlines/quotes.
+// Write arbitrary text to a path via base64 round-trip. Avoids quoting
+// headaches for JSON payloads containing newlines/quotes/unicode.
 async function writeFileViaExec(api, absPath, text) {
   const b64 = btoa(unescape(encodeURIComponent(text)));
-  const command = `echo ${shQuote(b64)} | base64 -d > ${shQuote(absPath)}`;
-  return api.t64("t64:exec", { command });
+  return api.t64("t64:exec", { command: writeFileFromB64Cmd(absPath, b64) });
 }
 
 async function readFileViaExec(api, absPath) {
-  const command = `cat ${shQuote(absPath)} 2>/dev/null || true`;
-  const res = await api.t64("t64:exec", { command });
+  const res = await api.t64("t64:exec", { command: readFileCmd(absPath) });
   return (res && typeof res.stdout === "string") ? res.stdout : "";
 }
 
@@ -90,7 +88,7 @@ export function mountSettings(root, api) {
     <section class="section">
       <h3>About</h3>
       <p>Ro Sync — zero-config two-way sync between Roblox Studio and your filesystem.</p>
-      <p style="color:var(--muted)">macOS arm64 only in v1.</p>
+      <p style="color:var(--muted)">Platform: <span id="set-platform">—</span></p>
     </section>
   `;
 
@@ -127,7 +125,9 @@ export function mountSettings(root, api) {
   function refresh() {
     const s = api.getState();
     const base = api.getDaemonBase();
-    $bin.textContent = WIDGET_DIR_SHELL + "/" + BINARY_REL;
+    $bin.textContent = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
+    const $plat = root.querySelector("#set-platform");
+    if ($plat) $plat.textContent = PLATFORM;
     $port.textContent = s.daemonPort ?? DEFAULT_PORT;
     $pid.textContent = s.daemonPid ?? "—";
     $base.textContent = base || "—";
@@ -231,21 +231,26 @@ export function mountSettings(root, api) {
   });
 
   $install.addEventListener("click", async () => {
-    const command = `mkdir -p ${PLUGIN_FOLDER_SHELL} && cp ${WIDGET_DIR_SHELL}/${PLUGIN_REL} ${PLUGIN_FOLDER_SHELL}/RoSync.lua && rm -f ${PLUGIN_FOLDER_SHELL}/RoSync.luau`;
+    const command = pluginInstallCmd({
+      srcFile:   joinShell(WIDGET_DIR_SHELL, PLUGIN_REL),
+      destDir:   PLUGIN_DIR_SHELL,
+      destName:  "RoSync.lua",
+      staleName: "RoSync.luau",
+    });
     try {
       const res = await api.t64("t64:exec", { command });
       if (res && res.code !== 0 && res.code != null) {
         throw new Error(res.stderr?.trim() || `exit ${res.code}`);
       }
       api.toast("Installed");
-      $pluginMsg.textContent = `Installed to ${PLUGIN_FOLDER_DISPLAY}/RoSync.lua — restart Studio`;
+      $pluginMsg.textContent = `Installed to ${joinShell(PLUGIN_DIR_DISPLAY, "RoSync.lua")} — restart Studio`;
     } catch (e) {
       $pluginMsg.textContent = `Install failed: ${e.message}`;
     }
   });
 
   $openFolder.addEventListener("click", async () => {
-    const command = `mkdir -p ${PLUGIN_FOLDER_SHELL} && /usr/bin/open ${PLUGIN_FOLDER_SHELL}`;
+    const command = openFolderEnsuredCmd(PLUGIN_DIR_SHELL);
     try {
       const res = await api.t64("t64:exec", { command });
       if (res && res.code !== 0 && res.code != null) {

@@ -77,13 +77,15 @@ pub fn router(state: AppState) -> Router {
 /// verbatim (after a timestamp is merged in) — callers should post a JSON
 /// object describing the write they just performed.
 async fn writelog(body: Json<Value>) -> Json<Value> {
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => h,
-        _ => {
-            return Json(json!({ "ok": false, "error": "HOME not set" }));
+    // dirs::home_dir() is cross-platform: reads $HOME on Unix (so test overrides
+    // via set_var("HOME", ...) still work) and %USERPROFILE% on Windows.
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            return Json(json!({ "ok": false, "error": "home directory not found" }));
         }
     };
-    let dir = Path::new(&home).join(".terminal64/widgets/ro-sync");
+    let dir = home.join(".terminal64").join("widgets").join("ro-sync");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Json(json!({ "ok": false, "error": format!("mkdir {}: {e}", dir.display()) }));
     }

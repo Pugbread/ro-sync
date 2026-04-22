@@ -6,6 +6,16 @@ import { mountConflicts } from "./views/conflicts.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
 import { mountPreviewModal } from "./views/preview.js";
+import {
+  PLATFORM, IS_WINDOWS,
+  BINARY_REL, WIDGET_DIR_SHELL,
+  shQuote,
+  pidAliveCmd, parsePidAlive,
+  killPidCmd, killDaemonOnPortCmd,
+  tailLogCmd, portOwnerCmd,
+  launchDaemonCmd, tmpLogPath,
+  joinShell,
+} from "./platform.js";
 
 // ---------- State store ----------
 // Persisted shape:
@@ -64,7 +74,6 @@ export function setState(patch) {
 
 const DEFAULT_PORT = 7878;
 const PORT_SCAN_MAX = 7890;   // inclusive — scan 7878..7890 before giving up
-const BINARY_REL = "daemon/rosync-darwin-arm64";
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
 // Persisted via t64:get-state/set-state under key "sessions". Shape:
@@ -89,8 +98,8 @@ async function pidAlive(pid) {
   const n = parseInt(pid, 10);
   if (!Number.isFinite(n) || n <= 0) return false;
   try {
-    const res = await t64("t64:exec", { command: `kill -0 ${n} 2>/dev/null; echo $?` });
-    return (res && typeof res.stdout === "string" ? res.stdout : "").trim() === "0";
+    const res = await t64("t64:exec", { command: pidAliveCmd(n) });
+    return parsePidAlive(res && res.stdout);
   } catch { return false; }
 }
 
@@ -147,47 +156,29 @@ function activeProjectPath() {
   return p ? p.path : null;
 }
 
-// POSIX single-quote shell escape: wraps in '…' and replaces every ' with '\''.
-function shQuote(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'";
-}
-
 async function launchDaemon(projectPath, port) {
   const proj = activeProject();
-  // Double-quoted so $HOME expands at shell time (single-quoting would not).
-  const binary = `"$HOME/.terminal64/widgets/ro-sync/${BINARY_REL}"`;
+  // Shell-level path — host expands $HOME / %USERPROFILE% at command time.
+  const binaryPath = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
 
-  const parts = [
-    shQuote("--project"), shQuote(projectPath),
-    shQuote("--port"), shQuote(String(port)),
+  // Raw (unquoted) args — launchDaemonCmd applies platform-native quoting.
+  const args = [
+    "--project", projectPath,
+    "--port",    String(port),
   ];
   if (proj && proj.gameId) {
-    parts.push(shQuote("--game-id"), shQuote(String(proj.gameId)));
+    args.push("--game-id", String(proj.gameId));
   }
   if (proj && Array.isArray(proj.placeIds)) {
     for (const pid of proj.placeIds) {
       const v = String(pid).trim();
       if (!v) continue;
-      parts.push(shQuote("--place-id"), shQuote(v));
+      args.push("--place-id", v);
     }
   }
 
-  const logPath = `/tmp/rosync-${port}.log`;
-  const grepPat = `rosync-darwin-arm64.*--port ${port}`;
-  // Subshell with `</dev/null` + `&` orphans the daemon to init so it survives
-  // t64:exec teardown (which otherwise kills the child process group).
-  // Poll pgrep up to ~3s in 200ms steps so a slow-starting daemon (or one
-  // that's racing a just-freed port) has time to show up. Echo "---" then
-  // the pid as the last stdout line so we can parse reliably.
-  const command =
-    `( nohup ${binary} ${parts.join(" ")} ` +
-    `</dev/null >${shQuote(logPath)} 2>&1 & ) ; ` +
-    `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ; do ` +
-    `  PID=$(pgrep -f ${shQuote(grepPat)} | tail -1) ; ` +
-    `  if [ -n "$PID" ] ; then echo "---" ; echo "$PID" ; exit 0 ; fi ; ` +
-    `  sleep 0.2 ; ` +
-    `done ; ` +
-    `echo "---" ; echo ""`;
+  const logPath = tmpLogPath(`rosync-${port}.log`);
+  const command = launchDaemonCmd({ binaryPath, args, logPath, port });
 
   try {
     const res = await t64("t64:exec", { command });
@@ -207,16 +198,12 @@ async function launchDaemon(projectPath, port) {
     // occupied by something else so we can surface a useful hint.
     let logTail = "";
     try {
-      const logRes = await t64("t64:exec", {
-        command: `tail -40 ${shQuote(logPath)} 2>/dev/null || true`,
-      });
+      const logRes = await t64("t64:exec", { command: tailLogCmd(logPath) });
       logTail = (logRes && logRes.stdout) ? logRes.stdout.trim() : "";
     } catch {}
     let portOwner = "";
     try {
-      const own = await t64("t64:exec", {
-        command: `lsof -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1 "(" $2 ")"}' | head -1`,
-      });
+      const own = await t64("t64:exec", { command: portOwnerCmd(port) });
       portOwner = (own && own.stdout) ? own.stdout.trim() : "";
     } catch {}
     const hint = logTail
@@ -339,7 +326,7 @@ async function killDaemon() {
     return;
   }
   try {
-    await t64("t64:exec", { command: "/bin/kill " + String(parseInt(pid, 10)) });
+    await t64("t64:exec", { command: killPidCmd(pid) });
   } catch (e) {
     console.warn("kill failed", e);
   }
@@ -353,23 +340,12 @@ async function killDaemon() {
 
 // Kill whatever rosync daemon is bound to `port`, even if we don't have its
 // PID in state (common after a widget reload or after an older build launched
-// it with different CLI args). Uses pkill (portable on BSD/macOS — unlike
-// `xargs -r` which is a GNU-ism) and waits long enough for the port to
-// actually release before returning.
+// it with different CLI args). Platform-aware — see killDaemonOnPortCmd.
 async function killStaleDaemonAt(port) {
   const portN = parseInt(port, 10);
   if (!Number.isFinite(portN)) return;
-  const pat = `rosync-darwin-arm64.*--port ${portN}`;
   try {
-    // SIGTERM first, brief wait, then SIGKILL stragglers + wait for bind to
-    // free up so the relaunch doesn't race into "address in use".
-    const cmd =
-      `pkill -f ${shQuote(pat)} 2>/dev/null ; ` +
-      `sleep 0.4 ; ` +
-      `pkill -9 -f ${shQuote(pat)} 2>/dev/null ; ` +
-      `sleep 0.6 ; ` +
-      `true`;
-    await t64("t64:exec", { command: cmd });
+    await t64("t64:exec", { command: killDaemonOnPortCmd(portN) });
   } catch (e) {
     console.warn("killStaleDaemonAt failed", e);
   }

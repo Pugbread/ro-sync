@@ -18,15 +18,35 @@ index.html     Widget entry
 style.css      Widget styles
 ```
 
-## Building
+## Supported platforms
+
+| Platform | Daemon | Widget UI | Plugin install |
+|---|---|---|---|
+| macOS (arm64) | ✅ | ✅ | `~/Documents/Roblox/Plugins` |
+| Windows (x86_64) | ✅ | ✅ | `%LOCALAPPDATA%\Roblox\Plugins` |
+| Linux (x86_64) | ✅ | ⚠️ daemon + CLI only (Roblox Studio isn't native) | — |
+
+The widget detects the host OS from `navigator.userAgent` at load time and picks the matching binary (`rosync-darwin-arm64`, `rosync-windows-x86_64.exe`, or `rosync-linux-x86_64`) from `daemon/`. All three are produced by the release workflow.
+
+## Building from source
+
+macOS / Linux:
 
 ```sh
 cd daemon
-cargo build --release
-# binary at daemon/target/release/rosync — copy into $PATH
+./build.sh         # emits rosync-<os>-<arch> next to Cargo.toml
 ```
 
-Plugin: open `plugin/Plugin.luau` in Roblox Studio's plugin folder (or use the widget's Settings → Install).
+Windows (PowerShell):
+
+```powershell
+cd daemon
+.\build.ps1        # emits rosync-windows-x86_64.exe
+```
+
+Or pull pre-built binaries from [GitHub Releases](https://github.com/Pugbread/ro-sync/releases) and drop them in `daemon/`.
+
+Plugin: the widget's **Settings → Install** button copies `plugin/Plugin.luau` into the correct Studio plugin folder for your OS. Or do it manually.
 
 ## Daemon
 
