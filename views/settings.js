@@ -1,13 +1,17 @@
 // views/settings.js — install helper, daemon info, controls.
 
 import {
-  PLATFORM,
+  PLATFORM, IS_WINDOWS,
   BINARY_REL, WIDGET_DIR_SHELL,
   PLUGIN_DIR_DISPLAY, PLUGIN_DIR_SHELL,
   pluginInstallCmd, openFolderEnsuredCmd,
   writeFileFromB64Cmd, readFileCmd,
+  checkBinaryCmd, checkCargoCmd, buildDaemonCmd, parseBuildOutput,
   joinShell,
 } from "../platform.js";
+
+const RELEASES_URL = "https://github.com/Pugbread/ro-sync/releases";
+const RUSTUP_URL   = "https://rustup.rs";
 
 const DEFAULT_PORT = 7878;
 const PLUGIN_REL = "plugin/Plugin.luau";
@@ -68,6 +72,28 @@ export function mountSettings(root, api) {
       <p id="set-plugin-msg" style="color:var(--muted); margin-top:8px"></p>
     </section>
 
+    <section class="section" id="sec-build" hidden>
+      <h3>Build daemon</h3>
+      <p id="build-status" style="color:var(--warn)">Checking…</p>
+      <pre id="build-log" class="build-log" hidden
+        style="max-height:240px; overflow:auto; padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:4px; font-size:12px; white-space:pre-wrap; word-break:break-all;"></pre>
+      <div class="row">
+        <button id="build-run" class="primary" hidden>Build now</button>
+        <a id="build-releases" href="${RELEASES_URL}" target="_blank" rel="noopener noreferrer">
+          <button type="button">Download from Releases</button>
+        </a>
+        <a id="build-rustup" href="${RUSTUP_URL}" target="_blank" rel="noopener noreferrer" hidden>
+          <button type="button">Install Rust</button>
+        </a>
+      </div>
+      <p style="color:var(--muted); margin-top:8px">
+        The daemon is a tiny Rust program. If it isn't built yet, click
+        <b>Build now</b> (requires the Rust toolchain) or grab a pre-built
+        binary from GitHub Releases and drop it in
+        <code id="build-dir-hint">—</code>.
+      </p>
+    </section>
+
     <section class="section">
       <h3>Daemon</h3>
       <dl class="kv">
@@ -104,6 +130,13 @@ export function mountSettings(root, api) {
   const $stop = root.querySelector("#set-stop");
   const $restart = root.querySelector("#set-restart");
 
+  const $buildSection = root.querySelector("#sec-build");
+  const $buildStatus  = root.querySelector("#build-status");
+  const $buildLog     = root.querySelector("#build-log");
+  const $buildRun     = root.querySelector("#build-run");
+  const $buildRustup  = root.querySelector("#build-rustup");
+  const $buildDirHint = root.querySelector("#build-dir-hint");
+
   const $ppSection = root.querySelector("#sec-project");
   const $ppName = root.querySelector("#pp-name");
   const $ppPriority = root.querySelector("#pp-priority");
@@ -112,6 +145,97 @@ export function mountSettings(root, api) {
   const $ppSave = root.querySelector("#pp-save");
   const $ppReset = root.querySelector("#pp-reset");
   const $ppMsg = root.querySelector("#pp-msg");
+
+  // --- Binary / build management ---
+  async function execStdout(cmd) {
+    try {
+      const res = await api.t64("t64:exec", { command: cmd });
+      return (res && typeof res.stdout === "string") ? res.stdout.trim() : "";
+    } catch { return ""; }
+  }
+
+  async function checkBinary() {
+    return (await execStdout(checkBinaryCmd())).toLowerCase() === "yes";
+  }
+
+  async function checkCargo() {
+    return (await execStdout(checkCargoCmd())).toLowerCase() === "yes";
+  }
+
+  async function refreshBuildBanner() {
+    $buildDirHint.textContent = joinShell(WIDGET_DIR_SHELL, "daemon");
+    const have = await checkBinary();
+    if (have) {
+      $buildSection.hidden = true;
+      return;
+    }
+    $buildSection.hidden = false;
+    $buildLog.hidden = true;
+    $buildLog.textContent = "";
+    const hasCargo = await checkCargo();
+    if (hasCargo) {
+      $buildStatus.textContent = "Daemon binary not found. Click “Build now” to compile it (~1-2 minutes).";
+      $buildRun.hidden = false;
+      $buildRustup.hidden = true;
+    } else {
+      $buildStatus.textContent =
+        "Daemon binary not found, and the Rust toolchain (cargo) isn’t on PATH. " +
+        "Install Rust first, or download a pre-built binary from Releases.";
+      $buildRun.hidden = true;
+      $buildRustup.hidden = false;
+    }
+  }
+
+  async function runBuild() {
+    $buildRun.disabled = true;
+    $buildStatus.textContent = "Building… this usually takes 1-2 minutes. Do not close the widget.";
+    $buildLog.hidden = false;
+    $buildLog.textContent = "$ " + (IS_WINDOWS ? "daemon\\build.ps1" : "daemon/build.sh") + "\n";
+    try {
+      // cargo build --release can take 1-2 minutes (cold cache). Override the
+      // bridge's default 30s timeout so the promise doesn't reject early.
+      const res = await api.t64("t64:exec", {
+        command: buildDaemonCmd(),
+        timeoutMs: 5 * 60_000,
+      });
+      const out = (res && typeof res.stdout === "string" ? res.stdout : "")
+        + (res && typeof res.stderr === "string" && res.stderr ? "\n" + res.stderr : "");
+      const { ok, code, log } = parseBuildOutput(out);
+      $buildLog.textContent = (log || "(no build output)").slice(-8000);
+      $buildLog.scrollTop = $buildLog.scrollHeight;
+      if (ok) {
+        $buildStatus.textContent = "Build succeeded. Starting daemon…";
+        api.toast("Daemon built");
+        setTimeout(async () => {
+          await refreshBuildBanner();
+          await api.ensureDaemon();
+          refresh();
+        }, 500);
+      } else {
+        $buildStatus.textContent = `Build failed (exit ${code ?? "?"}). See log below.`;
+      }
+    } catch (e) {
+      // Host may have its own exec timeout shorter than the build. Re-probe
+      // the binary before reporting failure — the background build often
+      // completes anyway.
+      const present = await checkBinary();
+      if (present) {
+        $buildStatus.textContent = "Build finished (exec stream cut off early, but the binary is now in place). Starting daemon…";
+        api.toast("Daemon built");
+        setTimeout(async () => {
+          await refreshBuildBanner();
+          await api.ensureDaemon();
+          refresh();
+        }, 500);
+      } else {
+        $buildStatus.textContent = `Build failed: ${e.message}`;
+      }
+    } finally {
+      $buildRun.disabled = false;
+    }
+  }
+
+  $buildRun.addEventListener("click", runBuild);
 
   function activeProject() {
     const s = api.getState();
@@ -276,10 +400,11 @@ export function mountSettings(root, api) {
   });
 
   const offState = api.onBus("state", refresh);
-  const offUp = api.onBus("daemon:up", refresh);
-  const offDown = api.onBus("daemon:down", refresh);
+  const offUp = api.onBus("daemon:up", () => { refresh(); refreshBuildBanner(); });
+  const offDown = api.onBus("daemon:down", () => { refresh(); refreshBuildBanner(); });
 
   refresh();
+  refreshBuildBanner();
 
   return () => { offState(); offUp(); offDown(); };
 }

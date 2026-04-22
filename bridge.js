@@ -18,18 +18,22 @@ function nextId() {
   return "r" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+// `payload.timeoutMs` — optional override for the default 30s timeout, for
+// long-running ops like `cargo build`. The timeoutMs key is NOT forwarded to
+// the host; it only controls our local pending-promise expiry.
 export function t64(type, payload = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId();
+    const { timeoutMs = 30000, ...forwarded } = payload || {};
     const timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
         reject(new Error(`t64 ${type} timed out`));
       }
-    }, 30000);
+    }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
     try {
-      window.parent.postMessage({ type, payload: { ...payload, id } }, "*");
+      window.parent.postMessage({ type, payload: { ...forwarded, id } }, "*");
     } catch (err) {
       clearTimeout(timer);
       pending.delete(id);

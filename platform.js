@@ -203,7 +203,7 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
       `$xp = { param($s) [Environment]::ExpandEnvironmentVariables($s) }; ` +
       `try { ` +
       `  $bin = & $xp ${psQuote(binaryPath)}; ` +
-      `  if (-not (Test-Path $bin)) { throw ('binary not found: ' + $bin + '  (build with daemon\\build.ps1 or download from GitHub Releases)') }; ` +
+      `  if (-not (Test-Path $bin)) { throw ('binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ' + $bin) }; ` +
       `  $log = & $xp ${psQuote(logPath)}; ` +
       `  $err = & $xp ${psQuote(logPath + ".err")}; ` +
       `  $proc = Start-Process -FilePath $bin ` +
@@ -218,11 +218,16 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
     return psEncodedCmd(ps);
   }
   // POSIX: double-quote binaryPath so $HOME expands; single-quote each arg so
-  // spaces and metachars are preserved. Background the daemon under nohup and
-  // poll pgrep up to ~3s for a slow start.
+  // spaces and metachars are preserved. Pre-flight: if the binary doesn't
+  // exist, short-circuit with an ERROR sentinel the widget parses.
   const quotedArgs = args.map(posixQuote).join(" ");
   const grepPat = `${BINARY_NAME}.*--port ${port}`;
   return (
+    `if [ ! -x "${binaryPath}" ] ; then ` +
+    `  echo "---" ; ` +
+    `  echo "ERROR: binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ${binaryPath}" ; ` +
+    `  exit 0 ; ` +
+    `fi ; ` +
     `( nohup "${binaryPath}" ${quotedArgs} ` +
     `</dev/null >${posixQuote(logPath)} 2>&1 & ) ; ` +
     `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ; do ` +
@@ -345,6 +350,75 @@ export function readFileCmd(absPath) {
     );
   }
   return `cat ${posixQuote(absPath)} 2>/dev/null || true`;
+}
+
+// ---------- Binary presence + build helpers ----------
+
+// Probe whether the daemon binary exists. Stdout is "yes" or "no".
+export function checkBinaryCmd() {
+  const rel = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
+  if (IS_WINDOWS) {
+    return psEncodedCmd(
+      `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(rel)}); ` +
+      `if (Test-Path $p) { 'yes' } else { 'no' }`
+    );
+  }
+  return `if [ -x ${posixQuote(rel)} ]; then echo yes; else echo no; fi`;
+}
+
+// Probe whether a `cargo` toolchain is on PATH. Stdout is "yes" or "no".
+export function checkCargoCmd() {
+  if (IS_WINDOWS) {
+    return psEncodedCmd(
+      `if (Get-Command cargo -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }`
+    );
+  }
+  // POSIX login shells often don't inherit the cargo path, so also look in
+  // the canonical $HOME/.cargo/bin as a fallback.
+  return (
+    `if command -v cargo >/dev/null 2>&1 || [ -x "$HOME/.cargo/bin/cargo" ]; ` +
+    `then echo yes; else echo no; fi`
+  );
+}
+
+// Run the platform-appropriate build script. Emits combined stdout+stderr
+// followed by a final line `___EXIT:<code>` so the caller can parse the
+// outcome without relying on t64:exec's own exit-code surface.
+export function buildDaemonCmd() {
+  if (IS_WINDOWS) {
+    const ps =
+      `$ErrorActionPreference = 'Continue'; ` +
+      `$ProgressPreference = 'SilentlyContinue'; ` +
+      `$dir = [Environment]::ExpandEnvironmentVariables(${psQuote(joinShell(WIDGET_DIR_SHELL, "daemon"))}); ` +
+      `Push-Location $dir; ` +
+      `try { ` +
+      `  & powershell -NoProfile -ExecutionPolicy Bypass -File .\\build.ps1 2>&1 | ForEach-Object { $_.ToString() }; ` +
+      `  $code = $LASTEXITCODE; ` +
+      `  if ($null -eq $code) { $code = 0 }; ` +
+      `  Write-Output ('___EXIT:' + $code) ` +
+      `} catch { ` +
+      `  Write-Output $_.Exception.Message; ` +
+      `  Write-Output '___EXIT:1' ` +
+      `} finally { Pop-Location }`;
+    return psEncodedCmd(ps);
+  }
+  // POSIX: cd into daemon, run build.sh, capture exit code. Prefer the user's
+  // cargo if rustup is installed under $HOME/.cargo.
+  return (
+    `cd ${posixQuote(WIDGET_DIR_SHELL)}/daemon && ` +
+    `CARGO="$HOME/.cargo/bin/cargo" bash ./build.sh 2>&1; ` +
+    `echo "___EXIT:$?"`
+  );
+}
+
+// Parse the `___EXIT:<code>` tail emitted by buildDaemonCmd. Returns
+// `{ ok, code, log }` where `log` is the build output without the sentinel.
+export function parseBuildOutput(stdout) {
+  const s = typeof stdout === "string" ? stdout : "";
+  const m = s.match(/___EXIT:(\d+)\s*$/);
+  const code = m ? parseInt(m[1], 10) : NaN;
+  const log = m ? s.slice(0, m.index).trimEnd() : s.trimEnd();
+  return { ok: code === 0, code: Number.isFinite(code) ? code : null, log };
 }
 
 // ---------- Path joining for shell-level concatenation ----------
