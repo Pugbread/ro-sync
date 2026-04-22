@@ -61,9 +61,41 @@ function posixQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 function winQuote(s)   { return '"' + String(s).replace(/"/g, '""') + '"'; }
 export function shQuote(s) { return IS_WINDOWS ? winQuote(s) : posixQuote(s); }
 
-// PowerShell single-quote escape (for use inside `-Command "...'…'..."`).
+// PowerShell single-quote escape (for use inside a PS script).
 // PowerShell: single-quoted strings escape ' as '' and do not expand variables.
 export function psQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
+
+// Encode a PowerShell script as UTF-16LE base64 so it can be passed via
+// `powershell -EncodedCommand <base64>`. This ELIMINATES every quoting concern
+// because the argument is pure [A-Za-z0-9+/=] — no shell can mangle it.
+//
+// Works in both browser (btoa) and Node (Buffer) contexts.
+function toUtf16LEBase64(s) {
+  const u8 = new Uint8Array(s.length * 2);
+  for (let i = 0; i < s.length; i++) {
+    const cp = s.charCodeAt(i);
+    u8[i * 2]     = cp & 0xFF;
+    u8[i * 2 + 1] = (cp >>> 8) & 0xFF;
+  }
+  if (typeof btoa === "function") {
+    let bin = "";
+    // Build binary string in chunks to avoid stack overflow on huge inputs.
+    for (let i = 0; i < u8.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  }
+  // Node fallback for tests.
+  return Buffer.from(u8).toString("base64");
+}
+
+// Build a `powershell -EncodedCommand <base64>` invocation. Arg tokens are all
+// bare ASCII, so no parent-shell can break them. Use for anything that would
+// otherwise need embedded " inside -Command.
+export function psEncodedCmd(psScript) {
+  const b64 = toUtf16LEBase64(psScript);
+  return `powershell -NoProfile -NonInteractive -EncodedCommand ${b64}`;
+}
 
 // ---------- Temp dir / log path ----------
 export function tmpLogPath(name) {
@@ -78,7 +110,9 @@ export function pidAliveCmd(pid) {
   const n = parseInt(pid, 10);
   if (!Number.isFinite(n) || n <= 0) return `echo dead`;
   if (IS_WINDOWS) {
-    return `powershell -NoProfile -Command "if (Get-Process -Id ${n} -ErrorAction SilentlyContinue) { 'alive' } else { 'dead' }"`;
+    return psEncodedCmd(
+      `if (Get-Process -Id ${n} -ErrorAction SilentlyContinue) { 'alive' } else { 'dead' }`
+    );
   }
   return `kill -0 ${n} 2>/dev/null && echo alive || echo dead`;
 }
@@ -106,11 +140,11 @@ export function killDaemonOnPortCmd(port) {
     // Match on process name + command-line substring via CIM; Stop-Process -Force.
     // Sleep 600ms after the kill so the port is fully released.
     const ps =
-      `$procs = Get-CimInstance Win32_Process -Filter \\"Name='${BINARY_NAME}'\\" | ` +
+      `$procs = Get-CimInstance Win32_Process -Filter "Name='${BINARY_NAME}'" | ` +
       `Where-Object { $_.CommandLine -like '*--port ${p}*' }; ` +
       `if ($procs) { $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }; ` +
       `Start-Sleep -Milliseconds 600`;
-    return `powershell -NoProfile -Command "${ps}"`;
+    return psEncodedCmd(ps);
   }
   const pat = `${BINARY_NAME}.*--port ${p}`;
   return (
@@ -124,9 +158,12 @@ export function killDaemonOnPortCmd(port) {
 
 // Tail the last ~40 lines of a log file (best-effort; empty if missing).
 export function tailLogCmd(path) {
-  return IS_WINDOWS
-    ? `powershell -NoProfile -Command "if (Test-Path ${psQuote(path)}) { Get-Content -Tail 40 ${psQuote(path)} }"`
-    : `tail -40 ${posixQuote(path)} 2>/dev/null || true`;
+  if (IS_WINDOWS) {
+    return psEncodedCmd(
+      `if (Test-Path ${psQuote(path)}) { Get-Content -Tail 40 ${psQuote(path)} }`
+    );
+  }
+  return `tail -40 ${posixQuote(path)} 2>/dev/null || true`;
 }
 
 // Find which process owns a TCP listen socket, as "name(pid)" or empty.
@@ -134,13 +171,11 @@ export function portOwnerCmd(port) {
   const p = parseInt(port, 10);
   if (!Number.isFinite(p)) return `echo`;
   if (IS_WINDOWS) {
-    // PS body uses only single-quoted literals + concatenation so we never
-    // need embedded " inside the outer cmd-level double-quoted -Command arg.
     const ps =
       `$c = Get-NetTCPConnection -LocalPort ${p} -State Listen -ErrorAction SilentlyContinue | Select -First 1; ` +
       `if ($c) { $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; ` +
       `if ($proc) { $proc.ProcessName + '(' + $proc.Id + ')' } }`;
-    return `powershell -NoProfile -Command "${ps}"`;
+    return psEncodedCmd(ps);
   }
   return `lsof -nP -iTCP:${p} -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1 "(" $2 ")"}' | head -1`;
 }
@@ -157,19 +192,23 @@ export function portOwnerCmd(port) {
 // PowerShell -Command argument before PowerShell parses it.
 export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
   if (IS_WINDOWS) {
-    // Start-Process -PassThru returns the Process object synchronously, so we
-    // don't need to poll — the PID is available immediately.
+    // Expand %VAR% references inside PS via ExpandEnvironmentVariables — no
+    // reliance on cmd-level pre-expansion. Start-Process -PassThru returns
+    // the Process object synchronously, so we don't need to poll.
     const psArgs = args.map(psQuote).join(",");
     const ps =
       `$ErrorActionPreference = 'Stop'; ` +
-      `$proc = Start-Process -FilePath ${psQuote(binaryPath)} ` +
+      `$xp = { param($s) [Environment]::ExpandEnvironmentVariables($s) }; ` +
+      `$bin = & $xp ${psQuote(binaryPath)}; ` +
+      `$log = & $xp ${psQuote(logPath)}; ` +
+      `$err = & $xp ${psQuote(logPath + ".err")}; ` +
+      `$proc = Start-Process -FilePath $bin ` +
       `-ArgumentList @(${psArgs}) ` +
       `-PassThru -WindowStyle Hidden ` +
-      `-RedirectStandardOutput ${psQuote(logPath)} ` +
-      `-RedirectStandardError ${psQuote(logPath + ".err")}; ` +
+      `-RedirectStandardOutput $log ` +
+      `-RedirectStandardError $err; ` +
       `Write-Output '---'; Write-Output $proc.Id`;
-    // Wrap in outer double quotes for cmd.exe; escape inner " as \".
-    return `powershell -NoProfile -Command "${ps.replace(/"/g, '\\"')}"`;
+    return psEncodedCmd(ps);
   }
   // POSIX: double-quote binaryPath so $HOME expands; single-quote each arg so
   // spaces and metachars are preserved. Background the daemon under nohup and
@@ -199,15 +238,22 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
 // platform-appropriate quoting internally.
 export function pluginInstallCmd({ srcFile, destDir, destName, staleName }) {
   if (IS_WINDOWS) {
-    const dest = destDir + "\\" + destName;
-    const stale = destDir + "\\" + staleName;
+    // Inside PS we expand env vars explicitly via [Environment]::ExpandEnvironmentVariables
+    // instead of relying on cmd-level %VAR% expansion. Makes the command
+    // shell-independent.
+    const destFile  = destDir + "\\" + destName;
+    const staleFile = destDir + "\\" + staleName;
     const ps =
       `$ErrorActionPreference = 'Stop'; ` +
-      `$dest = ${psQuote(destDir)}; ` +
-      `if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }; ` +
-      `Copy-Item -Path ${psQuote(srcFile)} -Destination ${psQuote(dest)} -Force; ` +
-      `if (Test-Path ${psQuote(stale)}) { Remove-Item -Path ${psQuote(stale)} -Force }`;
-    return `powershell -NoProfile -Command "${ps.replace(/"/g, '\\"')}"`;
+      `$xp = { param($s) [Environment]::ExpandEnvironmentVariables($s) }; ` +
+      `$src   = & $xp ${psQuote(srcFile)}; ` +
+      `$dir   = & $xp ${psQuote(destDir)}; ` +
+      `$dest  = & $xp ${psQuote(destFile)}; ` +
+      `$stale = & $xp ${psQuote(staleFile)}; ` +
+      `if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }; ` +
+      `Copy-Item -Path $src -Destination $dest -Force; ` +
+      `if (Test-Path $stale) { Remove-Item -Path $stale -Force }`;
+    return psEncodedCmd(ps);
   }
   // POSIX: sh sequence — mkdir -p is idempotent, cp -f overwrites, rm -f
   // silently skips missing. All in one line so it works under any invoking
@@ -226,10 +272,10 @@ export function pluginInstallCmd({ srcFile, destDir, destName, staleName }) {
 export function openFolderEnsuredCmd(dir) {
   if (IS_WINDOWS) {
     const ps =
-      `$dest = ${psQuote(dir)}; ` +
+      `$dest = [Environment]::ExpandEnvironmentVariables(${psQuote(dir)}); ` +
       `if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }; ` +
       `Start-Process explorer.exe -ArgumentList $dest`;
-    return `powershell -NoProfile -Command "${ps.replace(/"/g, '\\"')}"`;
+    return psEncodedCmd(ps);
   }
   const dq = posixQuote(dir);
   const opener = PLATFORM === "linux" ? "xdg-open" : "/usr/bin/open";
@@ -240,14 +286,19 @@ export function openFolderEnsuredCmd(dir) {
 // (empty string if the user cancels).
 export function pickFolderCmd(prompt) {
   if (IS_WINDOWS) {
+    // FolderBrowserDialog requires STA. Use encoded cmd so embedded quotes
+    // can't be mangled by the host shell, and emit ONLY the path (no banner)
+    // to stdout on success.
     const ps =
       `Add-Type -AssemblyName System.Windows.Forms | Out-Null; ` +
       `$dlg = New-Object System.Windows.Forms.FolderBrowserDialog; ` +
       `$dlg.Description = ${psQuote(prompt)}; ` +
       `$dlg.ShowNewFolderButton = $true; ` +
       `if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { ` +
-      `  Write-Output $dlg.SelectedPath } else { Write-Output '' }`;
-    return `powershell -NoProfile -STA -Command "${ps.replace(/"/g, '\\"')}"`;
+      `  [Console]::Out.WriteLine($dlg.SelectedPath) }`;
+    // -STA is required for Windows Forms dialogs.
+    const b64 = toUtf16LEBase64(ps);
+    return `powershell -NoProfile -NonInteractive -STA -EncodedCommand ${b64}`;
   }
   if (PLATFORM === "linux") {
     // zenity is on nearly every GNOME/GTK desktop; kdialog on KDE. Try both.
@@ -271,8 +322,9 @@ export function pickFolderCmd(prompt) {
 export function writeFileFromB64Cmd(absPath, b64) {
   if (IS_WINDOWS) {
     const ps =
-      `[IO.File]::WriteAllBytes(${psQuote(absPath)}, [Convert]::FromBase64String(${psQuote(b64)}))`;
-    return `powershell -NoProfile -Command "${ps.replace(/"/g, '\\"')}"`;
+      `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(absPath)}); ` +
+      `[IO.File]::WriteAllBytes($p, [Convert]::FromBase64String(${psQuote(b64)}))`;
+    return psEncodedCmd(ps);
   }
   return `echo ${posixQuote(b64)} | base64 -d > ${posixQuote(absPath)}`;
 }
@@ -280,7 +332,10 @@ export function writeFileFromB64Cmd(absPath, b64) {
 // Read a text file's full contents to stdout (empty if missing).
 export function readFileCmd(absPath) {
   if (IS_WINDOWS) {
-    return `powershell -NoProfile -Command "if (Test-Path ${psQuote(absPath)}) { Get-Content -Raw ${psQuote(absPath)} }"`;
+    return psEncodedCmd(
+      `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(absPath)}); ` +
+      `if (Test-Path $p) { Get-Content -Raw $p }`
+    );
   }
   return `cat ${posixQuote(absPath)} 2>/dev/null || true`;
 }

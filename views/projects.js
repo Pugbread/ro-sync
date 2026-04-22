@@ -258,13 +258,20 @@ export function mountProjects(root, api) {
       const res = await api.t64("t64:exec", {
         command: pickFolderCmd("Pick Ro Sync project folder"),
       });
-      // Strip trailing slash/backslash; osascript and PS both round-trip with
-      // a trailing sep on some paths.
-      const out = (res?.stdout || "").trim().replace(/[\\/]+$/, "");
-      if (out) {
+      // Trim, drop trailing sep. Defensive: if stdout is multi-line OR looks
+      // like a PowerShell / shell error banner, ignore it instead of pasting
+      // garbage into the input.
+      const raw = (res?.stdout || "").trim();
+      const out = raw.replace(/[\\/]+$/, "");
+      const looksLikePath =
+        out && !/\r?\n/.test(out) && /^(?:[A-Za-z]:[\\/]|[\\/]|~)/.test(out);
+      if (looksLikePath) {
         $path.value = out;
-      } else if (res?.stderr && !/User canceled|cancelled/i.test(res.stderr)) {
+      } else if (!out) {
+        // User canceled — silent no-op.
+      } else {
         api.toast("Folder picker failed");
+        console.warn("pickFolder: ignoring non-path stdout", { raw, stderr: res?.stderr });
       }
     } catch (e) {
       api.toast("Folder picker unavailable");
@@ -318,8 +325,10 @@ export function mountProjects(root, api) {
 
 function basename(p) {
   if (!p) return "";
-  const s = p.replace(/\/+$/, "");
-  const i = s.lastIndexOf("/");
+  // Strip trailing separators, then split on either / or \ so Windows paths
+  // ("C:\Users\x\My Project") produce a clean leaf.
+  const s = p.replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
   return i >= 0 ? s.slice(i + 1) : s;
 }
 function escapeAttr(s) {
