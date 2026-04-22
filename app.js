@@ -183,40 +183,60 @@ async function launchDaemon(projectPath, port) {
   try {
     const res = await t64("t64:exec", { command });
     const stdout = (res && typeof res.stdout === "string" ? res.stdout : "").trim();
-    // Last non-empty line after the "---" separator is the pid (or empty on failure).
-    const lines = stdout.split("\n");
+    // Parse the structured response: `---\n<pid>` on success, `---\nERROR: <msg>`
+    // on failure. PS may prepend warning lines (ignored — we key off the sep).
+    const lines = stdout.split(/\r?\n/);
     const sepIdx = lines.lastIndexOf("---");
-    const pidStr = sepIdx >= 0 ? (lines[sepIdx + 1] || "").trim() : "";
-    const pid = parseInt(pidStr, 10);
+    const payload = sepIdx >= 0 ? (lines[sepIdx + 1] || "").trim() : "";
+    const pid = parseInt(payload, 10);
     if (Number.isFinite(pid) && pid > 0) {
       setState({ daemonPid: pid, daemonPort: port, daemonProject: projectPath });
       await upsertSession({ port, pid, project: projectPath, startedAt: Date.now() });
       return pid;
     }
 
-    // Launch failed — grab the daemon log and check whether the port is
-    // occupied by something else so we can surface a useful hint.
-    let logTail = "";
-    try {
-      const logRes = await t64("t64:exec", { command: tailLogCmd(logPath) });
-      logTail = (logRes && logRes.stdout) ? logRes.stdout.trim() : "";
-    } catch {}
-    let portOwner = "";
-    try {
-      const own = await t64("t64:exec", { command: portOwnerCmd(port) });
-      portOwner = (own && own.stdout) ? own.stdout.trim() : "";
-    } catch {}
-    const hint = logTail
-      || (portOwner ? `port ${port} held by ${portOwner}` : "")
-      || (res && res.stderr)
-      || "no pid returned";
-    console.error("daemon launch failed", { stdout, pidStr, logTail, portOwner, stderr: res?.stderr });
-    setStatus(`daemon launch failed — ${hint.slice(0, 200)}`, "err");
+    // If the PS try/catch caught it, `payload` starts with "ERROR:" — use it
+    // directly. Otherwise fall through to log/port/stderr hints.
+    let hint = "";
+    if (payload.startsWith("ERROR:")) {
+      hint = payload.slice(6).trim();
+    } else {
+      let logTail = "";
+      try {
+        const logRes = await t64("t64:exec", { command: tailLogCmd(logPath) });
+        logTail = (logRes && logRes.stdout) ? logRes.stdout.trim() : "";
+      } catch {}
+      let portOwner = "";
+      try {
+        const own = await t64("t64:exec", { command: portOwnerCmd(port) });
+        portOwner = (own && own.stdout) ? own.stdout.trim() : "";
+      } catch {}
+      hint =
+        logTail ||
+        (portOwner ? `port ${port} held by ${portOwner}` : "") ||
+        cleanPsStderr(res && res.stderr) ||
+        "no pid returned";
+    }
+    console.error("daemon launch failed", { stdout, payload, stderr: res?.stderr });
+    setStatus(`daemon launch failed — ${hint.slice(0, 240)}`, "err");
   } catch (e) {
     console.error("launch daemon failed", e);
     setStatus(`daemon launch failed: ${e.message}`, "err");
   }
   return null;
+}
+
+// PowerShell serializes errors as CLIXML when piping to a non-PS consumer.
+// The blob is unreadable to humans — strip it down to the inner <S> message
+// text, or drop it entirely if we can't recover anything useful.
+function cleanPsStderr(s) {
+  if (!s || typeof s !== "string") return "";
+  const trimmed = s.trim();
+  if (!trimmed.startsWith("#< CLIXML")) return trimmed;
+  // Try to pull the first <S …>message</S> payload out of the XML.
+  const m = trimmed.match(/<S[^>]*>([^<]+)<\/S>/);
+  if (m) return m[1].replace(/&#x[0-9A-Fa-f]+;/g, "").trim();
+  return "PowerShell error (see devtools console for full CLIXML)";
 }
 
 // Probes a port and, if a daemon responds, decides whether it's OURS for the

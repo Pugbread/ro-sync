@@ -192,22 +192,29 @@ export function portOwnerCmd(port) {
 // PowerShell -Command argument before PowerShell parses it.
 export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
   if (IS_WINDOWS) {
-    // Expand %VAR% references inside PS via ExpandEnvironmentVariables — no
-    // reliance on cmd-level pre-expansion. Start-Process -PassThru returns
-    // the Process object synchronously, so we don't need to poll.
+    // Wrap Start-Process in try/catch so we ALWAYS emit a structured response
+    // on stdout: `---\n<pid>` on success, `---\nERROR: <message>` on failure.
+    // This stops PowerShell's default CLIXML error-serialization from leaking
+    // into the hint the widget displays.
     const psArgs = args.map(psQuote).join(",");
     const ps =
       `$ErrorActionPreference = 'Stop'; ` +
+      `$ProgressPreference = 'SilentlyContinue'; ` +
       `$xp = { param($s) [Environment]::ExpandEnvironmentVariables($s) }; ` +
-      `$bin = & $xp ${psQuote(binaryPath)}; ` +
-      `$log = & $xp ${psQuote(logPath)}; ` +
-      `$err = & $xp ${psQuote(logPath + ".err")}; ` +
-      `$proc = Start-Process -FilePath $bin ` +
-      `-ArgumentList @(${psArgs}) ` +
-      `-PassThru -WindowStyle Hidden ` +
-      `-RedirectStandardOutput $log ` +
-      `-RedirectStandardError $err; ` +
-      `Write-Output '---'; Write-Output $proc.Id`;
+      `try { ` +
+      `  $bin = & $xp ${psQuote(binaryPath)}; ` +
+      `  if (-not (Test-Path $bin)) { throw ('binary not found: ' + $bin + '  (build with daemon\\build.ps1 or download from GitHub Releases)') }; ` +
+      `  $log = & $xp ${psQuote(logPath)}; ` +
+      `  $err = & $xp ${psQuote(logPath + ".err")}; ` +
+      `  $proc = Start-Process -FilePath $bin ` +
+      `    -ArgumentList @(${psArgs}) ` +
+      `    -PassThru -WindowStyle Hidden ` +
+      `    -RedirectStandardOutput $log ` +
+      `    -RedirectStandardError $err; ` +
+      `  Write-Output '---'; Write-Output $proc.Id ` +
+      `} catch { ` +
+      `  Write-Output '---'; Write-Output ('ERROR: ' + $_.Exception.Message) ` +
+      `}`;
     return psEncodedCmd(ps);
   }
   // POSIX: double-quote binaryPath so $HOME expands; single-quote each arg so
