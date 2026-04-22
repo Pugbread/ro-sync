@@ -1,0 +1,22 @@
+# Rust build artifacts
+daemon/target/
+
+# Runtime state & logs (contain absolute paths / project-specific data)
+state.json
+writes.log
+
+# Terminal 64 runtime data
+.t64-attachments/
+
+# Pre-built binaries (ship via GitHub Releases instead)
+rosync-darwin-arm64
+rosync-linux-x86_64
+rosync-windows-x86_64.exe
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

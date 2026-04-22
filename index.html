@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ro Sync</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="root" class="app" data-view="projects">
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo" aria-hidden="true"></span>
+          <span class="brand-name">Ro Sync</span>
+          <span id="daemon-dot" class="dot dot-idle" title="Daemon status"></span>
+        </div>
+        <nav class="tabs" role="tablist">
+          <button class="tab" role="tab" data-route="projects">Projects</button>
+          <button class="tab" role="tab" data-route="active">Active</button>
+          <button class="tab" role="tab" data-route="conflicts">
+            Conflicts <span id="conflicts-badge" class="badge" hidden>0</span>
+          </button>
+          <button class="tab" role="tab" data-route="settings">Settings</button>
+        </nav>
+      </header>
+      <main id="view" class="view" aria-live="polite"></main>
+      <footer class="statusbar">
+        <span id="status-left" class="status-left">—</span>
+        <span id="status-right" class="status-right">—</span>
+      </footer>
+    </div>
+
+    <script type="module" src="bridge.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
