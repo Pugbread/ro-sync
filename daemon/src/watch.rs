@@ -348,8 +348,25 @@ mod tests {
         let op = recv_timeout(&mut rx, 5000).expect("op");
         assert_eq!(op.path, p);
         assert!(matches!(op.kind, OpKind::Add | OpKind::Update));
-        // no second op within debounce window
-        assert!(recv_timeout(&mut rx, 250).is_none());
+
+        // Linux inotify and Windows ReadDirectoryChangesW can split a create
+        // plus rapid writes into two debounced semantic events. The important
+        // contract is that ten writes do not fan out into ten plugin ops.
+        let mut trailing = Vec::new();
+        while let Some(next) = recv_timeout(&mut rx, 300) {
+            trailing.push(next);
+            if trailing.len() > 1 {
+                break;
+            }
+        }
+        assert!(
+            trailing.len() <= 1,
+            "burst writes should coalesce to at most one trailing op, got {trailing:?}"
+        );
+        for next in trailing {
+            assert_eq!(next.path, p);
+            assert!(matches!(next.kind, OpKind::Add | OpKind::Update));
+        }
     }
 
     #[test]

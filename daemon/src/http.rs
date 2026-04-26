@@ -81,9 +81,7 @@ pub fn router(state: AppState) -> Router {
 /// verbatim (after a timestamp is merged in) — callers should post a JSON
 /// object describing the write they just performed.
 async fn writelog(body: Json<Value>) -> Json<Value> {
-    // dirs::home_dir() is cross-platform: reads $HOME on Unix (so test overrides
-    // via set_var("HOME", ...) still work) and %USERPROFILE% on Windows.
-    let home = match dirs::home_dir() {
+    let home = match rosync_home_dir() {
         Some(h) => h,
         None => {
             return Json(json!({ "ok": false, "error": "home directory not found" }));
@@ -102,8 +100,10 @@ async fn writelog(body: Json<Value>) -> Json<Value> {
     if let Ok(meta) = std::fs::metadata(&log_path) {
         if meta.len() >= WRITES_LOG_ROTATE_BYTES {
             let rotated = dir.join("writes.log.1");
-            // Best-effort: any failure just leaves the current log in place;
-            // the append below still succeeds.
+            // Windows will not rename over an existing destination, so remove
+            // the previous generation first. Any failure is best-effort: the
+            // append below should still be allowed to proceed.
+            let _ = std::fs::remove_file(&rotated);
             let _ = std::fs::rename(&log_path, &rotated);
         }
     }
@@ -143,6 +143,15 @@ async fn writelog(body: Json<Value>) -> Json<Value> {
         return Json(json!({ "ok": false, "error": format!("write: {e}") }));
     }
     Json(json!({ "ok": true }))
+}
+
+fn rosync_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = std::env::var_os("ROSYNC_TEST_HOME") {
+        return Some(PathBuf::from(home));
+    }
+
+    dirs::home_dir()
 }
 
 async fn tree_post(State(state): State<AppState>, body: Bytes) -> Json<Value> {
@@ -1510,10 +1519,9 @@ mod tests {
         );
     }
 
-    // `writelog` reads HOME at call-time, so pointing HOME at a TempDir
-    // completely contains the side effects. `std::env::set_var` is
-    // process-global though, so the three writelog tests below serialize on
-    // this mutex to avoid clobbering each other when cargo parallelises.
+    // `writelog` reads a test-only home override at call-time, so pointing it
+    // at a TempDir completely contains the side effects. Environment mutation
+    // is process-global though, so the writelog tests serialize on this mutex.
     static WRITELOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn writes_log_paths(fake_home: &Path) -> (PathBuf, PathBuf) {
@@ -1525,7 +1533,7 @@ mod tests {
     async fn writelog_appends_under_fake_home() {
         let _guard = WRITELOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let d = TempDir::new("writelog-append");
-        std::env::set_var("HOME", d.path());
+        std::env::set_var("ROSYNC_TEST_HOME", d.path());
         let (log, _rot) = writes_log_paths(d.path());
         let resp = writelog(Json(json!({ "op": "set", "ok": true }))).await;
         assert_eq!(resp.0["ok"], true, "writelog should succeed");
@@ -1542,7 +1550,7 @@ mod tests {
     async fn writelog_rotates_when_over_10mib() {
         let _guard = WRITELOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let d = TempDir::new("writelog-rotate");
-        std::env::set_var("HOME", d.path());
+        std::env::set_var("ROSYNC_TEST_HOME", d.path());
         let (log, rotated) = writes_log_paths(d.path());
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         // Pre-fill writes.log past the 10 MiB threshold so the next POST
@@ -1570,7 +1578,7 @@ mod tests {
     async fn writelog_rotation_overwrites_prior_generation() {
         let _guard = WRITELOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let d = TempDir::new("writelog-rotate-overwrite");
-        std::env::set_var("HOME", d.path());
+        std::env::set_var("ROSYNC_TEST_HOME", d.path());
         let (log, rotated) = writes_log_paths(d.path());
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         // A prior rotation exists with distinctive content...
