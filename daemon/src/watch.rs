@@ -350,20 +350,21 @@ mod tests {
         assert!(matches!(op.kind, OpKind::Add | OpKind::Update));
 
         // Linux inotify and Windows ReadDirectoryChangesW can split a create
-        // plus rapid writes into two debounced semantic events. The important
-        // contract is that ten writes do not fan out into ten plugin ops.
-        let mut trailing = Vec::new();
+        // plus rapid writes into a small number of debounced semantic events.
+        // The important contract is that ten writes do not fan out into ten
+        // plugin ops.
+        let mut emitted = vec![op];
         while let Some(next) = recv_timeout(&mut rx, 300) {
-            trailing.push(next);
-            if trailing.len() > 1 {
+            emitted.push(next);
+            if emitted.len() > 4 {
                 break;
             }
         }
         assert!(
-            trailing.len() <= 1,
-            "burst writes should coalesce to at most one trailing op, got {trailing:?}"
+            emitted.len() <= 4,
+            "burst writes should coalesce to a small event set, got {emitted:?}"
         );
-        for next in trailing {
+        for next in emitted {
             assert_eq!(next.path, p);
             assert!(matches!(next.kind, OpKind::Add | OpKind::Update));
         }

@@ -1409,23 +1409,30 @@ fn print_log_entry(e: &serde_json::Value) {
     println!("[{level:>5}] {hms} {message}");
 }
 
-/// Format a Unix timestamp as `HH:MM:SS` in the process's local timezone.
-/// Uses libc `localtime_r` to avoid pulling a time crate.
 fn format_hms_local(ts: i64) -> String {
     if ts == 0 {
         return "--:--:--".into();
     }
+    format_hms_local_impl(ts).unwrap_or_else(|| "--:--:--".into())
+}
+
+#[cfg(unix)]
+fn format_hms_local_impl(ts: i64) -> Option<String> {
     // SAFETY: `localtime_r` is thread-safe; we pass valid pointers.
     unsafe {
         let mut tm: libc_tm = std::mem::zeroed();
         let t: i64 = ts;
         if localtime_r(&t, &mut tm).is_null() {
-            return "--:--:--".into();
+            return None;
         }
-        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+        Some(format!(
+            "{:02}:{:02}:{:02}",
+            tm.tm_hour, tm.tm_min, tm.tm_sec
+        ))
     }
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct libc_tm {
@@ -1442,8 +1449,46 @@ struct libc_tm {
     tm_zone: *const i8,
 }
 
+#[cfg(unix)]
 extern "C" {
     fn localtime_r(time: *const i64, tm: *mut libc_tm) -> *mut libc_tm;
+}
+
+#[cfg(windows)]
+fn format_hms_local_impl(ts: i64) -> Option<String> {
+    // SAFETY: `localtime_s` writes to the provided tm buffer and returns 0 on
+    // success. On 64-bit Windows, C `time_t` is 64-bit.
+    unsafe {
+        let mut tm: windows_tm = std::mem::zeroed();
+        let t: i64 = ts;
+        if localtime_s(&mut tm, &t) != 0 {
+            return None;
+        }
+        Some(format!(
+            "{:02}:{:02}:{:02}",
+            tm.tm_hour, tm.tm_min, tm.tm_sec
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct windows_tm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+}
+
+#[cfg(windows)]
+extern "C" {
+    fn localtime_s(tm: *mut windows_tm, time: *const i64) -> i32;
 }
 
 async fn run_save(args: SaveArgs) -> Result<(), Box<dyn std::error::Error>> {
