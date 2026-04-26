@@ -3,8 +3,6 @@
 -- Two-way sync between Studio DataModel and a local Rust daemon over HTTP.
 
 local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
-local Selection = game:GetService("Selection")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local ScriptEditorService: any = nil
 do
@@ -142,7 +140,7 @@ end
 --------------------------------------------------------------------------------
 
 local toolbar = plugin:CreateToolbar("Ro Sync")
-local toggleButton = toolbar:CreateButton("Ro Sync", "Open the Ro Sync panel", "rbxasset://textures/StudioSharedUI/publish.png")
+local toggleButton = toolbar:CreateButton("Ro Sync", "Open the Ro Sync panel", "")
 toggleButton.ClickableWhenViewportHidden = true
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
@@ -156,366 +154,319 @@ toggleButton.Click:Connect(function()
 	widget.Enabled = not widget.Enabled
 end)
 
-local root = Instance.new("Frame")
-root.Size = UDim2.fromScale(1, 1)
-root.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-root.BorderSizePixel = 0
-root.Parent = widget
+local startConnect: (() -> ())? = nil
 
-local pad = Instance.new("UIPadding")
-pad.PaddingTop = UDim.new(0, 8)
-pad.PaddingBottom = UDim.new(0, 8)
-pad.PaddingLeft = UDim.new(0, 8)
-pad.PaddingRight = UDim.new(0, 8)
-pad.Parent = root
+local function trimUiUrl(s)
+	return (tostring(s or ""):gsub("/+$", ""))
+end
 
-local layout = Instance.new("UIListLayout")
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-layout.Padding = UDim.new(0, 6)
-layout.Parent = root
+local function mountFallbackUi(reason)
+	local root = Instance.new("Frame")
+	root.Size = UDim2.fromScale(1, 1)
+	root.BackgroundColor3 = Color3.fromRGB(31, 33, 36)
+	root.BorderSizePixel = 0
+	root.Parent = widget
 
-local urlLabel = Instance.new("TextLabel")
-urlLabel.LayoutOrder = 1
-urlLabel.Size = UDim2.new(1, 0, 0, 16)
-urlLabel.BackgroundTransparency = 1
-urlLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-urlLabel.Font = Enum.Font.SourceSans
-urlLabel.TextSize = 14
-urlLabel.TextXAlignment = Enum.TextXAlignment.Left
-urlLabel.Text = "Manual URL override (leave blank to auto-discover)"
-urlLabel.Parent = root
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 12)
+	pad.PaddingBottom = UDim.new(0, 12)
+	pad.PaddingLeft = UDim.new(0, 12)
+	pad.PaddingRight = UDim.new(0, 12)
+	pad.Parent = root
 
-local urlBox = Instance.new("TextBox")
-urlBox.LayoutOrder = 2
-urlBox.Size = UDim2.new(1, 0, 0, 28)
-urlBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-urlBox.BorderSizePixel = 0
-urlBox.TextColor3 = Color3.fromRGB(235, 235, 235)
-urlBox.Font = Enum.Font.Code
-urlBox.TextSize = 14
-urlBox.TextXAlignment = Enum.TextXAlignment.Left
-urlBox.ClearTextOnFocus = false
-urlBox.PlaceholderText = DEFAULT_URL
-urlBox.Text = tostring(plugin:GetSetting(SETTING_MANUAL_URL) or "")
-urlBox.Parent = root
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent = root
 
-local urlPad = Instance.new("UIPadding")
-urlPad.PaddingLeft = UDim.new(0, 6)
-urlPad.PaddingRight = UDim.new(0, 6)
-urlPad.Parent = urlBox
+	local title = Instance.new("TextLabel")
+	title.LayoutOrder = 1
+	title.Size = UDim2.new(1, 0, 0, 24)
+	title.BackgroundTransparency = 1
+	title.TextColor3 = Color3.fromRGB(238, 240, 242)
+	title.Font = Enum.Font.SourceSansBold
+	title.TextSize = 20
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Text = "Ro Sync"
+	title.Parent = root
 
-local statusRow = Instance.new("Frame")
-statusRow.LayoutOrder = 3
-statusRow.Size = UDim2.new(1, 0, 0, 32)
-statusRow.BackgroundTransparency = 1
-statusRow.Parent = root
+	local loadError = Instance.new("TextLabel")
+	loadError.LayoutOrder = 2
+	loadError.Size = UDim2.new(1, 0, 0, 38)
+	loadError.BackgroundColor3 = Color3.fromRGB(213, 156, 58)
+	loadError.BorderSizePixel = 0
+	loadError.TextColor3 = Color3.fromRGB(38, 31, 19)
+	loadError.Font = Enum.Font.SourceSansBold
+	loadError.TextSize = 13
+	loadError.TextWrapped = true
+	loadError.Text = "React UI bundle unavailable; running fallback UI. " .. tostring(reason or "")
+	loadError.Parent = root
 
-local connectBtn = Instance.new("TextButton")
-connectBtn.Size = UDim2.new(0, 100, 1, 0)
-connectBtn.Position = UDim2.fromScale(0, 0)
-connectBtn.BackgroundColor3 = Color3.fromRGB(64, 128, 220)
-connectBtn.BorderSizePixel = 0
-connectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-connectBtn.Font = Enum.Font.SourceSansBold
-connectBtn.TextSize = 14
-connectBtn.Text = "Connect"
-connectBtn.AutoButtonColor = true
-connectBtn.Parent = statusRow
+	local loadCorner = Instance.new("UICorner")
+	loadCorner.CornerRadius = UDim.new(0, 5)
+	loadCorner.Parent = loadError
 
-local btnCorner = Instance.new("UICorner")
-btnCorner.CornerRadius = UDim.new(0, 4)
-btnCorner.Parent = connectBtn
+	local urlBox = Instance.new("TextBox")
+	urlBox.LayoutOrder = 3
+	urlBox.Size = UDim2.new(1, 0, 0, 32)
+	urlBox.BackgroundColor3 = Color3.fromRGB(22, 24, 27)
+	urlBox.BorderSizePixel = 0
+	urlBox.ClearTextOnFocus = false
+	urlBox.Font = Enum.Font.Code
+	urlBox.PlaceholderText = DEFAULT_URL
+	urlBox.Text = tostring(plugin:GetSetting(SETTING_MANUAL_URL) or "")
+	urlBox.TextColor3 = Color3.fromRGB(238, 240, 242)
+	urlBox.TextSize = 13
+	urlBox.TextXAlignment = Enum.TextXAlignment.Left
+	urlBox.Parent = root
 
-local pill = Instance.new("TextLabel")
-pill.Size = UDim2.new(1, -110, 1, -6)
-pill.Position = UDim2.new(0, 108, 0, 3)
-pill.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-pill.BorderSizePixel = 0
-pill.TextColor3 = Color3.fromRGB(230, 230, 230)
-pill.Font = Enum.Font.SourceSansBold
-pill.TextSize = 13
-pill.Text = "idle"
-pill.TextTruncate = Enum.TextTruncate.AtEnd
-pill.Parent = statusRow
+	local urlPad = Instance.new("UIPadding")
+	urlPad.PaddingLeft = UDim.new(0, 8)
+	urlPad.PaddingRight = UDim.new(0, 8)
+	urlPad.Parent = urlBox
 
-local pillCorner = Instance.new("UICorner")
-pillCorner.CornerRadius = UDim.new(1, 0)
-pillCorner.Parent = pill
+	local row = Instance.new("Frame")
+	row.LayoutOrder = 4
+	row.Size = UDim2.new(1, 0, 0, 34)
+	row.BackgroundTransparency = 1
+	row.Parent = root
 
-local pillPad = Instance.new("UIPadding")
-pillPad.PaddingLeft = UDim.new(0, 10)
-pillPad.PaddingRight = UDim.new(0, 10)
-pillPad.Parent = pill
+	local connectBtn = Instance.new("TextButton")
+	connectBtn.Size = UDim2.new(0, 112, 1, 0)
+	connectBtn.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+	connectBtn.BorderSizePixel = 0
+	connectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	connectBtn.Font = Enum.Font.SourceSansBold
+	connectBtn.TextSize = 14
+	connectBtn.Text = "Connect"
+	connectBtn.Parent = row
 
--- Banner for decision handshake
-local banner = Instance.new("TextLabel")
-banner.LayoutOrder = 4
-banner.Size = UDim2.new(1, 0, 0, 28)
-banner.BackgroundColor3 = Color3.fromRGB(200, 150, 50)
-banner.BorderSizePixel = 0
-banner.TextColor3 = Color3.fromRGB(30, 30, 30)
-banner.Font = Enum.Font.SourceSansBold
-banner.TextSize = 13
-banner.Text = ""
-banner.Visible = false
-banner.Parent = root
+	local btnCorner = Instance.new("UICorner")
+	btnCorner.CornerRadius = UDim.new(0, 5)
+	btnCorner.Parent = connectBtn
 
-local bannerCorner = Instance.new("UICorner")
-bannerCorner.CornerRadius = UDim.new(0, 4)
-bannerCorner.Parent = banner
+	local status = Instance.new("TextLabel")
+	status.Position = UDim2.new(0, 122, 0, 2)
+	status.Size = UDim2.new(1, -122, 1, -4)
+	status.BackgroundColor3 = Color3.fromRGB(112, 120, 128)
+	status.BorderSizePixel = 0
+	status.TextColor3 = Color3.fromRGB(238, 240, 242)
+	status.Font = Enum.Font.SourceSansBold
+	status.TextSize = 13
+	status.TextTruncate = Enum.TextTruncate.AtEnd
+	status.Text = "Idle"
+	status.Parent = row
 
-local logLabel = Instance.new("TextLabel")
-logLabel.LayoutOrder = 5
-logLabel.Size = UDim2.new(1, 0, 0, 16)
-logLabel.BackgroundTransparency = 1
-logLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-logLabel.Font = Enum.Font.SourceSans
-logLabel.TextSize = 14
-logLabel.TextXAlignment = Enum.TextXAlignment.Left
-logLabel.Text = "Log"
-logLabel.Parent = root
+	local statusCorner = Instance.new("UICorner")
+	statusCorner.CornerRadius = UDim.new(1, 0)
+	statusCorner.Parent = status
 
-local logFrame = Instance.new("ScrollingFrame")
-logFrame.LayoutOrder = 6
-logFrame.Size = UDim2.new(1, 0, 1, -160)
-logFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-logFrame.BorderSizePixel = 0
-logFrame.ScrollBarThickness = 6
-logFrame.CanvasSize = UDim2.fromScale(0, 0)
-logFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
-logFrame.Parent = root
+	local banner = Instance.new("TextLabel")
+	banner.LayoutOrder = 5
+	banner.Size = UDim2.new(1, 0, 0, 34)
+	banner.BackgroundColor3 = Color3.fromRGB(213, 156, 58)
+	banner.BorderSizePixel = 0
+	banner.TextColor3 = Color3.fromRGB(38, 31, 19)
+	banner.Font = Enum.Font.SourceSansBold
+	banner.TextSize = 13
+	banner.TextWrapped = true
+	banner.Visible = false
+	banner.Parent = root
 
-local logLayout = Instance.new("UIListLayout")
-logLayout.SortOrder = Enum.SortOrder.LayoutOrder
-logLayout.Padding = UDim.new(0, 2)
-logLayout.Parent = logFrame
+	local bannerCorner = Instance.new("UICorner")
+	bannerCorner.CornerRadius = UDim.new(0, 5)
+	bannerCorner.Parent = banner
 
-local logPad = Instance.new("UIPadding")
-logPad.PaddingTop = UDim.new(0, 6)
-logPad.PaddingBottom = UDim.new(0, 6)
-logPad.PaddingLeft = UDim.new(0, 8)
-logPad.PaddingRight = UDim.new(0, 8)
-logPad.Parent = logFrame
+	local logFrame = Instance.new("ScrollingFrame")
+	logFrame.LayoutOrder = 6
+	logFrame.Size = UDim2.new(1, 0, 1, -156)
+	logFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 27)
+	logFrame.BorderSizePixel = 0
+	logFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	logFrame.CanvasSize = UDim2.fromScale(0, 0)
+	logFrame.ScrollBarThickness = 6
+	logFrame.Parent = root
 
-local logCount = 0
-local function log(msg)
-	logCount += 1
-	local line = Instance.new("TextLabel")
-	line.LayoutOrder = logCount
-	line.Size = UDim2.new(1, 0, 0, 16)
-	line.BackgroundTransparency = 1
-	line.TextColor3 = Color3.fromRGB(210, 210, 210)
-	line.Font = Enum.Font.Code
-	line.TextSize = 12
-	line.TextXAlignment = Enum.TextXAlignment.Left
-	line.TextTruncate = Enum.TextTruncate.AtEnd
-	line.Text = string.format("[%.1fs] %s", os.clock(), tostring(msg))
-	line.Parent = logFrame
-	local children = logFrame:GetChildren()
-	if #children - 2 > MAX_LOG_LINES then
-		for _, c in ipairs(children) do
-			if c:IsA("TextLabel") and c.LayoutOrder <= logCount - MAX_LOG_LINES then
-				c:Destroy()
-			end
+	local logLayout = Instance.new("UIListLayout")
+	logLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	logLayout.Padding = UDim.new(0, 3)
+	logLayout.Parent = logFrame
+
+	local logPad = Instance.new("UIPadding")
+	logPad.PaddingTop = UDim.new(0, 8)
+	logPad.PaddingBottom = UDim.new(0, 8)
+	logPad.PaddingLeft = UDim.new(0, 10)
+	logPad.PaddingRight = UDim.new(0, 10)
+	logPad.Parent = logFrame
+
+	local logCount = 0
+
+	connectBtn.Activated:Connect(function()
+		if startConnect then
+			startConnect()
+		end
+	end)
+
+	urlBox.FocusLost:Connect(function(enter)
+		if enter then
+			plugin:SetSetting(SETTING_MANUAL_URL, trimUiUrl(urlBox.Text))
+		end
+	end)
+
+	local controller = {}
+
+	function controller.getManualUrl()
+		return urlBox.Text or ""
+	end
+
+	function controller.setManualUrl(text)
+		urlBox.Text = tostring(text or "")
+	end
+
+	function controller.setStatus(state, detail)
+		if state == "idle" then
+			status.Text = "Idle"
+			status.BackgroundColor3 = Color3.fromRGB(112, 120, 128)
+			connectBtn.Text = "Connect"
+		elseif state == "probing" then
+			status.Text = "Probing..."
+			status.BackgroundColor3 = Color3.fromRGB(213, 156, 58)
+			connectBtn.Text = "Cancel"
+		elseif state == "connecting" then
+			status.Text = "Connecting..."
+			status.BackgroundColor3 = Color3.fromRGB(213, 156, 58)
+			connectBtn.Text = "Cancel"
+		elseif state == "waiting" then
+			status.Text = "Waiting for decision..."
+			status.BackgroundColor3 = Color3.fromRGB(213, 156, 58)
+			connectBtn.Text = "Cancel"
+		elseif state == "connected" then
+			status.Text = string.format("Connected :%s", tostring(detail or "?"))
+			status.BackgroundColor3 = Color3.fromRGB(54, 158, 98)
+			connectBtn.Text = "Disconnect"
+		elseif state == "no_daemon" then
+			status.Text = string.format("No daemon for GameId %s", tostring(detail or "?"))
+			status.BackgroundColor3 = Color3.fromRGB(207, 72, 72)
+			connectBtn.Text = "Connect"
+		elseif state == "wrong_game" then
+			status.Text = "Wrong game"
+			status.BackgroundColor3 = Color3.fromRGB(207, 72, 72)
+			connectBtn.Text = "Connect"
+		elseif state == "error" then
+			status.Text = string.format("Error: %s", tostring(detail or "?"))
+			status.BackgroundColor3 = Color3.fromRGB(207, 72, 72)
+			connectBtn.Text = "Connect"
+		else
+			status.Text = tostring(state or "Idle")
+			status.BackgroundColor3 = Color3.fromRGB(112, 120, 128)
 		end
 	end
-	logFrame.CanvasPosition = Vector2.new(0, math.huge)
+
+	function controller.setBanner(text)
+		local nextText = tostring(text or "")
+		banner.Text = nextText
+		banner.Visible = nextText ~= ""
+	end
+
+	function controller.addLog(msg)
+		logCount += 1
+		local line = Instance.new("TextLabel")
+		line.LayoutOrder = logCount
+		line.Size = UDim2.new(1, -20, 0, 16)
+		line.BackgroundTransparency = 1
+		line.TextColor3 = Color3.fromRGB(164, 170, 176)
+		line.Font = Enum.Font.Code
+		line.TextSize = 12
+		line.TextXAlignment = Enum.TextXAlignment.Left
+		line.TextTruncate = Enum.TextTruncate.AtEnd
+		line.Text = string.format("[%.1fs] %s", os.clock(), tostring(msg))
+		line.Parent = logFrame
+		for _, child in ipairs(logFrame:GetChildren()) do
+			if child:IsA("TextLabel") and child.LayoutOrder <= logCount - MAX_LOG_LINES then
+				child:Destroy()
+			end
+		end
+		logFrame.CanvasPosition = Vector2.new(0, math.huge)
+	end
+
+	function controller.showUnpublishedModal(onResult)
+		controller.setBanner("Publish your place first, or use the manual URL field before connecting.")
+		if onResult then
+			onResult(nil)
+		end
+	end
+
+	function controller.hideUnpublishedModal(result)
+		return result
+	end
+
+	function controller.destroy()
+		root:Destroy()
+	end
+
+	return controller
+end
+
+local ui
+local appOk, appOrErr = pcall(function()
+	local appModule = (script.Parent :: Instance):WaitForChild("App", 2)
+	if not appModule then
+		error("missing App ModuleScript")
+	end
+	return require(appModule)
+end)
+
+if appOk and type(appOrErr) == "table" and type(appOrErr.mount) == "function" then
+	ui = appOrErr.mount(widget, {
+		initialUrl = tostring(plugin:GetSetting(SETTING_MANUAL_URL) or ""),
+		defaultUrl = DEFAULT_URL,
+		getStoredManualUrl = function()
+			return plugin:GetSetting(SETTING_MANUAL_URL)
+		end,
+		onConnect = function()
+			if startConnect then
+				startConnect()
+			end
+		end,
+		onUrlCommit = function(text)
+			plugin:SetSetting(SETTING_MANUAL_URL, trimUiUrl(text))
+		end,
+	})
+else
+	ui = mountFallbackUi(appOrErr)
+end
+
+local urlBox = setmetatable({}, {
+	__index = function(_, key)
+		if key == "Text" then
+			return ui.getManualUrl()
+		end
+		return nil
+	end,
+	__newindex = function(proxy, key, value)
+		if key == "Text" then
+			ui.setManualUrl(value)
+		else
+			rawset(proxy, key, value)
+		end
+	end,
+})
+
+local function log(msg)
+	ui.addLog(msg)
 end
 
 local function setPill(state, detail)
-	-- state: "idle" | "probing" | "connected" | "no_daemon" | "wrong_game" | "error" | "connecting" | "waiting"
-	if state == "idle" then
-		pill.Text = "idle"
-		pill.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-		connectBtn.Text = "Connect"
-	elseif state == "probing" then
-		pill.Text = "probing…"
-		pill.BackgroundColor3 = Color3.fromRGB(200, 150, 50)
-		connectBtn.Text = "Cancel"
-	elseif state == "connecting" then
-		pill.Text = "connecting…"
-		pill.BackgroundColor3 = Color3.fromRGB(200, 150, 50)
-		connectBtn.Text = "Cancel"
-	elseif state == "waiting" then
-		pill.Text = "waiting decision…"
-		pill.BackgroundColor3 = Color3.fromRGB(200, 150, 50)
-		connectBtn.Text = "Cancel"
-	elseif state == "connected" then
-		pill.Text = string.format("connected :%s", tostring(detail or "?"))
-		pill.BackgroundColor3 = Color3.fromRGB(60, 160, 90)
-		connectBtn.Text = "Disconnect"
-	elseif state == "no_daemon" then
-		pill.Text = string.format("No ro-sync daemon found for GameId %s", tostring(detail or "?"))
-		pill.BackgroundColor3 = Color3.fromRGB(200, 70, 70)
-		connectBtn.Text = "Connect"
-	elseif state == "wrong_game" then
-		pill.Text = "wrong game"
-		pill.BackgroundColor3 = Color3.fromRGB(200, 70, 70)
-		connectBtn.Text = "Connect"
-	elseif state == "error" then
-		pill.Text = string.format("error: %s", tostring(detail or "?"))
-		pill.BackgroundColor3 = Color3.fromRGB(200, 70, 70)
-		connectBtn.Text = "Connect"
-	else
-		pill.Text = tostring(state)
-		pill.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-	end
+	ui.setStatus(state, detail)
 end
 
 local function setBanner(text)
-	if text and text ~= "" then
-		banner.Text = text
-		banner.Visible = true
-	else
-		banner.Visible = false
-		banner.Text = ""
-	end
+	ui.setBanner(text)
 end
-
---------------------------------------------------------------------------------
--- Unpublished-place modal (GameId == "0")
---------------------------------------------------------------------------------
-
-local modalOverlay = Instance.new("Frame")
-modalOverlay.Size = UDim2.fromScale(1, 1)
-modalOverlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-modalOverlay.BackgroundTransparency = 0.35
-modalOverlay.BorderSizePixel = 0
-modalOverlay.Visible = false
-modalOverlay.ZIndex = 50
-modalOverlay.Parent = widget
-
-local modalCard = Instance.new("Frame")
-modalCard.Size = UDim2.new(1, -40, 0, 200)
-modalCard.Position = UDim2.new(0, 20, 0.5, -100)
-modalCard.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-modalCard.BorderSizePixel = 0
-modalCard.ZIndex = 51
-modalCard.Parent = modalOverlay
-
-local modalCorner = Instance.new("UICorner")
-modalCorner.CornerRadius = UDim.new(0, 6)
-modalCorner.Parent = modalCard
-
-local modalPad = Instance.new("UIPadding")
-modalPad.PaddingTop = UDim.new(0, 12)
-modalPad.PaddingBottom = UDim.new(0, 12)
-modalPad.PaddingLeft = UDim.new(0, 14)
-modalPad.PaddingRight = UDim.new(0, 14)
-modalPad.Parent = modalCard
-
-local modalLayout = Instance.new("UIListLayout")
-modalLayout.SortOrder = Enum.SortOrder.LayoutOrder
-modalLayout.Padding = UDim.new(0, 8)
-modalLayout.Parent = modalCard
-
-local modalTitle = Instance.new("TextLabel")
-modalTitle.LayoutOrder = 1
-modalTitle.Size = UDim2.new(1, 0, 0, 20)
-modalTitle.BackgroundTransparency = 1
-modalTitle.TextColor3 = Color3.fromRGB(240, 240, 240)
-modalTitle.Font = Enum.Font.SourceSansBold
-modalTitle.TextSize = 16
-modalTitle.TextXAlignment = Enum.TextXAlignment.Left
-modalTitle.Text = "Unpublished place"
-modalTitle.ZIndex = 52
-modalTitle.Parent = modalCard
-
-local modalBody = Instance.new("TextLabel")
-modalBody.LayoutOrder = 2
-modalBody.Size = UDim2.new(1, 0, 0, 60)
-modalBody.BackgroundTransparency = 1
-modalBody.TextColor3 = Color3.fromRGB(220, 220, 220)
-modalBody.Font = Enum.Font.SourceSans
-modalBody.TextSize = 14
-modalBody.TextXAlignment = Enum.TextXAlignment.Left
-modalBody.TextYAlignment = Enum.TextYAlignment.Top
-modalBody.TextWrapped = true
-modalBody.Text = "GameId is 0. Publish your place first, or enter a manual daemon URL below."
-modalBody.ZIndex = 52
-modalBody.Parent = modalCard
-
-local modalUrlBox = Instance.new("TextBox")
-modalUrlBox.LayoutOrder = 3
-modalUrlBox.Size = UDim2.new(1, 0, 0, 28)
-modalUrlBox.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-modalUrlBox.BorderSizePixel = 0
-modalUrlBox.TextColor3 = Color3.fromRGB(235, 235, 235)
-modalUrlBox.Font = Enum.Font.Code
-modalUrlBox.TextSize = 14
-modalUrlBox.TextXAlignment = Enum.TextXAlignment.Left
-modalUrlBox.ClearTextOnFocus = false
-modalUrlBox.PlaceholderText = DEFAULT_URL
-modalUrlBox.Text = ""
-modalUrlBox.ZIndex = 52
-modalUrlBox.Parent = modalCard
-
-local modalUrlPad = Instance.new("UIPadding")
-modalUrlPad.PaddingLeft = UDim.new(0, 6)
-modalUrlPad.PaddingRight = UDim.new(0, 6)
-modalUrlPad.Parent = modalUrlBox
-
-local modalBtnRow = Instance.new("Frame")
-modalBtnRow.LayoutOrder = 4
-modalBtnRow.Size = UDim2.new(1, 0, 0, 32)
-modalBtnRow.BackgroundTransparency = 1
-modalBtnRow.ZIndex = 52
-modalBtnRow.Parent = modalCard
-
-local modalCancel = Instance.new("TextButton")
-modalCancel.Size = UDim2.new(0, 90, 1, 0)
-modalCancel.Position = UDim2.new(1, -200, 0, 0)
-modalCancel.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-modalCancel.BorderSizePixel = 0
-modalCancel.TextColor3 = Color3.fromRGB(240, 240, 240)
-modalCancel.Font = Enum.Font.SourceSansBold
-modalCancel.TextSize = 14
-modalCancel.Text = "Cancel"
-modalCancel.ZIndex = 53
-modalCancel.Parent = modalBtnRow
-
-local modalCancelCorner = Instance.new("UICorner")
-modalCancelCorner.CornerRadius = UDim.new(0, 4)
-modalCancelCorner.Parent = modalCancel
-
-local modalOk = Instance.new("TextButton")
-modalOk.Size = UDim2.new(0, 100, 1, 0)
-modalOk.Position = UDim2.new(1, -100, 0, 0)
-modalOk.BackgroundColor3 = Color3.fromRGB(64, 128, 220)
-modalOk.BorderSizePixel = 0
-modalOk.TextColor3 = Color3.fromRGB(255, 255, 255)
-modalOk.Font = Enum.Font.SourceSansBold
-modalOk.TextSize = 14
-modalOk.Text = "Use URL"
-modalOk.ZIndex = 53
-modalOk.Parent = modalBtnRow
-
-local modalOkCorner = Instance.new("UICorner")
-modalOkCorner.CornerRadius = UDim.new(0, 4)
-modalOkCorner.Parent = modalOk
-
-local modalResolve: ((string?) -> ())? = nil
 
 local function showUnpublishedModal(onResult: (string?) -> ())
-	modalUrlBox.Text = tostring(plugin:GetSetting(SETTING_MANUAL_URL) or "")
-	modalResolve = onResult
-	modalOverlay.Visible = true
+	ui.showUnpublishedModal(onResult)
 end
-
-local function hideUnpublishedModal(result: string?)
-	modalOverlay.Visible = false
-	local cb = modalResolve
-	modalResolve = nil
-	if cb then cb(result) end
-end
-
-modalCancel.Activated:Connect(function() hideUnpublishedModal(nil) end)
-modalOk.Activated:Connect(function()
-	local txt = modalUrlBox.Text or ""
-	txt = (txt:gsub("^%s+", ""):gsub("%s+$", ""))
-	if txt == "" then return end
-	hideUnpublishedModal(txt)
-end)
 
 --------------------------------------------------------------------------------
 -- Serialization
@@ -550,6 +501,37 @@ local ALLOWED_CLASSES = {
 	ModuleScript = true,
 }
 
+-- Pass-through rule: any non-ALLOWED instance (Part, Model, Tool, ValueBase,
+-- etc.) is materialized on disk as a plain directory whenever it has at least
+-- one ALLOWED descendant. The real class stays in the read-only tree.json; on
+-- disk the pathway is just `Name/`. This lets users place a script anywhere
+-- inside Studio and still have it round-trip to a file.
+local function hasSyncableDescendant(inst)
+	if ALLOWED_CLASSES[inst.ClassName] then return true end
+	for _, child in ipairs(inst:GetChildren()) do
+		if not SUPPRESS_CLASSES[child.ClassName] and hasSyncableDescendant(child) then
+			return true
+		end
+	end
+	return false
+end
+
+-- True if an instance needs a presence on disk — either it's directly ALLOWED,
+-- or it's a pass-through container that has at least one ALLOWED descendant.
+local function isSyncable(inst)
+	if ALLOWED_CLASSES[inst.ClassName] then return true end
+	return hasSyncableDescendant(inst)
+end
+
+-- Non-ALLOWED instances we've materialized on disk as pass-through
+-- directories (because they contained at least one ALLOWED descendant at the
+-- time we serialized them). Tracked here so that `onDescendantRemoving` can
+-- still emit a cleanup delete even after the container's ALLOWED children
+-- have fired their own Removing events and pruned `hasSyncableDescendant`.
+-- Declared up-front because `serializeInstance` writes to it as a side
+-- effect during /snapshot bootstrap.
+local materializedContainers: {[Instance]: true} = {}
+
 local function readScriptSource(inst): string
 	if ScriptEditorService then
 		local ok, src = pcall(function()
@@ -572,18 +554,31 @@ local function serializeProperties(inst)
 end
 
 -- Serialize a subtree for /push and /snapshot. Non-ALLOWED classes are
--- filtered out at every level of recursion so Parts / Models / MeshParts /
--- etc. never appear in daemon payloads — those live only in the read-only
--- tree.json skeleton.
-local function serializeInstance(inst)
+-- emitted as pass-through Folders if (and only if) they contain an ALLOWED
+-- descendant — their real class stays Studio-authoritative (see tree.json).
+-- Callers should pre-check `isSyncable(inst)` before recursing; this function
+-- does not re-check because the top-level `inst` is always syncable by the
+-- time a caller has decided to emit an op for it.
+--
+-- Side effect: every non-ALLOWED instance emitted as a pass-through Folder is
+-- recorded in `materializedContainers` so that a subsequent delete on the
+-- container still triggers a disk cleanup, even after its ALLOWED children
+-- have already fired their own Removing events.
+local serializeInstance
+serializeInstance = function(inst)
+	local allowed = ALLOWED_CLASSES[inst.ClassName] == true
+	if not allowed and not SUPPRESS_CLASSES[inst.ClassName] then
+		materializedContainers[inst] = true
+	end
 	local node = {
-		class = inst.ClassName,
+		class = allowed and inst.ClassName or "Folder",
 		name = inst.Name,
-		properties = serializeProperties(inst),
+		properties = allowed and serializeProperties(inst) or {},
 		children = {},
 	}
 	for _, child in ipairs(inst:GetChildren()) do
-		if ALLOWED_CLASSES[child.ClassName] and not SUPPRESS_CLASSES[child.ClassName] then
+		if not SUPPRESS_CLASSES[child.ClassName]
+			and (ALLOWED_CLASSES[child.ClassName] or hasSyncableDescendant(child)) then
 			table.insert(node.children, serializeInstance(child))
 		end
 	end
@@ -752,6 +747,12 @@ local function applyNode(parent, node, opts)
 	local existing = parent:FindFirstChild(node.name)
 	local inst
 	if existing and existing.ClassName == node.class then
+		inst = existing
+	elseif existing and node.class == "Folder" and not ALLOWED_CLASSES[existing.ClassName] then
+		-- Pass-through container: disk emits `class="Folder"` for any directory,
+		-- but the Studio-side instance here is Studio-authoritative (a Model,
+		-- Part, Tool, BoolValue, ...). Never replace it — treat it as the
+		-- container for the incoming children. Its real class stays untouched.
 		inst = existing
 	else
 		if existing then
@@ -1196,6 +1197,8 @@ local serviceConnections: {RBXScriptConnection} = {}
 -- rename. Tracking the prior name here lets us emit a `rename` op with the
 -- correct old path + new name.
 local lastKnownName: {[Instance]: string} = {}
+-- `materializedContainers` is declared near the top of the file alongside
+-- `serializeInstance`, which writes to it as a side effect during bootstrap.
 
 -- Forward declarations so the event callbacks can refer to each other. These
 -- are plain locals rather than `local function` so the later `function foo()`
@@ -1208,6 +1211,19 @@ local connectTree
 local disconnectInstance
 local disconnectTree
 
+-- Walk `inst` and `inst`'s descendants; record each non-ALLOWED instance in
+-- `materializedContainers`, since emitting a `set` for a pass-through root
+-- implicitly materializes every pass-through ancestor and descendant node.
+local function recordMaterializedContainers(inst)
+	if SUPPRESS_CLASSES[inst.ClassName] then return end
+	if not ALLOWED_CLASSES[inst.ClassName] then
+		materializedContainers[inst] = true
+	end
+	for _, child in ipairs(inst:GetChildren()) do
+		recordMaterializedContainers(child)
+	end
+end
+
 onDescendantAdded = function(inst)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
@@ -1215,10 +1231,24 @@ onDescendantAdded = function(inst)
 	-- Any Studio-side addition — synced OR Studio-authoritative — changes the
 	-- skeleton. Mark dirty so pushTreeSkeleton picks it up on the next tick.
 	markTreeDirty()
-	-- Non-ALLOWED classes (Parts, Models, Lights, etc.) are Studio-
-	-- authoritative: they live only in tree.json and never generate set/delete
-	-- ops against the daemon.
-	if not ALLOWED_CLASSES[inst.ClassName] then return end
+	-- Emit a `set` for:
+	--   (a) ALLOWED classes directly, or
+	--   (b) non-ALLOWED classes that already have ALLOWED descendants (e.g. a
+	--       Part being reparented into Workspace with a Script already inside
+	--       it — we need the pass-through directory to materialize at once).
+	-- A bare non-ALLOWED with no syncable descendants is tree.json-only.
+	if not isSyncable(inst) then return end
+	-- When a script is added directly inside an existing pass-through Part,
+	-- this fires with `inst = Script` whose parent is the Part. The Part's
+	-- directory on disk is created implicitly when the daemon writes the
+	-- script file — but we still mark the Part as materialized so a later
+	-- Removing on the Part emits a cleanup delete.
+	local parent = inst.Parent
+	if parent and not ALLOWED_CLASSES[parent.ClassName] and not SUPPRESS_CLASSES[parent.ClassName]
+		and parent.Parent ~= nil then
+		recordMaterializedContainers(parent)
+	end
+	recordMaterializedContainers(inst)
 	queueOp({
 		op = "set",
 		path = pathFromRoot(inst.Parent),
@@ -1230,7 +1260,14 @@ onDescendantRemoving = function(inst)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
 	markTreeDirty()
-	if not ALLOWED_CLASSES[inst.ClassName] then return end
+	-- `Removing` fires top-down as children are re-parented to nil: by the
+	-- time it's the pass-through container's turn, its syncable children have
+	-- already been detached and `hasSyncableDescendant` returns false. Use
+	-- the `materializedContainers` record to recover: if we ever emitted this
+	-- instance as a directory on disk, emit a cleanup delete regardless.
+	local syncable = isSyncable(inst) or materializedContainers[inst] == true
+	materializedContainers[inst] = nil
+	if not syncable then return end
 	local path = pathFromRoot(inst)
 	log(string.format("delete: %s", table.concat(path, "/")))
 	queueOp({
@@ -1248,9 +1285,9 @@ onChanged = function(inst, prop)
 	if prop == "Name" then
 		-- Renames affect every tree.json consumer, not just the synced files.
 		markTreeDirty()
-		-- Non-ALLOWED instances don't exist on disk, so there's no file to
+		-- Non-syncable instances don't exist on disk, so there's no file to
 		-- rename — the tree.json push above is all the daemon needs.
-		if not ALLOWED_CLASSES[inst.ClassName] then
+		if not isSyncable(inst) then
 			lastKnownName[inst] = inst.Name
 			return
 		end
@@ -1294,6 +1331,7 @@ disconnectInstance = function(inst)
 	end
 	connections[inst] = nil
 	lastKnownName[inst] = nil
+	materializedContainers[inst] = nil
 end
 
 disconnectTree = function(inst)
@@ -1374,33 +1412,51 @@ end
 --------------------------------------------------------------------------------
 
 -- Initial-compare stats: daemon compares disk counts vs. Studio counts to
--- decide push-vs-pull. Only the four ALLOWED classes live on disk, so that's
--- all we count — otherwise a Studio-full-of-Parts place would always beat a
--- scripts-only disk on instanceCount and force a spurious push.
+-- decide push-vs-pull. We count what will actually be materialized on disk —
+-- ALLOWED classes plus pass-through containers (non-ALLOWED instances that
+-- have an ALLOWED descendant). Parts / Models with no scripts underneath are
+-- Studio-authoritative (tree.json only) and don't count.
+local function countSyncableSubtree(inst)
+	if SUPPRESS_CLASSES[inst.ClassName] then
+		return 0, 0, false
+	end
+	local isScript = inst:IsA("LuaSourceContainer")
+	local kidsInst, kidsScript, kidsHasScript = 0, 0, false
+	for _, child in ipairs(inst:GetChildren()) do
+		local ci, cs, ch = countSyncableSubtree(child)
+		kidsInst += ci
+		kidsScript += cs
+		if ch then kidsHasScript = true end
+	end
+	local subtreeHasScript = isScript or kidsHasScript
+	local selfCountable = ALLOWED_CLASSES[inst.ClassName] == true or subtreeHasScript
+	if selfCountable then
+		return kidsInst + 1, kidsScript + (isScript and 1 or 0), subtreeHasScript
+	end
+	return kidsInst, kidsScript, subtreeHasScript
+end
+
 local function collectStudioStats()
 	local scriptCount = 0
 	local instanceCount = 0
 	for _, name in ipairs(WATCHED_SERVICES) do
 		local ok, svc = pcall(function() return game:GetService(name) end)
 		if ok and svc then
-			for _, desc in ipairs(svc:GetDescendants()) do
-				if ALLOWED_CLASSES[desc.ClassName] then
-					instanceCount += 1
-					if desc:IsA("LuaSourceContainer") then
-						scriptCount += 1
-					end
-				end
+			for _, child in ipairs(svc:GetChildren()) do
+				local ci, cs = countSyncableSubtree(child)
+				instanceCount += ci
+				scriptCount += cs
 			end
 		end
 	end
 	return { scriptCount = scriptCount, instanceCount = instanceCount }
 end
 
--- Snapshot for /push bootstrap. serializeInstance already filters recursion
--- to ALLOWED, but if a service has *only* non-ALLOWED descendants it would
--- still emit a service node with an empty children[]. That's fine — the
--- daemon only materializes directories for services that actually contain
--- synced files, and bootstrapping an empty service is a no-op.
+-- Snapshot for /push bootstrap. serializeInstance emits ALLOWED classes
+-- directly and non-ALLOWED classes as pass-through Folders when they lead to
+-- at least one script. A service whose descendants are entirely non-syncable
+-- still emits a node with an empty children[] — the daemon treats that as a
+-- no-op and doesn't materialize the service directory on disk.
 local function collectSnapshot()
 	local services = {}
 	for _, name in ipairs(WATCHED_SERVICES) do
@@ -1681,7 +1737,7 @@ local function decodeRemoteValue(v)
 		end
 		return item
 	elseif tag == "BrickColor" then
-		return BrickColor.new(tostring(v.name or "Medium stone grey"))
+		return BrickColor.new((tostring(v.name or "Medium stone grey") :: any))
 	elseif tag == "NumberRange" then
 		return NumberRange.new(tonumber(v.min) or 0, tonumber(v.max) or 0)
 	elseif tag == "Instance" then
@@ -2186,7 +2242,7 @@ remoteHandlers.save = function(_args)
 	-- game:Save() can take several seconds; yielding here would blow the WS
 	-- request timeout. Fire-and-forget; surface any error to the plugin log.
 	task.spawn(function()
-		local ok, err = pcall(function() game:Save() end)
+		local ok, err = pcall(function() (game :: any):Save() end)
 		if not ok then
 			warn("[Ro Sync] game:Save() failed: " .. tostring(err))
 		end
@@ -3080,7 +3136,7 @@ end
 -- Connect / Disconnect entry point
 --------------------------------------------------------------------------------
 
-local function startConnect()
+startConnect = function()
 	if connected then
 		disconnect("user")
 		return
@@ -3179,16 +3235,11 @@ local function startConnect()
 	end)
 end
 
-connectBtn.Activated:Connect(startConnect)
-
-urlBox.FocusLost:Connect(function(enter)
-	if enter then
-		plugin:SetSetting(SETTING_MANUAL_URL, trimTrailingSlash(urlBox.Text or ""))
-	end
-end)
-
 plugin.Unloading:Connect(function()
 	disconnect("unloading")
+	if ui and ui.destroy then
+		ui.destroy()
+	end
 end)
 
 setPill("idle")

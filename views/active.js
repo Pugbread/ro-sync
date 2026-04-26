@@ -80,71 +80,12 @@ export function mountActive(root, api) {
   }
   lastSyncTimer = setInterval(updateLastSyncDisplay, 1000);
 
-  // Inspector: per-path snapshot of the last parsed .meta.json so subsequent
-  // updates can render a "Size 4,1,4 → 5,1,5" diff chip inline in the log.
-  const metaPrev = new Map();
-
-  function formatTypedValue(v) {
-    if (v === null || v === undefined) return String(v);
-    if (typeof v !== "object") return JSON.stringify(v);
-    if (Array.isArray(v)) return `[${v.map(formatTypedValue).join(",")}]`;
-    if (typeof v.__type === "string" && "value" in v) {
-      const val = v.value;
-      if (Array.isArray(val)) return val.join(",");
-      if (val && typeof val === "object") {
-        return Object.entries(val).map(([k, x]) => `${k}=${formatTypedValue(x)}`).join(" ");
-      }
-      return String(val);
-    }
-    try { return JSON.stringify(v); } catch { return String(v); }
-  }
-
-  function diffMeta(prev, next) {
-    const changes = [];
-    const keys = new Set([...Object.keys(prev || {}), ...Object.keys(next || {})]);
-    for (const k of keys) {
-      if (k === "className") continue;
-      const a = prev ? prev[k] : undefined;
-      const b = next ? next[k] : undefined;
-      const as = JSON.stringify(a);
-      const bs = JSON.stringify(b);
-      if (as === bs) continue;
-      if (a === undefined) changes.push(`${k} + ${formatTypedValue(b)}`);
-      else if (b === undefined) changes.push(`${k} −`);
-      else changes.push(`${k} ${formatTypedValue(a)} → ${formatTypedValue(b)}`);
-    }
-    return changes;
-  }
-
-  // ev here is a plugin-shape op: {op:"update"|"set"|"delete"|"rename",
-  // path:[segs], properties?:{...}, node?:{...}, from?:[segs], to?:[segs]}.
-  // For meta updates the daemon passes the decoded properties object directly
-  // (not raw bytes), so we diff against the previously-seen object.
-  function inspectMetaUpdate(innerOp) {
-    if (!innerOp || innerOp.op !== "update") return null;
-    const props = innerOp.properties;
-    if (!props || typeof props !== "object") return null;
-    const path = Array.isArray(innerOp.path) ? innerOp.path.join("/") : "";
-    if (!path) return null;
-    const short = innerOp.path.slice(-2).join("/");
-    const prev = metaPrev.get(path);
-    const changes = diffMeta(prev, props);
-    metaPrev.set(path, props);
-    if (!changes.length) return null;
-    return { short, changes };
-  }
-
   function opLine(frame) {
     const innerOp = frame && frame.op;
     if (!innerOp || typeof innerOp !== "object") return null;
     const kind = String(innerOp.op || "").toLowerCase();
     const pathArr = Array.isArray(innerOp.path) ? innerOp.path : [];
     const pathStr = pathArr.join("/");
-    const inspector = kind === "update" ? inspectMetaUpdate(innerOp) : null;
-    if (inspector) {
-      return { kind, cls: "lv-fs", chip: ' <span class="meta-chip">meta</span>',
-               msg: `${inspector.short} • ${inspector.changes.join(" · ")}` };
-    }
     if (kind === "rename") {
       const from = Array.isArray(innerOp.from) ? innerOp.from.join("/") : "?";
       const to = Array.isArray(innerOp.to) ? innerOp.to.join("/") : "?";

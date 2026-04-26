@@ -78,7 +78,9 @@ pub async fn request(port: u16, op: &str, args: Value) -> Result<Value, String> 
                 }
                 _ => continue,
             };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             if v.get("type").and_then(|t| t.as_str()) != Some("response") {
                 continue;
             }
@@ -122,8 +124,12 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             while let Some(msg) = ws.next().await {
-                let Ok(tungstenite::Message::Text(t)) = msg else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
+                let Ok(tungstenite::Message::Text(t)) = msg else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
                 if v.get("type").and_then(|x| x.as_str()) != Some("request") {
                     continue;
                 }
@@ -167,13 +173,9 @@ mod tests {
         })
         .await;
 
-        let resp = request(
-            addr.port(),
-            "get",
-            json!({ "path": "Workspace/Baseplate" }),
-        )
-        .await
-        .expect("request");
+        let resp = request(addr.port(), "get", json!({ "path": "Workspace/Baseplate" }))
+            .await
+            .expect("request");
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["value"]["class"], "Part");
         assert_eq!(resp["value"]["properties"]["Anchored"], true);
@@ -212,7 +214,9 @@ mod tests {
             )
         })
         .await;
-        let resp = request(addr.port(), "ls", json!({ "path": "Workspace" })).await.unwrap();
+        let resp = request(addr.port(), "ls", json!({ "path": "Workspace" }))
+            .await
+            .unwrap();
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["value"].as_array().unwrap().len(), 2);
     }
@@ -224,9 +228,13 @@ mod tests {
             (true, json!({ "name": "Workspace", "children": [] }), None)
         })
         .await;
-        let resp = request(addr.port(), "tree", json!({ "path": "Workspace", "depth": 2 }))
-            .await
-            .unwrap();
+        let resp = request(
+            addr.port(),
+            "tree",
+            json!({ "path": "Workspace", "depth": 2 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["value"]["name"], "Workspace");
     }
@@ -239,7 +247,9 @@ mod tests {
             (true, json!([{ "path": "Workspace/Part1" }]), None)
         })
         .await;
-        let resp = request(addr.port(), "find", json!({ "className": "Part" })).await.unwrap();
+        let resp = request(addr.port(), "find", json!({ "className": "Part" }))
+            .await
+            .unwrap();
         assert_eq!(resp["value"].as_array().unwrap().len(), 1);
     }
 
@@ -263,7 +273,9 @@ mod tests {
             (false, Value::Null, Some("instance not found".into()))
         })
         .await;
-        let resp = request(addr.port(), "get", json!({ "path": "Nope" })).await.unwrap();
+        let resp = request(addr.port(), "get", json!({ "path": "Nope" }))
+            .await
+            .unwrap();
         assert_eq!(resp["ok"], false);
         assert_eq!(resp["error"], "instance not found");
     }
@@ -345,13 +357,9 @@ mod tests {
             (true, json!({ "ok": true, "name": "batch-start" }), None)
         })
         .await;
-        let resp = request(
-            addr.port(),
-            "waypoint",
-            json!({ "name": "batch-start" }),
-        )
-        .await
-        .unwrap();
+        let resp = request(addr.port(), "waypoint", json!({ "name": "batch-start" }))
+            .await
+            .unwrap();
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["value"]["name"], "batch-start");
     }
@@ -429,7 +437,11 @@ mod tests {
         let addr = start_mock_responder(|op, args| {
             assert_eq!(op, "rm");
             assert_eq!(args["path"], "Workspace/Box");
-            (true, json!({ "path": "Workspace/Box", "destroyed": true }), None)
+            (
+                true,
+                json!({ "path": "Workspace/Box", "destroyed": true }),
+                None,
+            )
         })
         .await;
         let resp = request(addr.port(), "rm", json!({ "path": "Workspace/Box" }))
@@ -469,7 +481,11 @@ mod tests {
             assert_eq!(args["path"], "Workspace/Box");
             assert_eq!(args["name"], "Speed");
             assert_eq!(args["value"], 12.5);
-            (true, json!({ "path": "Workspace/Box", "name": "Speed" }), None)
+            (
+                true,
+                json!({ "path": "Workspace/Box", "name": "Speed" }),
+                None,
+            )
         })
         .await;
         let resp = request(
@@ -594,7 +610,11 @@ mod tests {
     async fn round_trip_select_get() {
         let addr = start_mock_responder(|op, _args| {
             assert_eq!(op, "select_get");
-            (true, json!(["Workspace/Box", "Workspace/SpawnLocation"]), None)
+            (
+                true,
+                json!(["Workspace/Box", "Workspace/SpawnLocation"]),
+                None,
+            )
         })
         .await;
         let resp = request(addr.port(), "select_get", json!({})).await.unwrap();
@@ -641,9 +661,13 @@ mod tests {
             )
         })
         .await;
-        let resp = request(addr.port(), "class_info", json!({ "class_name": "BasePart" }))
-            .await
-            .unwrap();
+        let resp = request(
+            addr.port(),
+            "class_info",
+            json!({ "class_name": "BasePart" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp["ok"], true);
         let props = resp["value"]["properties"].as_array().unwrap();
         assert_eq!(props.len(), 2);
@@ -759,7 +783,11 @@ mod tests {
     #[tokio::test]
     async fn round_trip_class_info_error_when_unknown() {
         let addr = start_mock_responder(|_op, _args| {
-            (false, Value::Null, Some("no class info available for: ZZZ".into()))
+            (
+                false,
+                Value::Null,
+                Some("no class info available for: ZZZ".into()),
+            )
         })
         .await;
         let resp = request(addr.port(), "class_info", json!({ "class_name": "ZZZ" }))

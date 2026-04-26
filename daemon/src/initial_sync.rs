@@ -61,7 +61,10 @@ pub fn compute_disk_stats(root: &Path) -> std::io::Result<Stats> {
         instance_count += 1;
         walk(&svc_dir, &mut script_count, &mut instance_count)?;
     }
-    Ok(Stats { script_count, instance_count })
+    Ok(Stats {
+        script_count,
+        instance_count,
+    })
 }
 
 fn walk(dir: &Path, scripts: &mut u32, instances: &mut u32) -> std::io::Result<()> {

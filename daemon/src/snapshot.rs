@@ -15,13 +15,29 @@ use std::path::Path;
 
 pub const RO_SYNC_MD: &str = "ro-sync.md";
 pub const CLAUDE_MD: &str = "CLAUDE.md";
+pub const AGENTS_MD: &str = "AGENTS.md";
 pub const TREE_JSON: &str = "tree.json";
+pub const CODEX_DIR: &str = ".codex";
+pub const CODEX_CONFIG_TOML: &str = "config.toml";
 
 /// The single line that signals `ro-sync.md` is linked from `CLAUDE.md`.
 /// Claude Code (and compatible agent harnesses) resolve `@path` references as
 /// inline imports, so a bare line containing this token pulls `ro-sync.md`
 /// into every session that loads `CLAUDE.md`.
 pub const RO_SYNC_IMPORT_LINE: &str = "@ro-sync.md";
+const CODEX_CONTEXT_START: &str = "<!-- ro-sync:codex-context:start -->";
+const CODEX_CONTEXT_END: &str = "<!-- ro-sync:codex-context:end -->";
+const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &[
+    "ro-sync.md",
+    "ro-sync.MD",
+    "rosync.md",
+    "ROSYNC.md",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+    "Claude.MD",
+];
+const CLAUDE_DOC_VARIANTS: &[&str] = &["CLAUDE.md", "CLAUDE.MD", "Claude.MD"];
+const RO_SYNC_DOC_VARIANTS: &[&str] = &["ro-sync.md", "ro-sync.MD", "rosync.md", "ROSYNC.md"];
 
 const CLAUDE_MD_TEMPLATE: &str = r#"# Project memory for agents
 
@@ -122,6 +138,23 @@ rosync query --project . '**/RemoteEvent' --format classes
 Non-script, non-folder instances are visible only via `tree.json` — query it
 when you need to know the shape of the rest of the DataModel.
 
+## 5b. Linting Luau
+
+`rosync lint` delegates to an installed `luau-lsp` executable and runs its
+standalone analyzer with a temporary Ro-Sync sourcemap for Roblox-style require
+resolution. It does not require the daemon or Studio to be connected. If
+`luau-lsp` is not on `PATH`, set `ROSYNC_LUAU_LSP` or pass `--luau-lsp`.
+When present, `tools/luau-lsp/roblox/globalTypes.d.luau` is passed as the
+Roblox definitions file automatically.
+
+```
+rosync lint --project .
+rosync lint --project . --path ServerScriptService/Foo.server.luau
+rosync lint --project . --no-sourcemap
+rosync lint --project . -- --no-flags-enabled
+rosync lint --project . --luau-lsp /path/to/luau-lsp
+```
+
 ## 6. Agent usage — live Studio control
 
 When the daemon is running (the user has Ro Sync connected to Studio), these
@@ -183,6 +216,7 @@ verify the plugin is reachable.
 
 ```
 # Health / handshake — prints plugin round-trip latency and version.
+rosync doctor --project .
 rosync ping --project .
 rosync version --project .
 
@@ -272,7 +306,7 @@ Every `rosync` subcommand above is part of a larger catalogue. Quick reference:
 
 - **Read-only inspection**: `get`, `ls`, `tree`, `find`, `find-attr`,
   `classinfo`, `enum`, `enums`, `query`, `attr ls`, `select get`, `logs`,
-  `version`, `ping`.
+  `version`, `ping`, `lint`.
 - **Structured writes (require `--yes`)**: `set`, `new`, `rm`, `mv`,
   `attr set|rm`, `tag add|rm`, `call`, `select set`, `save`, `undo`, `redo`,
   `waypoint`, `eval`.
@@ -354,6 +388,228 @@ pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Ensure Codex receives the same project memory Claude Code does.
+///
+/// Codex reads `AGENTS.md` as its native project context. It can also be
+/// configured with fallback project-doc filenames, but current Codex builds use
+/// the first matching fallback file rather than concatenating all matches. Ro
+/// Sync therefore prioritizes `ro-sync.md` in fallback config and writes a
+/// generated block into `AGENTS.md` with the full Ro Sync memory first.
+///
+/// Returns `true` when any Codex-facing file was created or modified.
+pub fn write_codex_context_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+    fs::create_dir_all(root)?;
+    let mut changed = false;
+    changed |= write_codex_config_if_missing_or_merge(root)?;
+    changed |= write_agents_md_if_missing_or_merge(root)?;
+    Ok(changed)
+}
+
+fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+    let dir = root.join(CODEX_DIR);
+    fs::create_dir_all(&dir)?;
+    let p = dir.join(CODEX_CONFIG_TOML);
+    let desired_line = codex_project_doc_fallback_line();
+    if !p.exists() {
+        fs::write(&p, format!("{desired_line}\n"))?;
+        return Ok(true);
+    }
+
+    let existing = fs::read_to_string(&p)?;
+    let merged = merge_codex_project_doc_fallbacks(&existing);
+    if merged == existing {
+        return Ok(false);
+    }
+    fs::write(&p, merged)?;
+    Ok(true)
+}
+
+fn write_agents_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+    let p = root.join(AGENTS_MD);
+    let block = codex_agents_block(root);
+    let next = if !p.exists() {
+        format!(
+            "# Codex project memory\n\nThis file is maintained by Ro Sync so Codex receives the same context as Claude Code.\n\n{block}"
+        )
+    } else {
+        let existing = fs::read_to_string(&p)?;
+        merge_generated_block(&existing, &block)
+    };
+
+    if p.exists() && fs::read_to_string(&p)? == next {
+        return Ok(false);
+    }
+    fs::write(&p, next)?;
+    Ok(true)
+}
+
+fn codex_agents_block(root: &Path) -> String {
+    let mut claude_sections = read_doc_variants(root, CLAUDE_DOC_VARIANTS);
+    if claude_sections.is_empty() {
+        claude_sections.push((CLAUDE_MD.to_string(), String::new()));
+    }
+    let mut ro_sync_sections = read_doc_variants(root, RO_SYNC_DOC_VARIANTS);
+    if ro_sync_sections.is_empty() {
+        ro_sync_sections.push((RO_SYNC_MD.to_string(), RO_SYNC_MD_TEMPLATE.into()));
+    }
+    let ro_sync = format_doc_sections(ro_sync_sections);
+    let claude = format_doc_sections(claude_sections);
+    format!(
+        "{CODEX_CONTEXT_START}\n\
+         # Ro Sync Codex Context\n\n\
+         The section between these markers is regenerated by Ro Sync. Put durable project-specific Codex notes outside the markers.\n\n\
+         ## Ro Sync Project Memory\n\n\
+         {ro_sync}\n\n\
+         ## Claude Project Memory\n\n\
+         {claude}\n\
+         {CODEX_CONTEXT_END}\n"
+    )
+}
+
+fn read_doc_variants(root: &Path, names: &[&str]) -> Vec<(String, String)> {
+    let mut docs = Vec::new();
+    for name in names {
+        let Ok(text) = fs::read_to_string(root.join(name)) else {
+            continue;
+        };
+        if docs.iter().any(|(_, existing)| existing == &text) {
+            continue;
+        }
+        docs.push(((*name).to_string(), text));
+    }
+    docs
+}
+
+fn format_doc_sections(sections: Vec<(String, String)>) -> String {
+    sections
+        .into_iter()
+        .map(|(name, body)| format!("### {name}\n\n{body}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn merge_generated_block(existing: &str, block: &str) -> String {
+    let Some(start) = existing.find(CODEX_CONTEXT_START) else {
+        let mut merged = existing.to_string();
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        if !merged.ends_with("\n\n") {
+            merged.push('\n');
+        }
+        merged.push_str(block);
+        return merged;
+    };
+    let Some(end_rel) = existing[start..].find(CODEX_CONTEXT_END) else {
+        let mut merged = existing.to_string();
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        if !merged.ends_with("\n\n") {
+            merged.push('\n');
+        }
+        merged.push_str(block);
+        return merged;
+    };
+    let end = start + end_rel + CODEX_CONTEXT_END.len();
+    let mut merged = String::new();
+    merged.push_str(&existing[..start]);
+    merged.push_str(block);
+    if existing[end..].starts_with('\n') {
+        merged.push_str(&existing[end + 1..]);
+    } else {
+        merged.push_str(&existing[end..]);
+    }
+    merged
+}
+
+fn codex_project_doc_fallback_line() -> String {
+    let quoted: Vec<String> = CODEX_PROJECT_DOC_FALLBACKS
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect();
+    format!("project_doc_fallback_filenames = [{}]", quoted.join(", "))
+}
+
+fn merge_codex_project_doc_fallbacks(existing: &str) -> String {
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut found = false;
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("project_doc_fallback_filenames") {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "project_doc_fallback_filenames" {
+            continue;
+        }
+        let names = order_codex_project_doc_fallbacks(parse_toml_string_array(value));
+        let prefix_len = line.len() - trimmed.len();
+        let prefix = " ".repeat(prefix_len);
+        let quoted: Vec<String> = names.iter().map(|name| format!("\"{name}\"")).collect();
+        *line = format!(
+            "{prefix}project_doc_fallback_filenames = [{}]",
+            quoted.join(", ")
+        );
+        found = true;
+        break;
+    }
+    if !found {
+        lines.push(codex_project_doc_fallback_line());
+    }
+
+    let mut merged = lines.join("\n");
+    if existing.ends_with('\n') || !merged.is_empty() {
+        merged.push('\n');
+    }
+    merged
+}
+
+fn order_codex_project_doc_fallbacks(existing: Vec<String>) -> Vec<String> {
+    let mut ordered = Vec::new();
+    for desired in CODEX_PROJECT_DOC_FALLBACKS {
+        if !ordered.iter().any(|name| name == desired) {
+            ordered.push((*desired).to_string());
+        }
+    }
+    for name in existing {
+        if !ordered.iter().any(|existing_name| existing_name == &name) {
+            ordered.push(name);
+        }
+    }
+    ordered
+}
+
+fn parse_toml_string_array(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '"' {
+            continue;
+        }
+        let mut item = String::new();
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if escaped {
+                item.push(next);
+                escaped = false;
+                continue;
+            }
+            match next {
+                '\\' => escaped = true,
+                '"' => break,
+                other => item.push(other),
+            }
+        }
+        if !out.iter().any(|existing| existing == &item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// True when any line of `contents` (after trimming whitespace) is exactly the
 /// `@ro-sync.md` import token, optionally prefixed with `./`. Keeps detection
 /// robust against minor user edits (leading spaces, trailing whitespace) while
@@ -397,7 +653,9 @@ fn walk_children(dir: &Path, parent_is_script: bool) -> io::Result<Vec<Value>> {
     for entry in fs::read_dir(dir)? {
         let e = entry?;
         let fname = e.file_name();
-        let Some(name_str) = fname.to_str() else { continue };
+        let Some(name_str) = fname.to_str() else {
+            continue;
+        };
         if name_str == META_FILE {
             continue;
         }
@@ -464,8 +722,12 @@ fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> String {
     };
     for entry in iter.flatten() {
         let fname = entry.file_name();
-        let Some(name_str) = fname.to_str() else { continue };
-        let Some((class, _)) = parse_init_file(name_str) else { continue };
+        let Some(name_str) = fname.to_str() else {
+            continue;
+        };
+        let Some((class, _)) = parse_init_file(name_str) else {
+            continue;
+        };
         if sc.map(|want| want == class).unwrap_or(true) {
             return fs::read_to_string(entry.path()).unwrap_or_default();
         }
@@ -547,6 +809,8 @@ mod tests {
             "rosync tree",
             "rosync find",
             "rosync eval",
+            "rosync doctor",
+            "rosync lint",
             "rosync classinfo",
             "rosync enums",
             "rosync enum ",
@@ -652,6 +916,90 @@ mod tests {
         let merged = fs::read_to_string(&p).unwrap();
         assert!(merged.starts_with("# tight"));
         assert!(merged.lines().any(|l| l.trim() == RO_SYNC_IMPORT_LINE));
+    }
+
+    #[test]
+    fn codex_context_inlines_claude_and_ro_sync_docs() {
+        let d = TempDir::new("codex-context");
+        fs::write(d.path().join(CLAUDE_MD), "# Claude notes\n").unwrap();
+        fs::write(d.path().join(RO_SYNC_MD), "# Ro Sync notes\n").unwrap();
+
+        assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
+        let agents = fs::read_to_string(d.path().join(AGENTS_MD)).unwrap();
+        assert!(agents.contains(CODEX_CONTEXT_START));
+        assert!(agents.contains("# Claude notes"));
+        assert!(agents.contains("# Ro Sync notes"));
+        assert!(
+            agents.find("## Ro Sync Project Memory").unwrap()
+                < agents.find("## Claude Project Memory").unwrap(),
+            "AGENTS.md must put full Ro Sync memory before Claude import notes; got:\n{agents}"
+        );
+
+        let config = fs::read_to_string(d.path().join(CODEX_DIR).join(CODEX_CONFIG_TOML)).unwrap();
+        assert!(config.contains("\"CLAUDE.md\""));
+        assert!(config.contains("\"ro-sync.md\""));
+        assert!(
+            config.find("\"ro-sync.md\"").unwrap() < config.find("\"CLAUDE.md\"").unwrap(),
+            "ro-sync.md must be the first matching Codex fallback; got:\n{config}"
+        );
+
+        assert!(!write_codex_context_if_missing_or_merge(d.path()).unwrap());
+    }
+
+    #[test]
+    fn codex_context_preserves_existing_agents_notes() {
+        let d = TempDir::new("codex-agents-merge");
+        fs::write(d.path().join(CLAUDE_MD), "# Claude v1\n").unwrap();
+        fs::write(d.path().join(RO_SYNC_MD), "# Ro Sync v1\n").unwrap();
+        let p = d.path().join(AGENTS_MD);
+        fs::write(&p, "# User Codex notes\n\nKeep this.\n").unwrap();
+
+        assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
+        let merged = fs::read_to_string(&p).unwrap();
+        assert!(merged.starts_with("# User Codex notes\n\nKeep this.\n"));
+        assert!(merged.contains("# Claude v1"));
+
+        fs::write(d.path().join(CLAUDE_MD), "# Claude v2\n").unwrap();
+        assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
+        let updated = fs::read_to_string(&p).unwrap();
+        assert!(updated.contains("# Claude v2"));
+        assert!(!updated.contains("# Claude v1"));
+        assert_eq!(updated.matches(CODEX_CONTEXT_START).count(), 1);
+    }
+
+    #[test]
+    fn codex_context_includes_distinct_claude_md_variant() {
+        let d = TempDir::new("codex-claude-case");
+        fs::write(d.path().join(CLAUDE_MD), "# Claude lower\n").unwrap();
+        fs::write(d.path().join("CLAUDE.MD"), "# Claude upper\n").unwrap();
+        fs::write(d.path().join(RO_SYNC_MD), "# Ro Sync notes\n").unwrap();
+
+        assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
+        let agents = fs::read_to_string(d.path().join(AGENTS_MD)).unwrap();
+        assert!(agents.contains("### CLAUDE.md"));
+        assert!(agents.contains("# Claude upper"));
+        let same_file = fs::canonicalize(d.path().join(CLAUDE_MD)).ok()
+            == fs::canonicalize(d.path().join("CLAUDE.MD")).ok();
+        if !same_file {
+            assert!(agents.contains("# Claude lower"));
+            assert!(agents.contains("### CLAUDE.MD"));
+        }
+    }
+
+    #[test]
+    fn codex_config_merges_existing_fallbacks() {
+        let existing =
+            "mcp_servers = {}\nproject_doc_fallback_filenames = [\"CUSTOM.md\", \"CLAUDE.md\"]\n";
+        let merged = merge_codex_project_doc_fallbacks(existing);
+        assert!(merged.contains("mcp_servers = {}"));
+        assert!(merged.contains("\"CUSTOM.md\""));
+        assert!(merged.contains("\"CLAUDE.md\""));
+        assert!(merged.contains("\"ro-sync.md\""));
+        assert_eq!(merged.matches("\"CLAUDE.md\"").count(), 1);
+        assert!(
+            merged.find("\"ro-sync.md\"").unwrap() < merged.find("\"CLAUDE.md\"").unwrap(),
+            "ro-sync.md must be moved ahead of CLAUDE.md; got:\n{merged}"
+        );
     }
 
     #[test]

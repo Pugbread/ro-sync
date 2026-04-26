@@ -197,7 +197,11 @@ async fn recv_loop(
                         },
                     );
                 }
-                Ok(ClientMsg::Request { request_id, op, args }) => {
+                Ok(ClientMsg::Request {
+                    request_id,
+                    op,
+                    args,
+                }) => {
                     // Stash the route so whoever responds later can find us.
                     {
                         let mut routes = state.pending_routes.lock().unwrap();
@@ -211,13 +215,23 @@ async fn recv_loop(
                         args,
                     });
                 }
-                Ok(ClientMsg::Response { request_id, ok, value, error }) => {
+                Ok(ClientMsg::Response {
+                    request_id,
+                    ok,
+                    value,
+                    error,
+                }) => {
                     let sink = {
                         let mut routes = state.pending_routes.lock().unwrap();
                         routes.remove(&request_id)
                     };
                     if let Some(sink) = sink {
-                        let msg = ServerMsg::Response { request_id, ok, value, error };
+                        let msg = ServerMsg::Response {
+                            request_id,
+                            ok,
+                            value,
+                            error,
+                        };
                         if let Ok(s) = serde_json::to_string(&msg) {
                             let _ = sink.send(Message::Text(s));
                         }
@@ -336,7 +350,9 @@ async fn send_ws_msg(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     msg: &ServerMsg,
 ) -> bool {
-    let Ok(s) = serde_json::to_string(msg) else { return true };
+    let Ok(s) = serde_json::to_string(msg) else {
+        return true;
+    };
     sender.send(Message::Text(s)).await.is_ok()
 }
 
@@ -345,11 +361,7 @@ async fn send_ws_msg(
 fn has_type(s: &str, kind: &str) -> bool {
     serde_json::from_str::<Value>(s)
         .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(|t| t.as_str())
-                .map(|n| n == kind)
-        })
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|n| n == kind))
         .unwrap_or(false)
 }
 
@@ -531,7 +543,10 @@ mod tests {
         .await
         .ok()
         .flatten();
-        assert!(echoed.is_none(), "CLI must not receive its own request back");
+        assert!(
+            echoed.is_none(),
+            "CLI must not receive its own request back"
+        );
     }
 
     /// End-to-end test using the `remote::request` client against a real
@@ -563,8 +578,12 @@ mod tests {
         // with `value = {"got": args.path}`.
         let plugin_task = tokio::spawn(async move {
             while let Some(msg) = plugin.next().await {
-                let Ok(tungstenite::Message::Text(t)) = msg else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
+                let Ok(tungstenite::Message::Text(t)) = msg else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
                 if v.get("type").and_then(|x| x.as_str()) != Some("request") {
                     continue;
                 }
@@ -640,7 +659,6 @@ mod tests {
                 path: std::fs::canonicalize(&script_path).unwrap(),
                 from: None,
                 content: Some(b"print('hi')\n".to_vec()),
-                meta: None,
             })
             .unwrap();
 

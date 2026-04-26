@@ -58,6 +58,9 @@ export function nativeRel(rel) {
 // but this keeps it safe). For PowerShell blocks we use the single-quoted form
 // inside the `-Command "..."` string directly.
 function posixQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+function posixExpandQuote(s) {
+  return '"' + String(s).replace(/(["\\`])/g, "\\$1") + '"';
+}
 function winQuote(s)   { return '"' + String(s).replace(/"/g, '""') + '"'; }
 export function shQuote(s) { return IS_WINDOWS ? winQuote(s) : posixQuote(s); }
 
@@ -169,7 +172,8 @@ export function killDaemonOnPortCmd(port) {
 export function tailLogCmd(path) {
   if (IS_WINDOWS) {
     return psEncodedCmd(
-      `if (Test-Path ${psQuote(path)}) { Get-Content -Tail 40 ${psQuote(path)} }`
+      `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(path)}); ` +
+      `if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Tail 40 -Encoding UTF8 }`
     );
   }
   return `tail -40 ${posixQuote(path)} 2>/dev/null || true`;
@@ -212,7 +216,7 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
       `$xp = { param($s) [Environment]::ExpandEnvironmentVariables($s) }; ` +
       `try { ` +
       `  $bin = & $xp ${psQuote(binaryPath)}; ` +
-      `  if (-not (Test-Path $bin)) { throw ('binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ' + $bin) }; ` +
+      `  if (-not (Test-Path -LiteralPath $bin)) { throw ('binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ' + $bin) }; ` +
       `  $log = & $xp ${psQuote(logPath)}; ` +
       `  $err = & $xp ${psQuote(logPath + ".err")}; ` +
       `  $proc = Start-Process -FilePath $bin ` +
@@ -259,35 +263,40 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
 //
 // Arguments are RAW absolute paths (no shell quoting). This function does
 // platform-appropriate quoting internally.
-export function pluginInstallCmd({ srcFile, destDir, destName, staleName }) {
+export function pluginInstallCmd({ srcFile, destDir, destName, staleName, staleNames }) {
+  const staleList = Array.isArray(staleNames)
+    ? staleNames
+    : (staleName ? [staleName] : []);
   if (IS_WINDOWS) {
     // Inside PS we expand env vars explicitly via [Environment]::ExpandEnvironmentVariables
     // instead of relying on cmd-level %VAR% expansion. Makes the command
     // shell-independent.
     const destFile  = destDir + "\\" + destName;
-    const staleFile = destDir + "\\" + staleName;
+    const staleDeletes = staleList.map((name) => {
+      const staleFile = destDir + "\\" + name;
+      return `$stale = & $xp ${psQuote(staleFile)}; if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }; `;
+    }).join("");
     const ps =
       `$ErrorActionPreference = 'Stop'; ` +
       `$xp = { param($s) [Environment]::ExpandEnvironmentVariables($s) }; ` +
       `$src   = & $xp ${psQuote(srcFile)}; ` +
       `$dir   = & $xp ${psQuote(destDir)}; ` +
       `$dest  = & $xp ${psQuote(destFile)}; ` +
-      `$stale = & $xp ${psQuote(staleFile)}; ` +
-      `if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }; ` +
-      `Copy-Item -Path $src -Destination $dest -Force; ` +
-      `if (Test-Path $stale) { Remove-Item -Path $stale -Force }`;
+      `if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }; ` +
+      `Copy-Item -LiteralPath $src -Destination $dest -Force; ` +
+      staleDeletes;
     return psEncodedCmd(ps);
   }
   // POSIX: sh sequence — mkdir -p is idempotent, cp -f overwrites, rm -f
   // silently skips missing. All in one line so it works under any invoking
   // shell (even ones that pass args as a single string to /bin/sh).
-  const dq = (s) => posixQuote(s);
+  const dq = (s) => posixExpandQuote(s);
   const dest = destDir + "/" + destName;
-  const stale = destDir + "/" + staleName;
+  const stale = staleList.map((name) => destDir + "/" + name);
   return (
     `mkdir -p ${dq(destDir)} && ` +
     `cp -f ${dq(srcFile)} ${dq(dest)} && ` +
-    `rm -f ${dq(stale)}`
+    `rm -f ${stale.map(dq).join(" ")}`
   );
 }
 
@@ -298,11 +307,11 @@ export function openFolderEnsuredCmd(dir) {
     // argument even when it contains spaces (e.g. `C:\Users\My Name\...`).
     const ps =
       `$dest = [Environment]::ExpandEnvironmentVariables(${psQuote(dir)}); ` +
-      `if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }; ` +
+      `if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }; ` +
       `Start-Process explorer.exe -ArgumentList ('"' + $dest + '"')`;
     return psEncodedCmd(ps);
   }
-  const dq = posixQuote(dir);
+  const dq = posixExpandQuote(dir);
   const opener = PLATFORM === "linux" ? "xdg-open" : "/usr/bin/open";
   return `mkdir -p ${dq} && ${opener} ${dq}`;
 }
@@ -315,6 +324,8 @@ export function pickFolderCmd(prompt) {
     // can't be mangled by the host shell, and emit ONLY the path (no banner)
     // to stdout on success.
     const ps =
+      `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ` +
+      `$OutputEncoding = [System.Text.Encoding]::UTF8; ` +
       `Add-Type -AssemblyName System.Windows.Forms | Out-Null; ` +
       `$dlg = New-Object System.Windows.Forms.FolderBrowserDialog; ` +
       `$dlg.Description = ${psQuote(prompt)}; ` +
@@ -362,7 +373,7 @@ export function readFileCmd(absPath) {
     // (project configs, writes.log, anything we authored ourselves).
     return psEncodedCmd(
       `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(absPath)}); ` +
-      `if (Test-Path $p) { Get-Content -Raw -Encoding UTF8 $p }`
+      `if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw -Encoding UTF8 }`
     );
   }
   return `cat ${posixQuote(absPath)} 2>/dev/null || true`;
@@ -376,10 +387,10 @@ export function checkBinaryCmd() {
   if (IS_WINDOWS) {
     return psEncodedCmd(
       `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(rel)}); ` +
-      `if (Test-Path $p) { 'yes' } else { 'no' }`
+      `if (Test-Path -LiteralPath $p) { 'yes' } else { 'no' }`
     );
   }
-  return `if [ -x ${posixQuote(rel)} ]; then echo yes; else echo no; fi`;
+  return `if [ -x ${posixExpandQuote(rel)} ]; then echo yes; else echo no; fi`;
 }
 
 // Probe whether a `cargo` toolchain is on PATH. Stdout is "yes" or "no".
@@ -427,7 +438,7 @@ export function buildDaemonCmd() {
   // POSIX: cd into daemon, run build.sh, capture exit code. Prefer the user's
   // cargo if rustup is installed under $HOME/.cargo.
   return (
-    `cd ${posixQuote(WIDGET_DIR_SHELL)}/daemon && ` +
+    `cd ${posixExpandQuote(joinShell(WIDGET_DIR_SHELL, "daemon"))} && ` +
     `CARGO="$HOME/.cargo/bin/cargo" bash ./build.sh 2>&1; ` +
     `echo "___EXIT:$?"`
   );

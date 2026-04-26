@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check widget platform commands
+        run: node scripts/check-platform-commands.mjs
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

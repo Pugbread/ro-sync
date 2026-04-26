@@ -1,9 +1,15 @@
 # Ro Sync value schema
 
 Shared single source of truth for the type-tagged JSON shapes that flow over
-`/push`, `/poll`, and land in `.meta.json` on disk. The **plugin** encodes
+`/push`, `/poll`, and the WebSocket channel. The **plugin** encodes
 (`encodeValue` / `decodeValue` in `plugin/Plugin.luau`) and the **daemon**
 must decode (and re-encode for reverse direction) with exactly the same shape.
+
+> `.meta.json` is **not** a supported artifact in Ro Sync. Property/attribute
+> persistence is intentionally out of scope — only scripts and folder-ish
+> container shapes round-trip to disk. The encodings below are used for
+> in-memory / wire traffic (e.g. `tree.json` skeleton values, `set`/`update`
+> op payloads), not for on-disk meta files.
 
 ## General rules
 
@@ -20,23 +26,6 @@ must decode (and re-encode for reverse direction) with exactly the same shape.
 - **Property names are PascalCase** exactly as Roblox exposes them
   (`BackgroundColor3`, not `backgroundColor3`). Attribute names are free-form
   but constrained by Roblox's own rules (see validator in `Plugin.luau`).
-
-## Top-level layout of `.meta.json`
-
-```json
-{
-  "className": "Part",
-  "properties": { ... encoded values ... },
-  "attributes": { ... encoded values ... },
-  "tags": ["Tag1", "Tag2"]
-}
-```
-
-`properties` and `attributes` use the SAME encoding table (below). The only
-difference is that attributes are constrained to a subset of types that
-`SetAttribute` actually accepts: `boolean`, `number`, `string`, `UDim`,
-`UDim2`, `BrickColor`, `Color3`, `Vector2`, `Vector3`, `CFrame`,
-`NumberSequence`, `ColorSequence`, `NumberRange`, `Rect`, `Font`, `EnumItem`.
 
 ## Encoded type catalogue
 

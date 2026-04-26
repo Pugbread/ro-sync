@@ -1,0 +1,15 @@
+{
+  "name": "RoSyncPlugin",
+  "tree": {
+    "$className": "Folder",
+    "RoSync": {
+      "$path": "src/RoSync.server.luau"
+    },
+    "App": {
+      "$path": "src/App.luau"
+    },
+    "Packages": {
+      "$path": "Packages"
+    }
+  }
+}

@@ -1,11 +1,14 @@
+use axum::body::Bytes;
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
-use axum::body::Bytes;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -21,8 +24,9 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
 use crate::fs_map::{
-    classify_script_file, encode_name, instance_to_path, normalize_line_endings, parse_disambiguated,
-    parse_init_file, path_to_instance_meta, InstanceDescriptor, PathInstance, ScriptClass, META_FILE,
+    classify_script_file, encode_name, instance_to_path, normalize_line_endings,
+    parse_disambiguated, parse_init_file, path_to_instance_meta, InstanceDescriptor, PathInstance,
+    ScriptClass, META_FILE,
 };
 
 /// Roblox classes the daemon will materialize on disk. Everything else is
@@ -130,7 +134,9 @@ async fn writelog(body: Json<Value>) -> Json<Value> {
     {
         Ok(f) => f,
         Err(e) => {
-            return Json(json!({ "ok": false, "error": format!("open {}: {e}", log_path.display()) }));
+            return Json(
+                json!({ "ok": false, "error": format!("open {}: {e}", log_path.display()) }),
+            );
         }
     };
     if let Err(e) = writeln!(f, "{line}") {
@@ -257,7 +263,11 @@ async fn initial_compare(
     {
         let mut rxs = PENDING_RX.lock().unwrap();
         rxs.retain(|(_, _, ready)| !ready.load(std::sync::atomic::Ordering::Relaxed));
-        rxs.push((choice_id.clone(), rx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))));
+        rxs.push((
+            choice_id.clone(),
+            rx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
     }
     let evt = json!({
         "type": "initial-choice-needed",
@@ -302,7 +312,11 @@ mod once_cell_stub {
 
     impl<T> Lazy<T> {
         pub const fn new(init: fn() -> T) -> Self {
-            Self { once: Once::new(), cell: UnsafeCell::new(None), init }
+            Self {
+                once: Once::new(),
+                cell: UnsafeCell::new(None),
+                init,
+            }
         }
     }
 
@@ -590,12 +604,9 @@ struct PollParams {
     since: Option<u64>,
 }
 
-async fn poll(
-    State(state): State<AppState>,
-    Query(_params): Query<PollParams>,
-) -> Json<Value> {
+async fn poll(State(state): State<AppState>, Query(_params): Query<PollParams>) -> Json<Value> {
     let mut rx = state.watch_tx.subscribe();
-    let root = state.project.as_path();
+    let root = state.canonical_project.as_path();
     let mut out: Vec<Value> = Vec::new();
 
     // Wait up to 30s for the first op, then drain anything else that arrived
@@ -658,7 +669,10 @@ struct ResolveBody {
     choice: Option<String>,
 }
 
-async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -> impl IntoResponse {
+async fn resolve(
+    State(state): State<AppState>,
+    Json(body): Json<ResolveBody>,
+) -> impl IntoResponse {
     let raw = body.resolution.or(body.choice).unwrap_or_default();
     let resolution = match raw.as_str() {
         "keep-local" | "keep_fs" | "fs" | "local" => Resolution::KeepLocal,
@@ -688,7 +702,9 @@ async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -
             if let Err(e) = std::fs::write(&target, &bytes) {
                 return Json(json!({ "ok": false, "error": format!("write: {e}") }));
             }
-            state.conflict.record_sync(&target, hash(&bytes), fs_mtime(&target));
+            state
+                .conflict
+                .record_sync(&target, hash(&bytes), fs_mtime(&target));
             // Quiet window so the watcher doesn't re-emit our own write.
             {
                 let canon = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
@@ -703,10 +719,11 @@ async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -
                 path: target.clone(),
                 from: None,
                 content: Some(bytes.clone()),
-                meta: None,
             };
             let _ = state.watch_tx.send(op);
-            state.conflict.record_sync(&target, hash(&bytes), fs_mtime(&target));
+            state
+                .conflict
+                .record_sync(&target, hash(&bytes), fs_mtime(&target));
             Json(json!({ "ok": true, "action": "pushed-studio", "path": body.path }))
         }
     }
@@ -739,11 +756,7 @@ fn path_segments(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn apply_op(
-    root: &Path,
-    op: &Value,
-    ctx: &PushCtx<'_>,
-) -> Result<ApplyOutcome, String> {
+fn apply_op(root: &Path, op: &Value, ctx: &PushCtx<'_>) -> Result<ApplyOutcome, String> {
     match op_kind(op) {
         "set" | "replace" => {
             let parent_segs = op.get("path").map(path_segments).unwrap_or_default();
@@ -778,12 +791,11 @@ fn apply_op(
     }
 }
 
-fn apply_service_node(
-    root: &Path,
-    node: &Value,
-    ctx: &PushCtx<'_>,
-) -> Result<usize, String> {
-    let name = node.get("name").and_then(|v| v.as_str()).ok_or("service: missing name")?;
+fn apply_service_node(root: &Path, node: &Value, ctx: &PushCtx<'_>) -> Result<usize, String> {
+    let name = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("service: missing name")?;
     let svc_dir = root.join(encode_name(name));
     std::fs::create_dir_all(&svc_dir).map_err(|e| format!("mkdir {}: {e}", svc_dir.display()))?;
     ctx.mark_quiet(&svc_dir);
@@ -836,10 +848,17 @@ fn apply_set(
         Some(f) => {
             let p = parent_dir.join(f);
             let is_dir = p.is_dir();
-            crate::fs_map::PathFragment { fragment: f.clone(), is_dir }
+            crate::fs_map::PathFragment {
+                fragment: f.clone(),
+                is_dir,
+            }
         }
         None => instance_to_path(
-            &InstanceDescriptor { class, name, has_children },
+            &InstanceDescriptor {
+                class,
+                name,
+                has_children,
+            },
             &taken,
         ),
     };
@@ -863,7 +882,10 @@ fn apply_set(
             let raw_bytes = source.unwrap_or_default().into_bytes();
             let bytes = normalize_line_endings(&raw_bytes).into_owned();
             let current = if target.is_file() {
-                Some((std::fs::read(&target).unwrap_or_default(), fs_mtime(&target)))
+                Some((
+                    std::fs::read(&target).unwrap_or_default(),
+                    fs_mtime(&target),
+                ))
             } else {
                 None
             };
@@ -941,11 +963,9 @@ fn apply_delete(root: &Path, segs: &[String], ctx: &PushCtx<'_>) -> Result<usize
         None => return Ok(0),
     };
     if target.is_dir() {
-        std::fs::remove_dir_all(&target)
-            .map_err(|e| format!("rmdir {}: {e}", target.display()))?;
+        std::fs::remove_dir_all(&target).map_err(|e| format!("rmdir {}: {e}", target.display()))?;
     } else if target.is_file() {
-        std::fs::remove_file(&target)
-            .map_err(|e| format!("rm {}: {e}", target.display()))?;
+        std::fs::remove_file(&target).map_err(|e| format!("rm {}: {e}", target.display()))?;
     }
     ctx.mark_quiet(&target);
     Ok(1)
@@ -1005,7 +1025,12 @@ fn apply_update(
     Ok(ApplyOutcome::Skipped)
 }
 
-fn apply_rename(root: &Path, segs: &[String], new_name: &str, ctx: &PushCtx<'_>) -> Result<usize, String> {
+fn apply_rename(
+    root: &Path,
+    segs: &[String],
+    new_name: &str,
+    ctx: &PushCtx<'_>,
+) -> Result<usize, String> {
     let Some(target) = resolve_segments_to_path(root, segs)? else {
         return Ok(0);
     };
@@ -1015,7 +1040,11 @@ fn apply_rename(root: &Path, segs: &[String], new_name: &str, ctx: &PushCtx<'_>)
         .to_path_buf();
 
     let (class, has_children) = match path_to_instance_meta(&target).map_err(|e| e.to_string())? {
-        Some(inst) => (inst.class, inst.is_dir && !inst.is_script_with_children || inst.is_script_with_children && children_exist(&target)),
+        Some(inst) => (
+            inst.class,
+            inst.is_dir && !inst.is_script_with_children
+                || inst.is_script_with_children && children_exist(&target),
+        ),
         None => ("Folder".to_string(), target.is_dir()),
     };
     let current_frag = target
@@ -1024,7 +1053,11 @@ fn apply_rename(root: &Path, segs: &[String], new_name: &str, ctx: &PushCtx<'_>)
         .map(|s| s.to_string());
     let taken = siblings_except(&parent_dir, current_frag.as_deref())?;
     let new_frag = instance_to_path(
-        &InstanceDescriptor { class: &class, name: new_name, has_children },
+        &InstanceDescriptor {
+            class: &class,
+            name: new_name,
+            has_children,
+        },
         &taken,
     );
     let new_path = parent_dir.join(&new_frag.fragment);
@@ -1054,7 +1087,12 @@ fn apply_rename(root: &Path, segs: &[String], new_name: &str, ctx: &PushCtx<'_>)
     Ok(1)
 }
 
-fn apply_move(root: &Path, from_segs: &[String], to_segs: &[String], ctx: &PushCtx<'_>) -> Result<usize, String> {
+fn apply_move(
+    root: &Path,
+    from_segs: &[String],
+    to_segs: &[String],
+    ctx: &PushCtx<'_>,
+) -> Result<usize, String> {
     let Some(src) = resolve_segments_to_path(root, from_segs)? else {
         return Ok(0);
     };
@@ -1073,7 +1111,11 @@ fn apply_move(root: &Path, from_segs: &[String], to_segs: &[String], ctx: &PushC
     };
     let taken = siblings_except(&parent_dir, None)?;
     let frag = instance_to_path(
-        &InstanceDescriptor { class: &class, name: new_name, has_children },
+        &InstanceDescriptor {
+            class: &class,
+            name: new_name,
+            has_children,
+        },
         &taken,
     );
     let dest = parent_dir.join(&frag.fragment);
@@ -1093,7 +1135,11 @@ fn apply_move(root: &Path, from_segs: &[String], to_segs: &[String], ctx: &PushC
 fn resolve_segments_to_path(root: &Path, segs: &[String]) -> Result<Option<PathBuf>, String> {
     let mut cur = root.to_path_buf();
     for (i, seg) in segs.iter().enumerate() {
-        let lookup_dir = if i == 0 { root.to_path_buf() } else { cur.clone() };
+        let lookup_dir = if i == 0 {
+            root.to_path_buf()
+        } else {
+            cur.clone()
+        };
         match find_child_fragment_by_name(&lookup_dir, seg).map_err(|e| e.to_string())? {
             Some(frag) => cur = lookup_dir.join(frag),
             None => {
@@ -1246,8 +1292,10 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                 // Translate into an update of the parent dir (Source on the script-with-children).
                 let parent_path = op.path.parent()?;
                 let parent_inst = path_to_instance_meta(parent_path).ok().flatten()?;
-                if let Some(PathInstance { is_script_with_children: true, .. }) = Some(&parent_inst)
-                    .filter(|i| i.is_script_with_children)
+                if let Some(PathInstance {
+                    is_script_with_children: true,
+                    ..
+                }) = Some(&parent_inst).filter(|i| i.is_script_with_children)
                 {
                     let parent_segs_fs: Vec<String> = segs[..segs.len() - 1].to_vec();
                     let inst_segs = segs_to_instance_path(&parent_segs_fs)?;
@@ -1386,7 +1434,10 @@ mod tests {
         engine: &'a ConflictEngine,
         quiet: &'a Mutex<HashMap<PathBuf, Instant>>,
     ) -> PushCtx<'a> {
-        PushCtx { conflicts: engine, push_quiet: quiet }
+        PushCtx {
+            conflicts: engine,
+            push_quiet: quiet,
+        }
     }
 
     fn push_quiet() -> Mutex<HashMap<PathBuf, Instant>> {
@@ -1444,8 +1495,7 @@ mod tests {
         assert!(final_path.exists(), "tree.json should exist after rename");
         assert!(!tmp.exists(), ".tree.json.tmp should be gone after rename");
 
-        let reloaded: Value =
-            serde_json::from_slice(&std::fs::read(&final_path).unwrap()).unwrap();
+        let reloaded: Value = serde_json::from_slice(&std::fs::read(&final_path).unwrap()).unwrap();
         assert_eq!(reloaded, skeleton);
 
         // The watcher blacklist should ignore both filenames — proving that a
@@ -1541,4 +1591,3 @@ mod tests {
         );
     }
 }
-

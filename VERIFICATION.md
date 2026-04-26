@@ -8,7 +8,8 @@ project-row duplicate-group subtitle (Agent 3, this branch).
 ## Prep
 
 1. `bash daemon/build.sh` and `cargo test` (in `daemon/`) — must both pass.
-2. Copy `plugin/Plugin.luau` to `~/Documents/Roblox/Plugins/RoSync.lua`.
+2. Use the widget Settings tab to install `plugin/Plugin.rbxm`, or copy it to
+   `~/Documents/Roblox/Plugins/RoSync.rbxm`.
 3. Create a scratch project folder: `mkdir -p /tmp/rosync-v2`.
 4. Open the Ro Sync widget, Add project `/tmp/rosync-v2`, Activate it.
    Daemon dot should go green with `:7878`.

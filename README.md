@@ -1,95 +1,218 @@
+# TERMINAL 64 WIDGET
+
 # Ro Sync
 
-Two-way filesystem sync between Roblox Studio and your editor, plus an agent-friendly CLI that can read/write the live DataModel while Studio is open.
+Ro Sync is a Terminal 64 widget for Roblox Studio projects. It keeps a narrow,
+safe filesystem mirror of your Studio DataModel in sync with your editor, and
+ships an agent-friendly `rosync` CLI for inspecting and controlling a live
+Studio session.
 
-- **Safe scope** — Scripts and Folders sync bidirectionally. Every other class is Studio-authoritative and surfaced via a read-only `tree.json` skeleton. No reflection-based property round-tripping, no `.meta.json` files.
-- **Agent surface** — A `rosync` CLI speaks to the daemon to inspect, mutate, and introspect Studio over WebSocket: `get`, `set`, `new`, `rm`, `mv`, `call`, `attr`, `tag`, `select`, `find`, `classinfo`, `enums`, `logs`, `waypoint`, `undo`, `redo`, `eval`, and more.
-- **Terminal 64 widget** — Ships with a web-based widget UI (`index.html`, `app.js`, `views/`) that runs inside the [Terminal 64](https://terminal64.com) host, manages projects, supervises the daemon, and resolves conflicts.
+## What It Does
 
-## Layout
+- Syncs `Folder`, `Script`, `LocalScript`, and `ModuleScript` instances between Roblox Studio and disk.
+- Represents non-script containers that hold scripts as pass-through folders so script paths round-trip cleanly.
+- Keeps non-file-backed Roblox instances Studio-authoritative and exposes their shape through `tree.json`.
+- Runs a local Rust daemon that bridges the Terminal 64 widget, Roblox Studio plugin, filesystem watcher, and CLI.
+- Installs a Rojo-built Roblox Studio plugin package, `plugin/Plugin.rbxm`, from the widget settings page.
+- Generates `ro-sync.md`, `CLAUDE.md`, `AGENTS.md`, and `.codex/config.toml` so coding agents understand the project rules.
 
+## CLI Tool
+
+The `rosync` CLI can work in two modes:
+
+- Offline project inspection through files such as `tree.json`.
+- Live Studio control through the daemon and plugin WebSocket bridge.
+
+Useful read-only commands:
+
+```sh
+rosync query --project /path/to/project '**/RemoteEvent' --format paths
+rosync get --project /path/to/project --path Workspace/Camera --prop FieldOfView
+rosync ls --project /path/to/project --path ReplicatedStorage
+rosync tree --project /path/to/project --path Workspace --depth 3
+rosync find --project /path/to/project --class RemoteEvent
+rosync classinfo --project /path/to/project --class BasePart
+rosync enums --project /path/to/project
+rosync logs --project /path/to/project --since 1m --level warn
+rosync doctor --project /path/to/project --port 7878
 ```
-daemon/        Rust daemon — HTTP + WebSocket server, filesystem watcher, conflict detector
-plugin/        Roblox Studio plugin (Plugin.luau) — WS client, DataModel mirror, remote handlers
-views/         Terminal 64 widget views (projects, active, conflicts, settings, modals)
-app.js         Widget router + state store + daemon supervisor
-bridge.js      postMessage + SSE helpers for the T64 host
-index.html     Widget entry
-style.css      Widget styles
+
+Useful write commands, all guarded by `--yes`:
+
+```sh
+rosync set --project /path/to/project --path Workspace/Part --prop Transparency --value 0.5 --yes
+rosync new --project /path/to/project --path Workspace --class Folder --name Enemies --yes
+rosync rm --project /path/to/project --path Workspace/Enemies --yes
+rosync mv --project /path/to/project --from Workspace/Part --to ServerStorage --force --yes
+rosync attr set --project /path/to/project --path Workspace/Part --name Health --value 100 --yes
+rosync tag add --project /path/to/project --path Workspace/Part --tag Enemy --yes
+rosync waypoint --project /path/to/project --name "before refactor"
+rosync undo --project /path/to/project --yes
+rosync redo --project /path/to/project --yes
+rosync eval --project /path/to/project --source 'return #workspace:GetDescendants()' --yes
 ```
 
-## Supported platforms
+Luau linting:
 
-| Platform | Daemon | Widget UI | Plugin install |
-|---|---|---|---|
-| macOS (arm64) | ✅ | ✅ | `~/Documents/Roblox/Plugins` |
-| Windows (x86_64) | ✅ | ✅ | `%LOCALAPPDATA%\Roblox\Plugins` |
-| Linux (x86_64) | ✅ | ⚠️ daemon + CLI only (Roblox Studio isn't native) | — |
+```sh
+rosync lint --project /path/to/project
+rosync lint --project /path/to/project --path ServerScriptService/Foo.server.luau
+rosync lint --project /path/to/project --no-sourcemap
+rosync lint --project /path/to/project --luau-lsp /path/to/luau-lsp
+```
 
-The widget detects the host OS from `navigator.userAgent` at load time and picks the matching binary (`rosync-darwin-arm64`, `rosync-windows-x86_64.exe`, or `rosync-linux-x86_64`) from `daemon/`. All three are produced by the release workflow.
+`rosync lint` delegates to `luau-lsp`, generates a temporary Ro-Sync sourcemap
+for require resolution, and automatically uses bundled Roblox definitions when
+`tools/luau-lsp/roblox/globalTypes.d.luau` exists.
 
-## Building from source
+## Requirements
+
+- Terminal 64.
+- Roblox Studio.
+- Git.
+- Rust toolchain, only if building the daemon locally.
+- Rojo and Wally, only if rebuilding the Studio plugin package locally.
+- Optional: `luau-lsp` for `rosync lint`.
+
+## Install The Widget
+
+1. Clone Ro Sync into the Terminal 64 widgets folder.
+
+   macOS / Linux:
+
+   ```sh
+   mkdir -p ~/.terminal64/widgets
+   git clone https://github.com/Pugbread/ro-sync.git ~/.terminal64/widgets/ro-sync
+   ```
+
+   Windows PowerShell:
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.terminal64\widgets" | Out-Null
+   git clone https://github.com/Pugbread/ro-sync.git "$env:USERPROFILE\.terminal64\widgets\ro-sync"
+   ```
+
+2. Open Terminal 64.
+
+3. Open the Ro Sync widget.
+
+4. Add a Roblox project folder from the Projects view.
+
+5. Turn on the project switch to start serving that project.
+
+## Install The Daemon
+
+The widget looks for one of these files in `daemon/`:
+
+- macOS arm64: `daemon/rosync-darwin-arm64`
+- Windows x86_64: `daemon/rosync-windows-x86_64.exe`
+- Linux x86_64: `daemon/rosync-linux-x86_64`
+
+Option A: download a prebuilt daemon from GitHub Releases and place it in
+`daemon/`.
+
+Option B: build from source.
 
 macOS / Linux:
 
 ```sh
-cd daemon
-./build.sh         # emits rosync-<os>-<arch> next to Cargo.toml
+cd ~/.terminal64/widgets/ro-sync/daemon
+./build.sh
 ```
 
-Windows (PowerShell):
+Windows PowerShell:
 
 ```powershell
+cd "$env:USERPROFILE\.terminal64\widgets\ro-sync\daemon"
+.\build.ps1
+```
+
+## Install The Roblox Studio Plugin
+
+1. Open the Ro Sync widget.
+
+2. Go to Settings.
+
+3. Click **Install to Plugins folder**.
+
+4. Restart Roblox Studio.
+
+5. Open the Ro Sync plugin panel in Studio.
+
+6. Click **Connect**.
+
+Manual plugin install paths:
+
+- macOS: `~/Documents/Roblox/Plugins/RoSync.rbxm`
+- Windows: `%LOCALAPPDATA%\Roblox\Plugins\RoSync.rbxm`
+
+## Build The Plugin Package
+
+The shipped plugin package is `plugin/Plugin.rbxm`. To rebuild it:
+
+```sh
+aftman install
+plugin/build-plugin.sh
+```
+
+The Rojo project lives in `plugin-src/` and bundles React Lua / ReactRoblox
+through Wally. The React UI is in `plugin-src/src/App.luau`; the sync and daemon
+protocol code remains in `plugin/Plugin.luau`.
+
+## Run Ro Sync Manually
+
+The widget usually launches the daemon for you. Manual launch:
+
+```sh
+rosync serve --project /path/to/project --port 7878
+```
+
+With game binding:
+
+```sh
+rosync serve --project /path/to/project --port 7878 --game-id 1234567890
+```
+
+Then open Roblox Studio, load the matching place, open the Ro Sync plugin, and
+click **Connect**.
+
+## Platform Support
+
+| Platform | Daemon | Widget | Plugin install |
+|---|---|---|---|
+| macOS arm64 | Supported | Supported | Supported |
+| Windows x86_64 | Supported and CI-gated | Supported and command-checked | Supported |
+| Linux x86_64 | Supported | Supported | Roblox Studio is not native |
+
+Windows support is checked by:
+
+```sh
+node scripts/check-platform-commands.mjs
 cd daemon
-.\build.ps1        # emits rosync-windows-x86_64.exe
+cargo test
+cargo check --target x86_64-pc-windows-msvc
 ```
 
-Or pull pre-built binaries from [GitHub Releases](https://github.com/Pugbread/ro-sync/releases) and drop them in `daemon/`.
+The release workflow also builds and tests the daemon on `windows-2022`.
 
-Plugin: the widget's **Settings → Install** button copies `plugin/Plugin.luau` into the correct Studio plugin folder for your OS. Or do it manually.
+## Safety Rules
 
-## Daemon
+- Filesystem sync is intentionally limited to scripts and folders.
+- Non-script Roblox classes do not round-trip through files.
+- Mutating CLI operations require `--yes`.
+- `set Parent = ...` is refused by default; use `rosync mv`.
+- Cross-service moves require `--force`.
+- Writes are audited to `~/.terminal64/widgets/ro-sync/writes.log`.
 
-```sh
-rosync serve --project /path/to/studio/project --port 7878
+## Repository Layout
+
+```text
+daemon/        Rust daemon and CLI
+plugin/        Roblox Studio plugin artifact and source bridge
+plugin-src/    Rojo/Wally plugin package project
+views/         Terminal 64 widget views
+scripts/       Local verification helpers
+tools/         Optional bundled tools such as luau-lsp
 ```
 
-On first run the daemon writes `ro-sync.md` (agent docs) and `CLAUDE.md` (import line) into the project root.
-
-## CLI
-
-Full subcommand list:
-
-```
-rosync help
-rosync <subcommand> --help
-```
-
-Highlights:
-
-```sh
-rosync query --project /path '**/RemoteEvent' --format paths
-rosync get  --path Workspace/Baseplate
-rosync set  --path Workspace/Part --prop Transparency --value 0.5 --yes
-rosync new  --path Workspace --class Folder --name Enemies --yes
-rosync find --class RemoteEvent
-rosync logs --since 5m --level warn
-rosync waypoint --name "big-change" && rosync undo --yes
-```
-
-`eval` is available as an escape hatch:
-
-```sh
-rosync eval --source 'return #workspace:GetDescendants()' --yes
-```
-
-## Safety
-
-- All mutating CLI ops require `--yes`.
-- `set Parent = ...` refuses by default (use `rosync mv` instead); override with `--force-parent`.
-- Cross-service `mv` requires `--force`.
-- Writes are audited to `~/.terminal64/widgets/ro-sync/writes.log` (rotated at 10 MiB).
-
-## License
-
-No license file yet — treat as "all rights reserved" until one is added.
+- Brought to you by Codex, Claude and Terminal 64.

@@ -126,21 +126,82 @@ pub fn parse_disambiguated(stem: &str) -> Option<(String, usize)> {
 // ---------------------------------------------------------------------------
 
 fn needs_escape(ch: char) -> bool {
-    matches!(ch, '/' | '\\' | '\0' | ':') || (ch as u32) < 0x20
+    // Portable-everywhere: POSIX separators, NUL, control chars, plus the
+    // characters Windows forbids in filenames (<>:"|?*). We apply the union on
+    // every platform so that a project authored on macOS and later opened on
+    // Windows (or vice-versa) doesn't produce paths that are legal on one but
+    // unwriteable on the other.
+    matches!(
+        ch,
+        '/' | '\\' | '\0' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+    ) || (ch as u32) < 0x20
 }
 
-/// Percent-encode characters that can't (or shouldn't) appear in POSIX paths.
+/// Case-insensitive match against the Windows reserved device-name list. These
+/// names (and `NAME.ext` forms) can't be created as files on Windows at all.
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    // Reserved names only match the portion before the first dot.
+    let head = stem.split('.').next().unwrap_or(stem);
+    let upper = head.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Percent-encode characters that can't (or shouldn't) appear in POSIX / NTFS
+/// paths. Also guards against trailing `.`/space (illegal as a Windows file
+/// name tail) and against Windows reserved device names (CON, PRN, ...).
 pub fn encode_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
+    let char_count = name.chars().count();
     for (i, ch) in name.chars().enumerate() {
         let leading_dot = i == 0 && ch == '.';
-        if leading_dot || needs_escape(ch) {
+        let trailing_dot_or_space = i + 1 == char_count && (ch == '.' || ch == ' ');
+        if leading_dot || trailing_dot_or_space || needs_escape(ch) {
             let mut buf = [0u8; 4];
             for b in ch.encode_utf8(&mut buf).as_bytes() {
                 out.push_str(&format!("%{:02X}", b));
             }
         } else {
             out.push(ch);
+        }
+    }
+    // If the result collides with a Windows reserved device name, escape the
+    // first character so the name becomes distinct without changing its
+    // human-readable shape beyond the percent-encoded prefix.
+    if is_windows_reserved_stem(&out) {
+        let mut first = out.chars();
+        if let Some(ch) = first.next() {
+            let rest: String = first.collect();
+            let mut buf = [0u8; 4];
+            let mut escaped = String::with_capacity(out.len() + 2);
+            for b in ch.encode_utf8(&mut buf).as_bytes() {
+                escaped.push_str(&format!("%{:02X}", b));
+            }
+            escaped.push_str(&rest);
+            return escaped;
         }
     }
     out
@@ -219,16 +280,25 @@ pub fn instance_to_path(inst: &InstanceDescriptor, taken: &[String]) -> PathFrag
 
     let base = make_fragment(&encoded);
     if !taken.iter().any(|t| t == &base) {
-        return PathFragment { fragment: base, is_dir };
+        return PathFragment {
+            fragment: base,
+            is_dir,
+        };
     }
 
     for n in 1..10_000 {
         let candidate = make_fragment(&format!("{} [{}]", encoded, n));
         if !taken.iter().any(|t| t == &candidate) {
-            return PathFragment { fragment: candidate, is_dir };
+            return PathFragment {
+                fragment: candidate,
+                is_dir,
+            };
         }
     }
-    PathFragment { fragment: format!("{}__{}", base, taken.len()), is_dir }
+    PathFragment {
+        fragment: format!("{}__{}", base, taken.len()),
+        is_dir,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +527,47 @@ mod tests {
     }
 
     #[test]
+    fn encode_escapes_windows_illegal_chars() {
+        // <>:"|?* all forbidden on Windows — must round-trip via percent-encoding.
+        let inputs = ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"];
+        for s in inputs {
+            let enc = encode_name(s);
+            assert!(
+                !enc.contains(|c: char| matches!(c, '<' | '>' | '"' | '|' | '?' | '*')),
+                "encoded form of {s:?} still contains a Windows-illegal char: {enc}"
+            );
+            assert_eq!(decode_name(&enc), s);
+        }
+    }
+
+    #[test]
+    fn encode_escapes_trailing_dot_and_space() {
+        assert!(encode_name("Foo.").ends_with("%2E"));
+        assert!(encode_name("Foo ").ends_with("%20"));
+        assert_eq!(decode_name(&encode_name("Foo.")), "Foo.");
+        assert_eq!(decode_name(&encode_name("Foo ")), "Foo ");
+    }
+
+    #[test]
+    fn encode_escapes_windows_reserved_names() {
+        // Exact reserved name — first char must be escaped so the result isn't CON.
+        let enc = encode_name("CON");
+        assert_ne!(enc.to_ascii_uppercase(), "CON");
+        assert_eq!(decode_name(&enc), "CON");
+
+        // Reserved + extension is still reserved on Windows.
+        let enc2 = encode_name("PRN");
+        assert_ne!(enc2.to_ascii_uppercase(), "PRN");
+
+        // Case-insensitive.
+        assert_ne!(encode_name("nul").to_ascii_uppercase(), "NUL");
+
+        // Non-reserved stems are left alone.
+        assert_eq!(encode_name("CONFIG"), "CONFIG");
+        assert_eq!(encode_name("COM"), "COM"); // only COM1..COM9 are reserved
+    }
+
+    #[test]
     fn encode_roundtrip_unicode() {
         let name = "配置/αβ.data";
         let enc = encode_name(name);
@@ -469,7 +580,11 @@ mod tests {
     #[test]
     fn instance_to_path_module_script() {
         let f = instance_to_path(
-            &InstanceDescriptor { class: "ModuleScript", name: "Config", has_children: false },
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Config",
+                has_children: false,
+            },
             &[],
         );
         assert_eq!(f.fragment, "Config.luau");
@@ -479,7 +594,11 @@ mod tests {
     #[test]
     fn instance_to_path_server_script() {
         let f = instance_to_path(
-            &InstanceDescriptor { class: "Script", name: "Main", has_children: false },
+            &InstanceDescriptor {
+                class: "Script",
+                name: "Main",
+                has_children: false,
+            },
             &[],
         );
         assert_eq!(f.fragment, "Main.server.luau");
@@ -488,7 +607,11 @@ mod tests {
     #[test]
     fn instance_to_path_script_with_children_is_dir() {
         let f = instance_to_path(
-            &InstanceDescriptor { class: "ModuleScript", name: "Net", has_children: true },
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Net",
+                has_children: true,
+            },
             &[],
         );
         assert_eq!(f.fragment, "Net");
@@ -498,7 +621,11 @@ mod tests {
     #[test]
     fn instance_to_path_folder() {
         let f = instance_to_path(
-            &InstanceDescriptor { class: "Folder", name: "Shared", has_children: true },
+            &InstanceDescriptor {
+                class: "Folder",
+                name: "Shared",
+                has_children: true,
+            },
             &[],
         );
         assert_eq!(f.fragment, "Shared");
@@ -511,7 +638,11 @@ mod tests {
         // uses a different fragment (`Thing/`) so doesn't collide.
         let taken = vec!["Thing.luau".to_string()];
         let f = instance_to_path(
-            &InstanceDescriptor { class: "Folder", name: "Thing", has_children: false },
+            &InstanceDescriptor {
+                class: "Folder",
+                name: "Thing",
+                has_children: false,
+            },
             &taken,
         );
         assert_eq!(f.fragment, "Thing");
@@ -519,7 +650,11 @@ mod tests {
 
         // Two ModuleScripts named Thing → second gets `[1]` suffix.
         let f2 = instance_to_path(
-            &InstanceDescriptor { class: "ModuleScript", name: "Thing", has_children: false },
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Thing",
+                has_children: false,
+            },
             &taken,
         );
         assert_eq!(f2.fragment, "Thing [1].luau");
@@ -527,12 +662,13 @@ mod tests {
 
     #[test]
     fn instance_to_path_collision_escalates_ordinal() {
-        let taken = vec![
-            "Thing.luau".to_string(),
-            "Thing [1].luau".to_string(),
-        ];
+        let taken = vec!["Thing.luau".to_string(), "Thing [1].luau".to_string()];
         let f = instance_to_path(
-            &InstanceDescriptor { class: "ModuleScript", name: "Thing", has_children: false },
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Thing",
+                has_children: false,
+            },
             &taken,
         );
         assert_eq!(f.fragment, "Thing [2].luau");
@@ -542,7 +678,11 @@ mod tests {
     fn instance_to_path_collision_folders_numbered() {
         let taken = vec!["Shared".to_string()];
         let f = instance_to_path(
-            &InstanceDescriptor { class: "Folder", name: "Shared", has_children: true },
+            &InstanceDescriptor {
+                class: "Folder",
+                name: "Shared",
+                has_children: true,
+            },
             &taken,
         );
         assert_eq!(f.fragment, "Shared [1]");
@@ -553,7 +693,11 @@ mod tests {
     fn instance_to_path_collision_script_with_children_numbered() {
         let taken = vec!["Net".to_string()];
         let f = instance_to_path(
-            &InstanceDescriptor { class: "ModuleScript", name: "Net", has_children: true },
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Net",
+                has_children: true,
+            },
             &taken,
         );
         assert_eq!(f.fragment, "Net [1]");
@@ -563,7 +707,11 @@ mod tests {
     #[test]
     fn instance_to_path_encodes_special_chars() {
         let f = instance_to_path(
-            &InstanceDescriptor { class: "ModuleScript", name: "a/b", has_children: false },
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "a/b",
+                has_children: false,
+            },
             &[],
         );
         assert_eq!(f.fragment, "a%2Fb.luau");
@@ -672,7 +820,11 @@ mod tests {
     #[test]
     fn roundtrip_module_script() {
         let d = TempDir::new("rt-mod");
-        let desc = InstanceDescriptor { class: "ModuleScript", name: "Config", has_children: false };
+        let desc = InstanceDescriptor {
+            class: "ModuleScript",
+            name: "Config",
+            has_children: false,
+        };
         let frag = instance_to_path(&desc, &[]);
         let p = d.path().join(&frag.fragment);
         fs::write(&p, b"return {}").unwrap();
@@ -684,7 +836,11 @@ mod tests {
     #[test]
     fn roundtrip_name_with_slash() {
         let d = TempDir::new("rt-slash");
-        let desc = InstanceDescriptor { class: "ModuleScript", name: "a/b", has_children: false };
+        let desc = InstanceDescriptor {
+            class: "ModuleScript",
+            name: "a/b",
+            has_children: false,
+        };
         let frag = instance_to_path(&desc, &[]);
         let p = d.path().join(&frag.fragment);
         fs::write(&p, b"return {}").unwrap();
@@ -695,7 +851,11 @@ mod tests {
     #[test]
     fn roundtrip_script_with_children() {
         let d = TempDir::new("rt-swc");
-        let desc = InstanceDescriptor { class: "Script", name: "Main", has_children: true };
+        let desc = InstanceDescriptor {
+            class: "Script",
+            name: "Main",
+            has_children: true,
+        };
         let frag = instance_to_path(&desc, &[]);
         let dir_path = d.path().join(&frag.fragment);
         fs::create_dir(&dir_path).unwrap();
@@ -706,5 +866,4 @@ mod tests {
         assert_eq!(inst.class, "Script");
         assert!(inst.is_script_with_children);
     }
-
 }

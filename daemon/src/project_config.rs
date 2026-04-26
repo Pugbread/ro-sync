@@ -74,8 +74,8 @@ pub fn read_from_disk(root: &Path) -> io::Result<Option<ProjectConfig>> {
         return Ok(None);
     }
     let text = fs::read_to_string(&p)?;
-    let cfg: ProjectConfig = serde_json::from_str(&text)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let cfg: ProjectConfig =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(cfg))
 }
 
@@ -146,7 +146,8 @@ mod tests {
     #[test]
     fn reads_existing_without_overwriting() {
         let d = TempDir::new("read");
-        let text = r#"{"name":"MyProj","gameId":"1234567890","placeIds":["111","222"],"version":1}"#;
+        let text =
+            r#"{"name":"MyProj","gameId":"1234567890","placeIds":["111","222"],"version":1}"#;
         fs::write(d.path().join(CONFIG_FILE), text).unwrap();
         let cfg = load_or_create(d.path()).unwrap();
         assert_eq!(cfg.name, "MyProj");
@@ -157,7 +158,11 @@ mod tests {
     #[test]
     fn apply_overrides_updates_fields() {
         let mut cfg = ProjectConfig::default_for(Path::new("/tmp/x"));
-        assert!(apply_overrides(&mut cfg, Some("42".into()), Some(vec!["9".into()])));
+        assert!(apply_overrides(
+            &mut cfg,
+            Some("42".into()),
+            Some(vec!["9".into()])
+        ));
         assert_eq!(cfg.game_id.as_deref(), Some("42"));
         assert_eq!(cfg.place_ids, vec!["9".to_string()]);
         // second call with same values -> no change

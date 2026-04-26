@@ -1,12 +1,17 @@
 # Rust build artifacts
 daemon/target/
 
+# Generated plugin build inputs
+plugin-src/Packages/
+
 # Runtime state & logs (contain absolute paths / project-specific data)
 state.json
 writes.log
 
 # Terminal 64 runtime data
 .t64-attachments/
+.codex/
+.mcp.json
 
 # Pre-built binaries (ship via GitHub Releases instead)
 rosync-darwin-arm64

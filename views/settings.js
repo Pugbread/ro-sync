@@ -14,7 +14,8 @@ const RELEASES_URL = "https://github.com/Pugbread/ro-sync/releases";
 const RUSTUP_URL   = "https://rustup.rs";
 
 const DEFAULT_PORT = 7878;
-const PLUGIN_REL = "plugin/Plugin.luau";
+const PLUGIN_REL = "plugin/Plugin.rbxm";
+const PLUGIN_SOURCE_REL = "plugin/Plugin.luau";
 
 // Write arbitrary text to a path via base64 round-trip. Avoids quoting
 // headaches for JSON payloads containing newlines/quotes/unicode.
@@ -26,6 +27,11 @@ async function writeFileViaExec(api, absPath, text) {
 async function readFileViaExec(api, absPath) {
   const res = await api.t64("t64:exec", { command: readFileCmd(absPath) });
   return (res && typeof res.stdout === "string") ? res.stdout : "";
+}
+
+function joinProjectFile(projectPath, fileName) {
+  const sep = IS_WINDOWS ? "\\" : "/";
+  return String(projectPath || "").replace(/[\\/]+$/, "") + sep + fileName;
 }
 
 export function mountSettings(root, api) {
@@ -63,10 +69,10 @@ export function mountSettings(root, api) {
 
     <section class="section">
       <h3>Studio plugin</h3>
-      <p>Copy <code>Plugin.luau</code> into Roblox Studio's Plugins folder. Studio loads it automatically.</p>
+      <p>Install the Rojo-built <code>Plugin.rbxm</code> into Roblox Studio's Plugins folder. Studio loads it automatically.</p>
       <div class="row">
-        <button id="set-copy" class="primary">Copy Plugin.luau</button>
-        <button id="set-install">Install to Plugins folder</button>
+        <button id="set-install" class="primary">Install to Plugins folder</button>
+        <button id="set-copy">Copy fallback Plugin.luau</button>
         <button id="set-open-folder">Open Plugins folder</button>
       </div>
       <p id="set-plugin-msg" style="color:var(--muted); margin-top:8px"></p>
@@ -287,7 +293,7 @@ export function mountSettings(root, api) {
     api.setState({ projects: next });
 
     // Merge into ro-sync.json at the project root (read → merge → write).
-    const cfgPath = proj.path.replace(/\/+$/, "") + "/ro-sync.json";
+    const cfgPath = joinProjectFile(proj.path, "ro-sync.json");
     let existing = {};
     try {
       const raw = await readFileViaExec(api, cfgPath);
@@ -322,14 +328,14 @@ export function mountSettings(root, api) {
 
   async function readPluginFile() {
     try {
-      const res = await api.t64("t64:read-file", { path: "{widgetDir}/" + PLUGIN_REL });
+      const res = await api.t64("t64:read-file", { path: "{widgetDir}/" + PLUGIN_SOURCE_REL });
       const text = (res && (res.content || res.text || res.data)) ?? (typeof res === "string" ? res : null);
       if (!text) throw new Error("empty");
       return text;
     } catch (e) {
       // Fallback: fetch relative to the widget's own origin.
       try {
-        const r = await fetch(PLUGIN_REL);
+        const r = await fetch(PLUGIN_SOURCE_REL);
         if (r.ok) return await r.text();
       } catch {}
       throw e;
@@ -345,7 +351,7 @@ export function mountSettings(root, api) {
     } catch (e) {
       // Fallback via host.
       try {
-        await api.t64("t64:clipboard-write", { path: "{widgetDir}/" + PLUGIN_REL });
+        await api.t64("t64:clipboard-write", { path: "{widgetDir}/" + PLUGIN_SOURCE_REL });
         api.toast("Plugin.luau copied");
         $pluginMsg.textContent = "Copied via host.";
       } catch (e2) {
@@ -358,8 +364,8 @@ export function mountSettings(root, api) {
     const command = pluginInstallCmd({
       srcFile:   joinShell(WIDGET_DIR_SHELL, PLUGIN_REL),
       destDir:   PLUGIN_DIR_SHELL,
-      destName:  "RoSync.lua",
-      staleName: "RoSync.luau",
+      destName:  "RoSync.rbxm",
+      staleNames: ["RoSync.lua", "RoSync.luau"],
     });
     try {
       const res = await api.t64("t64:exec", { command });
@@ -367,7 +373,7 @@ export function mountSettings(root, api) {
         throw new Error(res.stderr?.trim() || `exit ${res.code}`);
       }
       api.toast("Installed");
-      $pluginMsg.textContent = `Installed to ${joinShell(PLUGIN_DIR_DISPLAY, "RoSync.lua")} — restart Studio`;
+      $pluginMsg.textContent = `Installed to ${joinShell(PLUGIN_DIR_DISPLAY, "RoSync.rbxm")} — restart Studio`;
     } catch (e) {
       $pluginMsg.textContent = `Install failed: ${e.message}`;
     }

@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::event::{ModifyKind, RenameMode};
+use notify::RecommendedWatcher;
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
-use notify::RecommendedWatcher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -28,11 +28,12 @@ const DEBOUNCE_MS: u64 = 150;
 const CHANNEL_CAP: usize = 1024;
 
 /// Substrings / name fragments we never want to propagate. Matches are
-/// case-sensitive and applied to the final path component (except `.git` /
-/// `.vscode`, which match any ancestor component).
+/// case-sensitive and applied to the final path component (except `.git`,
+/// `.codex`, and `.vscode`, which match any ancestor component).
 const BLACKLISTED: &[&str] = &[
     ".DS_Store",
     ".git",
+    ".codex",
     ".vscode",
     "~$",
     ".#",
@@ -46,7 +47,15 @@ const BLACKLISTED: &[&str] = &[
 /// them would cause a feedback loop where our own emit-tree / write-config
 /// would bounce back as ops. Matched only at the project root — nested files
 /// with these names (unlikely, but allowed) are unaffected.
-const ROOT_RESERVED: &[&str] = &["ro-sync.json", "ro-sync.md", "tree.json"];
+const ROOT_RESERVED: &[&str] = &[
+    "ro-sync.json",
+    "ro-sync.md",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+    "Claude.MD",
+    "AGENTS.md",
+    "tree.json",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -68,8 +77,6 @@ pub struct Op {
     pub from: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<u8>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta: Option<serde_json::Value>,
 }
 
 pub struct Watch {
@@ -103,7 +110,12 @@ impl Watch {
         let pause_thread = pause_until.clone();
         std::thread::spawn(move || drain_loop(raw_rx, tx_thread, root_thread, pause_thread));
 
-        Ok(Self { _debouncer: debouncer, tx, root, pause_until })
+        Ok(Self {
+            _debouncer: debouncer,
+            tx,
+            root,
+            pause_until,
+        })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Op> {
@@ -199,12 +211,11 @@ fn classify_rename(from: &Path, to: &Path) -> Option<Op> {
         path: to.to_path_buf(),
         from: Some(from.to_path_buf()),
         content: None,
-        meta: None,
     })
 }
 
 /// Returns true if any component of the path matches a blacklisted fragment
-/// (either a fixed name like `.DS_Store`/`.git`/`.vscode`, or a substring
+/// (either a fixed name like `.DS_Store`/`.git`/`.codex`/`.vscode`, or a substring
 /// pattern for editor swap files).
 pub(crate) fn is_blacklisted(p: &Path) -> bool {
     // Ancestor-wide matches: bail early if any component is a blacklisted
@@ -213,7 +224,7 @@ pub(crate) fn is_blacklisted(p: &Path) -> bool {
         let Some(s) = comp.as_os_str().to_str() else {
             continue;
         };
-        if s == ".DS_Store" || s == ".git" || s == ".vscode" {
+        if s == ".DS_Store" || s == ".git" || s == ".codex" || s == ".vscode" {
             return true;
         }
     }
@@ -234,8 +245,9 @@ pub(crate) fn is_blacklisted(p: &Path) -> bool {
 }
 
 /// True if `path` is one of the daemon-authored root files (ro-sync.json,
-/// ro-sync.md, tree.json) sitting directly at the project root. Used to
-/// prevent a feedback loop from our own emit-tree / config writes.
+/// ro-sync.md, CLAUDE.md, AGENTS.md, tree.json) sitting directly at the
+/// project root. Used to prevent a feedback loop from our own emit-tree /
+/// config writes.
 pub(crate) fn is_root_reserved(path: &Path, root: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -252,7 +264,7 @@ pub(crate) fn is_root_reserved(path: &Path, root: &Path) -> bool {
 fn matches_fragment(name: &str, frag: &str) -> bool {
     match frag {
         ".DS_Store" => name == ".DS_Store",
-        ".git" | ".vscode" => name == frag,
+        ".git" | ".codex" | ".vscode" => name == frag,
         ".meta.json" | ".tree.json.tmp" => name == frag,
         ".#" => name.starts_with(".#"),
         "~$" => name.starts_with("~$"),
@@ -283,16 +295,10 @@ fn classify(path: &Path, kind: &EventKind, root: &Path) -> Option<Op> {
         return None;
     }
 
-    let (content, meta) = if matches!(op_kind, OpKind::Add | OpKind::Update) && is_file_now {
-        let bytes = std::fs::read(path).ok();
-        let meta = if path.file_name().and_then(|f| f.to_str()) == Some(".meta.json") {
-            bytes.as_deref().and_then(|b| serde_json::from_slice(b).ok())
-        } else {
-            None
-        };
-        (bytes, meta)
+    let content = if matches!(op_kind, OpKind::Add | OpKind::Update) && is_file_now {
+        std::fs::read(path).ok()
     } else {
-        (None, None)
+        None
     };
 
     Some(Op {
@@ -300,7 +306,6 @@ fn classify(path: &Path, kind: &EventKind, root: &Path) -> Option<Op> {
         path: path.to_path_buf(),
         from: None,
         content,
-        meta,
     })
 }
 
@@ -356,8 +361,8 @@ mod tests {
         use notify::event::{EventKind as EK, RemoveKind};
         let root = std::env::temp_dir();
         let p = root.join("phantom-deleted.luau");
-        let op = classify(&p, &EK::Remove(RemoveKind::File), &root)
-            .expect("classify should emit an op");
+        let op =
+            classify(&p, &EK::Remove(RemoveKind::File), &root).expect("classify should emit an op");
         assert_eq!(op.kind, OpKind::Delete);
         assert_eq!(op.path, p);
     }
@@ -369,7 +374,9 @@ mod tests {
         let mut rx = w.subscribe();
 
         w.pause_until(Instant::now() + Duration::from_secs(2));
-        let p = std::fs::canonicalize(dir.path()).unwrap().join("paused.luau");
+        let p = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("paused.luau");
         std::fs::write(&p, b"hi").unwrap();
 
         // Nothing should arrive during the pause.
@@ -392,6 +399,8 @@ mod tests {
         let root = PathBuf::from("/tmp/proj");
         assert!(is_root_reserved(&root.join("ro-sync.json"), &root));
         assert!(is_root_reserved(&root.join("ro-sync.md"), &root));
+        assert!(is_root_reserved(&root.join("CLAUDE.md"), &root));
+        assert!(is_root_reserved(&root.join("AGENTS.md"), &root));
         assert!(is_root_reserved(&root.join("tree.json"), &root));
         // Nested files with the same name are not reserved.
         assert!(!is_root_reserved(&root.join("sub/tree.json"), &root));
@@ -405,6 +414,7 @@ mod tests {
         assert!(is_blacklisted(Path::new("/tmp/proj/.DS_Store")));
         assert!(is_blacklisted(Path::new("/tmp/proj/sub/.DS_Store")));
         assert!(is_blacklisted(Path::new("/tmp/proj/.git/config")));
+        assert!(is_blacklisted(Path::new("/tmp/proj/.codex/config.toml")));
         assert!(is_blacklisted(Path::new("/tmp/proj/.vscode/settings.json")));
         assert!(is_blacklisted(Path::new("/tmp/proj/.#foo.luau")));
         assert!(is_blacklisted(Path::new("/tmp/proj/~$temp.docx")));

@@ -141,7 +141,10 @@ impl ConflictEngine {
         let mut b = self.baselines.lock().unwrap();
         b.insert(
             key,
-            Baseline { fs_mtime, last_plugin_push_hash: content_hash },
+            Baseline {
+                fs_mtime,
+                last_plugin_push_hash: content_hash,
+            },
         );
     }
 
@@ -291,14 +294,20 @@ mod tests {
     fn fs_noop_when_content_matches_baseline() {
         let e = ConflictEngine::new();
         e.record_sync(&p("/x/a.luau"), hash(b"hello"), 100);
-        assert_eq!(e.on_fs_change(&p("/x/a.luau"), b"hello", 200), FsDecision::NoChange);
+        assert_eq!(
+            e.on_fs_change(&p("/x/a.luau"), b"hello", 200),
+            FsDecision::NoChange
+        );
     }
 
     #[test]
     fn fs_change_propagates_when_no_studio_push_pending() {
         let e = ConflictEngine::new();
         e.record_sync(&p("/x/a.luau"), hash(b"hello"), 100);
-        assert_eq!(e.on_fs_change(&p("/x/a.luau"), b"world", 200), FsDecision::Propagate);
+        assert_eq!(
+            e.on_fs_change(&p("/x/a.luau"), b"world", 200),
+            FsDecision::Propagate
+        );
     }
 
     #[test]

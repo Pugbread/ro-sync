@@ -1,6 +1,8 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -13,6 +15,7 @@ mod project_config;
 mod query;
 mod remote;
 mod snapshot;
+mod sourcemap;
 mod watch;
 mod ws;
 
@@ -22,7 +25,11 @@ use watch::{Op, OpKind, Watch};
 use ws::{PendingRoutes, RequestEnvelope};
 
 #[derive(Parser, Debug)]
-#[command(name = "rosync", version, about = "Ro Sync — Roblox Studio sync daemon")]
+#[command(
+    name = "rosync",
+    version,
+    about = "Ro Sync — Roblox Studio sync daemon"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -81,6 +88,8 @@ pub enum Command {
     Ping(PingArgs),
     /// Print the daemon build version and (if reachable) the plugin version.
     Version(VersionArgs),
+    /// Check local Ro-Sync health: project files, daemon, plugin, linter, and sourcemap.
+    Doctor(DoctorArgs),
     /// Construct a new instance under a parent path. Requires `--yes`.
     New(NewArgs),
     /// Destroy an instance. Requires `--yes`.
@@ -107,6 +116,8 @@ pub enum Command {
     /// Find instances that have a given attribute set (optionally scoped to a
     /// subtree and filtered by value).
     FindAttr(FindAttrArgs),
+    /// Run luau-lsp's standalone analyzer against the project or a file path.
+    Lint(LintArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -323,6 +334,18 @@ pub struct VersionArgs {
     pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct DoctorArgs {
+    /// Project directory. Defaults to the current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Print JSON instead of human-readable checks.
     #[arg(long)]
     pub raw: bool,
 }
@@ -595,6 +618,27 @@ pub struct QueryArgs {
     pub format: QueryFormat,
 }
 
+#[derive(ClapArgs, Debug)]
+pub struct LintArgs {
+    /// Project directory. Defaults to the current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// File or directory to analyze. Relative paths are resolved from
+    /// `--project` when provided, otherwise from the current working directory.
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    /// Path to a luau-lsp executable. If omitted, `ROSYNC_LUAU_LSP` is checked,
+    /// then `luau-lsp` is resolved from PATH.
+    #[arg(long = "luau-lsp")]
+    pub luau_lsp: Option<PathBuf>,
+    /// Do not generate/pass a Ro-Sync sourcemap to luau-lsp.
+    #[arg(long = "no-sourcemap")]
+    pub no_sourcemap: bool,
+    /// Extra arguments passed to `luau-lsp analyze` after `--`.
+    #[arg(last = true)]
+    pub extra_args: Vec<String>,
+}
+
 #[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum QueryFormat {
     Json,
@@ -655,6 +699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Waypoint(args)) => run_waypoint(args).await,
         Some(Command::Ping(args)) => run_ping(args).await,
         Some(Command::Version(args)) => run_version(args).await,
+        Some(Command::Doctor(args)) => run_doctor(args).await,
         Some(Command::New(args)) => run_new(args).await,
         Some(Command::Rm(args)) => run_rm(args).await,
         Some(Command::Mv(args)) => run_mv(args).await,
@@ -666,10 +711,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Enums(args)) => run_enums(args).await,
         Some(Command::Enum(args)) => run_enum(args).await,
         Some(Command::FindAttr(args)) => run_find_attr(args).await,
+        Some(Command::Lint(args)) => run_lint(args),
         None => {
             // Back-compat: bare invocation runs the daemon using top-level flags.
             let project = cli.project.ok_or_else(|| -> Box<dyn std::error::Error> {
-                "missing --project (required for daemon mode; use a subcommand for other modes)".into()
+                "missing --project (required for daemon mode; use a subcommand for other modes)"
+                    .into()
             })?;
             run_serve(ServeArgs {
                 project,
@@ -693,6 +740,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&args.project) {
         eprintln!("rosync: failed to write CLAUDE.md: {e}");
     }
+    if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&args.project) {
+        eprintln!("rosync: failed to write Codex context: {e}");
+    }
 
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
     let mut cfg = match project_config::load_or_create(&args.project) {
@@ -702,8 +752,13 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             project_config::ProjectConfig::default_for(&args.project)
         }
     };
-    let place_ids_override = if args.place_id.is_empty() { None } else { Some(args.place_id.clone()) };
-    let changed = project_config::apply_overrides(&mut cfg, args.game_id.clone(), place_ids_override);
+    let place_ids_override = if args.place_id.is_empty() {
+        None
+    } else {
+        Some(args.place_id.clone())
+    };
+    let changed =
+        project_config::apply_overrides(&mut cfg, args.game_id.clone(), place_ids_override);
     if changed {
         if let Err(e) = project_config::write(&args.project, &cfg) {
             eprintln!("rosync: failed to write ro-sync.json: {e}");
@@ -734,11 +789,20 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         pending_routes: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    spawn_watch_bridge(watcher, tx.clone(), conflict_engine.clone(), push_quiet.clone());
+    spawn_watch_bridge(
+        watcher,
+        tx.clone(),
+        conflict_engine.clone(),
+        push_quiet.clone(),
+    );
     spawn_config_hot_reload(state.clone());
 
     let addr = format!("127.0.0.1:{}", args.port);
-    eprintln!("rosync listening on http://{} (project: {})", addr, args.project.display());
+    eprintln!(
+        "rosync listening on http://{} (project: {})",
+        addr,
+        args.project.display()
+    );
 
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -759,8 +823,8 @@ fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => return Err(format!("read {}: {e}", tree_path.display()).into()),
     };
-    let tree: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("parse {}: {e}", tree_path.display()))?;
+    let tree: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", tree_path.display()))?;
 
     let matches = query::query(&tree, &args.selector);
 
@@ -777,7 +841,10 @@ fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&serde_json::Value::Array(arr))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
+            );
         }
         QueryFormat::Paths => {
             for m in matches {
@@ -791,6 +858,209 @@ fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = match args.project {
+        Some(p) => p,
+        None => std::env::current_dir().map_err(|e| format!("lint: current directory: {e}"))?,
+    };
+    if !project.exists() {
+        return Err(format!("lint: project path does not exist: {}", project.display()).into());
+    }
+    if !project.is_dir() {
+        return Err(format!(
+            "lint: project path is not a directory: {}",
+            project.display()
+        )
+        .into());
+    }
+
+    let target = match args.path {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => project.join(path),
+        None => project.clone(),
+    };
+    if !target.exists() {
+        return Err(format!("lint: path does not exist: {}", target.display()).into());
+    }
+
+    let luau_lsp = resolve_luau_lsp(args.luau_lsp);
+    let sourcemap = if args.no_sourcemap || extra_args_include_sourcemap(&args.extra_args) {
+        None
+    } else {
+        Some(write_temp_sourcemap(&project)?)
+    };
+    let definitions = if extra_args_include_definitions(&args.extra_args) {
+        None
+    } else {
+        find_bundled_luau_definitions()
+    };
+    let mut cmd = std::process::Command::new(&luau_lsp);
+    cmd.arg("analyze");
+    if let Some(path) = &sourcemap {
+        cmd.arg(format!("--sourcemap={}", path.display()));
+    }
+    if let Some(path) = &definitions {
+        cmd.arg(format!("--definitions={}", path.display()));
+    }
+    cmd.args(args.extra_args)
+        .arg(&target)
+        .current_dir(&project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            cleanup_sourcemap(&sourcemap);
+            print_luau_lsp_missing(&luau_lsp);
+            std::process::exit(127);
+        }
+        Err(e) => {
+            cleanup_sourcemap(&sourcemap);
+            return Err(format!("lint: failed to run {}: {e}", luau_lsp.to_string_lossy()).into());
+        }
+    };
+
+    cleanup_sourcemap(&sourcemap);
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn write_temp_sourcemap(project: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let map = sourcemap::generate(project)?;
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "rosync-sourcemap-{}-{}.json",
+        std::process::id(),
+        unix_nanos()
+    ));
+    let text = serde_json::to_string_pretty(&map)?;
+    std::fs::write(&path, text).map_err(|e| format!("lint: write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn extra_args_include_sourcemap(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--sourcemap" || arg.starts_with("--sourcemap="))
+}
+
+fn extra_args_include_definitions(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--definitions"
+            || arg.starts_with("--definitions=")
+            || arg == "--defs"
+            || arg.starts_with("--defs=")
+    })
+}
+
+fn cleanup_sourcemap(path: &Option<PathBuf>) {
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn resolve_luau_lsp(explicit: Option<PathBuf>) -> OsString {
+    if let Some(path) = explicit {
+        return path.into_os_string();
+    }
+    if let Ok(path) = std::env::var("ROSYNC_LUAU_LSP") {
+        if !path.trim().is_empty() {
+            return OsString::from(path);
+        }
+    }
+    if let Some(path) = find_bundled_luau_lsp() {
+        return path.into_os_string();
+    }
+    OsString::from("luau-lsp")
+}
+
+fn find_bundled_luau_lsp() -> Option<PathBuf> {
+    let rel = PathBuf::from("tools")
+        .join("luau-lsp")
+        .join(platform_tool_triple())
+        .join(if cfg!(windows) {
+            "luau-lsp.exe"
+        } else {
+            "luau-lsp"
+        });
+    find_in_tool_bases(&rel)
+}
+
+fn find_bundled_luau_definitions() -> Option<PathBuf> {
+    let rel = PathBuf::from("tools")
+        .join("luau-lsp")
+        .join("roblox")
+        .join("globalTypes.d.luau");
+    find_in_tool_bases(&rel)
+}
+
+fn find_in_tool_bases(rel: &std::path::Path) -> Option<PathBuf> {
+    let mut bases = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent();
+        while let Some(dir) = cur {
+            bases.push(dir.to_path_buf());
+            cur = dir.parent();
+        }
+    }
+
+    for base in bases {
+        let candidate = base.join(&rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn platform_tool_triple() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "darwin-arm64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "darwin-x86_64"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "windows-x86_64"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "linux-x86_64"
+    } else {
+        "unknown"
+    }
+}
+
+fn print_luau_lsp_missing(luau_lsp: &OsString) {
+    eprintln!("luau-lsp not found: {}", luau_lsp.to_string_lossy());
+    eprintln!();
+    eprintln!("Install luau-lsp and make it available on PATH:");
+    eprintln!("https://github.com/JohnnyMorganz/luau-lsp");
+    eprintln!();
+    eprintln!("Ro-Sync also checks this bundled tool path:");
+    eprintln!(
+        "tools/luau-lsp/{}/{}",
+        platform_tool_triple(),
+        if cfg!(windows) {
+            "luau-lsp.exe"
+        } else {
+            "luau-lsp"
+        }
+    );
+    eprintln!();
+    eprintln!("Or pass an explicit executable path:");
+    eprintln!("rosync lint --luau-lsp /path/to/luau-lsp");
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +1086,9 @@ async fn run_set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
         return run_set_batch(args, batch_path).await;
     }
     if !args.yes {
-        return Err("set: --yes is required for single-op writes (or pass --batch <file.json>)".into());
+        return Err(
+            "set: --yes is required for single-op writes (or pass --batch <file.json>)".into(),
+        );
     }
     let path = args.path.clone().ok_or("set: --path is required")?;
     let prop = args.prop.clone().ok_or("set: --prop is required")?;
@@ -832,9 +1104,13 @@ async fn run_set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!(
             "set: refusing to set .Parent on {} without --force-parent (use `rosync mv` instead)",
             path
-        ).into());
+        )
+        .into());
     }
-    let value_raw = args.value.clone().ok_or("set: --value is required (JSON literal)")?;
+    let value_raw = args
+        .value
+        .clone()
+        .ok_or("set: --value is required (JSON literal)")?;
     let value: serde_json::Value = serde_json::from_str(&value_raw)
         .map_err(|e| format!("set: --value must be a JSON literal ({e})"))?;
     let req_args = serde_json::json!({
@@ -885,8 +1161,12 @@ async fn run_set_batch(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(&batch_path)
         .map_err(|e| format!("read {}: {e}", batch_path.display()))?;
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&text)
-        .map_err(|e| format!("parse {}: {e} (expected a JSON array)", batch_path.display()))?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "parse {}: {e} (expected a JSON array)",
+            batch_path.display()
+        )
+    })?;
     let total = entries.len();
     let mut ok_count = 0usize;
     let mut fail_count = 0usize;
@@ -897,7 +1177,10 @@ async fn run_set_batch(
     for (i, entry) in entries.iter().enumerate() {
         let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let prop = entry.get("prop").and_then(|v| v.as_str()).unwrap_or("");
-        let value = entry.get("value").cloned().unwrap_or(serde_json::Value::Null);
+        let value = entry
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         if path.is_empty() || prop.is_empty() {
             let msg = format!("[{}/{total}] invalid entry (missing path/prop)", i + 1);
             eprintln!("{msg}");
@@ -1102,7 +1385,10 @@ fn print_log_entries(value: &serde_json::Value) {
     let entries = match value.get("entries").and_then(|v| v.as_array()) {
         Some(e) => e,
         None => {
-            println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            );
             return;
         }
     };
@@ -1202,14 +1488,20 @@ async fn run_ping(args: PingArgs) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let ping_resp = remote::request(args.port, "ping", serde_json::json!({})).await?;
     let rtt = start.elapsed();
-    let ok = ping_resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ok = ping_resp
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !ok {
         let err = ping_resp
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
         if args.raw {
-            println!("{}", serde_json::to_string_pretty(&ping_resp).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ping_resp).unwrap_or_default()
+            );
         }
         return Err(err.to_string().into());
     }
@@ -1224,7 +1516,10 @@ async fn run_ping(args: PingArgs) -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => "unknown".into(),
     };
     if args.raw {
-        println!("{}", serde_json::to_string_pretty(&ping_resp).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ping_resp).unwrap_or_default()
+        );
         return Ok(());
     }
     println!(
@@ -1253,7 +1548,10 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
             return Ok(());
         }
     };
-    let value = plugin_info.get("value").cloned().unwrap_or(serde_json::Value::Null);
+    let value = plugin_info
+        .get("value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     if args.raw {
         println!(
             "{}",
@@ -1266,16 +1564,333 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
         .get("plugin_version")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let proto = value
-        .get("protocol")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let proto = value.get("protocol").and_then(|v| v.as_u64()).unwrap_or(0);
     let sv = value
         .get("studio_version")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     println!("plugin: {pv} (protocol {proto}, Studio {sv})");
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DoctorStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            DoctorStatus::Ok => "ok",
+            DoctorStatus::Warn => "warn",
+            DoctorStatus::Fail => "fail",
+        }
+    }
+}
+
+struct DoctorCheck {
+    name: &'static str,
+    status: DoctorStatus,
+    detail: String,
+}
+
+async fn run_doctor(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = match args.project {
+        Some(p) => p,
+        None => std::env::current_dir().map_err(|e| format!("doctor: current directory: {e}"))?,
+    };
+    let mut checks = Vec::new();
+
+    let project_ok = project.is_dir();
+    checks.push(check_project_path(&project));
+    checks.push(check_project_config(&project));
+    checks.push(check_tree_json(&project));
+    checks.push(check_sourcemap(&project));
+    checks.push(check_daemon_hello(args.port));
+    checks.push(check_luau_lsp());
+    checks.push(check_luau_definitions());
+    checks.push(check_writes_log_path());
+    checks.push(check_plugin_version(args.port).await);
+
+    if args.raw {
+        let arr: Vec<serde_json::Value> = checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": !checks.iter().any(|c| c.status == DoctorStatus::Fail),
+                "project": project,
+                "port": args.port,
+                "checks": arr,
+            }))?
+        );
+    } else {
+        println!("Ro-Sync doctor");
+        println!("project: {}", project.display());
+        println!("port: {}", args.port);
+        println!();
+        for check in &checks {
+            println!(
+                "[{:<4}] {:<18} {}",
+                check.status.as_str(),
+                check.name,
+                check.detail
+            );
+        }
+    }
+
+    if !project_ok {
+        return Err("doctor: project path is not a directory".into());
+    }
+    if checks.iter().any(|c| c.status == DoctorStatus::Fail) {
+        return Err("doctor: one or more checks failed".into());
+    }
+    Ok(())
+}
+
+fn doctor_check(
+    name: &'static str,
+    status: DoctorStatus,
+    detail: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        status,
+        detail: detail.into(),
+    }
+}
+
+fn check_project_path(project: &std::path::Path) -> DoctorCheck {
+    if !project.exists() {
+        return doctor_check(
+            "project",
+            DoctorStatus::Fail,
+            format!("missing: {}", project.display()),
+        );
+    }
+    if !project.is_dir() {
+        return doctor_check(
+            "project",
+            DoctorStatus::Fail,
+            format!("not a directory: {}", project.display()),
+        );
+    }
+    match std::fs::canonicalize(project) {
+        Ok(path) => doctor_check("project", DoctorStatus::Ok, path.display().to_string()),
+        Err(e) => doctor_check(
+            "project",
+            DoctorStatus::Warn,
+            format!("exists, but canonicalize failed: {e}"),
+        ),
+    }
+}
+
+fn check_project_config(project: &std::path::Path) -> DoctorCheck {
+    match project_config::read_from_disk(project) {
+        Ok(Some(cfg)) => doctor_check(
+            "ro-sync.json",
+            DoctorStatus::Ok,
+            format!(
+                "name={} gameId={}",
+                cfg.name,
+                cfg.game_id.unwrap_or_else(|| "-".into())
+            ),
+        ),
+        Ok(None) => doctor_check("ro-sync.json", DoctorStatus::Warn, "missing"),
+        Err(e) => doctor_check("ro-sync.json", DoctorStatus::Fail, format!("invalid: {e}")),
+    }
+}
+
+fn check_tree_json(project: &std::path::Path) -> DoctorCheck {
+    let path = project.join(snapshot::TREE_JSON);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return doctor_check("tree.json", DoctorStatus::Warn, "missing");
+        }
+        Err(e) => return doctor_check("tree.json", DoctorStatus::Fail, format!("read: {e}")),
+    };
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
+        return doctor_check("tree.json", DoctorStatus::Fail, format!("parse: {e}"));
+    }
+    let age = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(format_duration_short)
+        .unwrap_or_else(|| "unknown age".into());
+    doctor_check("tree.json", DoctorStatus::Ok, format!("valid ({age} old)"))
+}
+
+fn check_sourcemap(project: &std::path::Path) -> DoctorCheck {
+    match sourcemap::generate(project) {
+        Ok(map) => {
+            let services = map
+                .get("children")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if services == 0 {
+                doctor_check(
+                    "sourcemap",
+                    DoctorStatus::Warn,
+                    "generated, but no service dirs found",
+                )
+            } else {
+                doctor_check(
+                    "sourcemap",
+                    DoctorStatus::Ok,
+                    format!("{services} service dirs"),
+                )
+            }
+        }
+        Err(e) => doctor_check("sourcemap", DoctorStatus::Fail, format!("generate: {e}")),
+    }
+}
+
+fn check_daemon_hello(port: u16) -> DoctorCheck {
+    match http_get_json(port, "/hello") {
+        Ok(v) => {
+            let version = v.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = v.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            doctor_check("daemon", DoctorStatus::Ok, format!("{name} v{version}"))
+        }
+        Err(e) => doctor_check("daemon", DoctorStatus::Fail, e),
+    }
+}
+
+async fn check_plugin_version(port: u16) -> DoctorCheck {
+    match remote::request(port, "version", serde_json::json!({})).await {
+        Ok(resp) => {
+            if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let err = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("plugin request failed");
+                return doctor_check("plugin", DoctorStatus::Fail, err);
+            }
+            let value = resp.get("value").unwrap_or(&serde_json::Value::Null);
+            let plugin = value
+                .get("plugin_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let studio = value
+                .get("studio_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            doctor_check(
+                "plugin",
+                DoctorStatus::Ok,
+                format!("v{plugin}, Studio {studio}"),
+            )
+        }
+        Err(e) => doctor_check("plugin", DoctorStatus::Fail, e),
+    }
+}
+
+fn check_luau_lsp() -> DoctorCheck {
+    let luau_lsp = resolve_luau_lsp(None);
+    match std::process::Command::new(&luau_lsp)
+        .arg("--version")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            doctor_check(
+                "luau-lsp",
+                DoctorStatus::Ok,
+                format!("{} ({version})", luau_lsp.to_string_lossy()),
+            )
+        }
+        Ok(out) => doctor_check(
+            "luau-lsp",
+            DoctorStatus::Fail,
+            format!("{} exited with {}", luau_lsp.to_string_lossy(), out.status),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            doctor_check("luau-lsp", DoctorStatus::Fail, "not found")
+        }
+        Err(e) => doctor_check("luau-lsp", DoctorStatus::Fail, format!("run: {e}")),
+    }
+}
+
+fn check_luau_definitions() -> DoctorCheck {
+    match find_bundled_luau_definitions() {
+        Some(path) => doctor_check("roblox defs", DoctorStatus::Ok, path.display().to_string()),
+        None => doctor_check("roblox defs", DoctorStatus::Warn, "not bundled"),
+    }
+}
+
+fn check_writes_log_path() -> DoctorCheck {
+    let Some(home) = dirs::home_dir() else {
+        return doctor_check("writes.log", DoctorStatus::Warn, "home directory not found");
+    };
+    let dir = home.join(".terminal64").join("widgets").join("ro-sync");
+    let log = dir.join("writes.log");
+    if log.exists() {
+        return doctor_check("writes.log", DoctorStatus::Ok, log.display().to_string());
+    }
+    if dir.is_dir() {
+        return doctor_check(
+            "writes.log",
+            DoctorStatus::Warn,
+            format!("not created yet: {}", log.display()),
+        );
+    }
+    doctor_check(
+        "writes.log",
+        DoctorStatus::Warn,
+        format!("directory missing: {}", dir.display()),
+    )
+}
+
+fn http_get_json(port: u16, path: &str) -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let timeout = Duration::from_millis(750);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("connect http://127.0.0.1:{port}{path}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write request: {e}"))?;
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| format!("read response: {e}"))?;
+    let mut parts = resp.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or("");
+    let body = parts.next().unwrap_or("");
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        let status = head.lines().next().unwrap_or("no HTTP status");
+        return Err(status.to_string());
+    }
+    serde_json::from_str(body).map_err(|e| format!("parse response JSON: {e}"))
+}
+
+fn format_duration_short(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,8 +1903,14 @@ async fn run_new(args: NewArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err("new: --yes is required".into());
     }
     let mut req = serde_json::Map::new();
-    req.insert("parent".into(), serde_json::Value::String(args.path.clone()));
-    req.insert("class".into(), serde_json::Value::String(args.class.clone()));
+    req.insert(
+        "parent".into(),
+        serde_json::Value::String(args.path.clone()),
+    );
+    req.insert(
+        "class".into(),
+        serde_json::Value::String(args.class.clone()),
+    );
     if let Some(n) = &args.name {
         req.insert("name".into(), serde_json::Value::String(n.clone()));
     }
@@ -1302,7 +1923,10 @@ async fn run_new(args: NewArgs) -> Result<(), Box<dyn std::error::Error>> {
     let class_label = args.class.clone();
     print_response(&resp, args.raw, |v| {
         let path = v.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let class = v.get("class").and_then(|v| v.as_str()).unwrap_or(&class_label);
+        let class = v
+            .get("class")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&class_label);
         println!("ok: created {class} at {path}");
     });
     ok_or_err(&resp)
@@ -1316,7 +1940,10 @@ async fn run_rm(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
     let resp = remote::request(args.port, "rm", req).await?;
     let fallback_path = args.path.clone();
     print_response(&resp, args.raw, |v| {
-        let path = v.get("path").and_then(|v| v.as_str()).unwrap_or(&fallback_path);
+        let path = v
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&fallback_path);
         println!("ok: destroyed {path}");
     });
     ok_or_err(&resp)
@@ -1500,11 +2127,7 @@ async fn run_select_set(args: SelectSetArgs) -> Result<(), Box<dyn std::error::E
     ok_or_err(&resp)
 }
 
-fn print_response<F: FnOnce(&serde_json::Value)>(
-    resp: &serde_json::Value,
-    raw: bool,
-    pretty: F,
-) {
+fn print_response<F: FnOnce(&serde_json::Value)>(resp: &serde_json::Value, raw: bool, pretty: F) {
     if raw {
         println!(
             "{}",
@@ -1552,7 +2175,10 @@ fn print_get(args: &GetArgs, value: &serde_json::Value) {
     let obj = match value.as_object() {
         Some(o) => o,
         None => {
-            println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            );
             return;
         }
     };
@@ -1582,7 +2208,10 @@ fn print_get(args: &GetArgs, value: &serde_json::Value) {
     }
     if let Some(tags) = obj.get("tags").and_then(|v| v.as_array()) {
         if !tags.is_empty() {
-            let labels: Vec<String> = tags.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            let labels: Vec<String> = tags
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
             println!("Tags: {}", labels.join(", "));
         }
     }
@@ -1603,23 +2232,49 @@ fn format_pretty_value(v: &serde_json::Value) -> String {
         if let Some(tag) = obj.get("__type").and_then(|v| v.as_str()) {
             let num = |k: &str| obj.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
             match tag {
-                "Vector3" => return format!("Vector3({:.3}, {:.3}, {:.3})", num("x"), num("y"), num("z")),
+                "Vector3" => {
+                    return format!("Vector3({:.3}, {:.3}, {:.3})", num("x"), num("y"), num("z"))
+                }
                 "Vector2" => return format!("Vector2({:.3}, {:.3})", num("x"), num("y")),
-                "Color3" => return format!("Color3({:.3}, {:.3}, {:.3})", num("r"), num("g"), num("b")),
+                "Color3" => {
+                    return format!("Color3({:.3}, {:.3}, {:.3})", num("r"), num("g"), num("b"))
+                }
                 "UDim" => return format!("UDim({:.3}, {})", num("scale"), num("offset") as i64),
-                "UDim2" => return format!(
-                    "UDim2({:.3}, {}, {:.3}, {})",
-                    num("xScale"), num("xOffset") as i64, num("yScale"), num("yOffset") as i64
-                ),
-                "BrickColor" => if let Some(n) = obj.get("name").and_then(|v| v.as_str()) { return format!("BrickColor({n})"); },
+                "UDim2" => {
+                    return format!(
+                        "UDim2({:.3}, {}, {:.3}, {})",
+                        num("xScale"),
+                        num("xOffset") as i64,
+                        num("yScale"),
+                        num("yOffset") as i64
+                    )
+                }
+                "BrickColor" => {
+                    if let Some(n) = obj.get("name").and_then(|v| v.as_str()) {
+                        return format!("BrickColor({n})");
+                    }
+                }
                 "EnumItem" => {
                     let e = obj.get("enumType").and_then(|v| v.as_str()).unwrap_or("?");
                     let n = obj.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                     return format!("Enum.{e}.{n}");
                 }
-                "Instance" => if let Some(p) = obj.get("path").and_then(|v| v.as_str()) { return format!("→ {p}"); },
-                "CFrame" => return format!("CFrame(pos=({:.3}, {:.3}, {:.3}))", num("x"), num("y"), num("z")),
-                "NumberRange" => return format!("NumberRange({:.3}..{:.3})", num("min"), num("max")),
+                "Instance" => {
+                    if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                        return format!("→ {p}");
+                    }
+                }
+                "CFrame" => {
+                    return format!(
+                        "CFrame(pos=({:.3}, {:.3}, {:.3}))",
+                        num("x"),
+                        num("y"),
+                        num("z")
+                    )
+                }
+                "NumberRange" => {
+                    return format!("NumberRange({:.3}..{:.3})", num("min"), num("max"))
+                }
                 _ => {}
             }
         }
@@ -1634,7 +2289,10 @@ fn print_set(path: &str, prop: &str, value: &serde_json::Value) {
 
 fn print_ls(value: &serde_json::Value) {
     let Some(arr) = value.as_array() else {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
         return;
     };
     for item in arr {
@@ -1658,7 +2316,10 @@ fn print_tree(value: &serde_json::Value, depth: usize) {
 
 fn print_find(value: &serde_json::Value) {
     let Some(arr) = value.as_array() else {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
         return;
     };
     // Plugin returns `[path, ...]` (array of strings); some test responders
@@ -1789,9 +2450,8 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
     let prev_place_ids = state.place_ids.read().unwrap().clone();
     let prev_name = state.project_name.read().unwrap().clone();
 
-    let changed = prev_game_id != cfg.game_id
-        || prev_place_ids != cfg.place_ids
-        || prev_name != cfg.name;
+    let changed =
+        prev_game_id != cfg.game_id || prev_place_ids != cfg.place_ids || prev_name != cfg.name;
     if !changed {
         return Some(());
     }
@@ -1974,7 +2634,10 @@ async fn run_find_attr(args: FindAttrArgs) -> Result<(), Box<dyn std::error::Err
 
 fn print_classinfo(class_name: &str, value: &serde_json::Value) {
     let Some(obj) = value.as_object() else {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
         return;
     };
     println!("{class_name}");
@@ -1983,11 +2646,29 @@ fn print_classinfo(class_name: &str, value: &serde_json::Value) {
         // output is deterministic without requiring stable group ordering.
         let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
         for p in props {
-            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let cat = p.get("category").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let ty = p.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if name.is_empty() { continue; }
-            let cat_label = if cat.is_empty() { "(uncategorized)".to_string() } else { cat };
+            let name = p
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cat = p
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ty = p
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let cat_label = if cat.is_empty() {
+                "(uncategorized)".to_string()
+            } else {
+                cat
+            };
             match groups.iter_mut().find(|(c, _)| c == &cat_label) {
                 Some((_, entries)) => entries.push((name, ty)),
                 None => groups.push((cat_label, vec![(name, ty)])),
@@ -2020,7 +2701,10 @@ fn print_classinfo(class_name: &str, value: &serde_json::Value) {
 
 fn print_enum_items(enum_name: &str, value: &serde_json::Value) {
     let Some(arr) = value.as_array() else {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
         return;
     };
     println!("Enum.{enum_name}");
