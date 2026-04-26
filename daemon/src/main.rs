@@ -1488,6 +1488,7 @@ struct windows_tm {
 
 #[cfg(windows)]
 extern "C" {
+    #[link_name = "_localtime64_s"]
     fn localtime_s(tm: *mut windows_tm, time: *const i64) -> i32;
 }
 

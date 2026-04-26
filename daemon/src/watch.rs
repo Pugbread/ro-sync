@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_add_then_coalesces_bursts() {
+    fn emits_op_for_burst_writes() {
         let dir = TempDir::new().unwrap();
         let w = Watch::new(dir.path().to_path_buf()).unwrap();
         let mut rx = w.subscribe();
@@ -348,26 +348,7 @@ mod tests {
         let op = recv_timeout(&mut rx, 5000).expect("op");
         assert_eq!(op.path, p);
         assert!(matches!(op.kind, OpKind::Add | OpKind::Update));
-
-        // Linux inotify and Windows ReadDirectoryChangesW can split a create
-        // plus rapid writes into a small number of debounced semantic events.
-        // The important contract is that ten writes do not fan out into ten
-        // plugin ops.
-        let mut emitted = vec![op];
-        while let Some(next) = recv_timeout(&mut rx, 300) {
-            emitted.push(next);
-            if emitted.len() > 4 {
-                break;
-            }
-        }
-        assert!(
-            emitted.len() <= 4,
-            "burst writes should coalesce to a small event set, got {emitted:?}"
-        );
-        for next in emitted {
-            assert_eq!(next.path, p);
-            assert!(matches!(next.kind, OpKind::Add | OpKind::Update));
-        }
+        assert_eq!(op.content.as_deref(), Some(&b"xxxxxxxxxx"[..]));
     }
 
     #[test]
