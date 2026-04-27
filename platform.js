@@ -68,6 +68,16 @@ export function shQuote(s) { return IS_WINDOWS ? winQuote(s) : posixQuote(s); }
 // PowerShell: single-quoted strings escape ' as '' and do not expand variables.
 export function psQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
 
+// Start-Process joins -ArgumentList arrays with spaces before creating the
+// child process. Include literal double quotes inside each PowerShell string so
+// args containing spaces survive that flattening as one argv token.
+export function psArgQuote(s) {
+  const arg = String(s)
+    .replace(/(\\*)"/g, '$1$1\\"')
+    .replace(/(\\+)$/g, "$1$1");
+  return psQuote(`"${arg}"`);
+}
+
 // Encode a PowerShell script as UTF-16LE base64 so it can be passed via
 // `powershell -EncodedCommand <base64>`. This ELIMINATES every quoting concern
 // because the argument is pure [A-Za-z0-9+/=] — no shell can mangle it.
@@ -209,7 +219,7 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
     // on stdout: `---\n<pid>` on success, `---\nERROR: <message>` on failure.
     // This stops PowerShell's default CLIXML error-serialization from leaking
     // into the hint the widget displays.
-    const psArgs = args.map(psQuote).join(",");
+    const psArgs = args.map(psArgQuote).join(",");
     const ps =
       `$ErrorActionPreference = 'Stop'; ` +
       `$ProgressPreference = 'SilentlyContinue'; ` +

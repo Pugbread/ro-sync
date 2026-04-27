@@ -406,6 +406,7 @@ mod tests {
             watch_tx,
             project_name: Arc::new(RwLock::new("test".into())),
             game_id: Arc::new(RwLock::new(None)),
+            group_id: Arc::new(RwLock::new(None)),
             place_ids: Arc::new(RwLock::new(Vec::new())),
             pending_initial: Arc::new(Mutex::new(None)),
             push_quiet: Arc::new(Mutex::new(HashMap::<PathBuf, std::time::Instant>::new())),

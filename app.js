@@ -20,7 +20,7 @@ import {
 // ---------- State store ----------
 // Persisted shape:
 //   {
-//     projects: [{ id, name, path, addedAt, gameId, placeIds }],
+//     projects: [{ id, name, path, addedAt, gameId, groupId, placeIds }],
 //     activeProjectId,
 //     daemonPid, daemonPort, daemonProject,
 //     lastView,
@@ -175,6 +175,9 @@ async function launchDaemon(projectPath, port) {
   if (proj && proj.gameId) {
     args.push("--game-id", String(proj.gameId));
   }
+  if (proj && proj.groupId) {
+    args.push("--group-id", String(proj.groupId));
+  }
   if (proj && Array.isArray(proj.placeIds)) {
     for (const pid of proj.placeIds) {
       const v = String(pid).trim();
@@ -302,9 +305,9 @@ async function ensureDaemon() {
     if (ours) {
       // Already have a daemon for our project — great, use it.
     } else if (pointedAtOurProject) {
-      // Daemon IS serving our current project path, but gameId/placeIds don't
+      // Daemon IS serving our current project path, but gameId/groupId/placeIds don't
       // match. It was launched with stale CLI args (before the user set the
-      // gameId, or edited them while serving in an older widget build that
+      // Roblox ids, or edited them while serving in an older widget build that
       // didn't auto-restart). Kill and relaunch with current settings.
       await killStaleDaemonAt(preferred);
       hit = await launchAndWait(project, preferred);

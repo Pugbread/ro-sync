@@ -32,7 +32,7 @@ local MAX_LOG_LINES = 200
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "1.0.0"
+local PLUGIN_VERSION_STRING = "1.0.1"
 local PLUGIN_PROTOCOL_VERSION = 1
 
 --------------------------------------------------------------------------------
@@ -3011,9 +3011,13 @@ end
 -- section so wsLoop's lagged-resync path can reach it without a circular decl.
 runInitialCompare = function()
 	local studioStats = collectStudioStats()
+	local studioSnapshot = collectSnapshot()
 	log(string.format("initial-compare: scripts=%d instances=%d",
 		studioStats.scriptCount, studioStats.instanceCount))
-	local ok, resp = httpJson("/initial-compare", "POST", { studioStats = studioStats })
+	local ok, resp = httpJson("/initial-compare", "POST", {
+		studioStats = studioStats,
+		studioSnapshot = studioSnapshot,
+	})
 	if not ok then
 		log("initial-compare err: " .. tostring(resp))
 		setPill("error", "compare failed")

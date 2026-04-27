@@ -20,11 +20,10 @@ pub const TREE_JSON: &str = "tree.json";
 pub const CODEX_DIR: &str = ".codex";
 pub const CODEX_CONFIG_TOML: &str = "config.toml";
 
-/// The single line that signals `ro-sync.md` is linked from `CLAUDE.md`.
-/// Claude Code (and compatible agent harnesses) resolve `@path` references as
-/// inline imports, so a bare line containing this token pulls `ro-sync.md`
-/// into every session that loads `CLAUDE.md`.
+/// Claude Code resolves `@path` references as inline imports. New projects
+/// import AGENTS.md so Claude Code and Codex route through one canonical file.
 pub const RO_SYNC_IMPORT_LINE: &str = "@ro-sync.md";
+pub const AGENTS_IMPORT_LINE: &str = "@AGENTS.md";
 const CODEX_CONTEXT_START: &str = "<!-- ro-sync:codex-context:start -->";
 const CODEX_CONTEXT_END: &str = "<!-- ro-sync:codex-context:end -->";
 const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &[
@@ -38,15 +37,45 @@ const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &[
 ];
 const CLAUDE_DOC_VARIANTS: &[&str] = &["CLAUDE.md", "CLAUDE.MD", "Claude.MD"];
 const RO_SYNC_DOC_VARIANTS: &[&str] = &["ro-sync.md", "ro-sync.MD", "rosync.md", "ROSYNC.md"];
+const REQUIRED_RO_SYNC_MD_TOKENS: &[&str] = &[
+    "rosync get",
+    "rosync set",
+    "rosync ls",
+    "rosync tree",
+    "rosync snapshot",
+    "rosync diff",
+    "rosync find",
+    "rosync eval",
+    "rosync path",
+    "rosync status",
+    "rosync doctor",
+    "rosync lint",
+    "rosync img",
+    "rosync imgs",
+    "rosync img --help",
+    "do not investigate unrelated upload tools",
+    "Agent bootstrap",
+    "rbxcloud",
+    "Secrets store",
+    "rosync classinfo",
+    "rosync enums",
+    "rosync enum ",
+    "rosync find-attr",
+    "--under",
+    "--force-parent",
+    "--waypoint",
+    "writes.log",
+    "writes.log.1",
+    "escape",
+    "hatches",
+];
 
 const CLAUDE_MD_TEMPLATE: &str = r#"# Project memory for agents
 
-This directory is a Roblox Studio project mirrored by Ro Sync. Before editing
-any file or issuing CLI commands, read the imported context below — it
-describes what syncs, what doesn't, and which `rosync` subcommands are safe to
-run unattended.
+This directory is a Roblox Studio project mirrored by Ro Sync. Claude Code
+and Codex share the same project instructions through AGENTS.md.
 
-@ro-sync.md
+@AGENTS.md
 "#;
 
 /// Top-level services mirrored under the project root. Order drives the
@@ -66,6 +95,43 @@ const RO_SYNC_MD_TEMPLATE: &str = r#"# Ro Sync project memory
 
 Ro Sync mirrors a narrow slice of a Roblox Studio DataModel into this directory.
 Read this file before editing — the scope is deliberately small.
+
+## 0. Agent bootstrap
+
+You are in a Ro Sync project. Do not look for `rbxcloud`, Rojo upload scripts,
+or ad-hoc Roblox tooling before trying the built-in CLI.
+
+Use `rosync` directly, but validate it has the modern subcommands first:
+
+```
+rosync img --help
+```
+
+If that command is missing, do not investigate unrelated upload tools; use the
+widget daemon binary directly:
+
+- macOS arm64: `~/.terminal64/widgets/ro-sync/daemon/rosync-darwin-arm64`
+- Windows x86_64: `%USERPROFILE%\.terminal64\widgets\ro-sync\daemon\rosync-windows-x86_64.exe`
+- Linux x86_64: `~/.terminal64/widgets/ro-sync/daemon/rosync-linux-x86_64`
+
+From the project root, start with:
+
+```
+rosync status --project .
+rosync diff --project .
+rosync path --project . Workspace/Camera
+```
+
+For image uploads, use Ro Sync, not external asset tools:
+
+```
+rosync img ./image.png --project .
+rosync imgs ./image-folder --project . --manifest uploaded-assets.json
+```
+
+`rosync img` reads the Roblox Open Cloud credential from the Ro Sync widget
+Secrets store (or `ROBLOX_API_KEY`) and uses the project `groupId` as
+`group:<id>` when `--creator` is omitted.
 
 ## 1. What syncs, what doesn't
 
@@ -133,10 +199,15 @@ segment (any name) and `**` for zero or more segments.
 rosync query --project . 'Workspace/**/Camera'
 rosync query --project . 'ReplicatedStorage/Shared/*' --format paths
 rosync query --project . '**/RemoteEvent' --format classes
+rosync path --project . Workspace/Camera
+rosync path --project . --from fs ReplicatedStorage/Config.luau
 ```
 
 Non-script, non-folder instances are visible only via `tree.json` — query it
 when you need to know the shape of the rest of the DataModel.
+Use `rosync path` when you need to jump between Studio instance paths and the
+syncable files on disk. It refuses Studio-authoritative classes and paths not
+present in the latest `tree.json`.
 
 ## 5b. Linting Luau
 
@@ -154,6 +225,26 @@ rosync lint --project . --no-sourcemap
 rosync lint --project . -- --no-flags-enabled
 rosync lint --project . --luau-lsp /path/to/luau-lsp
 ```
+
+## 5c. Asset uploads
+
+`rosync img` uploads an image file through Roblox Open Cloud Assets. It does
+not require the daemon or Studio to be connected. The API key is read from
+`ROBLOX_API_KEY`, or from the Ro Sync widget Settings > Secrets value when the
+env var is not set. If `--creator` is omitted, Ro Sync uses the project
+`groupId` from `ro-sync.json` or the active widget project.
+
+```
+rosync img ./icon.png --creator user:123456
+rosync img ./icon.png --creator group:123456 --name "Inventory Icon" --asset-type decal
+rosync img ./icon.png --creator user:123456 --auth bearer --api-key-env ROBLOX_OAUTH_TOKEN
+rosync img ./icon.png --creator user:123456 --no-wait --raw
+rosync imgs ./icons ./banner.png --project . --manifest uploaded-assets.json
+```
+
+Use `rosync imgs` for bulk uploads. It accepts image files and directories,
+recurses by default, skips non-images found inside directories, continues after
+per-file failures, and can write a JSON manifest with `--manifest`.
 
 ## 6. Agent usage — live Studio control
 
@@ -179,6 +270,14 @@ rosync ls --project . --path ReplicatedStorage
 # Print the class+name tree under an instance (depth default 3).
 rosync tree --project . --path Workspace --depth 3
 
+# Export the live tree plus inspectable properties, attributes, and tags.
+# Defaults to ./rosync-snapshot-<unix-seconds>.json; pass --output to choose
+# a file or existing directory. Use snapshots for debugging and backups.
+rosync snapshot --project .
+
+# Compare the local script/folder representation with live Studio state.
+rosync diff --project .
+
 # Find instances by ClassName and/or name substring (live, whole DataModel).
 rosync find --project . --class RemoteEvent
 rosync find --project . --name Camera
@@ -187,15 +286,14 @@ rosync find --project . --name Camera
 Mutating (ask the user first — see the safety note below):
 
 ```
-# Set a property on one instance. Value is a JSON literal. --yes required.
-rosync set --project . --path Workspace/Camera --prop FieldOfView --value 90 --yes
+# Set a property on one instance. Value is a JSON literal.
+rosync set --project . --path Workspace/Camera --prop FieldOfView --value 90
 
 # Tagged values use their __type tag:
 rosync set --project . --path Workspace/Part --prop Position \
-  --value '{"__type":"Vector3","x":1,"y":2,"z":3}' --yes
+  --value '{"__type":"Vector3","x":1,"y":2,"z":3}'
 
 # Batch writes from a JSON file: [{"path":"…","prop":"…","value":…}, …]
-# Batch mode implies user intent, so --yes is not required.
 rosync set --project . --batch writes.json
 
 # Wrap a write (or a batch) in a named change-history waypoint so one
@@ -203,7 +301,7 @@ rosync set --project . --batch writes.json
 rosync set --project . --batch writes.json --waypoint "refactor camera"
 
 # Execute arbitrary Luau inside the plugin sandbox. Escape hatch only.
-rosync eval --project . --source 'return #game.Workspace:GetChildren()' --yes
+rosync eval --project . --source 'return #game.Workspace:GetChildren()'
 ```
 
 All of the above time out after 5 seconds if the plugin doesn't respond; a
@@ -215,7 +313,8 @@ These subcommands bracket batches, roll state back, capture output, and
 verify the plugin is reachable.
 
 ```
-# Health / handshake — prints plugin round-trip latency and version.
+# Health / handshake. `status --raw` prints concise JSON for automation.
+rosync status --project .
 rosync doctor --project .
 rosync ping --project .
 rosync version --project .
@@ -225,52 +324,51 @@ rosync logs --project . --since 1m --level warn
 rosync logs --project . --tail
 
 # Save the place file (asynchronous; the CLI returns when Studio accepts it).
-rosync save --project . --yes
+rosync save --project .
 
 # Change history. One waypoint flanking a batch means one ctrl-Z reverses
 # the whole batch; `undo` / `redo` also work from the CLI.
 rosync waypoint --project . --name "before refactor"
-rosync undo --project . --yes
-rosync redo --project . --yes
+rosync undo --project .
+rosync redo --project .
 ```
 
 ## 6c. Structured writes — construct, destroy, reparent, attrs, tags, call, select
 
 Live-DataModel ops beyond `set`/`eval`. Each write is appended to `writes.log`.
-Every destructive op requires `--yes`; `mv` additionally requires `--force` to
-cross a top-level service boundary.
+`mv` requires `--force` to cross a top-level service boundary.
 
 ```
 # Create a new instance. --path is the parent; --props is an optional JSON
 # object of initial properties (same codec as `rosync set --value`).
 rosync new --project . --path Workspace --class Part --name Box \
-  --props '{"Anchored":true,"Position":{"__type":"Vector3","x":0,"y":5,"z":0}}' --yes
+  --props '{"Anchored":true,"Position":{"__type":"Vector3","x":0,"y":5,"z":0}}'
 
 # Destroy an instance (:Destroy()).
-rosync rm --project . --path Workspace/Box --yes
+rosync rm --project . --path Workspace/Box
 
 # Reparent. Cross-service moves refuse without --force to catch mistakes like
 # punting something from Workspace into ServerStorage.
-rosync mv --project . --from Workspace/Box --to Workspace/Folder --yes
-rosync mv --project . --from Workspace/Box --to ServerStorage --force --yes
+rosync mv --project . --from Workspace/Box --to Workspace/Folder
+rosync mv --project . --from Workspace/Box --to ServerStorage --force
 
 # Attributes.
-rosync attr set --project . --path Workspace/Box --name Speed --value 12.5 --yes
-rosync attr rm  --project . --path Workspace/Box --name Speed --yes
+rosync attr set --project . --path Workspace/Box --name Speed --value 12.5
+rosync attr rm  --project . --path Workspace/Box --name Speed
 rosync attr ls  --project . --path Workspace/Box
 
 # CollectionService tags.
-rosync tag add --project . --path Workspace/Box --tag Enemy --yes
-rosync tag rm  --project . --path Workspace/Box --tag Enemy --yes
+rosync tag add --project . --path Workspace/Box --tag Enemy
+rosync tag rm  --project . --path Workspace/Box --tag Enemy
 
 # Invoke a method on an instance. --args is a JSON array encoded with the
 # same codec as --value; the return value is printed as pretty JSON.
 rosync call --project . --path Workspace/Folder --method FindFirstChild \
-  --args '["Box"]' --yes
+  --args '["Box"]'
 
 # Studio Selection.
 rosync select get --project .
-rosync select set --project . --paths '["Workspace/Box","Workspace/SpawnLocation"]' --yes
+rosync select set --project . --paths '["Workspace/Box","Workspace/SpawnLocation"]'
 ```
 
 ## 6d. Introspection — class info, enums, attribute-scoped search
@@ -305,9 +403,9 @@ rosync find-attr --project . --name Color --value \
 Every `rosync` subcommand above is part of a larger catalogue. Quick reference:
 
 - **Read-only inspection**: `get`, `ls`, `tree`, `find`, `find-attr`,
-  `classinfo`, `enum`, `enums`, `query`, `attr ls`, `select get`, `logs`,
-  `version`, `ping`, `lint`.
-- **Structured writes (require `--yes`)**: `set`, `new`, `rm`, `mv`,
+  `classinfo`, `enum`, `enums`, `query`, `path`, `attr ls`, `select get`, `logs`,
+  `snapshot`, `diff`, `status`, `version`, `ping`, `lint`.
+- **Structured writes**: `set`, `new`, `rm`, `mv`,
   `attr set|rm`, `tag add|rm`, `call`, `select set`, `save`, `undo`, `redo`,
   `waypoint`, `eval`.
 
@@ -319,9 +417,9 @@ Two write-path flags every agent should know:
   write: `rosync set --batch edits.json --waypoint "re-skin box"`.
 - **`set Parent` is guardrailed.** `rosync set --prop Parent …` refuses with
   a loud error by default — raw Parent assignment is the single most common
-  way to corrupt a DataModel. Use `rosync mv --path X --to Y --yes` for
+  way to corrupt a DataModel. Use `rosync mv --from X --to Y` for
   reparenting. If you genuinely need the raw write, pass `--force-parent`
-  along with `--yes`.
+  explicitly.
 
 `writes.log` auto-rotates once it passes 10 MiB: the current file is renamed
 to `writes.log.1` (overwriting any prior generation) and a fresh `writes.log`
@@ -348,20 +446,29 @@ pub fn write_ro_sync_md_if_missing(root: &Path) -> io::Result<bool> {
     fs::create_dir_all(root)?;
     let p = root.join(RO_SYNC_MD);
     if p.exists() {
+        let existing = fs::read_to_string(&p)?;
+        if existing.contains("# Ro Sync project memory")
+            && REQUIRED_RO_SYNC_MD_TOKENS
+                .iter()
+                .any(|token| !existing.contains(token))
+        {
+            fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
+            return Ok(true);
+        }
         return Ok(false);
     }
     fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
     Ok(true)
 }
 
-/// Ensure `CLAUDE.md` at the project root imports `ro-sync.md` so agent
-/// sessions load it automatically. Behavior:
+/// Ensure `CLAUDE.md` at the project root imports `AGENTS.md` so Claude Code
+/// and Codex use the same canonical project instructions. Behavior:
 ///
-/// * No `CLAUDE.md`: write one with a short preamble and the `@ro-sync.md`
+/// * No `CLAUDE.md`: write one with a short preamble and the `@AGENTS.md`
 ///   import line.
 /// * `CLAUDE.md` exists without the import line: append a blank line followed
 ///   by the import line (user content is preserved verbatim).
-/// * `CLAUDE.md` already imports `ro-sync.md`: no-op.
+/// * `CLAUDE.md` already imports `AGENTS.md`: no-op.
 ///
 /// Returns `true` when the file was created or modified.
 pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
@@ -372,7 +479,12 @@ pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
         return Ok(true);
     }
     let existing = fs::read_to_string(&p)?;
-    if claude_md_imports_ro_sync(&existing) {
+    let migrated = replace_bare_ro_sync_imports_with_agents(&existing);
+    if migrated != existing {
+        fs::write(&p, migrated)?;
+        return Ok(true);
+    }
+    if claude_md_imports_agents(&existing) {
         return Ok(false);
     }
     let mut merged = existing;
@@ -382,19 +494,17 @@ pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     if !merged.is_empty() && !merged.ends_with("\n\n") {
         merged.push('\n');
     }
-    merged.push_str(RO_SYNC_IMPORT_LINE);
+    merged.push_str(AGENTS_IMPORT_LINE);
     merged.push('\n');
     fs::write(&p, merged)?;
     Ok(true)
 }
 
-/// Ensure Codex receives the same project memory Claude Code does.
+/// Ensure Codex and Claude Code receive the same project memory.
 ///
-/// Codex reads `AGENTS.md` as its native project context. It can also be
-/// configured with fallback project-doc filenames, but current Codex builds use
-/// the first matching fallback file rather than concatenating all matches. Ro
-/// Sync therefore prioritizes `ro-sync.md` in fallback config and writes a
-/// generated block into `AGENTS.md` with the full Ro Sync memory first.
+/// Codex reads `AGENTS.md` as its native project context. Claude Code reads
+/// `CLAUDE.md`, which Ro Sync points at `AGENTS.md`. This keeps one canonical
+/// agent file while preserving tool-specific entrypoints.
 ///
 /// Returns `true` when any Codex-facing file was created or modified.
 pub fn write_codex_context_if_missing_or_merge(root: &Path) -> io::Result<bool> {
@@ -429,7 +539,7 @@ fn write_agents_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     let block = codex_agents_block(root);
     let next = if !p.exists() {
         format!(
-            "# Codex project memory\n\nThis file is maintained by Ro Sync so Codex receives the same context as Claude Code.\n\n{block}"
+            "# Agent project memory\n\nThis file is maintained by Ro Sync. Codex reads AGENTS.md directly; Claude Code reads CLAUDE.md, which imports this file.\n\n{block}"
         )
     } else {
         let existing = fs::read_to_string(&p)?;
@@ -444,24 +554,17 @@ fn write_agents_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
 }
 
 fn codex_agents_block(root: &Path) -> String {
-    let mut claude_sections = read_doc_variants(root, CLAUDE_DOC_VARIANTS);
-    if claude_sections.is_empty() {
-        claude_sections.push((CLAUDE_MD.to_string(), String::new()));
-    }
     let mut ro_sync_sections = read_doc_variants(root, RO_SYNC_DOC_VARIANTS);
     if ro_sync_sections.is_empty() {
         ro_sync_sections.push((RO_SYNC_MD.to_string(), RO_SYNC_MD_TEMPLATE.into()));
     }
     let ro_sync = format_doc_sections(ro_sync_sections);
-    let claude = format_doc_sections(claude_sections);
     format!(
         "{CODEX_CONTEXT_START}\n\
          # Ro Sync Codex Context\n\n\
          The section between these markers is regenerated by Ro Sync. Put durable project-specific Codex notes outside the markers.\n\n\
          ## Ro Sync Project Memory\n\n\
-         {ro_sync}\n\n\
-         ## Claude Project Memory\n\n\
-         {claude}\n\
+         {ro_sync}\n\
          {CODEX_CONTEXT_END}\n"
     )
 }
@@ -610,18 +713,44 @@ fn parse_toml_string_array(value: &str) -> Vec<String> {
     out
 }
 
-/// True when any line of `contents` (after trimming whitespace) is exactly the
-/// `@ro-sync.md` import token, optionally prefixed with `./`. Keeps detection
-/// robust against minor user edits (leading spaces, trailing whitespace) while
-/// avoiding false positives from mentions inside prose.
-fn claude_md_imports_ro_sync(contents: &str) -> bool {
+/// True when any line of `contents` (after trimming whitespace) is exactly an
+/// import token, optionally prefixed with `./`. Keeps detection robust against
+/// minor user edits while avoiding false positives from mentions inside prose.
+fn claude_md_imports_agents(contents: &str) -> bool {
     for line in contents.lines() {
         let t = line.trim();
-        if t == RO_SYNC_IMPORT_LINE || t == "@./ro-sync.md" {
+        if t == AGENTS_IMPORT_LINE || t == "@./AGENTS.md" {
             return true;
         }
     }
     false
+}
+
+fn replace_bare_ro_sync_imports_with_agents(contents: &str) -> String {
+    let mut changed = false;
+    let has_agents_import = claude_md_imports_agents(contents);
+    let mut inserted_agents_import = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed == RO_SYNC_IMPORT_LINE || trimmed == "@./ro-sync.md" {
+            if !has_agents_import && !inserted_agents_import {
+                lines.push(AGENTS_IMPORT_LINE.to_string());
+                inserted_agents_import = true;
+            }
+            changed = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !changed {
+        return contents.to_string();
+    }
+    let mut out = lines.join("\n");
+    if contents.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Walk each service directory and return a list of service nodes, each
@@ -798,31 +927,25 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_stale_generated_ro_sync_md() {
+        let d = TempDir::new("md-stale");
+        let p = d.path().join(RO_SYNC_MD);
+        fs::write(
+            &p,
+            "# Ro Sync project memory\n\nOld generated content without the image upload command.\n",
+        )
+        .unwrap();
+        assert!(write_ro_sync_md_if_missing(d.path()).unwrap());
+        let body = fs::read_to_string(&p).unwrap();
+        assert!(body.contains("rosync img"));
+    }
+
+    #[test]
     fn ro_sync_md_template_lists_new_cli_subcommands() {
         // The template is the contract agents read to learn which commands
         // exist. Lock it against regressions so future edits don't silently
         // drop a subcommand section.
-        for token in [
-            "rosync get",
-            "rosync set",
-            "rosync ls",
-            "rosync tree",
-            "rosync find",
-            "rosync eval",
-            "rosync doctor",
-            "rosync lint",
-            "rosync classinfo",
-            "rosync enums",
-            "rosync enum ",
-            "rosync find-attr",
-            "--under",
-            "--force-parent",
-            "--waypoint",
-            "writes.log",
-            "writes.log.1",
-            "escape",
-            "hatches",
-        ] {
+        for token in REQUIRED_RO_SYNC_MD_TOKENS {
             assert!(
                 RO_SYNC_MD_TEMPLATE.contains(token),
                 "ro-sync.md template missing {token:?}"
@@ -837,8 +960,8 @@ mod tests {
         let p = d.path().join(CLAUDE_MD);
         let body = fs::read_to_string(&p).unwrap();
         assert!(
-            body.lines().any(|l| l.trim() == RO_SYNC_IMPORT_LINE),
-            "new CLAUDE.md must import ro-sync.md; got:\n{body}"
+            body.lines().any(|l| l.trim() == AGENTS_IMPORT_LINE),
+            "new CLAUDE.md must import AGENTS.md; got:\n{body}"
         );
         // Idempotent: a second call must not rewrite the file.
         assert!(!write_claude_md_if_missing_or_merge(d.path()).unwrap());
@@ -859,7 +982,7 @@ mod tests {
             "user content must be preserved verbatim at the top"
         );
         assert!(
-            merged.lines().any(|l| l.trim() == RO_SYNC_IMPORT_LINE),
+            merged.lines().any(|l| l.trim() == AGENTS_IMPORT_LINE),
             "merged CLAUDE.md must contain the import line; got:\n{merged}"
         );
 
@@ -872,19 +995,30 @@ mod tests {
     fn claude_md_preserved_when_import_present() {
         let d = TempDir::new("claude-present");
         let p = d.path().join(CLAUDE_MD);
-        let existing = "# Existing\n\n@ro-sync.md\n\nMore user notes.\n";
+        let existing = "# Existing\n\n@AGENTS.md\n\nMore user notes.\n";
         fs::write(&p, existing).unwrap();
         assert!(!write_claude_md_if_missing_or_merge(d.path()).unwrap());
         assert_eq!(fs::read_to_string(&p).unwrap(), existing);
     }
 
     #[test]
+    fn claude_md_migrates_old_ro_sync_import_to_agents() {
+        let d = TempDir::new("claude-old-import");
+        let p = d.path().join(CLAUDE_MD);
+        fs::write(&p, "# Existing\n\n@ro-sync.md\n").unwrap();
+        assert!(write_claude_md_if_missing_or_merge(d.path()).unwrap());
+        let migrated = fs::read_to_string(&p).unwrap();
+        assert!(migrated.contains("@AGENTS.md"));
+        assert!(!migrated.lines().any(|line| line.trim() == "@ro-sync.md"));
+    }
+
+    #[test]
     fn claude_md_detects_relative_import_form() {
-        // `@./ro-sync.md` resolves to the same file in Claude Code, so it
+        // `@./AGENTS.md` resolves to the same file in Claude Code, so it
         // must count as already-imported and not trigger an append.
         let d = TempDir::new("claude-relative");
         let p = d.path().join(CLAUDE_MD);
-        let existing = "# doc\n\n@./ro-sync.md\n";
+        let existing = "# doc\n\n@./AGENTS.md\n";
         fs::write(&p, existing).unwrap();
         assert!(!write_claude_md_if_missing_or_merge(d.path()).unwrap());
         assert_eq!(fs::read_to_string(&p).unwrap(), existing);
@@ -892,17 +1026,17 @@ mod tests {
 
     #[test]
     fn claude_md_does_not_match_mention_inside_prose() {
-        // A line like "see @ro-sync.md for details" should NOT count as an
+        // A line like "see @AGENTS.md for details" should NOT count as an
         // import — Claude Code only treats bare `@path` lines as imports.
         let d = TempDir::new("claude-prose");
         let p = d.path().join(CLAUDE_MD);
-        let existing = "# doc\n\nsee @ro-sync.md for details\n";
+        let existing = "# doc\n\nsee @AGENTS.md for details\n";
         fs::write(&p, existing).unwrap();
         assert!(write_claude_md_if_missing_or_merge(d.path()).unwrap());
         let merged = fs::read_to_string(&p).unwrap();
         assert!(merged.starts_with(existing), "user content preserved");
         assert!(
-            merged.lines().any(|l| l.trim() == RO_SYNC_IMPORT_LINE),
+            merged.lines().any(|l| l.trim() == AGENTS_IMPORT_LINE),
             "bare import line should have been appended; got:\n{merged}"
         );
     }
@@ -915,11 +1049,11 @@ mod tests {
         assert!(write_claude_md_if_missing_or_merge(d.path()).unwrap());
         let merged = fs::read_to_string(&p).unwrap();
         assert!(merged.starts_with("# tight"));
-        assert!(merged.lines().any(|l| l.trim() == RO_SYNC_IMPORT_LINE));
+        assert!(merged.lines().any(|l| l.trim() == AGENTS_IMPORT_LINE));
     }
 
     #[test]
-    fn codex_context_inlines_claude_and_ro_sync_docs() {
+    fn codex_context_inlines_ro_sync_docs() {
         let d = TempDir::new("codex-context");
         fs::write(d.path().join(CLAUDE_MD), "# Claude notes\n").unwrap();
         fs::write(d.path().join(RO_SYNC_MD), "# Ro Sync notes\n").unwrap();
@@ -927,13 +1061,8 @@ mod tests {
         assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
         let agents = fs::read_to_string(d.path().join(AGENTS_MD)).unwrap();
         assert!(agents.contains(CODEX_CONTEXT_START));
-        assert!(agents.contains("# Claude notes"));
         assert!(agents.contains("# Ro Sync notes"));
-        assert!(
-            agents.find("## Ro Sync Project Memory").unwrap()
-                < agents.find("## Claude Project Memory").unwrap(),
-            "AGENTS.md must put full Ro Sync memory before Claude import notes; got:\n{agents}"
-        );
+        assert!(!agents.contains("# Claude notes"));
 
         let config = fs::read_to_string(d.path().join(CODEX_DIR).join(CODEX_CONFIG_TOML)).unwrap();
         assert!(config.contains("\"CLAUDE.md\""));
@@ -957,33 +1086,27 @@ mod tests {
         assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
         let merged = fs::read_to_string(&p).unwrap();
         assert!(merged.starts_with("# User Codex notes\n\nKeep this.\n"));
-        assert!(merged.contains("# Claude v1"));
+        assert!(merged.contains("# Ro Sync v1"));
 
-        fs::write(d.path().join(CLAUDE_MD), "# Claude v2\n").unwrap();
+        fs::write(d.path().join(RO_SYNC_MD), "# Ro Sync v2\n").unwrap();
         assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
         let updated = fs::read_to_string(&p).unwrap();
-        assert!(updated.contains("# Claude v2"));
-        assert!(!updated.contains("# Claude v1"));
+        assert!(updated.contains("# Ro Sync v2"));
+        assert!(!updated.contains("# Ro Sync v1"));
         assert_eq!(updated.matches(CODEX_CONTEXT_START).count(), 1);
     }
 
     #[test]
-    fn codex_context_includes_distinct_claude_md_variant() {
-        let d = TempDir::new("codex-claude-case");
-        fs::write(d.path().join(CLAUDE_MD), "# Claude lower\n").unwrap();
-        fs::write(d.path().join("CLAUDE.MD"), "# Claude upper\n").unwrap();
+    fn codex_context_does_not_inline_claude_to_avoid_import_cycles() {
+        let d = TempDir::new("codex-no-claude-cycle");
+        fs::write(d.path().join(CLAUDE_MD), "@AGENTS.md\n").unwrap();
         fs::write(d.path().join(RO_SYNC_MD), "# Ro Sync notes\n").unwrap();
 
         assert!(write_codex_context_if_missing_or_merge(d.path()).unwrap());
         let agents = fs::read_to_string(d.path().join(AGENTS_MD)).unwrap();
-        assert!(agents.contains("### CLAUDE.md"));
-        assert!(agents.contains("# Claude upper"));
-        let same_file = fs::canonicalize(d.path().join(CLAUDE_MD)).ok()
-            == fs::canonicalize(d.path().join("CLAUDE.MD")).ok();
-        if !same_file {
-            assert!(agents.contains("# Claude lower"));
-            assert!(agents.contains("### CLAUDE.MD"));
-        }
+        assert!(!agents.contains("@AGENTS.md"));
+        assert!(!agents.contains("### CLAUDE.md"));
+        assert!(agents.contains("# Ro Sync notes"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use std::collections::HashMap;
+use futures::StreamExt as _;
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -8,9 +10,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 mod conflict;
+mod diff;
 mod fs_map;
 mod http;
+mod img_upload;
 mod initial_sync;
+mod path_resolver;
 mod project_config;
 mod query;
 mod remote;
@@ -46,6 +51,10 @@ pub struct Cli {
     #[arg(long = "game-id")]
     pub game_id: Option<String>,
 
+    /// Roblox GroupId associated with this project.
+    #[arg(long = "group-id")]
+    pub group_id: Option<String>,
+
     /// Roblox PlaceId — may be repeated.
     #[arg(long = "place-id")]
     pub place_id: Vec<String>,
@@ -57,20 +66,29 @@ pub enum Command {
     Serve(ServeArgs),
     /// Match a selector against the plugin-emitted `tree.json` skeleton.
     Query(QueryArgs),
+    /// Translate between Studio instance paths and syncable filesystem paths.
+    Path(PathArgs),
     /// Read an instance (or a single property) from the live Studio session
     /// via the plugin.
     Get(GetArgs),
-    /// Set a property on a Studio instance. Requires `--yes` unless run in
-    /// `--batch` mode.
+    /// Set a property on a Studio instance.
     Set(SetArgs),
     /// List the children of a Studio instance.
     Ls(LsArgs),
     /// Print a subtree rooted at a Studio instance.
     Tree(TreeArgs),
+    /// Export the live Studio tree and inspectable properties to JSON.
+    Snapshot(SnapshotArgs),
+    /// Compare local scripts/folders against the live Studio syncable tree.
+    Diff(DiffArgs),
+    /// Upload an image through Roblox Open Cloud Assets.
+    Img(ImgArgs),
+    /// Bulk upload image files through Roblox Open Cloud Assets.
+    Imgs(ImgsArgs),
     /// Find instances matching a class and/or name.
     Find(FindArgs),
-    /// Execute Luau source inside Studio. Requires `--yes`. Escape hatch for
-    /// anything the structured ops don't cover.
+    /// Execute Luau source inside Studio. Escape hatch for anything the
+    /// structured ops don't cover.
     Eval(EvalArgs),
     /// Read recent Studio output/warn/error messages from the plugin's ring
     /// buffer.
@@ -88,21 +106,21 @@ pub enum Command {
     Ping(PingArgs),
     /// Print the daemon build version and (if reachable) the plugin version.
     Version(VersionArgs),
+    /// Summarize daemon, plugin, project, tree, sourcemap, and write-log status.
+    Status(StatusArgs),
     /// Check local Ro-Sync health: project files, daemon, plugin, linter, and sourcemap.
     Doctor(DoctorArgs),
-    /// Construct a new instance under a parent path. Requires `--yes`.
+    /// Construct a new instance under a parent path.
     New(NewArgs),
-    /// Destroy an instance. Requires `--yes`.
+    /// Destroy an instance.
     Rm(RmArgs),
-    /// Reparent an instance. Requires `--yes`. Cross-service moves require
-    /// `--force`.
+    /// Reparent an instance. Cross-service moves require `--force`.
     Mv(MvArgs),
     /// Attribute ops: `attr set|rm|ls`.
     Attr(AttrArgs),
     /// CollectionService tag ops: `tag add|rm`.
     Tag(TagArgs),
-    /// Invoke a method on an instance (`inst:Method(args...)`). Requires
-    /// `--yes`.
+    /// Invoke a method on an instance (`inst:Method(args...)`).
     Call(CallArgs),
     /// Selection service: `select get|set`.
     Select(SelectArgs),
@@ -155,12 +173,11 @@ pub struct SetArgs {
     /// `{"__type":"Vector3","x":1,"y":2,"z":3}`.
     #[arg(long)]
     pub value: Option<String>,
-    /// Confirm — required for single-op mode since it's a destructive write.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     /// Read a JSON array of `{path,prop,value}` from this file and execute
-    /// each entry sequentially. Batch mode implies user intent; `--yes` is
-    /// not required.
+    /// each entry sequentially.
     #[arg(long)]
     pub batch: Option<PathBuf>,
     /// In batch mode, continue past failures instead of aborting on the
@@ -207,6 +224,153 @@ pub struct TreeArgs {
     pub depth: u32,
     #[arg(long)]
     pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct SnapshotArgs {
+    /// Project directory used for the default output location.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Output file or existing directory. Defaults to
+    /// `<project-or-cwd>/rosync-snapshot-<unix-seconds>.json`.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct DiffArgs {
+    /// Project directory. Defaults to the current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Max recursion depth for the live Studio tree request.
+    #[arg(long, default_value_t = 128)]
+    pub depth: u32,
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ImgArgs {
+    /// Local image file to upload.
+    pub path: PathBuf,
+    /// Project directory to read `groupId` from when `--creator` is omitted.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Creator target as `user:<id>` or `group:<id>`. Can also be provided by
+    /// ROBLOX_CREATOR, project `groupId`, or the active widget project's Group ID.
+    #[arg(long)]
+    pub creator: Option<String>,
+    /// Asset display name. Defaults to the image file stem.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Asset description.
+    #[arg(long, default_value_t = String::new())]
+    pub description: String,
+    /// Roblox asset type to create.
+    #[arg(long = "asset-type", value_enum, default_value_t = ImgAssetType::Image)]
+    pub asset_type: ImgAssetType,
+    /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
+    #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
+    pub auth: ImgAuth,
+    /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
+    #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
+    pub api_key_env: String,
+    /// Return after Roblox accepts the operation instead of polling for the asset id.
+    #[arg(long = "no-wait")]
+    pub no_wait: bool,
+    /// Maximum time to wait for the Roblox operation.
+    #[arg(long = "timeout-seconds", default_value_t = 120)]
+    pub timeout_seconds: u64,
+    /// Poll interval while waiting for the Roblox operation.
+    #[arg(long = "poll-seconds", default_value_t = 2)]
+    pub poll_seconds: u64,
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ImgsArgs {
+    /// Image files or directories to upload.
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// Project directory to read `groupId` from when `--creator` is omitted.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Creator target as `user:<id>` or `group:<id>`. Can also be provided by
+    /// ROBLOX_CREATOR, project `groupId`, or the active widget project's Group ID.
+    #[arg(long)]
+    pub creator: Option<String>,
+    /// Asset description applied to every upload.
+    #[arg(long, default_value_t = String::new())]
+    pub description: String,
+    /// Roblox asset type to create.
+    #[arg(long = "asset-type", value_enum, default_value_t = ImgAssetType::Image)]
+    pub asset_type: ImgAssetType,
+    /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
+    #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
+    pub auth: ImgAuth,
+    /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
+    #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
+    pub api_key_env: String,
+    /// Return after Roblox accepts each operation instead of polling for asset ids.
+    #[arg(long = "no-wait")]
+    pub no_wait: bool,
+    /// Maximum time to wait for each Roblox operation.
+    #[arg(long = "timeout-seconds", default_value_t = 120)]
+    pub timeout_seconds: u64,
+    /// Poll interval while waiting for Roblox operations.
+    #[arg(long = "poll-seconds", default_value_t = 2)]
+    pub poll_seconds: u64,
+    /// Maximum number of simultaneous uploads.
+    #[arg(long, default_value_t = 2)]
+    pub concurrency: usize,
+    /// Do not recurse into directories.
+    #[arg(long = "no-recursive")]
+    pub no_recursive: bool,
+    /// Write a JSON manifest containing every per-file result.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImgAuth {
+    ApiKey,
+    Bearer,
+}
+
+impl ImgAuth {
+    fn as_upload_mode(self) -> img_upload::AuthMode {
+        match self {
+            ImgAuth::ApiKey => img_upload::AuthMode::ApiKey,
+            ImgAuth::Bearer => img_upload::AuthMode::Bearer,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImgAssetType {
+    Image,
+    Decal,
+}
+
+impl ImgAssetType {
+    fn as_cloud_str(self) -> &'static str {
+        match self {
+            ImgAssetType::Image => "Image",
+            ImgAssetType::Decal => "Decal",
+        }
+    }
 }
 
 #[derive(ClapArgs, Debug)]
@@ -274,8 +438,8 @@ pub struct SaveArgs {
     pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
-    /// Required — `save` mutates the place file on disk.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -287,7 +451,7 @@ pub struct UndoArgs {
     pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -299,7 +463,7 @@ pub struct RedoArgs {
     pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -339,6 +503,18 @@ pub struct VersionArgs {
 }
 
 #[derive(ClapArgs, Debug)]
+pub struct StatusArgs {
+    /// Project directory. Defaults to the current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Print JSON instead of human-readable checks.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
 pub struct DoctorArgs {
     /// Project directory. Defaults to the current working directory.
     #[arg(long)]
@@ -352,7 +528,7 @@ pub struct DoctorArgs {
 
 // ---------------------------------------------------------------------------
 // Tier 1 args — construction / destruction / reparent / attrs / tags / call /
-// selection. `--yes` is required on anything that mutates the DataModel.
+// selection.
 // ---------------------------------------------------------------------------
 
 #[derive(ClapArgs, Debug)]
@@ -374,8 +550,8 @@ pub struct NewArgs {
     /// `rosync set --value`.
     #[arg(long)]
     pub props: Option<String>,
-    /// Required — `new` mutates the DataModel.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -390,8 +566,8 @@ pub struct RmArgs {
     /// Instance path to destroy.
     #[arg(long)]
     pub path: String,
-    /// Required — `rm` calls `:Destroy()`.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -412,8 +588,8 @@ pub struct MvArgs {
     /// Allow moves that cross a service boundary (top-level segment change).
     #[arg(long)]
     pub force: bool,
-    /// Required — `mv` mutates the DataModel.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -427,9 +603,9 @@ pub struct AttrArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AttrCommand {
-    /// Set an attribute. Requires `--yes`.
+    /// Set an attribute.
     Set(AttrSetArgs),
-    /// Clear an attribute. Requires `--yes`.
+    /// Clear an attribute.
     Rm(AttrRmArgs),
     /// List attributes on an instance.
     Ls(AttrLsArgs),
@@ -448,7 +624,7 @@ pub struct AttrSetArgs {
     /// Value as a JSON literal. Same codec as `rosync set --value`.
     #[arg(long)]
     pub value: String,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -464,7 +640,7 @@ pub struct AttrRmArgs {
     pub path: String,
     #[arg(long)]
     pub name: String,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -490,9 +666,9 @@ pub struct TagArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum TagCommand {
-    /// Add a CollectionService tag. Requires `--yes`.
+    /// Add a CollectionService tag.
     Add(TagMutArgs),
-    /// Remove a CollectionService tag. Requires `--yes`.
+    /// Remove a CollectionService tag.
     Rm(TagMutArgs),
 }
 
@@ -506,7 +682,7 @@ pub struct TagMutArgs {
     pub path: String,
     #[arg(long)]
     pub tag: String,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -527,8 +703,8 @@ pub struct CallArgs {
     /// JSON array of arguments. Values use the same codec as `--value`.
     #[arg(long)]
     pub args: Option<String>,
-    /// Required — `call` invokes arbitrary methods.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -544,7 +720,7 @@ pub struct SelectArgs {
 pub enum SelectCommand {
     /// Print current Studio Selection, one path per line.
     Get(SelectGetArgs),
-    /// Replace the Studio Selection with the given paths. Requires `--yes`.
+    /// Replace the Studio Selection with the given paths.
     Set(SelectSetArgs),
 }
 
@@ -567,7 +743,7 @@ pub struct SelectSetArgs {
     /// JSON array of instance paths.
     #[arg(long)]
     pub paths: String,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -582,8 +758,8 @@ pub struct EvalArgs {
     /// Luau source to execute. Wrap in `return ...` to get a return value.
     #[arg(long)]
     pub source: String,
-    /// Required — `eval` is an unrestricted escape hatch.
-    #[arg(long)]
+    /// Deprecated no-op kept for old scripts.
+    #[arg(long, hide = true)]
     pub yes: bool,
     #[arg(long)]
     pub raw: bool,
@@ -599,6 +775,9 @@ pub struct ServeArgs {
 
     #[arg(long = "game-id")]
     pub game_id: Option<String>,
+
+    #[arg(long = "group-id")]
+    pub group_id: Option<String>,
 
     #[arg(long = "place-id")]
     pub place_id: Vec<String>,
@@ -616,6 +795,24 @@ pub struct QueryArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = QueryFormat::Json)]
     pub format: QueryFormat,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PathArgs {
+    /// Project directory containing `tree.json`.
+    #[arg(long)]
+    pub project: PathBuf,
+
+    /// Interpret input as `studio`, `fs`, or try `auto`.
+    #[arg(long, value_enum, default_value_t = path_resolver::PathInputKind::Auto)]
+    pub from: path_resolver::PathInputKind,
+
+    /// Studio path (`Workspace/Foo`) or filesystem path (`Workspace/Foo.luau`).
+    pub target: String,
+
+    /// Print JSON instead of the resolved path.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -659,6 +856,7 @@ pub struct AppState {
     pub watch_tx: broadcast::Sender<Op>,
     pub project_name: Arc<RwLock<String>>,
     pub game_id: Arc<RwLock<Option<String>>>,
+    pub group_id: Arc<RwLock<Option<String>>>,
     pub place_ids: Arc<RwLock<Vec<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
@@ -685,11 +883,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Command::Query(args)) => run_query(args),
+        Some(Command::Path(args)) => run_path(args),
         Some(Command::Serve(args)) => run_serve(args).await,
         Some(Command::Get(args)) => run_get(args).await,
         Some(Command::Set(args)) => run_set(args).await,
         Some(Command::Ls(args)) => run_ls(args).await,
         Some(Command::Tree(args)) => run_tree(args).await,
+        Some(Command::Snapshot(args)) => run_snapshot(args).await,
+        Some(Command::Diff(args)) => run_diff(args).await,
+        Some(Command::Img(args)) => run_img(args).await,
+        Some(Command::Imgs(args)) => run_imgs(args).await,
         Some(Command::Find(args)) => run_find(args).await,
         Some(Command::Eval(args)) => run_eval(args).await,
         Some(Command::Logs(args)) => run_logs(args).await,
@@ -699,6 +902,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Waypoint(args)) => run_waypoint(args).await,
         Some(Command::Ping(args)) => run_ping(args).await,
         Some(Command::Version(args)) => run_version(args).await,
+        Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Doctor(args)) => run_doctor(args).await,
         Some(Command::New(args)) => run_new(args).await,
         Some(Command::Rm(args)) => run_rm(args).await,
@@ -722,6 +926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 project,
                 port: cli.port,
                 game_id: cli.game_id,
+                group_id: cli.group_id,
                 place_id: cli.place_id,
             })
             .await
@@ -757,8 +962,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Some(args.place_id.clone())
     };
-    let changed =
-        project_config::apply_overrides(&mut cfg, args.game_id.clone(), place_ids_override);
+    let changed = project_config::apply_overrides(
+        &mut cfg,
+        args.game_id.clone(),
+        args.group_id.clone(),
+        place_ids_override,
+    );
     if changed {
         if let Err(e) = project_config::write(&args.project, &cfg) {
             eprintln!("rosync: failed to write ro-sync.json: {e}");
@@ -782,6 +991,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         watch_tx: watch_tx.clone(),
         project_name: Arc::new(RwLock::new(cfg.name.clone())),
         game_id: Arc::new(RwLock::new(cfg.game_id.clone())),
+        group_id: Arc::new(RwLock::new(cfg.group_id.clone())),
         place_ids: Arc::new(RwLock::new(cfg.place_ids.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
@@ -858,6 +1068,390 @@ fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn run_path(args: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = path_resolver::resolve(&args.project, &args.target, args.from)?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "inputKind": resolved.input_kind.as_str(),
+                "studioPath": resolved.studio_path,
+                "studioPathString": resolved.studio_path_string(),
+                "class": resolved.class,
+                "fsPath": resolved.fs_path,
+                "fsExists": resolved.fs_exists,
+            }))?
+        );
+    } else if resolved.input_kind == path_resolver::PathInputKind::Studio {
+        println!("{}", resolved.fs_path.display());
+    } else {
+        println!("{}", resolved.studio_path_string());
+    }
+    Ok(())
+}
+
+async fn run_img(args: ImgArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.no_wait && args.timeout_seconds == 0 {
+        return Err(
+            "img: --timeout-seconds must be greater than 0 unless --no-wait is used".into(),
+        );
+    }
+    if !args.no_wait && args.poll_seconds == 0 {
+        return Err("img: --poll-seconds must be greater than 0 unless --no-wait is used".into());
+    }
+
+    let creator_text = args
+        .creator
+        .or_else(|| std::env::var("ROBLOX_CREATOR").ok())
+        .or_else(|| resolve_img_creator(&args.project))
+        .ok_or("img: missing creator. Pass --creator user:<id> or group:<id>, set ROBLOX_CREATOR, or set a project Group ID.")?;
+    let creator = img_upload::parse_creator(&creator_text)
+        .map_err(|e| format!("img: invalid creator {creator_text:?}: {e}"))?;
+    let api_key = resolve_img_api_key(&args.api_key_env)?;
+    let display_name = args
+        .name
+        .unwrap_or_else(|| img_upload::default_display_name(&args.path));
+
+    let outcome = img_upload::upload_image(img_upload::ImgUploadRequest {
+        file: args.path,
+        api_key,
+        auth_mode: args.auth.as_upload_mode(),
+        creator,
+        asset_type: args.asset_type.as_cloud_str().to_string(),
+        display_name,
+        description: args.description,
+        wait: !args.no_wait,
+        timeout: Duration::from_secs(args.timeout_seconds),
+        poll: Duration::from_secs(args.poll_seconds),
+    })
+    .await?;
+
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else if args.no_wait && !outcome.done {
+        if let Some(path) = &outcome.operation_path {
+            println!("img: upload started for {} ({path})", outcome.display_name);
+        } else {
+            println!("img: upload started for {}", outcome.display_name);
+        }
+    } else if let Some(uri) = &outcome.asset_uri {
+        println!("img: uploaded {} -> {uri}", outcome.display_name);
+    } else if let Some(path) = &outcome.operation_path {
+        println!(
+            "img: upload completed for {} ({path}); Roblox did not return an asset id",
+            outcome.display_name
+        );
+    } else {
+        println!(
+            "img: upload completed for {}; Roblox did not return an asset id",
+            outcome.display_name
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ImgBulkJob {
+    index: usize,
+    file: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImgBulkResult {
+    index: usize,
+    file: String,
+    display_name: Option<String>,
+    ok: bool,
+    asset_id: Option<String>,
+    asset_uri: Option<String>,
+    operation_path: Option<String>,
+    error: Option<String>,
+}
+
+async fn run_imgs(args: ImgsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.no_wait && args.timeout_seconds == 0 {
+        return Err(
+            "imgs: --timeout-seconds must be greater than 0 unless --no-wait is used".into(),
+        );
+    }
+    if !args.no_wait && args.poll_seconds == 0 {
+        return Err("imgs: --poll-seconds must be greater than 0 unless --no-wait is used".into());
+    }
+    if args.concurrency == 0 {
+        return Err("imgs: --concurrency must be greater than 0".into());
+    }
+
+    let creator_text = args
+        .creator
+        .or_else(|| std::env::var("ROBLOX_CREATOR").ok())
+        .or_else(|| resolve_img_creator(&args.project))
+        .ok_or("imgs: missing creator. Pass --creator user:<id> or group:<id>, set ROBLOX_CREATOR, or set a project Group ID.")?;
+    let creator = img_upload::parse_creator(&creator_text)
+        .map_err(|e| format!("imgs: invalid creator {creator_text:?}: {e}"))?;
+    let api_key = resolve_img_api_key(&args.api_key_env)?;
+
+    let mut failures = Vec::new();
+    let jobs = collect_img_bulk_jobs(&args.inputs, !args.no_recursive, &mut failures)?;
+    if jobs.is_empty() && failures.is_empty() {
+        return Err("imgs: no supported image files found".into());
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+    let mut tasks = futures::stream::FuturesUnordered::new();
+    for job in jobs {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let api_key = api_key.clone();
+        let creator = creator.clone();
+        let description = args.description.clone();
+        let asset_type = args.asset_type.as_cloud_str().to_string();
+        let auth_mode = args.auth.as_upload_mode();
+        let wait = !args.no_wait;
+        let timeout = Duration::from_secs(args.timeout_seconds);
+        let poll = Duration::from_secs(args.poll_seconds);
+        tasks.push(tokio::spawn(async move {
+            let _permit = permit;
+            upload_img_bulk_job(
+                job,
+                api_key,
+                auth_mode,
+                creator,
+                asset_type,
+                description,
+                wait,
+                timeout,
+                poll,
+            )
+            .await
+        }));
+    }
+
+    let mut results = failures;
+    while let Some(result) = tasks.next().await {
+        match result {
+            Ok(result) => results.push(result),
+            Err(e) => results.push(ImgBulkResult {
+                index: usize::MAX,
+                file: String::new(),
+                display_name: None,
+                ok: false,
+                asset_id: None,
+                asset_uri: None,
+                operation_path: None,
+                error: Some(format!("task failed: {e}")),
+            }),
+        }
+    }
+    results.sort_by_key(|result| result.index);
+
+    if let Some(path) = &args.manifest {
+        write_img_manifest(path, &results)?;
+    }
+
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        print_img_bulk_results(&results);
+    }
+
+    let failed = results.iter().filter(|result| !result.ok).count();
+    if failed > 0 {
+        return Err(format!("imgs: {failed} upload(s) failed").into());
+    }
+    Ok(())
+}
+
+async fn upload_img_bulk_job(
+    job: ImgBulkJob,
+    api_key: String,
+    auth_mode: img_upload::AuthMode,
+    creator: img_upload::Creator,
+    asset_type: String,
+    description: String,
+    wait: bool,
+    timeout: Duration,
+    poll: Duration,
+) -> ImgBulkResult {
+    let display_name = img_upload::default_display_name(&job.file);
+    let file = job.file.display().to_string();
+    match img_upload::upload_image(img_upload::ImgUploadRequest {
+        file: job.file,
+        api_key,
+        auth_mode,
+        creator,
+        asset_type,
+        display_name: display_name.clone(),
+        description,
+        wait,
+        timeout,
+        poll,
+    })
+    .await
+    {
+        Ok(outcome) => ImgBulkResult {
+            index: job.index,
+            file,
+            display_name: Some(display_name),
+            ok: true,
+            asset_id: outcome.asset_id,
+            asset_uri: outcome.asset_uri,
+            operation_path: outcome.operation_path,
+            error: None,
+        },
+        Err(e) => ImgBulkResult {
+            index: job.index,
+            file,
+            display_name: Some(display_name),
+            ok: false,
+            asset_id: None,
+            asset_uri: None,
+            operation_path: None,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+fn collect_img_bulk_jobs(
+    inputs: &[PathBuf],
+    recursive: bool,
+    failures: &mut Vec<ImgBulkResult>,
+) -> Result<Vec<ImgBulkJob>, Box<dyn std::error::Error>> {
+    let mut jobs = Vec::new();
+    let mut index = 0;
+    for input in inputs {
+        collect_img_bulk_input(input, recursive, true, &mut index, &mut jobs, failures)?;
+    }
+    jobs.sort_by(|a, b| a.file.cmp(&b.file));
+    for (idx, job) in jobs.iter_mut().enumerate() {
+        job.index = idx;
+    }
+    for (offset, failure) in failures.iter_mut().enumerate() {
+        failure.index = jobs.len() + offset;
+    }
+    Ok(jobs)
+}
+
+fn collect_img_bulk_input(
+    input: &std::path::Path,
+    recursive: bool,
+    explicit: bool,
+    index: &mut usize,
+    jobs: &mut Vec<ImgBulkJob>,
+    failures: &mut Vec<ImgBulkResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if input.is_file() {
+        match img_upload::image_mime_for_path(input) {
+            Ok(_) => {
+                jobs.push(ImgBulkJob {
+                    index: *index,
+                    file: input.to_path_buf(),
+                });
+                *index += 1;
+            }
+            Err(e) if explicit => {
+                failures.push(ImgBulkResult {
+                    index: *index,
+                    file: input.display().to_string(),
+                    display_name: None,
+                    ok: false,
+                    asset_id: None,
+                    asset_uri: None,
+                    operation_path: None,
+                    error: Some(e),
+                });
+                *index += 1;
+            }
+            Err(_) => {}
+        }
+        return Ok(());
+    }
+    if input.is_dir() {
+        let mut entries = std::fs::read_dir(input)
+            .map_err(|e| format!("imgs: read directory {}: {e}", input.display()))?
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                if recursive {
+                    collect_img_bulk_input(&path, recursive, false, index, jobs, failures)?;
+                }
+            } else {
+                collect_img_bulk_input(&path, recursive, false, index, jobs, failures)?;
+            }
+        }
+        return Ok(());
+    }
+    failures.push(ImgBulkResult {
+        index: *index,
+        file: input.display().to_string(),
+        display_name: None,
+        ok: false,
+        asset_id: None,
+        asset_uri: None,
+        operation_path: None,
+        error: Some("path does not exist".to_string()),
+    });
+    *index += 1;
+    Ok(())
+}
+
+fn write_img_manifest(
+    path: &std::path::Path,
+    results: &[ImgBulkResult],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(results)? + "\n")?;
+    Ok(())
+}
+
+fn print_img_bulk_results(results: &[ImgBulkResult]) {
+    for result in results {
+        if result.ok {
+            let uri = result
+                .asset_uri
+                .as_deref()
+                .or(result.operation_path.as_deref())
+                .unwrap_or("uploaded");
+            println!("uploaded  {:40} {}", truncate_middle(&result.file, 40), uri);
+        } else {
+            println!(
+                "failed    {:40} {}",
+                truncate_middle(&result.file, 40),
+                result.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let head_len = (max_chars - 3) / 2;
+    let tail_len = max_chars - 3 - head_len;
+    let head: String = value.chars().take(head_len).collect();
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
 }
 
 fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -951,6 +1545,13 @@ fn unix_nanos() -> u128 {
         .unwrap_or(0)
 }
 
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn extra_args_include_sourcemap(args: &[String]) -> bool {
     args.iter()
         .any(|arg| arg == "--sourcemap" || arg.starts_with("--sourcemap="))
@@ -1004,6 +1605,169 @@ fn find_bundled_luau_definitions() -> Option<PathBuf> {
         .join("roblox")
         .join("globalTypes.d.luau");
     find_in_tool_bases(&rel)
+}
+
+fn resolve_img_api_key(env_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(value) = std::env::var(env_name) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+
+    if let Some(value) = find_widget_secret("robloxCloudApiKey") {
+        return Ok(value);
+    }
+
+    Err(format!(
+        "img: missing Roblox Open Cloud credential. Set {env_name}, or save it in the Ro Sync widget Settings > Secrets."
+    )
+    .into())
+}
+
+fn resolve_img_creator(project: &Option<PathBuf>) -> Option<String> {
+    if let Some(group_id) = project_group_id(project.as_deref()) {
+        return Some(format!("group:{group_id}"));
+    }
+    if let Some(group_id) = active_widget_project_group_id() {
+        return Some(format!("group:{group_id}"));
+    }
+    None
+}
+
+fn project_group_id(project: Option<&std::path::Path>) -> Option<String> {
+    let root = match project {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    project_config::read_from_disk(&root)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.group_id)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn active_widget_project_group_id() -> Option<String> {
+    for state_file in widget_state_file_candidates() {
+        let Ok(text) = std::fs::read_to_string(&state_file) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(group_id) = group_id_from_widget_state(&value) {
+            return Some(group_id);
+        }
+    }
+    None
+}
+
+fn group_id_from_widget_state(value: &serde_json::Value) -> Option<String> {
+    let state = value.get("state").unwrap_or(value);
+    let active_id = state
+        .get("activeProjectId")
+        .and_then(serde_json::Value::as_str)?;
+    let projects = state
+        .get("projects")
+        .and_then(serde_json::Value::as_array)?;
+    projects
+        .iter()
+        .find(|project| {
+            project
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id == active_id)
+        })
+        .and_then(|project| project.get("groupId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn find_widget_secret(key: &str) -> Option<String> {
+    for state_file in widget_state_file_candidates() {
+        let Ok(text) = std::fs::read_to_string(&state_file) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str(&text) else {
+            continue;
+        };
+        if let Some(secret) = secret_from_widget_state(&value, key) {
+            return Some(secret);
+        }
+    }
+    None
+}
+
+fn secret_from_widget_state(value: &serde_json::Value, key: &str) -> Option<String> {
+    for pointer in [
+        format!("/state/secrets/{key}"),
+        format!("/secrets/{key}"),
+        format!("/{key}"),
+    ] {
+        if let Some(secret) = value
+            .pointer(&pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+        {
+            return Some(secret.to_string());
+        }
+    }
+    None
+}
+
+fn widget_state_file_candidates() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        push_ancestors(&mut bases, cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        push_exe_ancestors(&mut bases, &exe);
+        if let Ok(canonical) = std::fs::canonicalize(&exe) {
+            push_exe_ancestors(&mut bases, &canonical);
+        }
+        if let Ok(target) = std::fs::read_link(&exe) {
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                exe.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(target)
+            };
+            push_exe_ancestors(&mut bases, &resolved);
+            if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                push_exe_ancestors(&mut bases, &canonical);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    for base in bases {
+        let candidate = base.join("state.json");
+        if !files.contains(&candidate) {
+            files.push(candidate);
+        }
+    }
+    files
+}
+
+fn push_exe_ancestors(paths: &mut Vec<PathBuf>, exe: &std::path::Path) {
+    if let Some(parent) = exe.parent() {
+        push_ancestors(paths, parent.to_path_buf());
+    }
+}
+
+fn push_ancestors(paths: &mut Vec<PathBuf>, start: PathBuf) {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if !paths.contains(&dir) {
+            paths.push(dir.clone());
+        }
+        cur = dir.parent().map(std::path::Path::to_path_buf);
+    }
 }
 
 fn find_in_tool_bases(rel: &std::path::Path) -> Option<PathBuf> {
@@ -1084,11 +1848,6 @@ async fn run_get(args: GetArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(batch_path) = args.batch.clone() {
         return run_set_batch(args, batch_path).await;
-    }
-    if !args.yes {
-        return Err(
-            "set: --yes is required for single-op writes (or pass --batch <file.json>)".into(),
-        );
     }
     let path = args.path.clone().ok_or("set: --path is required")?;
     let prop = args.prop.clone().ok_or("set: --prop is required")?;
@@ -1242,6 +2001,284 @@ async fn run_tree(args: TreeArgs) -> Result<(), Box<dyn std::error::Error>> {
     ok_or_err(&resp)
 }
 
+async fn run_snapshot(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let timestamp = unix_secs();
+    let output = snapshot_output_path(args.output.as_deref(), args.project.as_deref(), timestamp)?;
+    let tree_resp = remote::request(
+        args.port,
+        "tree",
+        serde_json::json!({ "path": "", "depth": u32::MAX }),
+    )
+    .await
+    .map_err(|e| format!("snapshot: tree request failed: {e}"))?;
+    let tree = response_value_or_err(&tree_resp, "snapshot tree")?;
+
+    let mut paths = Vec::new();
+    collect_snapshot_paths(&tree, "", &mut paths);
+    let mut inspections = BTreeMap::new();
+    for path in &paths {
+        let resp = remote::request(args.port, "get", serde_json::json!({ "path": path }))
+            .await
+            .map_err(|e| format!("snapshot: get {} failed: {e}", snapshot_path_label(path)))?;
+        let value = response_value_or_err(
+            &resp,
+            &format!("snapshot get {}", snapshot_path_label(path)),
+        )?;
+        inspections.insert(path.clone(), value);
+    }
+
+    let root = build_snapshot_node(&tree, "", &inspections);
+    let mut body = serde_json::Map::new();
+    body.insert("schema".into(), serde_json::json!("ro-sync.snapshot.v1"));
+    body.insert("captured_at_unix".into(), serde_json::json!(timestamp));
+    body.insert("source".into(), serde_json::json!({ "port": args.port }));
+    body.insert("root".into(), root);
+    let snapshot = serde_json::Value::Object(body);
+    let text = format!("{}\n", serde_json::to_string_pretty(&snapshot)?);
+    std::fs::write(&output, text)
+        .map_err(|e| format!("snapshot: write {}: {e}", output.display()))?;
+
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "output": output,
+                "nodes": paths.len(),
+            }))?
+        );
+    } else {
+        println!(
+            "snapshot: wrote {} ({} nodes)",
+            output.display(),
+            paths.len()
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_output_path(
+    output: Option<&std::path::Path>,
+    project: Option<&std::path::Path>,
+    timestamp: u64,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let filename = format!("rosync-snapshot-{timestamp}.json");
+    if let Some(path) = output {
+        if path.is_dir() {
+            return Ok(path.join(filename));
+        }
+        return Ok(path.to_path_buf());
+    }
+    let dir = match project {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| format!("snapshot: current directory: {e}"))?,
+    };
+    Ok(dir.join(filename))
+}
+
+fn response_value_or_err(
+    resp: &serde_json::Value,
+    context: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(resp
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
+    }
+    let err = resp
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("request failed");
+    Err(format!("{context}: {err}").into())
+}
+
+fn collect_snapshot_paths(node: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    out.push(path.to_string());
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            let child_path = snapshot_child_path(path, child);
+            collect_snapshot_paths(child, &child_path, out);
+        }
+    }
+}
+
+fn build_snapshot_node(
+    node: &serde_json::Value,
+    path: &str,
+    inspections: &BTreeMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let inspect = inspections.get(path);
+    let class = inspect
+        .and_then(|v| v.get("class"))
+        .or_else(|| node.get("class"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("?"));
+    let name = inspect
+        .and_then(|v| v.get("name"))
+        .or_else(|| node.get("name"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("?"));
+    let resolved_path = inspect
+        .and_then(|v| v.get("path"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(path));
+
+    let mut children: Vec<(&serde_json::Value, String)> = node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|child| {
+                    let child_path = snapshot_child_path(path, child);
+                    (child, child_path)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    children.sort_by(|(a, a_path), (b, b_path)| {
+        let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let a_class = a.get("class").and_then(|v| v.as_str()).unwrap_or("");
+        let b_class = b.get("class").and_then(|v| v.as_str()).unwrap_or("");
+        (a_name, a_class, a_path).cmp(&(b_name, b_class, b_path))
+    });
+    let child_values: Vec<serde_json::Value> = children
+        .iter()
+        .map(|(child, child_path)| build_snapshot_node(child, child_path, inspections))
+        .collect();
+
+    let mut out = serde_json::Map::new();
+    out.insert("class".into(), class);
+    out.insert("name".into(), name);
+    out.insert("path".into(), resolved_path);
+    out.insert(
+        "properties".into(),
+        normalize_snapshot_value(
+            inspect
+                .and_then(|v| v.get("properties"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        ),
+    );
+    out.insert(
+        "attributes".into(),
+        normalize_snapshot_value(
+            inspect
+                .and_then(|v| v.get("attributes"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        ),
+    );
+    out.insert("tags".into(), sorted_snapshot_tags(inspect));
+    out.insert("children".into(), serde_json::Value::Array(child_values));
+    serde_json::Value::Object(out)
+}
+
+fn snapshot_child_path(parent_path: &str, child: &serde_json::Value) -> String {
+    let name = child.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if parent_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_path}/{name}")
+    }
+}
+
+fn normalize_snapshot_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                out.insert(key, normalize_snapshot_value(value));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(normalize_snapshot_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn sorted_snapshot_tags(inspect: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut tags: Vec<String> = inspect
+        .and_then(|v| v.get("tags"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    tags.sort();
+    serde_json::json!(tags)
+}
+
+fn snapshot_path_label(path: &str) -> &str {
+    if path.is_empty() {
+        "<root>"
+    } else {
+        path
+    }
+}
+
+async fn run_diff(args: DiffArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = match args.project {
+        Some(p) => p,
+        None => std::env::current_dir().map_err(|e| format!("diff: current directory: {e}"))?,
+    };
+    if !project.exists() {
+        return Err(format!("diff: project path does not exist: {}", project.display()).into());
+    }
+    if !project.is_dir() {
+        return Err(format!(
+            "diff: project path is not a directory: {}",
+            project.display()
+        )
+        .into());
+    }
+
+    let local_services = snapshot::emit_services(&project)
+        .map_err(|e| format!("diff: scan {}: {e}", project.display()))?;
+    let local = diff::collect_local_nodes(&local_services);
+
+    let tree_resp = remote::request(
+        args.port,
+        "tree",
+        serde_json::json!({ "path": "", "depth": args.depth }),
+    )
+    .await?;
+    let live_tree = response_value_or_err(&tree_resp, "diff tree")?;
+    if diff::has_truncated_tree(&live_tree) {
+        return Err(format!(
+            "diff: live tree was truncated at --depth {}; rerun with a larger --depth",
+            args.depth
+        )
+        .into());
+    }
+
+    let mut studio = diff::collect_studio_tree_nodes(&live_tree);
+    for path in diff::studio_script_paths(&studio) {
+        let resp = remote::request(
+            args.port,
+            "get",
+            serde_json::json!({ "path": path, "prop": "Source" }),
+        )
+        .await?;
+        let source_value = response_value_or_err(&resp, &format!("diff get {path}.Source"))?;
+        let source = source_value.as_str().unwrap_or("").to_string();
+        diff::set_node_source(&mut studio, &path, source);
+    }
+
+    let report = diff::compare(&local, &studio);
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_diff_report(&report);
+    }
+    Ok(())
+}
+
 async fn run_find(args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut req_args = serde_json::Map::new();
     if let Some(c) = &args.class_name {
@@ -1262,9 +2299,6 @@ async fn run_find(args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_eval(args: EvalArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("eval: --yes is required (eval is an unrestricted escape hatch)".into());
-    }
     let req_args = serde_json::json!({ "source": args.source });
     let resp = remote::request(args.port, "eval", req_args).await?;
     print_response(&resp, args.raw, |v| {
@@ -1493,27 +2527,18 @@ extern "C" {
 }
 
 async fn run_save(args: SaveArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("save: --yes is required (writes the place file)".into());
-    }
     let resp = remote::request(args.port, "save", serde_json::json!({})).await?;
     print_response(&resp, args.raw, |_v| println!("ok: save started"));
     ok_or_err(&resp)
 }
 
 async fn run_undo(args: UndoArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("undo: --yes is required (mutates Studio state)".into());
-    }
     let resp = remote::request(args.port, "undo", serde_json::json!({})).await?;
     print_response(&resp, args.raw, |_v| println!("ok: undo"));
     ok_or_err(&resp)
 }
 
 async fn run_redo(args: RedoArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("redo: --yes is required (mutates Studio state)".into());
-    }
     let resp = remote::request(args.port, "redo", serde_json::json!({})).await?;
     print_response(&resp, args.raw, |_v| println!("ok: redo"));
     ok_or_err(&resp)
@@ -1579,7 +2604,7 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
     let daemon = env!("CARGO_PKG_VERSION");
     // Plugin may be offline — treat failures as "no plugin connected" rather
     // than aborting the subcommand.
-    let plugin_info = match remote::request(args.port, "version", serde_json::json!({})).await {
+    let value = match fetch_plugin_version(args.port).await {
         Ok(v) => v,
         Err(e) => {
             if args.raw {
@@ -1594,10 +2619,6 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
             return Ok(());
         }
     };
-    let value = plugin_info
-        .get("value")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
     if args.raw {
         println!(
             "{}",
@@ -1617,6 +2638,23 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
         .unwrap_or("unknown");
     println!("plugin: {pv} (protocol {proto}, Studio {sv})");
     Ok(())
+}
+
+async fn fetch_plugin_version(port: u16) -> Result<serde_json::Value, String> {
+    let resp = remote::request(port, "version", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("plugin request failed");
+        return Err(err.to_string());
+    }
+    Ok(resp
+        .get("value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1640,6 +2678,57 @@ struct DoctorCheck {
     name: &'static str,
     status: DoctorStatus,
     detail: String,
+}
+
+async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = match args.project {
+        Some(p) => p,
+        None => std::env::current_dir().map_err(|e| format!("status: current directory: {e}"))?,
+    };
+    let checks = vec![
+        check_project_path(&project),
+        check_daemon_hello(args.port),
+        check_plugin_version(args.port).await,
+        check_project_config(&project),
+        check_tree_json(&project),
+        check_sourcemap(&project),
+        check_writes_log_path(),
+    ];
+    let ok = !checks.iter().any(|c| c.status == DoctorStatus::Fail);
+
+    if args.raw {
+        let mut body = serde_json::Map::new();
+        body.insert("ok".into(), serde_json::Value::Bool(ok));
+        body.insert(
+            "project".into(),
+            serde_json::json!(project.display().to_string()),
+        );
+        body.insert("port".into(), serde_json::json!(args.port));
+        for check in &checks {
+            body.insert(status_json_key(check.name).into(), status_check_json(check));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(body))?
+        );
+    } else {
+        println!("Ro-Sync status");
+        println!("project: {}", project.display());
+        println!("port: {}", args.port);
+        for check in &checks {
+            println!(
+                "[{:<4}] {:<14} {}",
+                check.status.as_str(),
+                check.name,
+                check.detail
+            );
+        }
+    }
+
+    if !ok {
+        return Err("status: one or more checks failed".into());
+    }
+    Ok(())
 }
 
 async fn run_doctor(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1716,6 +2805,50 @@ fn doctor_check(
     }
 }
 
+fn status_json_key(name: &str) -> &str {
+    match name {
+        "project" => "project_path",
+        "ro-sync.json" => "project_config",
+        "tree.json" => "tree",
+        "writes.log" => "writes_log",
+        other => other,
+    }
+}
+
+fn status_check_json(check: &DoctorCheck) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".into(), serde_json::json!(check.status.as_str()));
+    obj.insert("detail".into(), serde_json::json!(check.detail));
+    match check.name {
+        "daemon" => {
+            obj.insert(
+                "reachable".into(),
+                serde_json::json!(check.status == DoctorStatus::Ok),
+            );
+        }
+        "plugin" => {
+            obj.insert(
+                "connected".into(),
+                serde_json::json!(check.status == DoctorStatus::Ok),
+            );
+        }
+        "ro-sync.json" => {
+            obj.insert(
+                "present".into(),
+                serde_json::json!(check.status == DoctorStatus::Ok),
+            );
+        }
+        "tree.json" | "sourcemap" => {
+            obj.insert("freshness".into(), serde_json::json!(check.detail));
+        }
+        "writes.log" => {
+            obj.insert("location".into(), serde_json::json!(check.detail));
+        }
+        _ => {}
+    }
+    serde_json::Value::Object(obj)
+}
+
 fn check_project_path(project: &std::path::Path) -> DoctorCheck {
     if !project.exists() {
         return doctor_check(
@@ -1747,9 +2880,10 @@ fn check_project_config(project: &std::path::Path) -> DoctorCheck {
             "ro-sync.json",
             DoctorStatus::Ok,
             format!(
-                "name={} gameId={}",
+                "name={} gameId={} groupId={}",
                 cfg.name,
-                cfg.game_id.unwrap_or_else(|| "-".into())
+                cfg.game_id.unwrap_or_else(|| "-".into()),
+                cfg.group_id.unwrap_or_else(|| "-".into())
             ),
         ),
         Ok(None) => doctor_check("ro-sync.json", DoctorStatus::Warn, "missing"),
@@ -1805,7 +2939,7 @@ fn check_sourcemap(project: &std::path::Path) -> DoctorCheck {
 }
 
 fn check_daemon_hello(port: u16) -> DoctorCheck {
-    match http_get_json(port, "/hello") {
+    match fetch_daemon_hello(port) {
         Ok(v) => {
             let version = v.get("version").and_then(|v| v.as_str()).unwrap_or("?");
             let name = v.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1816,16 +2950,8 @@ fn check_daemon_hello(port: u16) -> DoctorCheck {
 }
 
 async fn check_plugin_version(port: u16) -> DoctorCheck {
-    match remote::request(port, "version", serde_json::json!({})).await {
-        Ok(resp) => {
-            if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                let err = resp
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("plugin request failed");
-                return doctor_check("plugin", DoctorStatus::Fail, err);
-            }
-            let value = resp.get("value").unwrap_or(&serde_json::Value::Null);
+    match fetch_plugin_version(port).await {
+        Ok(value) => {
             let plugin = value
                 .get("plugin_version")
                 .and_then(|v| v.as_str())
@@ -1900,6 +3026,10 @@ fn check_writes_log_path() -> DoctorCheck {
     )
 }
 
+fn fetch_daemon_hello(port: u16) -> Result<serde_json::Value, String> {
+    http_get_json(port, "/hello")
+}
+
 fn http_get_json(port: u16, path: &str) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -1940,14 +3070,11 @@ fn format_duration_short(d: Duration) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 1 runners. Every mutating op requires `--yes`; `mv` also requires
-// `--force` to cross service boundaries (enforced plugin-side).
+// Tier 1 runners. `mv` requires `--force` to cross service boundaries
+// (enforced plugin-side).
 // ---------------------------------------------------------------------------
 
 async fn run_new(args: NewArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("new: --yes is required".into());
-    }
     let mut req = serde_json::Map::new();
     req.insert(
         "parent".into(),
@@ -1979,9 +3106,6 @@ async fn run_new(args: NewArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_rm(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("rm: --yes is required (calls :Destroy())".into());
-    }
     let req = serde_json::json!({ "path": args.path });
     let resp = remote::request(args.port, "rm", req).await?;
     let fallback_path = args.path.clone();
@@ -1996,9 +3120,6 @@ async fn run_rm(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_mv(args: MvArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("mv: --yes is required".into());
-    }
     let req = serde_json::json!({
         "from": args.from,
         "to": args.to,
@@ -2022,9 +3143,6 @@ async fn run_attr(args: AttrArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_attr_set(args: AttrSetArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("attr set: --yes is required".into());
-    }
     let value: serde_json::Value = serde_json::from_str(&args.value)
         .map_err(|e| format!("attr set: --value must be a JSON literal ({e})"))?;
     let req = serde_json::json!({
@@ -2042,9 +3160,6 @@ async fn run_attr_set(args: AttrSetArgs) -> Result<(), Box<dyn std::error::Error
 }
 
 async fn run_attr_rm(args: AttrRmArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("attr rm: --yes is required".into());
-    }
     let req = serde_json::json!({ "path": args.path, "name": args.name });
     let resp = remote::request(args.port, "rm_attr", req).await?;
     let path_label = args.path.clone();
@@ -2091,9 +3206,6 @@ async fn run_tag_mut(
     op: &'static str,
     verb: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err(format!("tag {op}: --yes is required").into());
-    }
     let req = serde_json::json!({ "path": args.path, "tag": args.tag });
     let resp = remote::request(args.port, op, req).await?;
     let path_label = args.path.clone();
@@ -2105,9 +3217,6 @@ async fn run_tag_mut(
 }
 
 async fn run_call(args: CallArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("call: --yes is required (invokes arbitrary methods)".into());
-    }
     let call_args: serde_json::Value = match &args.args {
         Some(raw) => serde_json::from_str(raw)
             .map_err(|e| format!("call: --args must be a JSON array ({e})"))?,
@@ -2156,9 +3265,6 @@ async fn run_select_get(args: SelectGetArgs) -> Result<(), Box<dyn std::error::E
 }
 
 async fn run_select_set(args: SelectSetArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.yes {
-        return Err("select set: --yes is required".into());
-    }
     let paths: serde_json::Value = serde_json::from_str(&args.paths)
         .map_err(|e| format!("select set: --paths must be a JSON array ({e})"))?;
     if !paths.is_array() {
@@ -2381,6 +3487,70 @@ fn print_find(value: &serde_json::Value) {
     }
 }
 
+fn print_diff_report(report: &diff::DiffReport) {
+    if report.is_clean() {
+        println!("in sync: local project matches Studio scripts/folders");
+        return;
+    }
+
+    println!(
+        "diff: {} added locally, {} removed locally, {} changed",
+        report.summary.added, report.summary.removed, report.summary.changed
+    );
+    if !report.added.is_empty() {
+        println!("Added locally:");
+        for item in &report.added {
+            print_diff_item("+", &item.class, item.kind, &item.path);
+        }
+    }
+    if !report.removed.is_empty() {
+        println!("Removed locally:");
+        for item in &report.removed {
+            print_diff_item("-", &item.class, item.kind, &item.path);
+        }
+    }
+    if !report.changed.is_empty() {
+        println!("Changed:");
+        for item in &report.changed {
+            let mut reasons = Vec::new();
+            if item.class_changed {
+                reasons.push("class");
+            }
+            if item.source_changed {
+                reasons.push("source");
+            }
+            let reason = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join(", "))
+            };
+            let class = if item.local_class == item.studio_class {
+                item.local_class.clone()
+            } else {
+                format!("{} -> {}", item.studio_class, item.local_class)
+            };
+            println!(
+                "  ~ {:20} {:7} {}{}",
+                class,
+                diff_kind_label(item.kind),
+                item.path,
+                reason
+            );
+        }
+    }
+}
+
+fn print_diff_item(prefix: &str, class: &str, kind: diff::DiffKind, path: &str) {
+    println!("  {prefix} {class:20} {:7} {path}", diff_kind_label(kind));
+}
+
+fn diff_kind_label(kind: diff::DiffKind) -> &'static str {
+    match kind {
+        diff::DiffKind::Folder => "folder",
+        diff::DiffKind::Script => "script",
+    }
+}
+
 /// Bridges the filesystem-watcher's `broadcast::Sender<Op>` into the shared
 /// `broadcast::Sender<String>` that `/events` streams. Each Op is first run
 /// through `ConflictEngine::on_fs_change` so that echoes of our own writes
@@ -2439,9 +3609,9 @@ fn is_push_quiet(
     false
 }
 
-/// Watch `<project>/ro-sync.json` itself. On change, re-parse and if gameId or
-/// placeIds differ from AppState's current snapshot, update state and broadcast
-/// a `{"type":"config-changed","gameId":...,"placeIds":[...]}` event.
+/// Watch `<project>/ro-sync.json` itself. On change, re-parse and if gameId,
+/// groupId, or placeIds differ from AppState's current snapshot, update state
+/// and broadcast a `{"type":"config-changed",...}` event.
 fn spawn_config_hot_reload(state: AppState) {
     // Use a fresh watcher scoped to the config file rather than reusing the
     // project-wide watcher: we want this event even during push-quiet windows.
@@ -2493,23 +3663,28 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
         _ => return None,
     };
     let prev_game_id = state.game_id.read().unwrap().clone();
+    let prev_group_id = state.group_id.read().unwrap().clone();
     let prev_place_ids = state.place_ids.read().unwrap().clone();
     let prev_name = state.project_name.read().unwrap().clone();
 
-    let changed =
-        prev_game_id != cfg.game_id || prev_place_ids != cfg.place_ids || prev_name != cfg.name;
+    let changed = prev_game_id != cfg.game_id
+        || prev_group_id != cfg.group_id
+        || prev_place_ids != cfg.place_ids
+        || prev_name != cfg.name;
     if !changed {
         return Some(());
     }
 
     *state.project_name.write().unwrap() = cfg.name.clone();
     *state.game_id.write().unwrap() = cfg.game_id.clone();
+    *state.group_id.write().unwrap() = cfg.group_id.clone();
     *state.place_ids.write().unwrap() = cfg.place_ids.clone();
 
     let evt = serde_json::json!({
         "type": "config-changed",
         "name": cfg.name,
         "gameId": cfg.game_id,
+        "groupId": cfg.group_id,
         "placeIds": cfg.place_ids,
     });
     if let Ok(s) = serde_json::to_string(&evt) {
@@ -2792,6 +3967,241 @@ mod tier2_tests {
         assert_eq!(LogLevel::Info.as_plugin_str(), "info");
         assert_eq!(LogLevel::Warn.as_plugin_str(), "warn");
         assert_eq!(LogLevel::Error.as_plugin_str(), "error");
+    }
+
+    #[test]
+    fn status_args_parse_raw_project_and_port() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "status",
+            "--project",
+            ".",
+            "--port",
+            "9001",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Status(args)) = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.port, 9001);
+        assert!(args.raw);
+    }
+
+    #[test]
+    fn status_json_uses_stable_keys_and_flags() {
+        assert_eq!(status_json_key("project"), "project_path");
+        assert_eq!(status_json_key("ro-sync.json"), "project_config");
+        assert_eq!(status_json_key("tree.json"), "tree");
+        assert_eq!(status_json_key("writes.log"), "writes_log");
+
+        let plugin = doctor_check("plugin", DoctorStatus::Ok, "v1, Studio test");
+        let value = status_check_json(&plugin);
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["connected"], true);
+
+        let config = doctor_check("ro-sync.json", DoctorStatus::Warn, "missing");
+        let value = status_check_json(&config);
+        assert_eq!(value["present"], false);
+    }
+
+    #[test]
+    fn img_args_parse_project_and_bearer_auth() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "img",
+            "icon.png",
+            "--project",
+            ".",
+            "--auth",
+            "bearer",
+            "--api-key-env",
+            "ROBLOX_OAUTH_TOKEN",
+        ])
+        .unwrap();
+        let Some(Command::Img(args)) = cli.command else {
+            panic!("expected img command");
+        };
+        assert_eq!(args.path, PathBuf::from("icon.png"));
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.auth, ImgAuth::Bearer);
+        assert_eq!(args.api_key_env, "ROBLOX_OAUTH_TOKEN");
+    }
+
+    #[test]
+    fn imgs_args_parse_manifest_and_concurrency() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "imgs",
+            "icons",
+            "banner.png",
+            "--project",
+            ".",
+            "--manifest",
+            "uploaded-assets.json",
+            "--concurrency",
+            "4",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Imgs(args)) = cli.command else {
+            panic!("expected imgs command");
+        };
+        assert_eq!(
+            args.inputs,
+            vec![PathBuf::from("icons"), PathBuf::from("banner.png")]
+        );
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(
+            args.manifest.unwrap(),
+            PathBuf::from("uploaded-assets.json")
+        );
+        assert_eq!(args.concurrency, 4);
+        assert!(args.raw);
+    }
+
+    #[test]
+    fn collect_img_bulk_jobs_recurses_and_skips_directory_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"not a real png").unwrap();
+        std::fs::write(dir.path().join("note.txt"), b"skip me").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested").join("b.jpg"), b"not a real jpg").unwrap();
+
+        let mut failures = Vec::new();
+        let jobs = collect_img_bulk_jobs(&[dir.path().to_path_buf()], true, &mut failures).unwrap();
+        let names: Vec<String> = jobs
+            .iter()
+            .filter_map(|job| {
+                job.file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(names, vec!["a.png".to_string(), "b.jpg".to_string()]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn collect_img_bulk_jobs_reports_explicit_unsupported_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gif = dir.path().join("bad.gif");
+        std::fs::write(&gif, b"gif").unwrap();
+        let mut failures = Vec::new();
+        let jobs = collect_img_bulk_jobs(&[gif], true, &mut failures).unwrap();
+        assert!(jobs.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unsupported image type"));
+    }
+
+    #[test]
+    fn active_widget_project_group_id_uses_active_project() {
+        let value = serde_json::json!({
+            "state": {
+                "activeProjectId": "p2",
+                "projects": [
+                    { "id": "p1", "groupId": "111" },
+                    { "id": "p2", "groupId": "222" }
+                ]
+            }
+        });
+        assert_eq!(group_id_from_widget_state(&value).as_deref(), Some("222"));
+    }
+
+    #[test]
+    fn snapshot_args_parse_output_project_and_port() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "snapshot",
+            "--project",
+            ".",
+            "--port",
+            "9002",
+            "--output",
+            "snapshots/live.json",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Snapshot(args)) = cli.command else {
+            panic!("expected snapshot command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.port, 9002);
+        assert_eq!(args.output.unwrap(), PathBuf::from("snapshots/live.json"));
+        assert!(args.raw);
+    }
+
+    #[test]
+    fn snapshot_output_path_defaults_to_project_timestamp() {
+        let out = snapshot_output_path(None, Some(std::path::Path::new("/tmp/project")), 123)
+            .expect("path");
+        assert_eq!(out, PathBuf::from("/tmp/project/rosync-snapshot-123.json"));
+    }
+
+    #[test]
+    fn snapshot_output_path_accepts_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = snapshot_output_path(Some(dir.path()), None, 456).expect("path");
+        assert_eq!(out, dir.path().join("rosync-snapshot-456.json"));
+    }
+
+    #[test]
+    fn snapshot_node_merges_inspections_and_sorts_children_and_tags() {
+        let tree = serde_json::json!({
+            "class": "DataModel",
+            "name": "Game",
+            "children": [
+                { "class": "Folder", "name": "Zed", "children": [] },
+                { "class": "Part", "name": "Alpha", "children": [] }
+            ]
+        });
+        let mut inspections = BTreeMap::new();
+        inspections.insert(
+            "".into(),
+            serde_json::json!({
+                "class": "DataModel",
+                "name": "Game",
+                "path": "",
+                "properties": {},
+                "attributes": {},
+                "tags": []
+            }),
+        );
+        inspections.insert(
+            "Alpha".into(),
+            serde_json::json!({
+                "class": "Part",
+                "name": "Alpha",
+                "path": "Alpha",
+                "properties": { "Size": { "z": 1, "x": 2, "y": 3 } },
+                "attributes": { "Health": 100 },
+                "tags": ["Enemy", "A"]
+            }),
+        );
+        inspections.insert(
+            "Zed".into(),
+            serde_json::json!({
+                "class": "Folder",
+                "name": "Zed",
+                "path": "Zed",
+                "properties": {},
+                "attributes": {},
+                "tags": []
+            }),
+        );
+
+        let node = build_snapshot_node(&tree, "", &inspections);
+        let children = node["children"].as_array().unwrap();
+        assert_eq!(children[0]["name"], "Alpha");
+        assert_eq!(children[0]["tags"], serde_json::json!(["A", "Enemy"]));
+        assert_eq!(children[0]["properties"]["Size"]["x"], 2);
+        assert_eq!(children[1]["name"], "Zed");
     }
 
     // ---- Tier 3: set Parent guardrail -----------------------------------

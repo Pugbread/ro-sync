@@ -23,6 +23,7 @@ use tokio_stream::StreamExt;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
+use crate::diff;
 use crate::fs_map::{
     classify_script_file, encode_name, instance_to_path, normalize_line_endings,
     parse_disambiguated, parse_init_file, path_to_instance_meta, InstanceDescriptor, PathInstance,
@@ -176,6 +177,8 @@ struct Hello {
     project: String,
     #[serde(rename = "gameId")]
     game_id: Option<String>,
+    #[serde(rename = "groupId")]
+    group_id: Option<String>,
     #[serde(rename = "placeIds")]
     place_ids: Vec<String>,
 }
@@ -186,6 +189,7 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         version: env!("CARGO_PKG_VERSION"),
         project: state.project.display().to_string(),
         game_id: state.game_id.read().unwrap().clone(),
+        group_id: state.group_id.read().unwrap().clone(),
         place_ids: state.place_ids.read().unwrap().clone(),
     })
 }
@@ -198,6 +202,8 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
 struct InitialCompareBody {
     #[serde(rename = "studioStats")]
     studio_stats: Stats,
+    #[serde(rename = "studioSnapshot", default)]
+    studio_snapshot: Vec<Value>,
 }
 
 async fn initial_compare(
@@ -235,21 +241,37 @@ async fn initial_compare(
         }));
     }
 
-    // Already-synced fast-path: when disk and Studio agree on both counts
-    // (script files + instances), skip the modal and go straight to hooks +
-    // WS. This is the common case for a reconnect after the first sync — the
-    // previous behavior prompted every single time, which was noisy.
-    // A small tolerance absorbs minor drift from transient objects the
-    // plugin now suppresses (Camera, Terrain, PackageLink, PlayerScripts).
-    let d = disk_stats;
-    let s = body.studio_stats;
-    let script_drift = (d.script_count as i64 - s.script_count as i64).abs();
-    let instance_drift = (d.instance_count as i64 - s.instance_count as i64).abs();
-    if script_drift == 0 && instance_drift <= 2 {
-        return Json(json!({
-            "action": "in-sync",
-            "diskStats": disk_stats,
-        }));
+    if !body.studio_snapshot.is_empty() {
+        match initial_snapshots_match(state.canonical_project.as_path(), &body.studio_snapshot) {
+            Ok(true) => {
+                return Json(json!({
+                    "action": "in-sync",
+                    "diskStats": disk_stats,
+                }));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": format!("snapshot compare: {e}"),
+                }));
+            }
+        }
+    } else {
+        // Legacy plugin fallback: use counts only when they agree. Counts are
+        // not strong enough to prove a conflict because scripts-with-children
+        // and pass-through containers can make disk/Studio totals differ even
+        // when the actual mirrored data is identical.
+        let d = disk_stats;
+        let s = body.studio_stats;
+        let script_drift = (d.script_count as i64 - s.script_count as i64).abs();
+        let instance_drift = (d.instance_count as i64 - s.instance_count as i64).abs();
+        if script_drift == 0 && instance_drift <= 2 {
+            return Json(json!({
+                "action": "in-sync",
+                "diskStats": disk_stats,
+            }));
+        }
     }
 
     // Both non-empty → park a pending decision and tell the plugin to drive the UI.
@@ -292,6 +314,14 @@ async fn initial_compare(
         "choiceId": choice_id,
         "diskStats": disk_stats,
     }))
+}
+
+fn initial_snapshots_match(root: &Path, studio_services: &[Value]) -> Result<bool, String> {
+    let local_services =
+        snapshot::emit_services(root).map_err(|e| format!("scan {}: {e}", root.display()))?;
+    let local = diff::collect_local_nodes(&local_services);
+    let studio = diff::collect_local_nodes(studio_services);
+    Ok(diff::compare(&local, &studio).is_clean())
 }
 
 // Parked oneshot receivers keyed by choice_id. Using a module-scope static so
@@ -1517,6 +1547,61 @@ mod tests {
             is_blacklisted(&tmp) || is_root_reserved(&tmp, root),
             ".tree.json.tmp should be filtered out of watcher ops"
         );
+    }
+
+    #[test]
+    fn initial_snapshot_compare_accepts_matching_script_with_children() {
+        let d = TempDir::new("initial-match");
+        let sss = d.path().join("ServerScriptService");
+        let controller = sss.join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        std::fs::write(
+            controller.join("init (Controller).server.luau"),
+            "print('root')\n",
+        )
+        .unwrap();
+        std::fs::write(controller.join("Child.luau"), "return {}\n").unwrap();
+
+        let studio = vec![json!({
+            "class": "ServerScriptService",
+            "name": "ServerScriptService",
+            "properties": {},
+            "children": [{
+                "class": "Script",
+                "name": "Controller",
+                "properties": { "Source": "print('root')\r\n" },
+                "children": [{
+                    "class": "ModuleScript",
+                    "name": "Child",
+                    "properties": { "Source": "return {}\r\n" },
+                    "children": []
+                }]
+            }]
+        })];
+
+        assert!(initial_snapshots_match(d.path(), &studio).unwrap());
+    }
+
+    #[test]
+    fn initial_snapshot_compare_detects_real_source_change() {
+        let d = TempDir::new("initial-diff");
+        let sss = d.path().join("ServerScriptService");
+        std::fs::create_dir_all(&sss).unwrap();
+        std::fs::write(sss.join("Main.server.luau"), "print('disk')\n").unwrap();
+
+        let studio = vec![json!({
+            "class": "ServerScriptService",
+            "name": "ServerScriptService",
+            "properties": {},
+            "children": [{
+                "class": "Script",
+                "name": "Main",
+                "properties": { "Source": "print('studio')\n" },
+                "children": []
+            }]
+        })];
+
+        assert!(!initial_snapshots_match(d.path(), &studio).unwrap());
     }
 
     // `writelog` reads a test-only home override at call-time, so pointing it

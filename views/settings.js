@@ -16,6 +16,7 @@ const RUSTUP_URL   = "https://rustup.rs";
 const DEFAULT_PORT = 7878;
 const PLUGIN_REL = "plugin/Plugin.rbxm";
 const PLUGIN_SOURCE_REL = "plugin/Plugin.luau";
+const SECRETS_STATE_KEY = "secrets";
 
 // Write arbitrary text to a path via base64 round-trip. Avoids quoting
 // headaches for JSON payloads containing newlines/quotes/unicode.
@@ -29,6 +30,20 @@ async function readFileViaExec(api, absPath) {
   return (res && typeof res.stdout === "string") ? res.stdout : "";
 }
 
+async function loadSecrets(api) {
+  try {
+    const res = await api.t64("t64:get-state", { key: SECRETS_STATE_KEY });
+    const value = res && typeof res === "object" ? res.value : null;
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+async function saveSecrets(api, secrets) {
+  await api.t64("t64:set-state", { key: SECRETS_STATE_KEY, value: secrets });
+}
+
 function joinProjectFile(projectPath, fileName) {
   const sep = IS_WINDOWS ? "\\" : "/";
   return String(projectPath || "").replace(/[\\/]+$/, "") + sep + fileName;
@@ -36,6 +51,24 @@ function joinProjectFile(projectPath, fileName) {
 
 export function mountSettings(root, api) {
   root.innerHTML = `
+    <section class="section">
+      <h3>Secrets</h3>
+      <p style="color:var(--muted)">Stored in Terminal 64 widget state, not in <code>ro-sync.json</code>. Use this for upload/API credentials.</p>
+      <div class="secret-grid">
+        <label>Roblox OAuth / Open Cloud key
+          <div class="secret-input-row">
+            <input id="secret-roblox-key" type="password" placeholder="Paste key or token" spellcheck="false" autocomplete="off" />
+            <button id="secret-toggle" type="button">Show</button>
+          </div>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="secret-save" class="primary">Save secrets</button>
+        <button id="secret-clear" class="danger">Clear Roblox key</button>
+      </div>
+      <p id="secret-msg" style="color:var(--muted); margin-top:8px"></p>
+    </section>
+
     <section class="section" id="sec-project" hidden>
       <h3>Project: <span id="pp-name">—</span></h3>
       <p style="color:var(--muted)">Stored in <code>ro-sync.json</code> at the project root. The daemon hot-reloads the file.</p>
@@ -135,6 +168,12 @@ export function mountSettings(root, api) {
   const $start = root.querySelector("#set-start");
   const $stop = root.querySelector("#set-stop");
   const $restart = root.querySelector("#set-restart");
+
+  const $secretRobloxKey = root.querySelector("#secret-roblox-key");
+  const $secretToggle = root.querySelector("#secret-toggle");
+  const $secretSave = root.querySelector("#secret-save");
+  const $secretClear = root.querySelector("#secret-clear");
+  const $secretMsg = root.querySelector("#secret-msg");
 
   const $buildSection = root.querySelector("#sec-build");
   const $buildStatus  = root.querySelector("#build-status");
@@ -242,6 +281,47 @@ export function mountSettings(root, api) {
   }
 
   $buildRun.addEventListener("click", runBuild);
+
+  let secrets = {};
+
+  async function hydrateSecrets() {
+    secrets = await loadSecrets(api);
+    $secretRobloxKey.value = secrets.robloxCloudApiKey || "";
+    $secretMsg.textContent = secrets.robloxCloudApiKey ? "Roblox key saved." : "No Roblox key saved.";
+  }
+
+  async function persistSecrets() {
+    $secretSave.disabled = true;
+    try {
+      const value = $secretRobloxKey.value.trim();
+      secrets = {
+        ...secrets,
+        robloxCloudApiKey: value,
+        robloxCloudApiKeyUpdatedAt: value ? Date.now() : null,
+      };
+      await saveSecrets(api, secrets);
+      $secretMsg.textContent = value ? "Roblox key saved." : "Roblox key cleared.";
+      api.toast(value ? "Secrets saved" : "Secret cleared");
+    } catch (e) {
+      $secretMsg.textContent = `Save failed: ${e.message}`;
+      api.toast(`Secrets save failed: ${e.message}`);
+    } finally {
+      $secretSave.disabled = false;
+    }
+  }
+
+  async function clearRobloxKey() {
+    $secretRobloxKey.value = "";
+    await persistSecrets();
+  }
+
+  $secretToggle.addEventListener("click", () => {
+    const showing = $secretRobloxKey.type === "text";
+    $secretRobloxKey.type = showing ? "password" : "text";
+    $secretToggle.textContent = showing ? "Show" : "Hide";
+  });
+  $secretSave.addEventListener("click", persistSecrets);
+  $secretClear.addEventListener("click", clearRobloxKey);
 
   function activeProject() {
     const s = api.getState();
@@ -411,6 +491,7 @@ export function mountSettings(root, api) {
 
   refresh();
   refreshBuildBanner();
+  hydrateSecrets();
 
   return () => { offState(); offUp(); offDown(); };
 }

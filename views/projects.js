@@ -11,6 +11,7 @@ export function mountProjects(root, api) {
     </div>
     <div class="projects-header projects-header-2">
       <input id="proj-game-id" type="text" placeholder="Game ID (optional, e.g. 1234567890)" spellcheck="false" inputmode="numeric" />
+      <input id="proj-group-id" type="text" placeholder="Group ID (optional, for uploads)" spellcheck="false" inputmode="numeric" />
       <input id="proj-place-ids" type="text" placeholder="Place IDs (optional, comma-separated)" spellcheck="false" />
     </div>
     <ul id="proj-list" class="project-list"></ul>
@@ -21,6 +22,7 @@ export function mountProjects(root, api) {
   const $pick = root.querySelector("#proj-pick");
   const $add = root.querySelector("#proj-add");
   const $gameId = root.querySelector("#proj-game-id");
+  const $groupId = root.querySelector("#proj-group-id");
   const $placeIds = root.querySelector("#proj-place-ids");
   const $list = root.querySelector("#proj-list");
   const $empty = root.querySelector("#proj-empty");
@@ -64,7 +66,7 @@ export function mountProjects(root, api) {
             <input type="checkbox" data-act="serve" ${isServing ? "checked" : ""} aria-label="Serve this project" />
             <span class="switch-track"><span class="switch-thumb"></span></span>
           </label>
-          <button data-act="edit" title="Edit GameId / PlaceIds" aria-label="Edit">${pencilSVG()}</button>
+          <button data-act="edit" title="Edit Game ID / Group ID / Place IDs" aria-label="Edit">${pencilSVG()}</button>
         </div>
       `;
       li.querySelector(".name").textContent = p.name || basename(p.path);
@@ -72,6 +74,7 @@ export function mountProjects(root, api) {
       const $ids = li.querySelector(".roblox-ids");
       const idBits = [];
       if (p.gameId) idBits.push(`game: ${p.gameId}`);
+      if (p.groupId) idBits.push(`group: ${p.groupId}`);
       if (placeIdsStr) idBits.push(`places: ${placeIdsStr}`);
       if (idBits.length) {
         $ids.textContent = idBits.join("  ·  ");
@@ -108,6 +111,9 @@ export function mountProjects(root, api) {
       <label>Game ID
         <input type="text" data-field="gameId" spellcheck="false" inputmode="numeric" />
       </label>
+      <label>Group ID
+        <input type="text" data-field="groupId" spellcheck="false" inputmode="numeric" />
+      </label>
       <label>Place IDs (comma-separated)
         <input type="text" data-field="placeIds" spellcheck="false" />
       </label>
@@ -119,12 +125,14 @@ export function mountProjects(root, api) {
       </div>
     `;
     const $g = form.querySelector('[data-field="gameId"]');
+    const $group = form.querySelector('[data-field="groupId"]');
     const $pl = form.querySelector('[data-field="placeIds"]');
     $g.value = p.gameId || "";
+    $group.value = p.groupId || "";
     $pl.value = Array.isArray(p.placeIds) ? p.placeIds.join(", ") : "";
     form.addEventListener("click", (e) => e.stopPropagation());
     form.querySelector('[data-act="save"]').addEventListener("click", () => {
-      saveEdit(p.id, $g.value.trim(), parsePlaceIds($pl.value));
+      saveEdit(p.id, $g.value.trim(), $group.value.trim(), parsePlaceIds($pl.value));
     });
     form.querySelector('[data-act="cancel"]').addEventListener("click", () => {
       editingId = null;
@@ -159,17 +167,22 @@ export function mountProjects(root, api) {
     render();
   }
 
-  async function saveEdit(id, gameId, placeIds) {
+  async function saveEdit(id, gameId, groupId, placeIds) {
     const s = api.getState();
     const prev = (s.projects || []).find((p) => p.id === id);
     const prevGameId = (prev && prev.gameId) || null;
+    const prevGroupId = (prev && prev.groupId) || null;
     const prevPlaceIds = (prev && Array.isArray(prev.placeIds)) ? prev.placeIds.join(",") : "";
     const nextGameId = gameId || null;
+    const nextGroupId = groupId || null;
     const nextPlaceIdsStr = placeIds.join(",");
-    const changedLaunchArgs = (prevGameId !== nextGameId) || (prevPlaceIds !== nextPlaceIdsStr);
+    const changedLaunchArgs =
+      (prevGameId !== nextGameId) ||
+      (prevGroupId !== nextGroupId) ||
+      (prevPlaceIds !== nextPlaceIdsStr);
 
     const next = (s.projects || []).map((p) =>
-      p.id === id ? { ...p, gameId: nextGameId, placeIds } : p
+      p.id === id ? { ...p, gameId: nextGameId, groupId: nextGroupId, placeIds } : p
     );
     api.setState({ projects: next });
     editingId = null;
@@ -178,7 +191,7 @@ export function mountProjects(root, api) {
     if (id === s.activeProjectId && changedLaunchArgs) {
       // Daemon was launched with the old --game-id / --place-id CLI args.
       // Kill it so the state observer's ensureDaemon() relaunches with the
-      // new args; otherwise the plugin keeps seeing the stale gameId and
+      // new args; otherwise the plugin keeps seeing stale Roblox ids and
       // reports "wrong game".
       if (typeof api.killDaemon === "function") {
         try { await api.killDaemon(); } catch (e) { console.warn("killDaemon", e); }
@@ -206,6 +219,7 @@ export function mountProjects(root, api) {
       path,
       addedAt: Date.now(),
       gameId: $gameId.value.trim() || null,
+      groupId: $groupId.value.trim() || null,
       placeIds: parsePlaceIds($placeIds.value),
     };
     const next = [...(s.projects || []), proj];
@@ -213,6 +227,7 @@ export function mountProjects(root, api) {
     api.setState({ projects: next });
     $path.value = "";
     $gameId.value = "";
+    $groupId.value = "";
     $placeIds.value = "";
     render();
     refreshStatuses();
@@ -313,6 +328,7 @@ export function mountProjects(root, api) {
   $pick.addEventListener("click", pickFolder);
   $path.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
   $gameId.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+  $groupId.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
   $placeIds.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
 
   const offState = api.onBus("state", render);

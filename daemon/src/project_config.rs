@@ -15,6 +15,8 @@ pub struct ProjectConfig {
     pub name: String,
     #[serde(rename = "gameId")]
     pub game_id: Option<String>,
+    #[serde(rename = "groupId")]
+    pub group_id: Option<String>,
     #[serde(rename = "placeIds", default)]
     pub place_ids: Vec<String>,
     #[serde(default = "default_version")]
@@ -35,6 +37,7 @@ impl ProjectConfig {
         ProjectConfig {
             name,
             game_id: None,
+            group_id: None,
             place_ids: Vec::new(),
             version: CONFIG_VERSION,
         }
@@ -83,12 +86,19 @@ pub fn read_from_disk(root: &Path) -> io::Result<Option<ProjectConfig>> {
 pub fn apply_overrides(
     cfg: &mut ProjectConfig,
     game_id: Option<String>,
+    group_id: Option<String>,
     place_ids: Option<Vec<String>>,
 ) -> bool {
     let mut changed = false;
     if let Some(gid) = game_id {
         if cfg.game_id.as_deref() != Some(gid.as_str()) {
             cfg.game_id = Some(gid);
+            changed = true;
+        }
+    }
+    if let Some(gid) = group_id {
+        if cfg.group_id.as_deref() != Some(gid.as_str()) {
+            cfg.group_id = Some(gid);
             changed = true;
         }
     }
@@ -146,12 +156,12 @@ mod tests {
     #[test]
     fn reads_existing_without_overwriting() {
         let d = TempDir::new("read");
-        let text =
-            r#"{"name":"MyProj","gameId":"1234567890","placeIds":["111","222"],"version":1}"#;
+        let text = r#"{"name":"MyProj","gameId":"1234567890","groupId":"333","placeIds":["111","222"],"version":1}"#;
         fs::write(d.path().join(CONFIG_FILE), text).unwrap();
         let cfg = load_or_create(d.path()).unwrap();
         assert_eq!(cfg.name, "MyProj");
         assert_eq!(cfg.game_id.as_deref(), Some("1234567890"));
+        assert_eq!(cfg.group_id.as_deref(), Some("333"));
         assert_eq!(cfg.place_ids, vec!["111".to_string(), "222".to_string()]);
     }
 
@@ -161,14 +171,17 @@ mod tests {
         assert!(apply_overrides(
             &mut cfg,
             Some("42".into()),
+            Some("7".into()),
             Some(vec!["9".into()])
         ));
         assert_eq!(cfg.game_id.as_deref(), Some("42"));
+        assert_eq!(cfg.group_id.as_deref(), Some("7"));
         assert_eq!(cfg.place_ids, vec!["9".to_string()]);
         // second call with same values -> no change
         assert!(!apply_overrides(
             &mut cfg,
             Some("42".into()),
+            Some("7".into()),
             Some(vec!["9".into()])
         ));
     }

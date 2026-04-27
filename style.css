@@ -195,7 +195,7 @@ button.primary:hover { background: #8df; border-color: #8df; }
 button.danger { color: var(--danger); border-color: var(--danger); }
 button.danger:hover { background: rgba(255, 102, 102, 0.1); }
 
-input[type="text"], input[type="search"] {
+input[type="text"], input[type="search"], input[type="password"] {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -567,6 +567,26 @@ input:focus {
   gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+}
+
+.secret-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+.secret-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.secret-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
 }
 
 .toast {

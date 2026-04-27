@@ -13,6 +13,7 @@ case "$uname_s" in
   Linux)   out="rosync-linux-${uname_m/aarch64/arm64}";;
   *)       out="rosync-${uname_s}-${uname_m}";;
 esac
+rm -f "$out"
 cp target/release/rosync "$out"
 chmod +x "$out"
 echo "built: $(pwd)/$out"
