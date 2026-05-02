@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const ASSETS_BASE_URL: &str = "https://apis.roblox.com/assets/v1";
-const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_ASSET_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Creator {
@@ -23,7 +23,7 @@ impl Creator {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ImgUploadOutcome {
+pub struct AssetUploadOutcome {
     pub display_name: String,
     pub asset_type: String,
     pub operation_path: Option<String>,
@@ -35,12 +35,13 @@ pub struct ImgUploadOutcome {
     pub final_operation: Option<Value>,
 }
 
-pub struct ImgUploadRequest {
+pub struct AssetUploadRequest {
     pub file: PathBuf,
     pub api_key: String,
     pub auth_mode: AuthMode,
     pub creator: Creator,
     pub asset_type: String,
+    pub content_type: String,
     pub display_name: String,
     pub description: String,
     pub wait: bool,
@@ -75,23 +76,8 @@ pub fn default_display_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .unwrap_or("Ro Sync Image")
+        .unwrap_or("Ro Sync Asset")
         .to_string()
-}
-
-pub fn image_mime_for_path(path: &Path) -> Result<&'static str, String> {
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Ok("image/png"),
-        "jpg" | "jpeg" => Ok("image/jpeg"),
-        "bmp" => Ok("image/bmp"),
-        "tga" => Ok("image/tga"),
-        _ => Err("unsupported image type; expected .png, .jpg, .jpeg, .bmp, or .tga".to_string()),
-    }
 }
 
 pub fn operation_url(operation_path: &str) -> String {
@@ -123,20 +109,18 @@ pub fn extract_asset_id(value: &Value) -> Option<String> {
     None
 }
 
-pub async fn upload_image(
-    request: ImgUploadRequest,
-) -> Result<ImgUploadOutcome, Box<dyn std::error::Error>> {
+pub async fn upload_asset(
+    request: AssetUploadRequest,
+) -> Result<AssetUploadOutcome, Box<dyn std::error::Error>> {
     validate_file(&request.file)?;
-    let mime = image_mime_for_path(&request.file)
-        .map_err(|e| format!("img: {}: {e}", request.file.display()))?;
     let bytes = tokio::fs::read(&request.file)
         .await
-        .map_err(|e| format!("img: read {}: {e}", request.file.display()))?;
+        .map_err(|e| format!("upload: read {}: {e}", request.file.display()))?;
     let file_name = request
         .file
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("image")
+        .unwrap_or("asset")
         .to_string();
 
     let request_json = serde_json::json!({
@@ -159,7 +143,7 @@ pub async fn upload_image(
             "fileContent",
             reqwest::multipart::Part::bytes(bytes)
                 .file_name(file_name)
-                .mime_str(mime)?,
+                .mime_str(&request.content_type)?,
         );
 
     let client = reqwest::Client::new();
@@ -176,12 +160,12 @@ pub async fn upload_image(
     )
     .await?;
     if let Some(error) = operation_error(&initial_operation) {
-        return Err(format!("img: Roblox asset operation failed: {error}").into());
+        return Err(format!("upload: Roblox asset operation failed: {error}").into());
     }
 
     let operation_path = operation_path_from(&initial_operation);
     if !request.wait {
-        return Ok(ImgUploadOutcome {
+        return Ok(AssetUploadOutcome {
             display_name: request.display_name,
             asset_type: request.asset_type,
             operation_path,
@@ -195,7 +179,7 @@ pub async fn upload_image(
 
     let Some(operation_path) = operation_path else {
         let asset_id = extract_asset_id(&initial_operation);
-        return Ok(ImgUploadOutcome {
+        return Ok(AssetUploadOutcome {
             display_name: request.display_name,
             asset_type: request.asset_type,
             operation_path: None,
@@ -211,7 +195,7 @@ pub async fn upload_image(
     loop {
         if started.elapsed() > request.timeout {
             return Err(format!(
-                "img: timed out waiting for Roblox asset operation {operation_path}"
+                "upload: timed out waiting for Roblox asset operation {operation_path}"
             )
             .into());
         }
@@ -231,12 +215,12 @@ pub async fn upload_image(
         if initial_operation_done(&current) {
             if let Some(error) = operation_error(&current) {
                 return Err(format!(
-                    "img: Roblox asset operation {operation_path} failed: {error}"
+                    "upload: Roblox asset operation {operation_path} failed: {error}"
                 )
                 .into());
             }
             let asset_id = extract_asset_id(&current);
-            return Ok(ImgUploadOutcome {
+            return Ok(AssetUploadOutcome {
                 display_name: request.display_name,
                 asset_type: request.asset_type,
                 operation_path: Some(operation_path),
@@ -251,16 +235,20 @@ pub async fn upload_image(
 }
 
 fn validate_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("img: image path is not readable: {}: {e}", path.display()))?;
+    let meta = std::fs::metadata(path).map_err(|e| {
+        format!(
+            "upload: asset path is not readable: {}: {e}",
+            path.display()
+        )
+    })?;
     if !meta.is_file() {
-        return Err(format!("img: image path is not a file: {}", path.display()).into());
+        return Err(format!("upload: asset path is not a file: {}", path.display()).into());
     }
-    if meta.len() > MAX_IMAGE_BYTES {
+    if meta.len() > MAX_ASSET_BYTES {
         return Err(format!(
-            "img: image is too large ({} bytes); Roblox Open Cloud image uploads must be <= {} bytes",
+            "upload: asset is too large ({} bytes); Roblox Open Cloud asset uploads must be <= {} bytes",
             meta.len(),
-            MAX_IMAGE_BYTES
+            MAX_ASSET_BYTES
         )
         .into());
     }
@@ -274,10 +262,10 @@ async fn response_json(
     let status = response.status();
     let text = response.text().await?;
     if !status.is_success() {
-        return Err(format!("img: Roblox Open Cloud {label} failed ({status}): {text}").into());
+        return Err(format!("upload: Roblox Open Cloud {label} failed ({status}): {text}").into());
     }
     serde_json::from_str(&text)
-        .map_err(|e| format!("img: Roblox Open Cloud {label} returned invalid JSON: {e}").into())
+        .map_err(|e| format!("upload: Roblox Open Cloud {label} returned invalid JSON: {e}").into())
 }
 
 fn apply_auth(
@@ -331,23 +319,6 @@ mod tests {
         );
         assert!(parse_creator("place:789").is_err());
         assert!(parse_creator("user:abc").is_err());
-    }
-
-    #[test]
-    fn maps_image_mimes() {
-        assert_eq!(
-            image_mime_for_path(Path::new("icon.PNG")).unwrap(),
-            "image/png"
-        );
-        assert_eq!(
-            image_mime_for_path(Path::new("icon.jpeg")).unwrap(),
-            "image/jpeg"
-        );
-        assert_eq!(
-            image_mime_for_path(Path::new("icon.tga")).unwrap(),
-            "image/tga"
-        );
-        assert!(image_mime_for_path(Path::new("icon.gif")).is_err());
     }
 
     #[test]

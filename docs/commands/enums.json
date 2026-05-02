@@ -1,0 +1,13 @@
+{
+  "name": "enums",
+  "title": "rosync enums",
+  "category": "Live inspection",
+  "description": "Lists every Enum type name exposed by the connected Studio session.",
+  "usage": "rosync enums [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync enums --project ."
+  ],
+  "notes": [
+    "Use `rosync enum --name <EnumName>` to inspect one enum's items."
+  ]
+}

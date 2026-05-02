@@ -1,0 +1,14 @@
+{
+  "name": "find-attr",
+  "title": "rosync find-attr",
+  "category": "Live inspection",
+  "description": "Finds live Studio instances that have a named attribute, optionally matching a value.",
+  "usage": "rosync find-attr [--project <path>] [--port <port>] --name <attribute> [--under <studio-path>] [--value <json>] [--raw]",
+  "examples": [
+    "rosync find-attr --project . --name Health --under Workspace",
+    "rosync find-attr --project . --name Color --value '{\"__type\":\"Color3\",\"r\":1,\"g\":0,\"b\":0}'"
+  ],
+  "notes": [
+    "`--value` uses the same JSON literal and tagged-value codec as `rosync set --value`."
+  ]
+}

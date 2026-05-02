@@ -1,0 +1,14 @@
+{
+  "name": "status",
+  "title": "rosync status",
+  "category": "Live diagnostics",
+  "description": "Summarizes daemon reachability, plugin handshake, project config, `tree.json`, sourcemap, and write-log health.",
+  "usage": "rosync status [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync status --project .",
+    "rosync status --project . --raw"
+  ],
+  "notes": [
+    "Useful as the first live check before making further CLI calls."
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "redo",
+  "title": "rosync redo",
+  "category": "Live writes",
+  "description": "Requests Studio to redo the last undone change-history entry.",
+  "usage": "rosync redo [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync redo --project ."
+  ],
+  "notes": [
+    "Requires the same live Studio/plugin connection as `undo`."
+  ]
+}

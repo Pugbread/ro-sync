@@ -81,9 +81,13 @@ pub enum Command {
     Snapshot(SnapshotArgs),
     /// Compare local scripts/folders against the live Studio syncable tree.
     Diff(DiffArgs),
+    /// Upload assets through Roblox Open Cloud Assets.
+    Upload(UploadArgs),
     /// Upload an image through Roblox Open Cloud Assets.
+    #[command(hide = true)]
     Img(ImgArgs),
     /// Bulk upload image files through Roblox Open Cloud Assets.
+    #[command(hide = true)]
     Imgs(ImgsArgs),
     /// Find instances matching a class and/or name.
     Find(FindArgs),
@@ -110,6 +114,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Check local Ro-Sync health: project files, daemon, plugin, linter, and sourcemap.
     Doctor(DoctorArgs),
+    /// Refresh generated Ro Sync agent docs without starting the daemon.
+    Refresh(RefreshArgs),
     /// Construct a new instance under a parent path.
     New(NewArgs),
     /// Destroy an instance.
@@ -257,6 +263,59 @@ pub struct DiffArgs {
 }
 
 #[derive(ClapArgs, Debug)]
+pub struct UploadArgs {
+    /// Asset files or directories to upload.
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// Project directory to read `groupId` from when `--creator` is omitted.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Creator target as `user:<id>` or `group:<id>`. Can also be provided by
+    /// ROBLOX_CREATOR, project `groupId`, or the active widget project's Group ID.
+    #[arg(long)]
+    pub creator: Option<String>,
+    /// Asset display name. Only valid when exactly one file is uploaded.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Asset description.
+    #[arg(long, default_value_t = String::new())]
+    pub description: String,
+    /// Roblox asset type to create. When omitted, Ro Sync infers it from the file extension.
+    #[arg(long = "asset-type", value_enum)]
+    pub asset_type: Option<UploadAssetType>,
+    /// Override the multipart file content type.
+    #[arg(long = "content-type")]
+    pub content_type: Option<String>,
+    /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
+    #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
+    pub auth: ImgAuth,
+    /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
+    #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
+    pub api_key_env: String,
+    /// Return after Roblox accepts the operation instead of polling for the asset id.
+    #[arg(long = "no-wait")]
+    pub no_wait: bool,
+    /// Maximum time to wait for the Roblox operation.
+    #[arg(long = "timeout-seconds", default_value_t = 120)]
+    pub timeout_seconds: u64,
+    /// Poll interval while waiting for the Roblox operation.
+    #[arg(long = "poll-seconds", default_value_t = 2)]
+    pub poll_seconds: u64,
+    /// Maximum number of simultaneous uploads.
+    #[arg(long, default_value_t = 2)]
+    pub concurrency: usize,
+    /// Do not recurse into directories.
+    #[arg(long = "no-recursive")]
+    pub no_recursive: bool,
+    /// Write a JSON manifest containing every per-file result.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
 pub struct ImgArgs {
     /// Local image file to upload.
     pub path: PathBuf,
@@ -274,21 +333,21 @@ pub struct ImgArgs {
     #[arg(long, default_value_t = String::new())]
     pub description: String,
     /// Roblox asset type to create.
-    #[arg(long = "asset-type", value_enum, default_value_t = ImgAssetType::Image)]
-    pub asset_type: ImgAssetType,
+    #[arg(long = "asset-type", value_enum, default_value_t = UploadAssetType::Image)]
+    pub asset_type: UploadAssetType,
     /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
     #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
     pub auth: ImgAuth,
     /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
     #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
     pub api_key_env: String,
-    /// Return after Roblox accepts the operation instead of polling for the asset id.
+    /// Return after Roblox accepts each operation instead of polling for asset ids.
     #[arg(long = "no-wait")]
     pub no_wait: bool,
-    /// Maximum time to wait for the Roblox operation.
+    /// Maximum time to wait for each Roblox operation.
     #[arg(long = "timeout-seconds", default_value_t = 120)]
     pub timeout_seconds: u64,
-    /// Poll interval while waiting for the Roblox operation.
+    /// Poll interval while waiting for Roblox operations.
     #[arg(long = "poll-seconds", default_value_t = 2)]
     pub poll_seconds: u64,
     /// Print JSON instead of human-readable output.
@@ -312,8 +371,8 @@ pub struct ImgsArgs {
     #[arg(long, default_value_t = String::new())]
     pub description: String,
     /// Roblox asset type to create.
-    #[arg(long = "asset-type", value_enum, default_value_t = ImgAssetType::Image)]
-    pub asset_type: ImgAssetType,
+    #[arg(long = "asset-type", value_enum, default_value_t = UploadAssetType::Image)]
+    pub asset_type: UploadAssetType,
     /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
     #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
     pub auth: ImgAuth,
@@ -359,16 +418,26 @@ impl ImgAuth {
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImgAssetType {
+pub enum UploadAssetType {
+    Animation,
+    Audio,
     Image,
     Decal,
+    Mesh,
+    Model,
+    Video,
 }
 
-impl ImgAssetType {
+impl UploadAssetType {
     fn as_cloud_str(self) -> &'static str {
         match self {
-            ImgAssetType::Image => "Image",
-            ImgAssetType::Decal => "Decal",
+            UploadAssetType::Animation => "Animation",
+            UploadAssetType::Audio => "Audio",
+            UploadAssetType::Image => "Image",
+            UploadAssetType::Decal => "Decal",
+            UploadAssetType::Mesh => "Mesh",
+            UploadAssetType::Model => "Model",
+            UploadAssetType::Video => "Video",
         }
     }
 }
@@ -522,6 +591,16 @@ pub struct DoctorArgs {
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
     /// Print JSON instead of human-readable checks.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct RefreshArgs {
+    /// Project directory. Defaults to the current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Print JSON instead of human-readable output.
     #[arg(long)]
     pub raw: bool,
 }
@@ -891,6 +970,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Tree(args)) => run_tree(args).await,
         Some(Command::Snapshot(args)) => run_snapshot(args).await,
         Some(Command::Diff(args)) => run_diff(args).await,
+        Some(Command::Upload(args)) => run_upload(args).await,
         Some(Command::Img(args)) => run_img(args).await,
         Some(Command::Imgs(args)) => run_imgs(args).await,
         Some(Command::Find(args)) => run_find(args).await,
@@ -904,6 +984,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Version(args)) => run_version(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Doctor(args)) => run_doctor(args).await,
+        Some(Command::Refresh(args)) => run_refresh(args),
         Some(Command::New(args)) => run_new(args).await,
         Some(Command::Rm(args)) => run_rm(args).await,
         Some(Command::Mv(args)) => run_mv(args).await,
@@ -1092,79 +1173,192 @@ fn run_path(args: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_upload(args: UploadArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_upload_inner(args).await
+}
+
 async fn run_img(args: ImgArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_upload_inner(UploadArgs {
+        inputs: vec![args.path],
+        project: args.project,
+        creator: args.creator,
+        name: args.name,
+        description: args.description,
+        asset_type: Some(args.asset_type),
+        content_type: None,
+        auth: args.auth,
+        api_key_env: args.api_key_env,
+        no_wait: args.no_wait,
+        timeout_seconds: args.timeout_seconds,
+        poll_seconds: args.poll_seconds,
+        concurrency: 1,
+        no_recursive: true,
+        manifest: None,
+        raw: args.raw,
+    })
+    .await
+}
+
+async fn run_imgs(args: ImgsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_upload_inner(UploadArgs {
+        inputs: args.inputs,
+        project: args.project,
+        creator: args.creator,
+        name: None,
+        description: args.description,
+        asset_type: Some(args.asset_type),
+        content_type: None,
+        auth: args.auth,
+        api_key_env: args.api_key_env,
+        no_wait: args.no_wait,
+        timeout_seconds: args.timeout_seconds,
+        poll_seconds: args.poll_seconds,
+        concurrency: args.concurrency,
+        no_recursive: args.no_recursive,
+        manifest: args.manifest,
+        raw: args.raw,
+    })
+    .await
+}
+
+async fn run_upload_inner(args: UploadArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !args.no_wait && args.timeout_seconds == 0 {
         return Err(
-            "img: --timeout-seconds must be greater than 0 unless --no-wait is used".into(),
+            "upload: --timeout-seconds must be greater than 0 unless --no-wait is used".into(),
         );
     }
     if !args.no_wait && args.poll_seconds == 0 {
-        return Err("img: --poll-seconds must be greater than 0 unless --no-wait is used".into());
+        return Err(
+            "upload: --poll-seconds must be greater than 0 unless --no-wait is used".into(),
+        );
+    }
+    if args.concurrency == 0 {
+        return Err("upload: --concurrency must be greater than 0".into());
+    }
+    if args
+        .content_type
+        .as_deref()
+        .is_some_and(|content_type| content_type.trim().is_empty())
+    {
+        return Err("upload: --content-type cannot be empty".into());
     }
 
-    let creator_text = args
-        .creator
-        .or_else(|| std::env::var("ROBLOX_CREATOR").ok())
-        .or_else(|| resolve_img_creator(&args.project))
-        .ok_or("img: missing creator. Pass --creator user:<id> or group:<id>, set ROBLOX_CREATOR, or set a project Group ID.")?;
-    let creator = img_upload::parse_creator(&creator_text)
-        .map_err(|e| format!("img: invalid creator {creator_text:?}: {e}"))?;
-    let api_key = resolve_img_api_key(&args.api_key_env)?;
-    let display_name = args
-        .name
-        .unwrap_or_else(|| img_upload::default_display_name(&args.path));
+    let mut failures = Vec::new();
+    let jobs = collect_upload_jobs(
+        &args.inputs,
+        !args.no_recursive,
+        args.asset_type,
+        args.content_type.as_deref(),
+        &mut failures,
+    )?;
+    let attempted = jobs.len() + failures.len();
+    if args.name.is_some() && attempted != 1 {
+        return Err("upload: --name can only be used when exactly one file is uploaded".into());
+    }
+    if jobs.is_empty() && failures.is_empty() {
+        return Err("upload: no supported asset files found".into());
+    }
 
-    let outcome = img_upload::upload_image(img_upload::ImgUploadRequest {
-        file: args.path,
-        api_key,
-        auth_mode: args.auth.as_upload_mode(),
-        creator,
-        asset_type: args.asset_type.as_cloud_str().to_string(),
-        display_name,
-        description: args.description,
-        wait: !args.no_wait,
-        timeout: Duration::from_secs(args.timeout_seconds),
-        poll: Duration::from_secs(args.poll_seconds),
-    })
-    .await?;
+    let mut results = failures;
+    if !jobs.is_empty() {
+        let creator_text = args
+            .creator
+            .or_else(|| std::env::var("ROBLOX_CREATOR").ok())
+            .or_else(|| resolve_img_creator(&args.project))
+            .ok_or("upload: missing creator. Pass --creator user:<id> or group:<id>, set ROBLOX_CREATOR, or set a project Group ID.")?;
+        let creator = img_upload::parse_creator(&creator_text)
+            .map_err(|e| format!("upload: invalid creator {creator_text:?}: {e}"))?;
+        let api_key = resolve_img_api_key(&args.api_key_env)?;
 
-    if args.raw {
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
-    } else if args.no_wait && !outcome.done {
-        if let Some(path) = &outcome.operation_path {
-            println!("img: upload started for {} ({path})", outcome.display_name);
-        } else {
-            println!("img: upload started for {}", outcome.display_name);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for job in jobs {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let api_key = api_key.clone();
+            let creator = creator.clone();
+            let description = args.description.clone();
+            let auth_mode = args.auth.as_upload_mode();
+            let wait = !args.no_wait;
+            let timeout = Duration::from_secs(args.timeout_seconds);
+            let poll = Duration::from_secs(args.poll_seconds);
+            let display_name = args.name.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = permit;
+                upload_asset_job(
+                    job,
+                    api_key,
+                    auth_mode,
+                    creator,
+                    description,
+                    display_name,
+                    wait,
+                    timeout,
+                    poll,
+                )
+                .await
+            }));
         }
-    } else if let Some(uri) = &outcome.asset_uri {
-        println!("img: uploaded {} -> {uri}", outcome.display_name);
-    } else if let Some(path) = &outcome.operation_path {
-        println!(
-            "img: upload completed for {} ({path}); Roblox did not return an asset id",
-            outcome.display_name
-        );
-    } else {
-        println!(
-            "img: upload completed for {}; Roblox did not return an asset id",
-            outcome.display_name
-        );
+
+        while let Some(result) = tasks.next().await {
+            match result {
+                Ok(result) => results.push(result),
+                Err(e) => results.push(UploadBulkResult {
+                    index: usize::MAX,
+                    file: String::new(),
+                    display_name: None,
+                    asset_type: None,
+                    content_type: None,
+                    ok: false,
+                    asset_id: None,
+                    asset_uri: None,
+                    operation_path: None,
+                    error: Some(format!("task failed: {e}")),
+                }),
+            }
+        }
+    }
+    results.sort_by_key(|result| result.index);
+
+    if let Some(path) = &args.manifest {
+        write_upload_manifest(path, &results)?;
     }
 
+    if args.raw && results.len() == 1 && results[0].ok {
+        println!("{}", serde_json::to_string_pretty(&results[0])?);
+    } else if args.raw {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        print_upload_results(&results);
+    }
+
+    let failed = results.iter().filter(|result| !result.ok).count();
+    if failed > 0 {
+        return Err(format!("upload: {failed} upload(s) failed").into());
+    }
     Ok(())
 }
 
 #[derive(Clone)]
-struct ImgBulkJob {
+struct UploadJob {
     index: usize,
     file: PathBuf,
+    media: UploadMedia,
+}
+
+#[derive(Clone)]
+struct UploadMedia {
+    asset_type: UploadAssetType,
+    content_type: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImgBulkResult {
+struct UploadBulkResult {
     index: usize,
     file: String,
     display_name: Option<String>,
+    asset_type: Option<String>,
+    content_type: Option<String>,
     ok: bool,
     asset_id: Option<String>,
     asset_uri: Option<String>,
@@ -1172,117 +1366,28 @@ struct ImgBulkResult {
     error: Option<String>,
 }
 
-async fn run_imgs(args: ImgsArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.no_wait && args.timeout_seconds == 0 {
-        return Err(
-            "imgs: --timeout-seconds must be greater than 0 unless --no-wait is used".into(),
-        );
-    }
-    if !args.no_wait && args.poll_seconds == 0 {
-        return Err("imgs: --poll-seconds must be greater than 0 unless --no-wait is used".into());
-    }
-    if args.concurrency == 0 {
-        return Err("imgs: --concurrency must be greater than 0".into());
-    }
-
-    let creator_text = args
-        .creator
-        .or_else(|| std::env::var("ROBLOX_CREATOR").ok())
-        .or_else(|| resolve_img_creator(&args.project))
-        .ok_or("imgs: missing creator. Pass --creator user:<id> or group:<id>, set ROBLOX_CREATOR, or set a project Group ID.")?;
-    let creator = img_upload::parse_creator(&creator_text)
-        .map_err(|e| format!("imgs: invalid creator {creator_text:?}: {e}"))?;
-    let api_key = resolve_img_api_key(&args.api_key_env)?;
-
-    let mut failures = Vec::new();
-    let jobs = collect_img_bulk_jobs(&args.inputs, !args.no_recursive, &mut failures)?;
-    if jobs.is_empty() && failures.is_empty() {
-        return Err("imgs: no supported image files found".into());
-    }
-
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
-    let mut tasks = futures::stream::FuturesUnordered::new();
-    for job in jobs {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let api_key = api_key.clone();
-        let creator = creator.clone();
-        let description = args.description.clone();
-        let asset_type = args.asset_type.as_cloud_str().to_string();
-        let auth_mode = args.auth.as_upload_mode();
-        let wait = !args.no_wait;
-        let timeout = Duration::from_secs(args.timeout_seconds);
-        let poll = Duration::from_secs(args.poll_seconds);
-        tasks.push(tokio::spawn(async move {
-            let _permit = permit;
-            upload_img_bulk_job(
-                job,
-                api_key,
-                auth_mode,
-                creator,
-                asset_type,
-                description,
-                wait,
-                timeout,
-                poll,
-            )
-            .await
-        }));
-    }
-
-    let mut results = failures;
-    while let Some(result) = tasks.next().await {
-        match result {
-            Ok(result) => results.push(result),
-            Err(e) => results.push(ImgBulkResult {
-                index: usize::MAX,
-                file: String::new(),
-                display_name: None,
-                ok: false,
-                asset_id: None,
-                asset_uri: None,
-                operation_path: None,
-                error: Some(format!("task failed: {e}")),
-            }),
-        }
-    }
-    results.sort_by_key(|result| result.index);
-
-    if let Some(path) = &args.manifest {
-        write_img_manifest(path, &results)?;
-    }
-
-    if args.raw {
-        println!("{}", serde_json::to_string_pretty(&results)?);
-    } else {
-        print_img_bulk_results(&results);
-    }
-
-    let failed = results.iter().filter(|result| !result.ok).count();
-    if failed > 0 {
-        return Err(format!("imgs: {failed} upload(s) failed").into());
-    }
-    Ok(())
-}
-
-async fn upload_img_bulk_job(
-    job: ImgBulkJob,
+async fn upload_asset_job(
+    job: UploadJob,
     api_key: String,
     auth_mode: img_upload::AuthMode,
     creator: img_upload::Creator,
-    asset_type: String,
     description: String,
+    display_name: Option<String>,
     wait: bool,
     timeout: Duration,
     poll: Duration,
-) -> ImgBulkResult {
-    let display_name = img_upload::default_display_name(&job.file);
+) -> UploadBulkResult {
+    let display_name = display_name.unwrap_or_else(|| img_upload::default_display_name(&job.file));
     let file = job.file.display().to_string();
-    match img_upload::upload_image(img_upload::ImgUploadRequest {
+    let asset_type = job.media.asset_type.as_cloud_str().to_string();
+    let content_type = job.media.content_type;
+    match img_upload::upload_asset(img_upload::AssetUploadRequest {
         file: job.file,
         api_key,
         auth_mode,
         creator,
-        asset_type,
+        asset_type: asset_type.clone(),
+        content_type: content_type.clone(),
         display_name: display_name.clone(),
         description,
         wait,
@@ -1291,20 +1396,24 @@ async fn upload_img_bulk_job(
     })
     .await
     {
-        Ok(outcome) => ImgBulkResult {
+        Ok(outcome) => UploadBulkResult {
             index: job.index,
             file,
             display_name: Some(display_name),
+            asset_type: Some(asset_type),
+            content_type: Some(content_type),
             ok: true,
             asset_id: outcome.asset_id,
             asset_uri: outcome.asset_uri,
             operation_path: outcome.operation_path,
             error: None,
         },
-        Err(e) => ImgBulkResult {
+        Err(e) => UploadBulkResult {
             index: job.index,
             file,
             display_name: Some(display_name),
+            asset_type: Some(asset_type),
+            content_type: Some(content_type),
             ok: false,
             asset_id: None,
             asset_uri: None,
@@ -1314,15 +1423,26 @@ async fn upload_img_bulk_job(
     }
 }
 
-fn collect_img_bulk_jobs(
+fn collect_upload_jobs(
     inputs: &[PathBuf],
     recursive: bool,
-    failures: &mut Vec<ImgBulkResult>,
-) -> Result<Vec<ImgBulkJob>, Box<dyn std::error::Error>> {
+    asset_type: Option<UploadAssetType>,
+    content_type: Option<&str>,
+    failures: &mut Vec<UploadBulkResult>,
+) -> Result<Vec<UploadJob>, Box<dyn std::error::Error>> {
     let mut jobs = Vec::new();
     let mut index = 0;
     for input in inputs {
-        collect_img_bulk_input(input, recursive, true, &mut index, &mut jobs, failures)?;
+        collect_upload_input(
+            input,
+            recursive,
+            true,
+            asset_type,
+            content_type,
+            &mut index,
+            &mut jobs,
+            failures,
+        )?;
     }
     jobs.sort_by(|a, b| a.file.cmp(&b.file));
     for (idx, job) in jobs.iter_mut().enumerate() {
@@ -1334,28 +1454,33 @@ fn collect_img_bulk_jobs(
     Ok(jobs)
 }
 
-fn collect_img_bulk_input(
+fn collect_upload_input(
     input: &std::path::Path,
     recursive: bool,
     explicit: bool,
+    asset_type: Option<UploadAssetType>,
+    content_type: Option<&str>,
     index: &mut usize,
-    jobs: &mut Vec<ImgBulkJob>,
-    failures: &mut Vec<ImgBulkResult>,
+    jobs: &mut Vec<UploadJob>,
+    failures: &mut Vec<UploadBulkResult>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if input.is_file() {
-        match img_upload::image_mime_for_path(input) {
-            Ok(_) => {
-                jobs.push(ImgBulkJob {
+        match resolve_upload_media(input, asset_type, content_type, explicit) {
+            Ok(media) => {
+                jobs.push(UploadJob {
                     index: *index,
                     file: input.to_path_buf(),
+                    media,
                 });
                 *index += 1;
             }
             Err(e) if explicit => {
-                failures.push(ImgBulkResult {
+                failures.push(UploadBulkResult {
                     index: *index,
                     file: input.display().to_string(),
                     display_name: None,
+                    asset_type: asset_type.map(|asset_type| asset_type.as_cloud_str().to_string()),
+                    content_type: content_type.map(|content_type| content_type.to_string()),
                     ok: false,
                     asset_id: None,
                     asset_uri: None,
@@ -1370,25 +1495,45 @@ fn collect_img_bulk_input(
     }
     if input.is_dir() {
         let mut entries = std::fs::read_dir(input)
-            .map_err(|e| format!("imgs: read directory {}: {e}", input.display()))?
+            .map_err(|e| format!("upload: read directory {}: {e}", input.display()))?
             .collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.path());
         for entry in entries {
             let path = entry.path();
             if path.is_dir() {
                 if recursive {
-                    collect_img_bulk_input(&path, recursive, false, index, jobs, failures)?;
+                    collect_upload_input(
+                        &path,
+                        recursive,
+                        false,
+                        asset_type,
+                        content_type,
+                        index,
+                        jobs,
+                        failures,
+                    )?;
                 }
             } else {
-                collect_img_bulk_input(&path, recursive, false, index, jobs, failures)?;
+                collect_upload_input(
+                    &path,
+                    recursive,
+                    false,
+                    asset_type,
+                    content_type,
+                    index,
+                    jobs,
+                    failures,
+                )?;
             }
         }
         return Ok(());
     }
-    failures.push(ImgBulkResult {
+    failures.push(UploadBulkResult {
         index: *index,
         file: input.display().to_string(),
         display_name: None,
+        asset_type: asset_type.map(|asset_type| asset_type.as_cloud_str().to_string()),
+        content_type: content_type.map(|content_type| content_type.to_string()),
         ok: false,
         asset_id: None,
         asset_uri: None,
@@ -1399,9 +1544,151 @@ fn collect_img_bulk_input(
     Ok(())
 }
 
-fn write_img_manifest(
+fn resolve_upload_media(
     path: &std::path::Path,
-    results: &[ImgBulkResult],
+    requested_asset_type: Option<UploadAssetType>,
+    content_type_override: Option<&str>,
+    explicit: bool,
+) -> Result<UploadMedia, String> {
+    let inferred = infer_upload_media(path);
+    let asset_type = match requested_asset_type {
+        Some(asset_type) => asset_type,
+        None => inferred
+            .as_ref()
+            .map(|media| media.asset_type)
+            .ok_or_else(|| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("asset");
+                format!(
+                    "unsupported or ambiguous asset type for {name}; pass --asset-type and optionally --content-type"
+                )
+            })?,
+    };
+    let content_type = match content_type_override {
+        Some(content_type) => content_type.trim().to_string(),
+        None => match (requested_asset_type, inferred) {
+            (None, Some(media)) => media.content_type,
+            _ => content_type_for_asset_type(path, asset_type, explicit)?.to_string(),
+        },
+    };
+    Ok(UploadMedia {
+        asset_type,
+        content_type,
+    })
+}
+
+fn infer_upload_media(path: &std::path::Path) -> Option<UploadMedia> {
+    let ext = upload_extension(path);
+    let (asset_type, content_type) = match ext.as_str() {
+        "png" => (UploadAssetType::Image, "image/png"),
+        "jpg" | "jpeg" => (UploadAssetType::Image, "image/jpeg"),
+        "bmp" => (UploadAssetType::Image, "image/bmp"),
+        "tga" => (UploadAssetType::Image, "image/tga"),
+        "mp3" => (UploadAssetType::Audio, "audio/mpeg"),
+        "ogg" => (UploadAssetType::Audio, "audio/ogg"),
+        "wav" => (UploadAssetType::Audio, "audio/wav"),
+        "flac" => (UploadAssetType::Audio, "audio/flac"),
+        "fbx" => (UploadAssetType::Model, "model/fbx"),
+        "gltf" => (UploadAssetType::Model, "model/gltf+json"),
+        "glb" => (UploadAssetType::Model, "model/gltf-binary"),
+        "mesh" | "rbxmesh" => (UploadAssetType::Mesh, "model/x-file-mesh-data"),
+        "mp4" => (UploadAssetType::Video, "video/mp4"),
+        "mov" => (UploadAssetType::Video, "video/mov"),
+        _ => return None,
+    };
+    Some(UploadMedia {
+        asset_type,
+        content_type: content_type.to_string(),
+    })
+}
+
+fn content_type_for_asset_type(
+    path: &std::path::Path,
+    asset_type: UploadAssetType,
+    explicit: bool,
+) -> Result<&'static str, String> {
+    let ext = upload_extension(path);
+    match asset_type {
+        UploadAssetType::Animation => match ext.as_str() {
+            "rbxm" | "rbxmx" => Ok("model/x-rbxm"),
+            _ => Err(format!(
+                "unsupported file type for Animation; expected {}",
+                expected_extensions(asset_type)
+            )),
+        },
+        UploadAssetType::Audio => match ext.as_str() {
+            "mp3" => Ok("audio/mpeg"),
+            "ogg" => Ok("audio/ogg"),
+            "wav" => Ok("audio/wav"),
+            "flac" => Ok("audio/flac"),
+            _ => Err(format!(
+                "unsupported file type for Audio; expected {}",
+                expected_extensions(asset_type)
+            )),
+        },
+        UploadAssetType::Decal | UploadAssetType::Image => match ext.as_str() {
+            "png" => Ok("image/png"),
+            "jpg" | "jpeg" => Ok("image/jpeg"),
+            "bmp" => Ok("image/bmp"),
+            "tga" => Ok("image/tga"),
+            _ => Err(format!(
+                "unsupported file type for {}; expected {}",
+                asset_type.as_cloud_str(),
+                expected_extensions(asset_type)
+            )),
+        },
+        UploadAssetType::Mesh => match ext.as_str() {
+            "mesh" | "rbxmesh" => Ok("model/x-file-mesh-data"),
+            _ if explicit => Ok("model/x-file-mesh-data"),
+            _ => Err(format!(
+                "unsupported file type for Mesh; expected {}",
+                expected_extensions(asset_type)
+            )),
+        },
+        UploadAssetType::Model => match ext.as_str() {
+            "fbx" => Ok("model/fbx"),
+            "gltf" => Ok("model/gltf+json"),
+            "glb" => Ok("model/gltf-binary"),
+            "rbxm" | "rbxmx" => Ok("model/x-rbxm"),
+            _ => Err(format!(
+                "unsupported file type for Model; expected {}",
+                expected_extensions(asset_type)
+            )),
+        },
+        UploadAssetType::Video => match ext.as_str() {
+            "mp4" => Ok("video/mp4"),
+            "mov" => Ok("video/mov"),
+            _ => Err(format!(
+                "unsupported file type for Video; expected {}",
+                expected_extensions(asset_type)
+            )),
+        },
+    }
+}
+
+fn expected_extensions(asset_type: UploadAssetType) -> &'static str {
+    match asset_type {
+        UploadAssetType::Animation => ".rbxm or .rbxmx",
+        UploadAssetType::Audio => ".mp3, .ogg, .wav, or .flac",
+        UploadAssetType::Decal | UploadAssetType::Image => ".png, .jpg, .jpeg, .bmp, or .tga",
+        UploadAssetType::Mesh => ".mesh or .rbxmesh, or pass --content-type model/x-file-mesh-data",
+        UploadAssetType::Model => ".fbx, .gltf, .glb, .rbxm, or .rbxmx",
+        UploadAssetType::Video => ".mp4 or .mov",
+    }
+}
+
+fn upload_extension(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn write_upload_manifest(
+    path: &std::path::Path,
+    results: &[UploadBulkResult],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path
         .parent()
@@ -1413,7 +1700,7 @@ fn write_img_manifest(
     Ok(())
 }
 
-fn print_img_bulk_results(results: &[ImgBulkResult]) {
+fn print_upload_results(results: &[UploadBulkResult]) {
     for result in results {
         if result.ok {
             let uri = result
@@ -1421,7 +1708,13 @@ fn print_img_bulk_results(results: &[ImgBulkResult]) {
                 .as_deref()
                 .or(result.operation_path.as_deref())
                 .unwrap_or("uploaded");
-            println!("uploaded  {:40} {}", truncate_middle(&result.file, 40), uri);
+            let asset_type = result.asset_type.as_deref().unwrap_or("Asset");
+            println!(
+                "uploaded  {:40} {:9} {}",
+                truncate_middle(&result.file, 40),
+                asset_type,
+                uri
+            );
         } else {
             println!(
                 "failed    {:40} {}",
@@ -1620,7 +1913,7 @@ fn resolve_img_api_key(env_name: &str) -> Result<String, Box<dyn std::error::Err
     }
 
     Err(format!(
-        "img: missing Roblox Open Cloud credential. Set {env_name}, or save it in the Ro Sync widget Settings > Secrets."
+        "upload: missing Roblox Open Cloud credential. Set {env_name}, or save it in the Ro Sync widget Settings > Secrets."
     )
     .into())
 }
@@ -2680,6 +2973,13 @@ struct DoctorCheck {
     detail: String,
 }
 
+#[derive(Serialize)]
+struct RefreshFileStatus {
+    path: &'static str,
+    status: &'static str,
+    note: Option<&'static str>,
+}
+
 async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let project = match args.project {
         Some(p) => p,
@@ -2791,6 +3091,87 @@ async fn run_doctor(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> 
         return Err("doctor: one or more checks failed".into());
     }
     Ok(())
+}
+
+fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = match args.project {
+        Some(p) => p,
+        None => std::env::current_dir().map_err(|e| format!("refresh: current directory: {e}"))?,
+    };
+
+    let ro_sync_status = snapshot::refresh_ro_sync_md(&project)?;
+    let mut files = vec![RefreshFileStatus {
+        path: snapshot::RO_SYNC_MD,
+        status: ro_sync_status.as_str(),
+        note: if matches!(ro_sync_status, snapshot::RoSyncDocRefresh::SkippedCustom) {
+            Some("unmarked custom file left untouched")
+        } else {
+            None
+        },
+    }];
+
+    let claude_existed = project.join(snapshot::CLAUDE_MD).exists();
+    let claude_changed = snapshot::write_claude_md_if_missing_or_merge(&project)?;
+    files.push(RefreshFileStatus {
+        path: snapshot::CLAUDE_MD,
+        status: refresh_file_status(claude_existed, claude_changed),
+        note: Some("custom content preserved; @AGENTS.md ensured"),
+    });
+
+    let codex_config_path = project
+        .join(snapshot::CODEX_DIR)
+        .join(snapshot::CODEX_CONFIG_TOML);
+    let codex_config_existed = codex_config_path.exists();
+    let codex_config_changed = snapshot::write_codex_config_if_missing_or_merge(&project)?;
+    files.push(RefreshFileStatus {
+        path: ".codex/config.toml",
+        status: refresh_file_status(codex_config_existed, codex_config_changed),
+        note: Some("project doc fallbacks merged"),
+    });
+
+    let agents_existed = project.join(snapshot::AGENTS_MD).exists();
+    let agents_changed = snapshot::write_agents_md_if_missing_or_merge(&project)?;
+    files.push(RefreshFileStatus {
+        path: snapshot::AGENTS_MD,
+        status: refresh_file_status(agents_existed, agents_changed),
+        note: Some("only the Ro Sync marker block was regenerated"),
+    });
+
+    let changed = files
+        .iter()
+        .filter(|file| file.status == "created" || file.status == "updated")
+        .count();
+
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "project": project.display().to_string(),
+                "changed": changed,
+                "files": files,
+            }))?
+        );
+    } else {
+        println!("Ro-Sync refresh");
+        println!("project: {}", project.display());
+        println!();
+        for file in &files {
+            match file.note {
+                Some(note) => println!("[{:<14}] {:<18} {}", file.status, file.path, note),
+                None => println!("[{:<14}] {}", file.status, file.path),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn refresh_file_status(existed: bool, changed: bool) -> &'static str {
+    match (existed, changed) {
+        (false, true) => "created",
+        (true, true) => "updated",
+        _ => "unchanged",
+    }
 }
 
 fn doctor_check(
@@ -3990,6 +4371,16 @@ mod tier2_tests {
     }
 
     #[test]
+    fn refresh_args_parse_project_and_raw() {
+        let cli = Cli::try_parse_from(["rosync", "refresh", "--project", ".", "--raw"]).unwrap();
+        let Some(Command::Refresh(args)) = cli.command else {
+            panic!("expected refresh command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert!(args.raw);
+    }
+
+    #[test]
     fn status_json_uses_stable_keys_and_flags() {
         assert_eq!(status_json_key("project"), "project_path");
         assert_eq!(status_json_key("ro-sync.json"), "project_config");
@@ -4004,6 +4395,30 @@ mod tier2_tests {
         let config = doctor_check("ro-sync.json", DoctorStatus::Warn, "missing");
         let value = status_check_json(&config);
         assert_eq!(value["present"], false);
+    }
+
+    #[test]
+    fn upload_args_parse_project_and_bearer_auth() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "upload",
+            "icon.png",
+            "--project",
+            ".",
+            "--auth",
+            "bearer",
+            "--api-key-env",
+            "ROBLOX_OAUTH_TOKEN",
+        ])
+        .unwrap();
+        let Some(Command::Upload(args)) = cli.command else {
+            panic!("expected upload command");
+        };
+        assert_eq!(args.inputs, vec![PathBuf::from("icon.png")]);
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.auth, ImgAuth::Bearer);
+        assert_eq!(args.api_key_env, "ROBLOX_OAUTH_TOKEN");
+        assert_eq!(args.asset_type, None);
     }
 
     #[test]
@@ -4062,7 +4477,7 @@ mod tier2_tests {
     }
 
     #[test]
-    fn collect_img_bulk_jobs_recurses_and_skips_directory_junk() {
+    fn collect_upload_jobs_recurses_and_skips_directory_junk() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), b"not a real png").unwrap();
         std::fs::write(dir.path().join("note.txt"), b"skip me").unwrap();
@@ -4070,7 +4485,9 @@ mod tier2_tests {
         std::fs::write(dir.path().join("nested").join("b.jpg"), b"not a real jpg").unwrap();
 
         let mut failures = Vec::new();
-        let jobs = collect_img_bulk_jobs(&[dir.path().to_path_buf()], true, &mut failures).unwrap();
+        let jobs =
+            collect_upload_jobs(&[dir.path().to_path_buf()], true, None, None, &mut failures)
+                .unwrap();
         let names: Vec<String> = jobs
             .iter()
             .filter_map(|job| {
@@ -4085,19 +4502,47 @@ mod tier2_tests {
     }
 
     #[test]
-    fn collect_img_bulk_jobs_reports_explicit_unsupported_file() {
+    fn collect_upload_jobs_reports_explicit_unsupported_file() {
         let dir = tempfile::tempdir().unwrap();
         let gif = dir.path().join("bad.gif");
         std::fs::write(&gif, b"gif").unwrap();
         let mut failures = Vec::new();
-        let jobs = collect_img_bulk_jobs(&[gif], true, &mut failures).unwrap();
+        let jobs = collect_upload_jobs(&[gif], true, None, None, &mut failures).unwrap();
         assert!(jobs.is_empty());
         assert_eq!(failures.len(), 1);
         assert!(failures[0]
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("unsupported image type"));
+            .contains("unsupported or ambiguous asset type"));
+    }
+
+    #[test]
+    fn upload_media_infers_common_asset_types() {
+        let png = resolve_upload_media(std::path::Path::new("icon.png"), None, None, true).unwrap();
+        assert_eq!(png.asset_type, UploadAssetType::Image);
+        assert_eq!(png.content_type, "image/png");
+
+        let mp3 =
+            resolve_upload_media(std::path::Path::new("sound.mp3"), None, None, true).unwrap();
+        assert_eq!(mp3.asset_type, UploadAssetType::Audio);
+        assert_eq!(mp3.content_type, "audio/mpeg");
+
+        let model =
+            resolve_upload_media(std::path::Path::new("thing.glb"), None, None, true).unwrap();
+        assert_eq!(model.asset_type, UploadAssetType::Model);
+        assert_eq!(model.content_type, "model/gltf-binary");
+
+        assert!(resolve_upload_media(std::path::Path::new("clip.rbxm"), None, None, true).is_err());
+        let animation = resolve_upload_media(
+            std::path::Path::new("clip.rbxm"),
+            Some(UploadAssetType::Animation),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(animation.asset_type, UploadAssetType::Animation);
+        assert_eq!(animation.content_type, "model/x-rbxm");
     }
 
     #[test]

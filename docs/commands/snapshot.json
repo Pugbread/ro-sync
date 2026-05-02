@@ -1,0 +1,15 @@
+{
+  "name": "snapshot",
+  "title": "rosync snapshot",
+  "category": "Live inspection",
+  "description": "Exports the live Studio tree plus inspectable properties, attributes, and tags to deterministic JSON.",
+  "usage": "rosync snapshot [--project <path>] [--port <port>] [--output <file-or-dir>] [--raw]",
+  "examples": [
+    "rosync snapshot --project .",
+    "rosync snapshot --project . --output snapshots/"
+  ],
+  "notes": [
+    "Defaults to `rosync-snapshot-<unix-seconds>.json` under the project or current directory.",
+    "Useful for backups, debugging, and comparing Studio state outside the sync surface."
+  ]
+}

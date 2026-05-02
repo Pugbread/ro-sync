@@ -1,0 +1,13 @@
+{
+  "name": "rm",
+  "title": "rosync rm",
+  "category": "Live writes",
+  "description": "Destroys a live Studio instance.",
+  "usage": "rosync rm [--project <path>] [--port <port>] --path <studio-path> [--raw]",
+  "examples": [
+    "rosync rm --project . --path Workspace/Box"
+  ],
+  "notes": [
+    "Calls `:Destroy()` through the plugin and records the write in `writes.log`."
+  ]
+}

@@ -1,0 +1,534 @@
+{
+  "schemaVersion": 1,
+  "source": "docs/commands/*.json",
+  "categories": [
+    "Offline inspection",
+    "Open Cloud",
+    "Live inspection",
+    "Live diagnostics",
+    "Project docs",
+    "Live writes",
+    "Daemon"
+  ],
+  "commands": [
+    {
+      "name": "query",
+      "title": "rosync query",
+      "category": "Offline inspection",
+      "description": "Matches a selector against the project `tree.json` skeleton without needing the daemon or Studio.",
+      "usage": "rosync query --project <path> <selector> [--format json|paths|classes]",
+      "examples": [
+        "rosync query --project . 'Workspace/**/Camera'",
+        "rosync query --project . '**/RemoteEvent' --format paths"
+      ],
+      "notes": [
+        "`*` matches one path segment and `**` matches zero or more segments.",
+        "Use this first when you only need to discover what exists in the latest Studio tree."
+      ],
+      "slug": "query"
+    },
+    {
+      "name": "path",
+      "title": "rosync path",
+      "category": "Offline inspection",
+      "description": "Translates between Studio instance paths and syncable filesystem paths using `tree.json`.",
+      "usage": "rosync path --project <path> [--from auto|studio|fs] <target> [--raw]",
+      "examples": [
+        "rosync path --project . Workspace/Camera",
+        "rosync path --project . --from fs ReplicatedStorage/Config.luau"
+      ],
+      "notes": [
+        "Studio-authoritative classes are reported clearly instead of pretending they map to files.",
+        "Generated files such as `tree.json` and `ro-sync.md` are not syncable Studio instances."
+      ],
+      "slug": "path"
+    },
+    {
+      "name": "lint",
+      "title": "rosync lint",
+      "category": "Offline inspection",
+      "description": "Runs `luau-lsp analyze` against a project or path with an optional Ro Sync sourcemap.",
+      "usage": "rosync lint [--project <path>] [--path <file-or-dir>] [--luau-lsp <path>] [--no-sourcemap] [-- <luau-lsp args>...]",
+      "examples": [
+        "rosync lint --project .",
+        "rosync lint --project . --path ServerScriptService/Foo.server.luau",
+        "rosync lint --project . --no-sourcemap"
+      ],
+      "notes": [
+        "If `--luau-lsp` is omitted, Ro Sync checks `ROSYNC_LUAU_LSP` and then `PATH`.",
+        "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`."
+      ],
+      "slug": "lint"
+    },
+    {
+      "name": "upload",
+      "title": "rosync upload",
+      "category": "Open Cloud",
+      "description": "Uploads Roblox assets through Open Cloud from files or directories.",
+      "usage": "rosync upload <files-or-directories>... [--project <path>] [--creator user:<id>|group:<id>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--raw]",
+      "examples": [
+        "rosync upload ./icon.png --creator user:123456",
+        "rosync upload ./sound.mp3 ./models --project . --manifest uploaded-assets.json",
+        "rosync upload ./clip.rbxm --project . --asset-type animation"
+      ],
+      "notes": [
+        "Reads credentials from `ROBLOX_API_KEY`, a custom `--api-key-env`, or the widget Secrets store.",
+        "Directories recurse by default, skip unsupported files, and continue after per-file failures.",
+        "Use `--auth bearer` for OAuth tokens instead of API keys."
+      ],
+      "slug": "upload"
+    },
+    {
+      "name": "get",
+      "title": "rosync get",
+      "category": "Live inspection",
+      "description": "Reads an instance view or one property from the live Studio session.",
+      "usage": "rosync get [--project <path>] [--port <port>] --path <studio-path> [--prop <property>] [--raw]",
+      "examples": [
+        "rosync get --project . --path Workspace/Camera --prop FieldOfView",
+        "rosync get --project . --path ReplicatedStorage/Shared --raw"
+      ],
+      "notes": [
+        "Requires the daemon and Studio plugin to be connected.",
+        "Works across the whole DataModel, not only filesystem-synced classes."
+      ],
+      "slug": "get"
+    },
+    {
+      "name": "ls",
+      "title": "rosync ls",
+      "category": "Live inspection",
+      "description": "Lists the direct children of a live Studio instance.",
+      "usage": "rosync ls [--project <path>] [--port <port>] [--path <studio-path>] [--raw]",
+      "examples": [
+        "rosync ls --project . --path ReplicatedStorage",
+        "rosync ls --project . --path \"\""
+      ],
+      "notes": [
+        "An empty path lists top-level DataModel services.",
+        "Use `tree` when you need recursive output."
+      ],
+      "slug": "ls"
+    },
+    {
+      "name": "tree",
+      "title": "rosync tree",
+      "category": "Live inspection",
+      "description": "Prints a class and name tree below a live Studio instance.",
+      "usage": "rosync tree [--project <path>] [--port <port>] [--path <studio-path>] [--depth <n>] [--raw]",
+      "examples": [
+        "rosync tree --project . --path Workspace --depth 3",
+        "rosync tree --project . --path ReplicatedStorage --depth 8 --raw"
+      ],
+      "notes": [
+        "Depth defaults to 3; use 0 for only the root instance."
+      ],
+      "slug": "tree"
+    },
+    {
+      "name": "snapshot",
+      "title": "rosync snapshot",
+      "category": "Live inspection",
+      "description": "Exports the live Studio tree plus inspectable properties, attributes, and tags to deterministic JSON.",
+      "usage": "rosync snapshot [--project <path>] [--port <port>] [--output <file-or-dir>] [--raw]",
+      "examples": [
+        "rosync snapshot --project .",
+        "rosync snapshot --project . --output snapshots/"
+      ],
+      "notes": [
+        "Defaults to `rosync-snapshot-<unix-seconds>.json` under the project or current directory.",
+        "Useful for backups, debugging, and comparing Studio state outside the sync surface."
+      ],
+      "slug": "snapshot"
+    },
+    {
+      "name": "diff",
+      "title": "rosync diff",
+      "category": "Live inspection",
+      "description": "Compares local scripts and folders against the live Studio syncable tree.",
+      "usage": "rosync diff [--project <path>] [--port <port>] [--depth <n>] [--raw]",
+      "examples": [
+        "rosync diff --project .",
+        "rosync diff --project . --raw"
+      ],
+      "notes": [
+        "Reports items added locally, removed locally, and scripts whose `Source` differs."
+      ],
+      "slug": "diff"
+    },
+    {
+      "name": "find",
+      "title": "rosync find",
+      "category": "Live inspection",
+      "description": "Finds live Studio instances by class name and/or name substring.",
+      "usage": "rosync find [--project <path>] [--port <port>] [--class <ClassName>] [--name <text>] [--under <studio-path>] [--raw]",
+      "examples": [
+        "rosync find --project . --class RemoteEvent",
+        "rosync find --project . --class Part --under Workspace/Map"
+      ],
+      "notes": [
+        "Omit `--under` to search the whole DataModel."
+      ],
+      "slug": "find"
+    },
+    {
+      "name": "find-attr",
+      "title": "rosync find-attr",
+      "category": "Live inspection",
+      "description": "Finds live Studio instances that have a named attribute, optionally matching a value.",
+      "usage": "rosync find-attr [--project <path>] [--port <port>] --name <attribute> [--under <studio-path>] [--value <json>] [--raw]",
+      "examples": [
+        "rosync find-attr --project . --name Health --under Workspace",
+        "rosync find-attr --project . --name Color --value '{\"__type\":\"Color3\",\"r\":1,\"g\":0,\"b\":0}'"
+      ],
+      "notes": [
+        "`--value` uses the same JSON literal and tagged-value codec as `rosync set --value`."
+      ],
+      "slug": "find-attr"
+    },
+    {
+      "name": "classinfo",
+      "title": "rosync classinfo",
+      "category": "Live inspection",
+      "description": "Lists properties and methods for a Roblox class using Studio reflection when available.",
+      "usage": "rosync classinfo [--project <path>] [--port <port>] --class <ClassName> [--raw]",
+      "examples": [
+        "rosync classinfo --project . --class BasePart",
+        "rosync classinfo --project . --class TextLabel --raw"
+      ],
+      "notes": [
+        "Falls back to a baked table for common classes when reflection is unavailable."
+      ],
+      "slug": "classinfo"
+    },
+    {
+      "name": "enums",
+      "title": "rosync enums",
+      "category": "Live inspection",
+      "description": "Lists every Enum type name exposed by the connected Studio session.",
+      "usage": "rosync enums [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync enums --project ."
+      ],
+      "notes": [
+        "Use `rosync enum --name <EnumName>` to inspect one enum's items."
+      ],
+      "slug": "enums"
+    },
+    {
+      "name": "enum",
+      "title": "rosync enum",
+      "category": "Live inspection",
+      "description": "Lists the items for one Roblox Enum type.",
+      "usage": "rosync enum [--project <path>] [--port <port>] --name <EnumName> [--raw]",
+      "examples": [
+        "rosync enum --project . --name Material",
+        "rosync enum --project . --name KeyCode --raw"
+      ],
+      "notes": [
+        "Outputs item names and underlying integer values."
+      ],
+      "slug": "enum"
+    },
+    {
+      "name": "logs",
+      "title": "rosync logs",
+      "category": "Live diagnostics",
+      "description": "Reads recent Studio output, warning, and error messages from the plugin log buffer.",
+      "usage": "rosync logs [--project <path>] [--port <port>] [--since <duration>] [--level info|warn|error] [--limit <n>] [--tail] [--raw]",
+      "examples": [
+        "rosync logs --project . --since 1m --level warn",
+        "rosync logs --project . --tail"
+      ],
+      "notes": [
+        "`--tail` streams until interrupted."
+      ],
+      "slug": "logs"
+    },
+    {
+      "name": "status",
+      "title": "rosync status",
+      "category": "Live diagnostics",
+      "description": "Summarizes daemon reachability, plugin handshake, project config, `tree.json`, sourcemap, and write-log health.",
+      "usage": "rosync status [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync status --project .",
+        "rosync status --project . --raw"
+      ],
+      "notes": [
+        "Useful as the first live check before making further CLI calls."
+      ],
+      "slug": "status"
+    },
+    {
+      "name": "doctor",
+      "title": "rosync doctor",
+      "category": "Live diagnostics",
+      "description": "Runs a broader health check over project files, daemon, plugin, linter, and sourcemap setup.",
+      "usage": "rosync doctor [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync doctor --project .",
+        "rosync doctor --project . --raw"
+      ],
+      "notes": [
+        "Use after `status` when setup or connectivity looks suspicious."
+      ],
+      "slug": "doctor"
+    },
+    {
+      "name": "ping",
+      "title": "rosync ping",
+      "category": "Live diagnostics",
+      "description": "Round-trips a lightweight request to the Studio plugin and reports latency.",
+      "usage": "rosync ping [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync ping --project ."
+      ],
+      "notes": [
+        "A fast way to confirm the plugin WebSocket path is alive."
+      ],
+      "slug": "ping"
+    },
+    {
+      "name": "version",
+      "title": "rosync version",
+      "category": "Live diagnostics",
+      "description": "Prints the daemon build version and, when reachable, the plugin version.",
+      "usage": "rosync version [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync version --project ."
+      ],
+      "notes": [
+        "Useful when checking for mismatched widget, daemon, or plugin installs."
+      ],
+      "slug": "version"
+    },
+    {
+      "name": "refresh",
+      "title": "rosync refresh",
+      "category": "Project docs",
+      "description": "Refreshes generated Ro Sync agent docs without starting the daemon.",
+      "usage": "rosync refresh [--project <path>] [--raw]",
+      "examples": [
+        "rosync refresh --project .",
+        "rosync refresh --project . --raw"
+      ],
+      "notes": [
+        "Updates `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside generated blocks."
+      ],
+      "slug": "refresh"
+    },
+    {
+      "name": "set",
+      "title": "rosync set",
+      "category": "Live writes",
+      "description": "Sets one property or applies a batch of property writes in the live Studio session.",
+      "usage": "rosync set [--project <path>] [--port <port>] (--path <studio-path> --prop <property> --value <json> | --batch <file>) [--keep-going] [--waypoint <name>] [--force-parent] [--raw]",
+      "examples": [
+        "rosync set --project . --path Workspace/Camera --prop FieldOfView --value 90",
+        "rosync set --project . --batch writes.json --waypoint \"refactor camera\""
+      ],
+      "notes": [
+        "Every successful write is appended to `writes.log`.",
+        "`set Parent` is refused by default; use `rosync mv`, or pass `--force-parent` only when raw parent assignment is intentional.",
+        "`--waypoint` brackets the write so one Studio undo can reverse the batch."
+      ],
+      "slug": "set"
+    },
+    {
+      "name": "new",
+      "title": "rosync new",
+      "category": "Live writes",
+      "description": "Creates a new live Studio instance under a parent path.",
+      "usage": "rosync new [--project <path>] [--port <port>] --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>] [--raw]",
+      "examples": [
+        "rosync new --project . --path Workspace --class Part --name Box --props '{\"Anchored\":true}'",
+        "rosync new --project . --path ReplicatedStorage --class RemoteEvent --name DamageEvent"
+      ],
+      "notes": [
+        "`--props` uses the same value codec as `rosync set --value`.",
+        "The created instance is written to `writes.log`."
+      ],
+      "slug": "new"
+    },
+    {
+      "name": "rm",
+      "title": "rosync rm",
+      "category": "Live writes",
+      "description": "Destroys a live Studio instance.",
+      "usage": "rosync rm [--project <path>] [--port <port>] --path <studio-path> [--raw]",
+      "examples": [
+        "rosync rm --project . --path Workspace/Box"
+      ],
+      "notes": [
+        "Calls `:Destroy()` through the plugin and records the write in `writes.log`."
+      ],
+      "slug": "rm"
+    },
+    {
+      "name": "mv",
+      "title": "rosync mv",
+      "category": "Live writes",
+      "description": "Reparents a live Studio instance to a destination parent path.",
+      "usage": "rosync mv [--project <path>] [--port <port>] --from <studio-path> --to <parent-path> [--force] [--raw]",
+      "examples": [
+        "rosync mv --project . --from Workspace/Box --to Workspace/Folder",
+        "rosync mv --project . --from Workspace/Box --to ServerStorage --force"
+      ],
+      "notes": [
+        "Cross-service moves require `--force` to catch accidental DataModel reshuffles.",
+        "Use this instead of `rosync set --prop Parent`."
+      ],
+      "slug": "mv"
+    },
+    {
+      "name": "attr",
+      "title": "rosync attr",
+      "category": "Live writes",
+      "description": "Lists, sets, or removes attributes on a live Studio instance.",
+      "usage": "rosync attr set|rm|ls [--project <path>] [--port <port>] --path <studio-path> [--name <attribute>] [--value <json>] [--raw]",
+      "examples": [
+        "rosync attr set --project . --path Workspace/Box --name Speed --value 12.5",
+        "rosync attr rm --project . --path Workspace/Box --name Speed",
+        "rosync attr ls --project . --path Workspace/Box"
+      ],
+      "notes": [
+        "`attr ls` is read-only; `attr set` and `attr rm` are written to `writes.log`.",
+        "`--value` uses the same JSON literal and tagged-value codec as `rosync set --value`."
+      ],
+      "slug": "attr"
+    },
+    {
+      "name": "tag",
+      "title": "rosync tag",
+      "category": "Live writes",
+      "description": "Adds or removes CollectionService tags on a live Studio instance.",
+      "usage": "rosync tag add|rm [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]",
+      "examples": [
+        "rosync tag add --project . --path Workspace/Box --tag Enemy",
+        "rosync tag rm --project . --path Workspace/Box --tag Enemy"
+      ],
+      "notes": [
+        "Successful tag mutations are written to `writes.log`."
+      ],
+      "slug": "tag"
+    },
+    {
+      "name": "call",
+      "title": "rosync call",
+      "category": "Live writes",
+      "description": "Invokes a method on a live Studio instance and prints the returned value.",
+      "usage": "rosync call [--project <path>] [--port <port>] --path <studio-path> --method <MethodName> [--args <json-array>] [--raw]",
+      "examples": [
+        "rosync call --project . --path Workspace/Folder --method FindFirstChild --args '[\"Box\"]'"
+      ],
+      "notes": [
+        "`--args` is a JSON array using the same tagged-value codec as `rosync set --value`.",
+        "Treat methods with side effects as writes; successful calls are audited."
+      ],
+      "slug": "call"
+    },
+    {
+      "name": "select",
+      "title": "rosync select",
+      "category": "Live writes",
+      "description": "Reads or replaces the current Studio Selection.",
+      "usage": "rosync select get|set [--project <path>] [--port <port>] [--paths <json-array>] [--raw]",
+      "examples": [
+        "rosync select get --project .",
+        "rosync select set --project . --paths '[\"Workspace/Box\",\"Workspace/SpawnLocation\"]'"
+      ],
+      "notes": [
+        "`select get` is read-only; `select set` is a Studio state change."
+      ],
+      "slug": "select"
+    },
+    {
+      "name": "eval",
+      "title": "rosync eval",
+      "category": "Live writes",
+      "description": "Executes Luau source inside Studio through the plugin sandbox.",
+      "usage": "rosync eval [--project <path>] [--port <port>] --source <luau> [--raw]",
+      "examples": [
+        "rosync eval --project . --source 'return #game.Workspace:GetChildren()'"
+      ],
+      "notes": [
+        "Use `return ...` when you need a returned value.",
+        "This is the broadest escape hatch; ask before using it for mutations."
+      ],
+      "slug": "eval"
+    },
+    {
+      "name": "save",
+      "title": "rosync save",
+      "category": "Live writes",
+      "description": "Asks Studio to save the current place.",
+      "usage": "rosync save [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync save --project ."
+      ],
+      "notes": [
+        "The CLI returns after Studio accepts the save request; the actual save is asynchronous."
+      ],
+      "slug": "save"
+    },
+    {
+      "name": "waypoint",
+      "title": "rosync waypoint",
+      "category": "Live writes",
+      "description": "Creates a named Studio change-history waypoint.",
+      "usage": "rosync waypoint [--project <path>] [--port <port>] --name <label> [--raw]",
+      "examples": [
+        "rosync waypoint --project . --name \"before refactor\""
+      ],
+      "notes": [
+        "Use waypoints before and after multi-step edits so Studio undo has a clear boundary."
+      ],
+      "slug": "waypoint"
+    },
+    {
+      "name": "undo",
+      "title": "rosync undo",
+      "category": "Live writes",
+      "description": "Requests Studio to undo one change-history entry.",
+      "usage": "rosync undo [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync undo --project ."
+      ],
+      "notes": [
+        "Pairs naturally with `--waypoint` on `rosync set` for reversible batches."
+      ],
+      "slug": "undo"
+    },
+    {
+      "name": "redo",
+      "title": "rosync redo",
+      "category": "Live writes",
+      "description": "Requests Studio to redo the last undone change-history entry.",
+      "usage": "rosync redo [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync redo --project ."
+      ],
+      "notes": [
+        "Requires the same live Studio/plugin connection as `undo`."
+      ],
+      "slug": "redo"
+    },
+    {
+      "name": "serve",
+      "title": "rosync serve",
+      "category": "Daemon",
+      "description": "Runs the local HTTP/WebSocket daemon that bridges the widget, Studio plugin, filesystem watcher, and CLI.",
+      "usage": "rosync serve --project <path> [--port <port>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]",
+      "examples": [
+        "rosync serve --project . --port 7878",
+        "rosync serve --project . --port 7878 --game-id 1234567890"
+      ],
+      "notes": [
+        "The widget normally launches this for the active project.",
+        "Use it manually when debugging daemon/plugin connectivity outside the widget."
+      ],
+      "slug": "serve"
+    }
+  ]
+}

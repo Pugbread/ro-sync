@@ -1,0 +1,14 @@
+{
+  "name": "call",
+  "title": "rosync call",
+  "category": "Live writes",
+  "description": "Invokes a method on a live Studio instance and prints the returned value.",
+  "usage": "rosync call [--project <path>] [--port <port>] --path <studio-path> --method <MethodName> [--args <json-array>] [--raw]",
+  "examples": [
+    "rosync call --project . --path Workspace/Folder --method FindFirstChild --args '[\"Box\"]'"
+  ],
+  "notes": [
+    "`--args` is a JSON array using the same tagged-value codec as `rosync set --value`.",
+    "Treat methods with side effects as writes; successful calls are audited."
+  ]
+}

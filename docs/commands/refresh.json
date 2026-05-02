@@ -1,0 +1,14 @@
+{
+  "name": "refresh",
+  "title": "rosync refresh",
+  "category": "Project docs",
+  "description": "Refreshes generated Ro Sync agent docs without starting the daemon.",
+  "usage": "rosync refresh [--project <path>] [--raw]",
+  "examples": [
+    "rosync refresh --project .",
+    "rosync refresh --project . --raw"
+  ],
+  "notes": [
+    "Updates `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside generated blocks."
+  ]
+}

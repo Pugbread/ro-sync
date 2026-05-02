@@ -112,7 +112,9 @@ function parseMaybe(s) {
 
 // WebSocket wrapper for daemon realtime channel (replaces SSE /events).
 // Opens ws://<host>/ws (derived from http base). Auto-reconnects with 1s→30s
-// exponential backoff on close/error. handlers = { open, message, error, close }.
+// exponential backoff on close/error.
+// handlers = { open, message, error, close, skipRaw }.
+// skipRaw(raw, event) can return true to avoid JSON parsing hot-path frames.
 // message receives a JSON-decoded frame (or raw string on parse failure).
 // Returns { close, send }. close() stops reconnects and shuts the socket.
 export function daemonWS(base, path = "/ws", handlers = {}) {
@@ -149,6 +151,13 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
       if (handlers.open) { try { handlers.open(e); } catch (err) { console.error(err); } }
     };
     ws.onmessage = (e) => {
+      if (handlers.skipRaw) {
+        try {
+          if (handlers.skipRaw(e.data, e)) return;
+        } catch (err) {
+          console.error(err);
+        }
+      }
       if (!handlers.message) return;
       const data = parseMaybe(e.data);
       try { handlers.message(data, e); } catch (err) { console.error(err); }

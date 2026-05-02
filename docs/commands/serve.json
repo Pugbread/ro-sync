@@ -1,0 +1,15 @@
+{
+  "name": "serve",
+  "title": "rosync serve",
+  "category": "Daemon",
+  "description": "Runs the local HTTP/WebSocket daemon that bridges the widget, Studio plugin, filesystem watcher, and CLI.",
+  "usage": "rosync serve --project <path> [--port <port>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]",
+  "examples": [
+    "rosync serve --project . --port 7878",
+    "rosync serve --project . --port 7878 --game-id 1234567890"
+  ],
+  "notes": [
+    "The widget normally launches this for the active project.",
+    "Use it manually when debugging daemon/plugin connectivity outside the widget."
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "mv",
+  "title": "rosync mv",
+  "category": "Live writes",
+  "description": "Reparents a live Studio instance to a destination parent path.",
+  "usage": "rosync mv [--project <path>] [--port <port>] --from <studio-path> --to <parent-path> [--force] [--raw]",
+  "examples": [
+    "rosync mv --project . --from Workspace/Box --to Workspace/Folder",
+    "rosync mv --project . --from Workspace/Box --to ServerStorage --force"
+  ],
+  "notes": [
+    "Cross-service moves require `--force` to catch accidental DataModel reshuffles.",
+    "Use this instead of `rosync set --prop Parent`."
+  ]
+}

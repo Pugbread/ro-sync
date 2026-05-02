@@ -13,6 +13,8 @@ Studio session.
 - Represents non-script containers that hold scripts as pass-through folders so script paths round-trip cleanly.
 - Keeps non-file-backed Roblox instances Studio-authoritative and exposes their shape through `tree.json`.
 - Runs a local Rust daemon that bridges the Terminal 64 widget, Roblox Studio plugin, filesystem watcher, and CLI.
+- Provides a sidebar widget UI with searchable projects, serving controls, per-project status, recent activity, and one-click Terminal 64 session spawning.
+- Provides a Docs tab generated from the same command catalogue used by the agent Markdown.
 - Installs a Rojo-built Roblox Studio plugin package, `plugin/Plugin.rbxm`, from the widget settings page.
 - Generates `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` so Codex and Claude Code start with the same Ro Sync CLI instructions.
 
@@ -23,98 +25,29 @@ The `rosync` CLI can work in two modes:
 - Offline project inspection through files such as `tree.json`.
 - Live Studio control through the daemon and plugin WebSocket bridge.
 
-Useful read-only commands:
+The command catalogue is sourced from one JSON file per command under
+`docs/commands/`. Run the builder after editing command docs:
 
 ```sh
-rosync query --project /path/to/project '**/RemoteEvent' --format paths
-rosync path --project /path/to/project Workspace/Camera
-rosync path --project /path/to/project --from fs ReplicatedStorage/Config.luau
-rosync get --project /path/to/project --path Workspace/Camera --prop FieldOfView
-rosync ls --project /path/to/project --path ReplicatedStorage
-rosync tree --project /path/to/project --path Workspace --depth 3
-rosync snapshot --project /path/to/project
-rosync diff --project /path/to/project --port 7878
-rosync find --project /path/to/project --class RemoteEvent
-rosync classinfo --project /path/to/project --class BasePart
-rosync enums --project /path/to/project
-rosync logs --project /path/to/project --since 1m --level warn
-rosync status --project /path/to/project --port 7878
-rosync doctor --project /path/to/project --port 7878
+node scripts/build-command-docs.mjs
 ```
 
-Useful write commands:
+The builder writes:
+
+- `docs/client-commands.generated.json` for the widget Docs tab.
+- `docs/client-commands.md`, which is bundled into generated `ro-sync.md`.
+
+Common starting points:
 
 ```sh
-rosync set --project /path/to/project --path Workspace/Part --prop Transparency --value 0.5
-rosync new --project /path/to/project --path Workspace --class Folder --name Enemies
-rosync rm --project /path/to/project --path Workspace/Enemies
-rosync mv --project /path/to/project --from Workspace/Part --to ServerStorage --force
-rosync attr set --project /path/to/project --path Workspace/Part --name Health --value 100
-rosync tag add --project /path/to/project --path Workspace/Part --tag Enemy
-rosync waypoint --project /path/to/project --name "before refactor"
-rosync undo --project /path/to/project
-rosync redo --project /path/to/project
-rosync eval --project /path/to/project --source 'return #workspace:GetDescendants()'
+rosync refresh --project .
+rosync status --project .
+rosync diff --project .
+rosync path --project . Workspace/Camera
+rosync upload ./icon.png --project .
 ```
 
-Luau linting:
-
-```sh
-rosync lint --project /path/to/project
-rosync lint --project /path/to/project --path ServerScriptService/Foo.server.luau
-rosync lint --project /path/to/project --no-sourcemap
-rosync lint --project /path/to/project --luau-lsp /path/to/luau-lsp
-```
-
-`rosync lint` delegates to `luau-lsp`, generates a temporary Ro-Sync sourcemap
-for require resolution, and automatically uses bundled Roblox definitions when
-`tools/luau-lsp/roblox/globalTypes.d.luau` exists.
-
-Asset uploads:
-
-```sh
-rosync img ./icon.png --creator user:123456
-rosync img ./icon.png --creator group:123456 --name "Inventory Icon" --asset-type decal
-rosync img ./icon.png --creator user:123456 --auth bearer --api-key-env ROBLOX_OAUTH_TOKEN
-rosync img ./icon.png --creator user:123456 --no-wait --raw
-rosync imgs ./icons ./banner.png --project . --manifest uploaded-assets.json
-```
-
-`rosync img` uploads `.png`, `.jpg`, `.jpeg`, `.bmp`, and `.tga` files through
-Roblox Open Cloud Assets. It reads the API key from `ROBLOX_API_KEY`, or from
-the widget Settings > Secrets field when the env var is not set. Pass
-`--creator user:<id>` or `--creator group:<id>` to choose the asset owner;
-`ROBLOX_CREATOR` can provide the same value for scripts. If no creator is
-provided, Ro Sync uses the project Group ID from `ro-sync.json` or the active
-widget project. The default auth mode uses Roblox API keys (`x-api-key`); pass
-`--auth bearer` for OAuth access tokens.
-
-`rosync imgs` bulk uploads image files and directories using the same credential
-and creator resolution as `rosync img`. Directories recurse by default, skip
-non-image files, continue after per-file failures, and support `--manifest` for
-a JSON file-to-asset-id result map. Default concurrency is `2`; tune with
-`--concurrency`.
-
-`rosync status` is a concise health summary for scripts and agents: daemon
-reachability, plugin/version handshake, project config, `tree.json`,
-sourcemap generation, and the `writes.log` location. Pass `--raw` for JSON.
-
-`rosync diff` compares the local Ro-Sync script/folder representation with
-live Studio state. It reports items added locally, removed locally, and scripts
-whose `Source` differs. Pass `--raw` for JSON.
-
-`rosync snapshot` exports the live Studio tree plus inspectable properties,
-attributes, and tags into a deterministic JSON document. By default it writes a
-timestamped `rosync-snapshot-<unix-seconds>.json` file under `--project` (or
-the current directory); pass `--output` to choose a file or existing directory.
-Use snapshots for debugging, backups, and comparing Studio state outside the
-filesystem sync surface.
-
-`rosync path` is an offline resolver for jumping between Studio paths and disk.
-Studio instance paths print the syncable filesystem path; `--from fs` maps a
-Ro-Sync file such as `ReplicatedStorage/Config.luau` back to its Studio path.
-It reads `tree.json` and errors clearly for Studio-authoritative classes,
-unsynced services, generated files, and paths missing from the latest tree.
+Open the widget Docs tab for the full searchable command reference.
 
 ## Agent Context
 
@@ -123,9 +56,18 @@ Ro Sync keeps one canonical agent entrypoint:
 - Codex reads `AGENTS.md`.
 - Claude Code reads `CLAUDE.md`, which imports `@AGENTS.md`.
 - `AGENTS.md` contains a regenerated Ro Sync block sourced from `ro-sync.md`.
+- The command reference inside `ro-sync.md` is generated from
+  `docs/commands/*.json`.
 
 The generated context tells agents to use `rosync` first, including
-`rosync img`, before searching for unrelated Roblox upload tools.
+`rosync upload`, before searching for unrelated Roblox upload tools.
+
+Run `rosync refresh --project /path/to/project` after updating Ro Sync to pull
+the latest generated agent docs into an existing project. It refreshes the Ro
+Sync generated block in `AGENTS.md`, ensures `CLAUDE.md` imports `@AGENTS.md`,
+and updates `ro-sync.md` when it is a generated Ro Sync file. Custom content in
+`AGENTS.md` outside the marker block and custom content in `CLAUDE.md` are left
+in place.
 
 ## Requirements
 
@@ -161,9 +103,33 @@ The generated context tells agents to use `rosync` first, including
 4. Add a Roblox project folder from the Projects view.
 
 5. Optionally enter the project Game ID, Group ID, and Place IDs. The Group ID
-   is used as the default owner for `rosync img` uploads.
+   is used as the default owner for `rosync upload`.
 
 6. Turn on the project switch to start serving that project.
+
+## Use The Widget
+
+The widget uses a left sidebar for Projects, Activity, Conflicts, Docs, and Settings.
+
+Projects is the main workspace:
+
+- Use **Add Project** or the add tile to register a local Roblox project folder.
+- Use the search box and filters to narrow larger project lists.
+- Toggle a project on to serve it. Ro Sync serves one project at a time, so turning one on replaces the previous active project.
+- Select a project card to open its detail pane. The detail pane shows recent daemon/plugin activity for the active project and exposes edit, folder, status refresh, diff, delete, and **Spawn Session** actions.
+- Duplicate Studio sibling names are surfaced on project cards as duplicate-name chips when the daemon snapshot contains `[N]` disambiguated paths.
+
+Activity shows the live daemon stream with ops, last sync timing, plugin state,
+and the active project. The log can be paused with **Stop live log** and cleared
+without stopping sync. High-volume op bursts are collapsed before full JSON
+parsing so large initial syncs do not flood the Terminal 64 host.
+
+The app-level daemon stream remains connected for control prompts such as
+initial sync decisions and batch previews. Raw op frames are handled on the
+string hot path and only control events are fully parsed globally.
+
+Docs shows the generated command catalogue with search, category filters, usage
+examples, notes, and copy buttons.
 
 ## Install The Daemon
 
@@ -280,6 +246,7 @@ The release workflow also builds and tests the daemon on `windows-2022`.
 
 ```text
 daemon/        Rust daemon and CLI
+docs/          Command JSON source and generated command docs
 plugin/        Roblox Studio plugin artifact and source bridge
 plugin-src/    Rojo/Wally plugin package project
 views/         Terminal 64 widget views

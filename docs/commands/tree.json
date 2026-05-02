@@ -1,0 +1,14 @@
+{
+  "name": "tree",
+  "title": "rosync tree",
+  "category": "Live inspection",
+  "description": "Prints a class and name tree below a live Studio instance.",
+  "usage": "rosync tree [--project <path>] [--port <port>] [--path <studio-path>] [--depth <n>] [--raw]",
+  "examples": [
+    "rosync tree --project . --path Workspace --depth 3",
+    "rosync tree --project . --path ReplicatedStorage --depth 8 --raw"
+  ],
+  "notes": [
+    "Depth defaults to 3; use 0 for only the root instance."
+  ]
+}

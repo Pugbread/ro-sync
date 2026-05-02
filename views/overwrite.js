@@ -1,7 +1,7 @@
-// views/overwrite.js — blocking modal for "initial-choice-needed" SSE events.
+// views/overwrite.js — blocking modal for "initial-choice-needed" daemon events.
 //
 // Mount once at app boot. It subscribes to two bus events (fanned out by
-// app.js from the daemon /events stream):
+// app.js from the daemon WebSocket stream):
 //   - initial-choice-needed : { choiceId, diskStats, studioStats }
 //   - initial-choice-made   : { choiceId, ... }  (dismiss if still showing)
 // On button click it POSTs {choiceId, choice} to <daemonBase>/initial-choice.

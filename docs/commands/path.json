@@ -1,0 +1,15 @@
+{
+  "name": "path",
+  "title": "rosync path",
+  "category": "Offline inspection",
+  "description": "Translates between Studio instance paths and syncable filesystem paths using `tree.json`.",
+  "usage": "rosync path --project <path> [--from auto|studio|fs] <target> [--raw]",
+  "examples": [
+    "rosync path --project . Workspace/Camera",
+    "rosync path --project . --from fs ReplicatedStorage/Config.luau"
+  ],
+  "notes": [
+    "Studio-authoritative classes are reported clearly instead of pretending they map to files.",
+    "Generated files such as `tree.json` and `ro-sync.md` are not syncable Studio instances."
+  ]
+}

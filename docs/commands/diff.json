@@ -1,0 +1,14 @@
+{
+  "name": "diff",
+  "title": "rosync diff",
+  "category": "Live inspection",
+  "description": "Compares local scripts and folders against the live Studio syncable tree.",
+  "usage": "rosync diff [--project <path>] [--port <port>] [--depth <n>] [--raw]",
+  "examples": [
+    "rosync diff --project .",
+    "rosync diff --project . --raw"
+  ],
+  "notes": [
+    "Reports items added locally, removed locally, and scripts whose `Source` differs."
+  ]
+}

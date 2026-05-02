@@ -1,0 +1,14 @@
+{
+  "name": "tag",
+  "title": "rosync tag",
+  "category": "Live writes",
+  "description": "Adds or removes CollectionService tags on a live Studio instance.",
+  "usage": "rosync tag add|rm [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]",
+  "examples": [
+    "rosync tag add --project . --path Workspace/Box --tag Enemy",
+    "rosync tag rm --project . --path Workspace/Box --tag Enemy"
+  ],
+  "notes": [
+    "Successful tag mutations are written to `writes.log`."
+  ]
+}

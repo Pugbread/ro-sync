@@ -1,9 +1,8 @@
-# Ro Sync — manual verification (full-property + rename/delete + [N] suffix)
+# Ro Sync — manual verification (sync + widget workspace)
 
-Covers the combined feature set after the three parallel patches land:
-reflection-driven `.meta.json` (Agent 1, daemon + plugin), `[N]` sibling
-disambiguation (Agent 2, daemon + plugin), and widget log enrichment +
-project-row duplicate-group subtitle (Agent 3, this branch).
+Covers reflection-driven `.meta.json`, `[N]` sibling disambiguation, and the
+Terminal 64 widget workspace: sidebar navigation, project detail/activity,
+duplicate-name chips, session spawning, and throttled live logs.
 
 ## Prep
 
@@ -11,10 +10,13 @@ project-row duplicate-group subtitle (Agent 3, this branch).
 2. Use the widget Settings tab to install `plugin/Plugin.rbxm`, or copy it to
    `~/Documents/Roblox/Plugins/RoSync.rbxm`.
 3. Create a scratch project folder: `mkdir -p /tmp/rosync-v2`.
-4. Open the Ro Sync widget, Add project `/tmp/rosync-v2`, Activate it.
-   Daemon dot should go green with `:7878`.
+4. Open the Ro Sync widget, go to Projects from the sidebar, add project
+   `/tmp/rosync-v2`, and turn on its serving switch. Daemon dot should go green
+   with `:7878`.
 5. Open Roblox Studio → Plugins → RoSync → **Connect**. Plugin stat in the
    Active view should read `connected`.
+6. Run widget JS smoke checks after editing UI files:
+   `node --check app.js bridge.js views/active.js views/projects.js`.
 
 ## Checklist
 
@@ -27,8 +29,11 @@ project-row duplicate-group subtitle (Agent 3, this branch).
 | 5 | In Studio, create two sibling parts under `Workspace` both named `Foo`. | Disk has `Workspace/Foo.luau`/`.meta.json` **and** `Workspace/Foo [1].luau`/`.meta.json`. No `(ClassName)`-style names anywhere. | ☐ |
 | 6 | Add a third sibling `Foo`. | `Workspace/Foo [2].luau`/`.meta.json` appears. Existing `Foo` and `Foo [1]` files are untouched. | ☐ |
 | 7 | Delete the middle `Foo [1]` in Studio. | `Foo [1].meta.json` is removed. `Foo` and `Foo [2]` remain (stable — no cascading rename is required; loose ordering is OK). | ☐ |
-| 8 | Back on the Projects tab, wait for the status dot to refresh. | Project row for `/tmp/rosync-v2` shows a muted subtitle `1 duplicate-name group` (from the remaining `Foo` siblings). Switch projects / return to confirm subtitle persists until duplicates resolved. | ☐ |
-| 9 | Grep the widget JS for stale disambiguation references: `grep -n "(ClassName)" app.js views/*.js bridge.js` | No matches. | ☐ |
+| 8 | Back on the Projects tab, wait for status to refresh. | Project card for `/tmp/rosync-v2` shows a warning chip `1 duplicate-name group` from the remaining `Foo` siblings. Switch views / return to confirm the chip persists until duplicates resolve. | ☐ |
+| 9 | Select the project card, then click **Edit** in the detail pane. | The detail pane opens the editable Game ID / Group ID / Place IDs fields plus Local Path, Plugin, Refresh Status, View Diff, and two-click Delete actions. | ☐ |
+| 10 | Click **Spawn Session** from the project detail header. | Terminal 64 opens a new session with cwd set to `/tmp/rosync-v2`. If the host lacks `t64:create-session`, the widget shows `Spawn session failed` without breaking navigation. | ☐ |
+| 11 | Go to Activity and exercise a burst such as creating/deleting many Studio children. | The log remains responsive, shows op counts/last sync, and collapses saturated daemon events instead of rendering every frame. **Stop live log** pauses the stream and **Start live log** resumes it. | ☐ |
+| 12 | Grep the widget JS for stale disambiguation references: `grep -n "(ClassName)" app.js views/*.js bridge.js` | No matches. | ☐ |
 
 ## UX gotchas noted while wiring the widget
 
@@ -36,13 +41,13 @@ project-row duplicate-group subtitle (Agent 3, this branch).
   `views/projects.js` walks either `children[]`, `services[]`, or a bare
   array — if Agent 1/2 settle on a different tree key, update that visitor.
   The current daemon returns `{bootstrap, services, strict}`, so the
-  subtitle stays hidden (0 groups) until the tree is populated — that's
+  duplicate-name chip stays hidden (0 groups) until the tree is populated — that's
   fine for the empty-project state.
-* **Meta diff chip depends on in-session state.** The first `op:update` for
-  a `.meta.json` after the widget opens has no prior snapshot to diff
-  against, so it renders as `+` additions only. That is intentional — it
-  still tells you *which* keys are in play without pretending to know a
-  baseline we never saw.
+* **Widget streams are intentionally lossy for display.** Control events still
+  reach the app-level prompt modals, but high-volume raw `op` frames are
+  throttled/collapsed before JSON parsing in the app relay and live logs. The
+  daemon/plugin sync path is unchanged; this only affects what the widget
+  chooses to render.
 * **SSE content is a byte-array.** The inspector decodes via
   `String.fromCharCode(...content)`, which is fine for ASCII/UTF-8 up to a
   few KB but will silently truncate on very long `.meta.json` content

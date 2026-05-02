@@ -1,7 +1,11 @@
 // views/active.js — live WS log tail, op counter, plugin connection state.
 import { daemonWS, daemonJson } from "../bridge.js";
 
-const MAX_LINES = 500;
+const MAX_LINES = 200;
+const MAX_PENDING_LINES = 400;
+const MAX_FLUSH_LINES = 80;
+const MAX_PARSED_OPS_PER_SECOND = 20;
+const RAW_OP_RE = /"type"\s*:\s*"op"/;
 
 export function mountActive(root, api) {
   root.innerHTML = `
@@ -13,7 +17,8 @@ export function mountActive(root, api) {
     </div>
     <div class="row" style="margin-bottom:8px">
       <button id="act-clear">Clear log</button>
-      <button id="act-snapshot">Re-snapshot</button>
+      <button id="act-live">Stop live log</button>
+      <button id="act-snapshot">Refresh snapshot</button>
       <span class="status-left" id="act-hint" style="color:var(--muted)"></span>
       <span id="act-unsynced" class="badge badge-warn" hidden></span>
     </div>
@@ -26,6 +31,7 @@ export function mountActive(root, api) {
   const $project = root.querySelector("#s-project");
   const $log = root.querySelector("#act-log");
   const $clear = root.querySelector("#act-clear");
+  const $live = root.querySelector("#act-live");
   const $snap = root.querySelector("#act-snapshot");
   const $hint = root.querySelector("#act-hint");
   const $unsynced = root.querySelector("#act-unsynced");
@@ -33,7 +39,17 @@ export function mountActive(root, api) {
   let opCount = 0;
   let lastSync = null;
   let lastSyncTimer = null;
+  let statsRaf = 0;
+  let unsyncedRaf = 0;
+  let logRaf = 0;
+  let droppedNoticeTimer = 0;
+  let rawWindowStart = 0;
+  let parsedOpsInWindow = 0;
+  let skippedRawOps = 0;
+  let droppedLogFrames = 0;
+  let liveEnabled = true;
   let ws = null;
+  const pendingLogFrames = [];
 
   // Rolling-window unsynced-ops tracker: if >10 ops hit in the last 10s we
   // surface a yellow "unsynced changes" badge (Argon's queue.rs threshold).
@@ -46,7 +62,14 @@ export function mountActive(root, api) {
     recentOps.push(now);
     const cutoff = now - UNSYNCED_WINDOW_MS;
     while (recentOps.length && recentOps[0] < cutoff) recentOps.shift();
-    updateUnsyncedBadge();
+    scheduleUnsyncedBadge();
+  }
+  function scheduleUnsyncedBadge() {
+    if (unsyncedRaf) return;
+    unsyncedRaf = requestAnimationFrame(() => {
+      unsyncedRaf = 0;
+      updateUnsyncedBadge();
+    });
   }
   function updateUnsyncedBadge() {
     const cutoff = Date.now() - UNSYNCED_WINDOW_MS;
@@ -113,7 +136,7 @@ export function mountActive(root, api) {
     return { kind: t, cls, chip: "", msg };
   }
 
-  function addLine(frame) {
+  function renderLine(frame) {
     const line = document.createElement("span");
     line.className = "line";
     const time = new Date(Date.now()).toLocaleTimeString();
@@ -125,28 +148,139 @@ export function mountActive(root, api) {
       `<span class="t">${time}</span> ` +
       `<span class="${rendered.cls}">[${escape(rendered.kind)}]</span>${rendered.chip} ` +
       `<span>${escape(rendered.msg)}</span>`;
-    $log.appendChild(line);
-    while ($log.childElementCount > MAX_LINES) $log.removeChild($log.firstChild);
-    $log.scrollTop = $log.scrollHeight;
+    return line;
+  }
+
+  function droppedLine(count) {
+    const line = document.createElement("span");
+    line.className = "line";
+    const time = new Date(Date.now()).toLocaleTimeString();
+    line.innerHTML =
+      `<span class="t">${time}</span> ` +
+      `<span class="lv-info">[busy]</span> ` +
+      `<span>collapsed ${count} daemon events while the log was saturated</span>`;
+    return line;
+  }
+
+  function isNearBottom() {
+    return $log.scrollHeight - $log.scrollTop - $log.clientHeight < 32;
+  }
+
+  function flushLogLines() {
+    logRaf = 0;
+    if (!$log.isConnected) {
+      pendingLogFrames.length = 0;
+      droppedLogFrames = 0;
+      return;
+    }
+
+    const stickToBottom = isNearBottom();
+    const fragment = document.createDocumentFragment();
+    if (droppedLogFrames > 0) {
+      fragment.appendChild(droppedLine(droppedLogFrames));
+      droppedLogFrames = 0;
+    }
+
+    const batch = pendingLogFrames.splice(0, MAX_FLUSH_LINES);
+    for (const frame of batch) {
+      const line = renderLine(frame);
+      if (line) fragment.appendChild(line);
+    }
+
+    if (fragment.childNodes.length > 0) {
+      $log.appendChild(fragment);
+      while ($log.childElementCount > MAX_LINES) {
+        const first = $log.firstElementChild || $log.firstChild;
+        if (!first) break;
+        $log.removeChild(first);
+      }
+      if (stickToBottom) $log.scrollTop = $log.scrollHeight;
+    }
+
+    if (pendingLogFrames.length > 0 && !logRaf) {
+      logRaf = requestAnimationFrame(flushLogLines);
+    }
+  }
+
+  function addLine(frame) {
+    if (document.hidden) {
+      droppedLogFrames++;
+      return;
+    }
+    pendingLogFrames.push(frame);
+    if (pendingLogFrames.length > MAX_PENDING_LINES) {
+      const drop = pendingLogFrames.length - Math.floor(MAX_PENDING_LINES / 2);
+      pendingLogFrames.splice(0, drop);
+      droppedLogFrames += drop;
+    }
+    if (!logRaf) logRaf = requestAnimationFrame(flushLogLines);
+  }
+
+  function flushSkippedRawNotice() {
+    droppedNoticeTimer = 0;
+    if (skippedRawOps <= 0) return;
+    droppedLogFrames += skippedRawOps;
+    skippedRawOps = 0;
+    if (!logRaf) logRaf = requestAnimationFrame(flushLogLines);
+  }
+
+  function scheduleSkippedRawNotice() {
+    if (droppedNoticeTimer) return;
+    droppedNoticeTimer = setTimeout(flushSkippedRawNotice, 1000);
+  }
+
+  function shouldSkipRawFrame(raw) {
+    if (typeof raw !== "string" || !RAW_OP_RE.test(raw)) return false;
+    const now = Date.now();
+    if (now - rawWindowStart >= 1000) {
+      rawWindowStart = now;
+      parsedOpsInWindow = 0;
+      flushSkippedRawNotice();
+    }
+    if (parsedOpsInWindow < MAX_PARSED_OPS_PER_SECOND) {
+      parsedOpsInWindow++;
+      return false;
+    }
+
+    skippedRawOps++;
+    opCount++;
+    lastSync = now;
+    scheduleStatsUpdate();
+    scheduleUnsyncedBadge();
+    scheduleSkippedRawNotice();
+    return true;
+  }
+
+  function scheduleStatsUpdate() {
+    if (statsRaf) return;
+    statsRaf = requestAnimationFrame(() => {
+      statsRaf = 0;
+      $ops.textContent = String(opCount);
+      updateLastSyncDisplay();
+    });
   }
 
   function bumpOp() {
     opCount++;
-    $ops.textContent = String(opCount);
     lastSync = Date.now();
-    updateLastSyncDisplay();
+    scheduleStatsUpdate();
   }
 
   function openStream() {
+    if (!liveEnabled) {
+      $hint.textContent = "live log paused";
+      return;
+    }
     const base = api.getDaemonBase();
     if (!base) {
       setPluginStatus("daemon offline", "err");
       $hint.textContent = "waiting for daemon…";
       return;
     }
-    if (ws) { try { ws.close(); } catch {} ws = null; }
+    if (ws) return;
     try {
       ws = daemonWS(base, "/ws", {
+        skipRaw: shouldSkipRawFrame,
         open: () => { $hint.textContent = "streaming /ws"; },
         error: () => { $hint.textContent = "stream error — retrying"; },
         close: () => { $hint.textContent = "stream closed — reconnecting"; },
@@ -178,6 +312,13 @@ export function mountActive(root, api) {
     }
   }
 
+  function closeStream() {
+    if (ws) {
+      try { ws.close(); } catch {}
+      ws = null;
+    }
+  }
+
   async function refreshHeader() {
     const s = api.getState();
     const proj = (s.projects || []).find((p) => p.id === s.activeProjectId);
@@ -194,25 +335,43 @@ export function mountActive(root, api) {
     } catch {}
   }
 
-  $clear.addEventListener("click", () => { $log.innerHTML = ""; opCount = 0; $ops.textContent = "0"; });
+  $clear.addEventListener("click", () => {
+    pendingLogFrames.length = 0;
+    droppedLogFrames = 0;
+    $log.innerHTML = "";
+    opCount = 0;
+    $ops.textContent = "0";
+  });
+  $live.addEventListener("click", () => {
+    liveEnabled = !liveEnabled;
+    $live.textContent = liveEnabled ? "Stop live log" : "Start live log";
+    if (liveEnabled) openStream();
+    else {
+      closeStream();
+      $hint.textContent = "live log paused";
+    }
+  });
   $snap.addEventListener("click", async () => {
     const base = api.getDaemonBase();
     const s = api.getState();
     const proj = (s.projects || []).find((p) => p.id === s.activeProjectId);
     if (!base || !proj) { api.toast("No active project"); return; }
     try {
-      await daemonJson(base, "/snapshot", {
-        method: "POST",
-        body: JSON.stringify({ force: true }),
-      });
-      api.toast("Re-snapshot queued");
+      await daemonJson(base, "/snapshot");
+      await refreshHeader();
+      api.toast("Snapshot refreshed");
     } catch (e) { api.toast(`snapshot failed: ${e.message}`); }
   });
 
   const offUp = api.onBus("daemon:up", () => { clearUnsynced(); openStream(); refreshHeader(); });
-  const offDown = api.onBus("daemon:down", () => setPluginStatus("daemon offline", "err"));
+  const offDown = api.onBus("daemon:down", () => {
+    closeStream();
+    setPluginStatus("daemon offline", "err");
+    $hint.textContent = liveEnabled ? "waiting for daemon…" : "live log paused";
+  });
   const offState = api.onBus("state", () => { refreshHeader(); openStream(); });
 
+  $hint.textContent = "waiting for daemon…";
   openStream();
   refreshHeader();
 
@@ -220,7 +379,12 @@ export function mountActive(root, api) {
     offUp(); offDown(); offState();
     clearInterval(lastSyncTimer);
     clearInterval(unsyncedTimer);
-    if (ws) { try { ws.close(); } catch {} }
+    if (statsRaf) cancelAnimationFrame(statsRaf);
+    if (unsyncedRaf) cancelAnimationFrame(unsyncedRaf);
+    if (logRaf) cancelAnimationFrame(logRaf);
+    if (droppedNoticeTimer) clearTimeout(droppedNoticeTimer);
+    pendingLogFrames.length = 0;
+    closeStream();
   };
 }
 

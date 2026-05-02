@@ -1,0 +1,14 @@
+{
+  "name": "find",
+  "title": "rosync find",
+  "category": "Live inspection",
+  "description": "Finds live Studio instances by class name and/or name substring.",
+  "usage": "rosync find [--project <path>] [--port <port>] [--class <ClassName>] [--name <text>] [--under <studio-path>] [--raw]",
+  "examples": [
+    "rosync find --project . --class RemoteEvent",
+    "rosync find --project . --class Part --under Workspace/Map"
+  ],
+  "notes": [
+    "Omit `--under` to search the whole DataModel."
+  ]
+}

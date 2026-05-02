@@ -1,0 +1,13 @@
+{
+  "name": "ping",
+  "title": "rosync ping",
+  "category": "Live diagnostics",
+  "description": "Round-trips a lightweight request to the Studio plugin and reports latency.",
+  "usage": "rosync ping [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync ping --project ."
+  ],
+  "notes": [
+    "A fast way to confirm the plugin WebSocket path is alive."
+  ]
+}

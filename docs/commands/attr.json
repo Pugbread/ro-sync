@@ -1,0 +1,16 @@
+{
+  "name": "attr",
+  "title": "rosync attr",
+  "category": "Live writes",
+  "description": "Lists, sets, or removes attributes on a live Studio instance.",
+  "usage": "rosync attr set|rm|ls [--project <path>] [--port <port>] --path <studio-path> [--name <attribute>] [--value <json>] [--raw]",
+  "examples": [
+    "rosync attr set --project . --path Workspace/Box --name Speed --value 12.5",
+    "rosync attr rm --project . --path Workspace/Box --name Speed",
+    "rosync attr ls --project . --path Workspace/Box"
+  ],
+  "notes": [
+    "`attr ls` is read-only; `attr set` and `attr rm` are written to `writes.log`.",
+    "`--value` uses the same JSON literal and tagged-value codec as `rosync set --value`."
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "new",
+  "title": "rosync new",
+  "category": "Live writes",
+  "description": "Creates a new live Studio instance under a parent path.",
+  "usage": "rosync new [--project <path>] [--port <port>] --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>] [--raw]",
+  "examples": [
+    "rosync new --project . --path Workspace --class Part --name Box --props '{\"Anchored\":true}'",
+    "rosync new --project . --path ReplicatedStorage --class RemoteEvent --name DamageEvent"
+  ],
+  "notes": [
+    "`--props` uses the same value codec as `rosync set --value`.",
+    "The created instance is written to `writes.log`."
+  ]
+}

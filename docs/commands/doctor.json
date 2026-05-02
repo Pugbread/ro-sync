@@ -1,0 +1,14 @@
+{
+  "name": "doctor",
+  "title": "rosync doctor",
+  "category": "Live diagnostics",
+  "description": "Runs a broader health check over project files, daemon, plugin, linter, and sourcemap setup.",
+  "usage": "rosync doctor [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync doctor --project .",
+    "rosync doctor --project . --raw"
+  ],
+  "notes": [
+    "Use after `status` when setup or connectivity looks suspicious."
+  ]
+}

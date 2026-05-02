@@ -1,0 +1,14 @@
+{
+  "name": "enum",
+  "title": "rosync enum",
+  "category": "Live inspection",
+  "description": "Lists the items for one Roblox Enum type.",
+  "usage": "rosync enum [--project <path>] [--port <port>] --name <EnumName> [--raw]",
+  "examples": [
+    "rosync enum --project . --name Material",
+    "rosync enum --project . --name KeyCode --raw"
+  ],
+  "notes": [
+    "Outputs item names and underlying integer values."
+  ]
+}

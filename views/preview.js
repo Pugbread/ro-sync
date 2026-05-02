@@ -1,7 +1,7 @@
 // views/preview.js — threshold change-preview modal.
 //
 // Mount once at app boot. Subscribes to the "batch-preview" bus event fanned
-// out by app.js. Shape:
+// out by app.js from the daemon WebSocket stream. Shape:
 //   { summary: { added, updated, removed }, ops: [...], source?: "daemon"|"heuristic" }
 //
 // On Accept, POSTs {accept:true} to <daemonBase>/batch-decision (ignoring 404s

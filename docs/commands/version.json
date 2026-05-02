@@ -1,0 +1,13 @@
+{
+  "name": "version",
+  "title": "rosync version",
+  "category": "Live diagnostics",
+  "description": "Prints the daemon build version and, when reachable, the plugin version.",
+  "usage": "rosync version [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync version --project ."
+  ],
+  "notes": [
+    "Useful when checking for mismatched widget, daemon, or plugin installs."
+  ]
+}

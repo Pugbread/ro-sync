@@ -24,6 +24,8 @@ pub const CODEX_CONFIG_TOML: &str = "config.toml";
 /// import AGENTS.md so Claude Code and Codex route through one canonical file.
 pub const RO_SYNC_IMPORT_LINE: &str = "@ro-sync.md";
 pub const AGENTS_IMPORT_LINE: &str = "@AGENTS.md";
+const RO_SYNC_CONTEXT_START: &str = "<!-- ro-sync:project-memory:start -->";
+const RO_SYNC_CONTEXT_END: &str = "<!-- ro-sync:project-memory:end -->";
 const CODEX_CONTEXT_START: &str = "<!-- ro-sync:codex-context:start -->";
 const CODEX_CONTEXT_END: &str = "<!-- ro-sync:codex-context:end -->";
 const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &[
@@ -49,10 +51,10 @@ const REQUIRED_RO_SYNC_MD_TOKENS: &[&str] = &[
     "rosync path",
     "rosync status",
     "rosync doctor",
+    "rosync refresh",
     "rosync lint",
-    "rosync img",
-    "rosync imgs",
-    "rosync img --help",
+    "rosync upload",
+    "rosync upload --help",
     "do not investigate unrelated upload tools",
     "Agent bootstrap",
     "rbxcloud",
@@ -91,8 +93,9 @@ pub const SYNCED_SERVICES: &[&str] = &[
     "Lighting",
 ];
 
-const RO_SYNC_MD_TEMPLATE: &str = r#"# Ro Sync project memory
+const RO_SYNC_MD_TEMPLATE: &str = concat!(r#"# Ro Sync project memory
 
+<!-- ro-sync:project-memory:start -->
 Ro Sync mirrors a narrow slice of a Roblox Studio DataModel into this directory.
 Read this file before editing — the scope is deliberately small.
 
@@ -104,7 +107,7 @@ or ad-hoc Roblox tooling before trying the built-in CLI.
 Use `rosync` directly, but validate it has the modern subcommands first:
 
 ```
-rosync img --help
+rosync upload --help
 ```
 
 If that command is missing, do not investigate unrelated upload tools; use the
@@ -117,21 +120,39 @@ widget daemon binary directly:
 From the project root, start with:
 
 ```
+rosync refresh --project .
 rosync status --project .
 rosync diff --project .
 rosync path --project . Workspace/Camera
 ```
 
-For image uploads, use Ro Sync, not external asset tools:
+For asset uploads, use Ro Sync, not external asset tools:
 
 ```
-rosync img ./image.png --project .
-rosync imgs ./image-folder --project . --manifest uploaded-assets.json
+rosync upload ./image.png --project .
+rosync upload ./audio.mp3 ./models --project . --manifest uploaded-assets.json
+rosync upload ./clip.rbxm --project . --asset-type animation
 ```
 
-`rosync img` reads the Roblox Open Cloud credential from the Ro Sync widget
+`rosync upload` reads the Roblox Open Cloud credential from the Ro Sync widget
 Secrets store (or `ROBLOX_API_KEY`) and uses the project `groupId` as
-`group:<id>` when `--creator` is omitted.
+`group:<id>` when `--creator` is omitted. It supports Roblox Open Cloud asset
+types including image, decal, audio, model, mesh, animation, and video. Use
+`--asset-type` for decals and ambiguous `.rbxm`/`.rbxmx` files.
+
+## 0b. Refreshing agent docs
+
+After upgrading Ro Sync, run:
+
+```
+rosync refresh --project .
+```
+
+This refreshes `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and
+`.codex/config.toml` without discarding project notes. Keep custom Codex notes
+in `AGENTS.md` outside the Ro Sync marker block; keep Claude-specific notes in
+`CLAUDE.md` around the `@AGENTS.md` import. `ro-sync.md` is the generated Ro
+Sync tool reference.
 
 ## 1. What syncs, what doesn't
 
@@ -187,7 +208,7 @@ service the plugin keeps in sync:
 - `tree.json` — read-only DataModel skeleton (class + name + children). The
   plugin regenerates it from Studio on every sync. Use it to discover instances
   that don't live on disk.
-- `ro-sync.md` — this file. Regenerated only if it goes missing.
+- `ro-sync.md` — this file. Ro Sync refreshes its generated tool reference.
 
 ## 5. Querying the tree
 
@@ -228,23 +249,26 @@ rosync lint --project . --luau-lsp /path/to/luau-lsp
 
 ## 5c. Asset uploads
 
-`rosync img` uploads an image file through Roblox Open Cloud Assets. It does
-not require the daemon or Studio to be connected. The API key is read from
+`rosync upload` uploads assets through Roblox Open Cloud Assets. It does not
+require the daemon or Studio to be connected. The API key is read from
 `ROBLOX_API_KEY`, or from the Ro Sync widget Settings > Secrets value when the
 env var is not set. If `--creator` is omitted, Ro Sync uses the project
 `groupId` from `ro-sync.json` or the active widget project.
 
 ```
-rosync img ./icon.png --creator user:123456
-rosync img ./icon.png --creator group:123456 --name "Inventory Icon" --asset-type decal
-rosync img ./icon.png --creator user:123456 --auth bearer --api-key-env ROBLOX_OAUTH_TOKEN
-rosync img ./icon.png --creator user:123456 --no-wait --raw
-rosync imgs ./icons ./banner.png --project . --manifest uploaded-assets.json
+rosync upload ./icon.png --creator user:123456
+rosync upload ./icon.png --creator group:123456 --name "Inventory Icon" --asset-type decal
+rosync upload ./sound.mp3 ./models --project . --manifest uploaded-assets.json
+rosync upload ./clip.rbxm --project . --asset-type animation
+rosync upload ./icon.png --creator user:123456 --auth bearer --api-key-env ROBLOX_OAUTH_TOKEN
+rosync upload ./icon.png --creator user:123456 --no-wait --raw
 ```
 
-Use `rosync imgs` for bulk uploads. It accepts image files and directories,
-recurses by default, skips non-images found inside directories, continues after
-per-file failures, and can write a JSON manifest with `--manifest`.
+`rosync upload` accepts files and directories, recurses by default, skips
+unsupported files found inside directories, continues after per-file failures,
+and can write a JSON manifest with `--manifest`. It infers image, audio, model,
+mesh, and video types from extensions; pass `--asset-type` for decals and
+ambiguous `.rbxm`/`.rbxmx` model or animation files.
 
 ## 6. Agent usage — live Studio control
 
@@ -398,16 +422,11 @@ rosync find-attr --project . --name Color --value \
   '{"__type":"Color3","r":1,"g":0,"b":0}'
 ```
 
-## 6e. Agent usage — extended (what Tier 1/2/3 adds)
+## 6e. Client command reference
 
-Every `rosync` subcommand above is part of a larger catalogue. Quick reference:
-
-- **Read-only inspection**: `get`, `ls`, `tree`, `find`, `find-attr`,
-  `classinfo`, `enum`, `enums`, `query`, `path`, `attr ls`, `select get`, `logs`,
-  `snapshot`, `diff`, `status`, `version`, `ping`, `lint`.
-- **Structured writes**: `set`, `new`, `rm`, `mv`,
-  `attr set|rm`, `tag add|rm`, `call`, `select set`, `save`, `undo`, `redo`,
-  `waypoint`, `eval`.
+"#,
+include_str!("../../docs/client-commands.md"),
+r#"
 
 Two write-path flags every agent should know:
 
@@ -438,27 +457,120 @@ their behalf.
 This build deliberately skips Roblox property sync through the filesystem;
 attempts to push property changes by editing files are silently ignored. Use
 `rosync set` (with the user's consent) if a property really needs to change.
-"#;
+<!-- ro-sync:project-memory:end -->
+"#);
 
-/// Write `ro-sync.md` at the root if it doesn't already exist. Returns `true`
-/// when the file was freshly written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoSyncDocRefresh {
+    Created,
+    Updated,
+    Unchanged,
+    SkippedCustom,
+}
+
+impl RoSyncDocRefresh {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoSyncDocRefresh::Created => "created",
+            RoSyncDocRefresh::Updated => "updated",
+            RoSyncDocRefresh::Unchanged => "unchanged",
+            RoSyncDocRefresh::SkippedCustom => "skipped-custom",
+        }
+    }
+
+    pub fn changed(self) -> bool {
+        matches!(self, RoSyncDocRefresh::Created | RoSyncDocRefresh::Updated)
+    }
+}
+
+/// Write `ro-sync.md` at the root if it doesn't already exist. Existing
+/// unmarked user files are left alone; generated-looking legacy files can be
+/// upgraded to the current marked template.
 pub fn write_ro_sync_md_if_missing(root: &Path) -> io::Result<bool> {
+    Ok(refresh_ro_sync_md_impl(root, false)?.changed())
+}
+
+/// Refresh the generated Ro Sync project-memory reference. This updates marked
+/// generated content and legacy generated-looking `ro-sync.md` files, but it
+/// does not overwrite an unmarked custom file.
+pub fn refresh_ro_sync_md(root: &Path) -> io::Result<RoSyncDocRefresh> {
+    refresh_ro_sync_md_impl(root, true)
+}
+
+fn refresh_ro_sync_md_impl(root: &Path, explicit_refresh: bool) -> io::Result<RoSyncDocRefresh> {
     fs::create_dir_all(root)?;
     let p = root.join(RO_SYNC_MD);
     if p.exists() {
         let existing = fs::read_to_string(&p)?;
-        if existing.contains("# Ro Sync project memory")
-            && REQUIRED_RO_SYNC_MD_TOKENS
-                .iter()
-                .any(|token| !existing.contains(token))
-        {
-            fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
-            return Ok(true);
+        if let Some(merged) = merge_ro_sync_generated_block(&existing) {
+            if merged == existing {
+                return Ok(RoSyncDocRefresh::Unchanged);
+            }
+            fs::write(&p, merged)?;
+            return Ok(RoSyncDocRefresh::Updated);
         }
-        return Ok(false);
+        if looks_like_legacy_generated_ro_sync_md(&existing)
+            && (explicit_refresh || ro_sync_md_missing_required_tokens(&existing))
+        {
+            if existing == RO_SYNC_MD_TEMPLATE {
+                return Ok(RoSyncDocRefresh::Unchanged);
+            }
+            fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
+            return Ok(RoSyncDocRefresh::Updated);
+        }
+        if explicit_refresh && !looks_like_legacy_generated_ro_sync_md(&existing) {
+            return Ok(RoSyncDocRefresh::SkippedCustom);
+        }
+        return Ok(RoSyncDocRefresh::Unchanged);
     }
     fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
-    Ok(true)
+    Ok(RoSyncDocRefresh::Created)
+}
+
+fn ro_sync_md_missing_required_tokens(contents: &str) -> bool {
+    REQUIRED_RO_SYNC_MD_TOKENS
+        .iter()
+        .any(|token| !contents.contains(token))
+}
+
+fn looks_like_legacy_generated_ro_sync_md(contents: &str) -> bool {
+    contents.contains("# Ro Sync project memory")
+        && (contents.contains("Ro Sync mirrors a narrow slice")
+            || contents.contains("## 0. Agent bootstrap")
+            || contents.contains("## 4. Generated files")
+            || contents.contains("rosync status --project .")
+            || contents.contains("do not investigate unrelated upload tools"))
+}
+
+fn merge_ro_sync_generated_block(existing: &str) -> Option<String> {
+    let start = existing.find(RO_SYNC_CONTEXT_START)?;
+    let end_rel = existing[start..].find(RO_SYNC_CONTEXT_END)?;
+    let end = start + end_rel + RO_SYNC_CONTEXT_END.len();
+    let block = ro_sync_generated_block();
+
+    let mut merged = String::new();
+    merged.push_str(&existing[..start]);
+    merged.push_str(block);
+    if existing[end..].starts_with('\n') {
+        merged.push_str(&existing[end + 1..]);
+    } else {
+        merged.push_str(&existing[end..]);
+    }
+    Some(merged)
+}
+
+fn ro_sync_generated_block() -> &'static str {
+    let start = RO_SYNC_MD_TEMPLATE
+        .find(RO_SYNC_CONTEXT_START)
+        .expect("ro-sync template missing start marker");
+    let end_rel = RO_SYNC_MD_TEMPLATE[start..]
+        .find(RO_SYNC_CONTEXT_END)
+        .expect("ro-sync template missing end marker");
+    let mut end = start + end_rel + RO_SYNC_CONTEXT_END.len();
+    if RO_SYNC_MD_TEMPLATE[end..].starts_with('\n') {
+        end += 1;
+    }
+    &RO_SYNC_MD_TEMPLATE[start..end]
 }
 
 /// Ensure `CLAUDE.md` at the project root imports `AGENTS.md` so Claude Code
@@ -515,7 +627,7 @@ pub fn write_codex_context_if_missing_or_merge(root: &Path) -> io::Result<bool> 
     Ok(changed)
 }
 
-fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+pub fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     let dir = root.join(CODEX_DIR);
     fs::create_dir_all(&dir)?;
     let p = dir.join(CODEX_CONFIG_TOML);
@@ -534,7 +646,7 @@ fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn write_agents_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+pub fn write_agents_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     let p = root.join(AGENTS_MD);
     let block = codex_agents_block(root);
     let next = if !p.exists() {
@@ -932,12 +1044,49 @@ mod tests {
         let p = d.path().join(RO_SYNC_MD);
         fs::write(
             &p,
-            "# Ro Sync project memory\n\nOld generated content without the image upload command.\n",
+            "# Ro Sync project memory\n\nRo Sync mirrors a narrow slice of a Roblox Studio DataModel into this directory.\n\nOld generated content without the asset upload command.\n",
         )
         .unwrap();
         assert!(write_ro_sync_md_if_missing(d.path()).unwrap());
         let body = fs::read_to_string(&p).unwrap();
-        assert!(body.contains("rosync img"));
+        assert!(body.contains("rosync upload"));
+    }
+
+    #[test]
+    fn refresh_skips_unmarked_custom_ro_sync_md() {
+        let d = TempDir::new("md-custom");
+        let p = d.path().join(RO_SYNC_MD);
+        let custom = "# My own project notes\n\nKeep this file mine.\n";
+        fs::write(&p, custom).unwrap();
+
+        assert_eq!(
+            refresh_ro_sync_md(d.path()).unwrap(),
+            RoSyncDocRefresh::SkippedCustom
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), custom);
+    }
+
+    #[test]
+    fn refresh_preserves_content_around_marked_ro_sync_block() {
+        let d = TempDir::new("md-marked");
+        let p = d.path().join(RO_SYNC_MD);
+        fs::write(
+            &p,
+            format!(
+                "# Ro Sync project memory\n\nUser preface.\n\n{RO_SYNC_CONTEXT_START}\nold\n{RO_SYNC_CONTEXT_END}\n\nUser footer.\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            refresh_ro_sync_md(d.path()).unwrap(),
+            RoSyncDocRefresh::Updated
+        );
+        let body = fs::read_to_string(&p).unwrap();
+        assert!(body.contains("User preface."));
+        assert!(body.contains("User footer."));
+        assert!(body.contains("rosync refresh --project ."));
+        assert!(!body.contains("\nold\n"));
     }
 
     #[test]

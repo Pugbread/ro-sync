@@ -1,0 +1,14 @@
+{
+  "name": "logs",
+  "title": "rosync logs",
+  "category": "Live diagnostics",
+  "description": "Reads recent Studio output, warning, and error messages from the plugin log buffer.",
+  "usage": "rosync logs [--project <path>] [--port <port>] [--since <duration>] [--level info|warn|error] [--limit <n>] [--tail] [--raw]",
+  "examples": [
+    "rosync logs --project . --since 1m --level warn",
+    "rosync logs --project . --tail"
+  ],
+  "notes": [
+    "`--tail` streams until interrupted."
+  ]
+}

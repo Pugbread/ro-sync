@@ -1,0 +1,14 @@
+{
+  "name": "select",
+  "title": "rosync select",
+  "category": "Live writes",
+  "description": "Reads or replaces the current Studio Selection.",
+  "usage": "rosync select get|set [--project <path>] [--port <port>] [--paths <json-array>] [--raw]",
+  "examples": [
+    "rosync select get --project .",
+    "rosync select set --project . --paths '[\"Workspace/Box\",\"Workspace/SpawnLocation\"]'"
+  ],
+  "notes": [
+    "`select get` is read-only; `select set` is a Studio state change."
+  ]
+}

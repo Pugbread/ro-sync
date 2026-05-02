@@ -1,0 +1,14 @@
+{
+  "name": "eval",
+  "title": "rosync eval",
+  "category": "Live writes",
+  "description": "Executes Luau source inside Studio through the plugin sandbox.",
+  "usage": "rosync eval [--project <path>] [--port <port>] --source <luau> [--raw]",
+  "examples": [
+    "rosync eval --project . --source 'return #game.Workspace:GetChildren()'"
+  ],
+  "notes": [
+    "Use `return ...` when you need a returned value.",
+    "This is the broadest escape hatch; ask before using it for mutations."
+  ]
+}

@@ -48,7 +48,7 @@ const launchPs = decodePowerShell(win.launchDaemonCmd({
 }));
 assert(launchPs.includes("Test-Path -LiteralPath $bin"), "launch must probe literal binary path");
 assert(launchPs.includes("-RedirectStandardError $err"), "launch must capture stderr");
-assert(launchPs.includes("'C:\\Users\\Test User\\Game [Dev]'"), "launch must preserve spaced/bracketed project path");
+assert(launchPs.includes("'\"C:\\Users\\Test User\\Game [Dev]\"'"), "launch must preserve spaced/bracketed project path");
 
 const tailPs = decodePowerShell(win.tailLogCmd("%TEMP%\\rosync-7878.log"));
 assert(tailPs.includes("[Environment]::ExpandEnvironmentVariables"), "tail must expand env vars");

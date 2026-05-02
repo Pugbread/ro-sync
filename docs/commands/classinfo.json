@@ -1,0 +1,14 @@
+{
+  "name": "classinfo",
+  "title": "rosync classinfo",
+  "category": "Live inspection",
+  "description": "Lists properties and methods for a Roblox class using Studio reflection when available.",
+  "usage": "rosync classinfo [--project <path>] [--port <port>] --class <ClassName> [--raw]",
+  "examples": [
+    "rosync classinfo --project . --class BasePart",
+    "rosync classinfo --project . --class TextLabel --raw"
+  ],
+  "notes": [
+    "Falls back to a baked table for common classes when reflection is unavailable."
+  ]
+}

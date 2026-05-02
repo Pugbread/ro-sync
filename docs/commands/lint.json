@@ -1,0 +1,16 @@
+{
+  "name": "lint",
+  "title": "rosync lint",
+  "category": "Offline inspection",
+  "description": "Runs `luau-lsp analyze` against a project or path with an optional Ro Sync sourcemap.",
+  "usage": "rosync lint [--project <path>] [--path <file-or-dir>] [--luau-lsp <path>] [--no-sourcemap] [-- <luau-lsp args>...]",
+  "examples": [
+    "rosync lint --project .",
+    "rosync lint --project . --path ServerScriptService/Foo.server.luau",
+    "rosync lint --project . --no-sourcemap"
+  ],
+  "notes": [
+    "If `--luau-lsp` is omitted, Ro Sync checks `ROSYNC_LUAU_LSP` and then `PATH`.",
+    "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`."
+  ]
+}

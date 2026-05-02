@@ -1,0 +1,15 @@
+{
+  "name": "get",
+  "title": "rosync get",
+  "category": "Live inspection",
+  "description": "Reads an instance view or one property from the live Studio session.",
+  "usage": "rosync get [--project <path>] [--port <port>] --path <studio-path> [--prop <property>] [--raw]",
+  "examples": [
+    "rosync get --project . --path Workspace/Camera --prop FieldOfView",
+    "rosync get --project . --path ReplicatedStorage/Shared --raw"
+  ],
+  "notes": [
+    "Requires the daemon and Studio plugin to be connected.",
+    "Works across the whole DataModel, not only filesystem-synced classes."
+  ]
+}

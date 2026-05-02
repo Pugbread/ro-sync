@@ -1,0 +1,13 @@
+{
+  "name": "save",
+  "title": "rosync save",
+  "category": "Live writes",
+  "description": "Asks Studio to save the current place.",
+  "usage": "rosync save [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync save --project ."
+  ],
+  "notes": [
+    "The CLI returns after Studio accepts the save request; the actual save is asynchronous."
+  ]
+}

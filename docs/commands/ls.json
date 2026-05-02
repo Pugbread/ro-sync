@@ -1,0 +1,15 @@
+{
+  "name": "ls",
+  "title": "rosync ls",
+  "category": "Live inspection",
+  "description": "Lists the direct children of a live Studio instance.",
+  "usage": "rosync ls [--project <path>] [--port <port>] [--path <studio-path>] [--raw]",
+  "examples": [
+    "rosync ls --project . --path ReplicatedStorage",
+    "rosync ls --project . --path \"\""
+  ],
+  "notes": [
+    "An empty path lists top-level DataModel services.",
+    "Use `tree` when you need recursive output."
+  ]
+}

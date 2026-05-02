@@ -1,0 +1,13 @@
+{
+  "name": "undo",
+  "title": "rosync undo",
+  "category": "Live writes",
+  "description": "Requests Studio to undo one change-history entry.",
+  "usage": "rosync undo [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync undo --project ."
+  ],
+  "notes": [
+    "Pairs naturally with `--waypoint` on `rosync set` for reversible batches."
+  ]
+}

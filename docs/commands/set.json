@@ -1,0 +1,16 @@
+{
+  "name": "set",
+  "title": "rosync set",
+  "category": "Live writes",
+  "description": "Sets one property or applies a batch of property writes in the live Studio session.",
+  "usage": "rosync set [--project <path>] [--port <port>] (--path <studio-path> --prop <property> --value <json> | --batch <file>) [--keep-going] [--waypoint <name>] [--force-parent] [--raw]",
+  "examples": [
+    "rosync set --project . --path Workspace/Camera --prop FieldOfView --value 90",
+    "rosync set --project . --batch writes.json --waypoint \"refactor camera\""
+  ],
+  "notes": [
+    "Every successful write is appended to `writes.log`.",
+    "`set Parent` is refused by default; use `rosync mv`, or pass `--force-parent` only when raw parent assignment is intentional.",
+    "`--waypoint` brackets the write so one Studio undo can reverse the batch."
+  ]
+}

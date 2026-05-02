@@ -3,6 +3,7 @@ import { t64, onT64, daemonJson, daemonWS, emit, on } from "./bridge.js";
 import { mountProjects } from "./views/projects.js";
 import { mountActive } from "./views/active.js";
 import { mountConflicts } from "./views/conflicts.js";
+import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
 import { mountPreviewModal } from "./views/preview.js";
@@ -419,7 +420,31 @@ async function healthTick() {
     }
   }
 }
-setInterval(healthTick, 5000);
+
+let healthTimer = null;
+let healthInFlight = false;
+const HEALTH_INTERVAL_MS = 30000;
+
+function scheduleHealthTick() {
+  if (healthTimer) clearTimeout(healthTimer);
+  healthTimer = setTimeout(() => { void runHealthTick(); }, HEALTH_INTERVAL_MS);
+}
+
+async function runHealthTick() {
+  if (document.hidden || healthInFlight) {
+    scheduleHealthTick();
+    return;
+  }
+  healthInFlight = true;
+  try {
+    await healthTick();
+  } finally {
+    healthInFlight = false;
+    scheduleHealthTick();
+  }
+}
+
+scheduleHealthTick();
 
 // ---------- UI wiring ----------
 const $view = document.getElementById("view");
@@ -432,6 +457,7 @@ const ROUTES = {
   projects: mountProjects,
   active: mountActive,
   conflicts: mountConflicts,
+  docs: mountDocs,
   settings: mountSettings,
 };
 
@@ -534,6 +560,10 @@ onT64("t64:init", (payload) => {
 // ---------- App-level WS relay ----------
 // Opens a single WebSocket per daemon so events (e.g. initial-choice-needed)
 // can fan out to modal/overlay components regardless of the current view.
+//
+// The stream stays connected for control events, but raw op frames are handled
+// before JSON.parse so large file bursts do not stall the Terminal 64 host.
+const ENABLE_APP_REALTIME_STREAM = true;
 // Server frames are serde-tagged with `type`:
 //   {type:"op", op:{op:"set"|"delete"|"update"|"rename", path:[...], ...}}
 //       → bufferOp(innerOp) for the burst-preview heuristic
@@ -544,6 +574,7 @@ onT64("t64:init", (payload) => {
 //   {type:"ping"} / {type:"pong"} / {type:"lagged"} / {type:"push-result"} /
 //   {type:"error"} → transport-only, ignored here
 let appWS = null;
+const RAW_OP_RE = /"type"\s*:\s*"op"/;
 
 // Heuristic collector: any op burst where >5 ops arrive within 500ms triggers
 // a synthetic "batch-preview" bus event, so the preview modal can gate large
@@ -552,6 +583,10 @@ let appWS = null;
 // to the bus without passing through here.
 const opBuffer = [];
 let opFlushTimer = null;
+let droppedBufferedOps = 0;
+const MAX_OP_BUFFER = 200;
+let rawOpCount = 0;
+let rawOpFlushTimer = null;
 // While an initial sync is in flight, hundreds-to-thousands of ops flood the
 // stream legitimately. The >5-ops-in-500ms heuristic would pop the preview
 // modal every burst, creating an infinite accept loop. Suppress until ops
@@ -564,6 +599,7 @@ function suppressHeuristic(ms) {
 on("initial-choice-needed", () => suppressHeuristic(60_000));
 on("initial-choice-made", () => suppressHeuristic(60_000));
 function bufferOp(data) {
+  if (document.hidden) return;
   lastOpTs = Date.now();
   // During bootstrap, extend suppression with a rolling 5s trailing window
   // so the last burst doesn't immediately pop a preview modal.
@@ -572,6 +608,11 @@ function bufferOp(data) {
     return;
   }
   opBuffer.push(data);
+  if (opBuffer.length > MAX_OP_BUFFER) {
+    const drop = opBuffer.length - MAX_OP_BUFFER;
+    opBuffer.splice(0, drop);
+    droppedBufferedOps += drop;
+  }
   if (!opFlushTimer) opFlushTimer = setTimeout(flushOpBuffer, 500);
 }
 function flushOpBuffer() {
@@ -591,16 +632,49 @@ function flushOpBuffer() {
   }
   emit("batch-preview", {
     source: "heuristic",
-    summary: { added, updated, removed },
+    summary: { added, updated, removed, dropped: droppedBufferedOps },
     ops,
+  });
+  droppedBufferedOps = 0;
+}
+
+function shouldSkipRawAppFrame(raw) {
+  if (typeof raw !== "string" || !RAW_OP_RE.test(raw)) return false;
+  if (document.hidden) return true;
+
+  const now = Date.now();
+  lastOpTs = now;
+  if (now < suppressHeuristicUntil) {
+    suppressHeuristicUntil = Math.max(suppressHeuristicUntil, now + 5_000);
+    return true;
+  }
+
+  rawOpCount++;
+  if (!rawOpFlushTimer) rawOpFlushTimer = setTimeout(flushRawOpHeuristic, 500);
+  return true;
+}
+
+function flushRawOpHeuristic() {
+  rawOpFlushTimer = null;
+  const count = rawOpCount;
+  rawOpCount = 0;
+  if (count <= 5 || Date.now() < suppressHeuristicUntil) return;
+  emit("batch-preview", {
+    source: "heuristic",
+    summary: { added: 0, updated: count, removed: 0, dropped: 0 },
+    ops: [],
   });
 }
 
 function openAppStream() {
+  if (!ENABLE_APP_REALTIME_STREAM) {
+    return;
+  }
   if (!app.daemonBase) return;
   if (appWS) { try { appWS.close(); } catch {} appWS = null; }
   try {
     appWS = daemonWS(app.daemonBase, "/ws", {
+      skipRaw: shouldSkipRawAppFrame,
       message: (data) => {
         if (!data || typeof data !== "object") return;
         const t = data.type;

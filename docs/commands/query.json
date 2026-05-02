@@ -1,0 +1,15 @@
+{
+  "name": "query",
+  "title": "rosync query",
+  "category": "Offline inspection",
+  "description": "Matches a selector against the project `tree.json` skeleton without needing the daemon or Studio.",
+  "usage": "rosync query --project <path> <selector> [--format json|paths|classes]",
+  "examples": [
+    "rosync query --project . 'Workspace/**/Camera'",
+    "rosync query --project . '**/RemoteEvent' --format paths"
+  ],
+  "notes": [
+    "`*` matches one path segment and `**` matches zero or more segments.",
+    "Use this first when you only need to discover what exists in the latest Studio tree."
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "waypoint",
+  "title": "rosync waypoint",
+  "category": "Live writes",
+  "description": "Creates a named Studio change-history waypoint.",
+  "usage": "rosync waypoint [--project <path>] [--port <port>] --name <label> [--raw]",
+  "examples": [
+    "rosync waypoint --project . --name \"before refactor\""
+  ],
+  "notes": [
+    "Use waypoints before and after multi-step edits so Studio undo has a clear boundary."
+  ]
+}
