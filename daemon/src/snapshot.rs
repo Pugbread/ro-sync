@@ -7,7 +7,10 @@
 //! plugin's responsibility and reach the project via the read-only
 //! `tree.json` skeleton (class+name+children, no property values).
 
-use crate::fs_map::{parse_init_file, path_to_instance_meta, ScriptClass, META_FILE};
+use crate::fs_map::{
+    is_init_file, parse_init_file, parse_plain_init_file, path_to_instance_meta, ScriptClass,
+    META_FILE,
+};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::io;
@@ -19,6 +22,8 @@ pub const AGENTS_MD: &str = "AGENTS.md";
 pub const TREE_JSON: &str = "tree.json";
 pub const CODEX_DIR: &str = ".codex";
 pub const CODEX_CONFIG_TOML: &str = "config.toml";
+pub const STYLUA_TOML: &str = ".stylua.toml";
+pub const AFTMAN_TOML: &str = "aftman.toml";
 
 /// Claude Code resolves `@path` references as inline imports. New projects
 /// import AGENTS.md so Claude Code and Codex route through one canonical file.
@@ -28,6 +33,7 @@ const RO_SYNC_CONTEXT_START: &str = "<!-- ro-sync:project-memory:start -->";
 const RO_SYNC_CONTEXT_END: &str = "<!-- ro-sync:project-memory:end -->";
 const CODEX_CONTEXT_START: &str = "<!-- ro-sync:codex-context:start -->";
 const CODEX_CONTEXT_END: &str = "<!-- ro-sync:codex-context:end -->";
+const ROJO_PROJECT_FILE: &str = "default.project.json";
 const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &[
     "ro-sync.md",
     "ro-sync.MD",
@@ -40,36 +46,21 @@ const CODEX_PROJECT_DOC_FALLBACKS: &[&str] = &[
 const CLAUDE_DOC_VARIANTS: &[&str] = &["CLAUDE.md", "CLAUDE.MD", "Claude.MD"];
 const RO_SYNC_DOC_VARIANTS: &[&str] = &["ro-sync.md", "ro-sync.MD", "rosync.md", "ROSYNC.md"];
 const REQUIRED_RO_SYNC_MD_TOKENS: &[&str] = &[
-    "rosync get",
-    "rosync set",
-    "rosync ls",
-    "rosync tree",
-    "rosync snapshot",
-    "rosync diff",
-    "rosync find",
-    "rosync eval",
+    "LLM-first command budget",
+    "rosync context --project .",
+    "rosync commands --compact",
+    "rosync commands <name>",
+    "Cheap-first",
+    "full command registry by default",
+    "Never run mutating commands",
+    "rosync plan",
     "rosync path",
-    "rosync status",
-    "rosync doctor",
-    "rosync refresh",
-    "rosync lint",
-    "rosync upload",
-    "rosync upload --help",
-    "do not investigate unrelated upload tools",
-    "Agent bootstrap",
-    "rbxcloud",
-    "Secrets store",
-    "rosync classinfo",
-    "rosync enums",
-    "rosync enum ",
-    "rosync find-attr",
-    "--under",
-    "--force-parent",
-    "--waypoint",
+    "rosync meta",
+    "get --prop",
+    "rosync source",
+    "rosync changes",
+    "conflicts",
     "writes.log",
-    "writes.log.1",
-    "escape",
-    "hatches",
 ];
 
 const CLAUDE_MD_TEMPLATE: &str = r#"# Project memory for agents
@@ -79,6 +70,23 @@ and Codex share the same project instructions through AGENTS.md.
 
 @AGENTS.md
 "#;
+
+const STYLUA_TOOL_LINE: &str = "stylua = \"JohnnyMorganz/StyLua@2.4.1\"";
+const STYLUA_TOML_TEMPLATE: &str = r#"column_width = 120
+line_endings = "Unix"
+indent_type = "Tabs"
+indent_width = 4
+quote_style = "AutoPreferDouble"
+call_parentheses = "Always"
+collapse_simple_statement = "Never"
+"#;
+
+const AFTMAN_TOML_TEMPLATE: &str = concat!(
+    "# This file lists tools managed by Aftman, a cross-platform toolchain manager.\n",
+    "# For more information, see https://github.com/LPGhatguy/aftman\n\n",
+    "[tools]\n",
+    "stylua = \"JohnnyMorganz/StyLua@2.4.1\"\n",
+);
 
 /// Top-level services mirrored under the project root. Order drives the
 /// on-disk service sort for the snapshot response.
@@ -93,7 +101,8 @@ pub const SYNCED_SERVICES: &[&str] = &[
     "Lighting",
 ];
 
-const RO_SYNC_MD_TEMPLATE: &str = concat!(r#"# Ro Sync project memory
+const RO_SYNC_MD_TEMPLATE: &str = concat!(
+    r#"# Ro Sync project memory
 
 <!-- ro-sync:project-memory:start -->
 Ro Sync mirrors a narrow slice of a Roblox Studio DataModel into this directory.
@@ -242,6 +251,7 @@ Roblox definitions file automatically.
 ```
 rosync lint --project .
 rosync lint --project . --path ServerScriptService/Foo.server.luau
+rosync lint --project . --path ServerScriptService --path ReplicatedStorage/Shared --owned-only --summary
 rosync lint --project . --no-sourcemap
 rosync lint --project . -- --no-flags-enabled
 rosync lint --project . --luau-lsp /path/to/luau-lsp
@@ -422,11 +432,64 @@ rosync find-attr --project . --name Color --value \
   '{"__type":"Color3","r":1,"g":0,"b":0}'
 ```
 
-## 6e. Client command reference
+## 6e. LLM-first command budget
 
-"#,
-include_str!("../../docs/client-commands.md"),
-r#"
+Do not paste or request the full command registry by default. It is large and
+usually worse for agent reasoning. Use this flow instead:
+
+1. Run `rosync context --project .` once at task start.
+2. Run `rosync commands --compact` only when choosing between command families.
+3. Run `rosync commands <name>` for the exact command you are about to use.
+4. Prefer cheap offline commands before live Studio reads.
+5. Never run mutating commands from an LLM workflow without a read-only
+   `rosync plan` when plan coverage exists.
+
+Cheap-first discovery:
+
+```
+rosync context --project .
+rosync status --project . --raw
+rosync query --project . 'ReplicatedStorage/**/Thing' --format paths
+rosync path --project . ReplicatedStorage/Thing
+rosync meta --project . ReplicatedStorage/Thing
+rosync services --project . --raw
+```
+
+Targeted reads:
+
+```
+rosync get --project . --path Workspace/Part --prop Anchored
+rosync props --project . --path Workspace/Part
+rosync source --project . --path ReplicatedStorage/Client/App --disk
+rosync source --project . --path ReplicatedStorage/Client/App
+```
+
+Higher-token reads; use only when the task needs them:
+
+```
+rosync changes --project .
+rosync tree --project . --path Workspace --depth 3
+rosync find --project . --name Camera --under Workspace
+rosync logs --project . --limit 50
+```
+
+Backup/debug only:
+
+```
+rosync snapshot --project .
+```
+
+Use plain `rosync commands` only when the user explicitly needs the full
+machine-readable registry.
+
+Preferred workflow snippets:
+
+- Inspect one object: `meta` -> `get --prop` or `props` -> `source` only for scripts.
+- Find source: `where` or `query` -> `source --disk`; use live `source` only when checking Studio divergence.
+- Compare disk vs Studio: `changes`; avoid `diff --raw` unless machine parsing is needed.
+- Resolve conflict: `conflicts` -> `changes` -> `plan resolve` -> explicit `resolve`.
+- Write Studio: `plan set|new|rm|mv` -> user confirmation -> mutating command, preferably with a waypoint for batches.
+- Upload/Open Cloud: enumerate files or `monetization discover/list` first; avoid recursive/bulk writes until the target set is clear.
 
 Two write-path flags every agent should know:
 
@@ -458,7 +521,8 @@ This build deliberately skips Roblox property sync through the filesystem;
 attempts to push property changes by editing files are silently ignored. Use
 `rosync set` (with the user's consent) if a property really needs to change.
 <!-- ro-sync:project-memory:end -->
-"#);
+"#
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoSyncDocRefresh {
@@ -625,6 +689,98 @@ pub fn write_codex_context_if_missing_or_merge(root: &Path) -> io::Result<bool> 
     changed |= write_codex_config_if_missing_or_merge(root)?;
     changed |= write_agents_md_if_missing_or_merge(root)?;
     Ok(changed)
+}
+
+/// Ensure project-local formatter/toolchain defaults exist.
+///
+/// These files live at the Ro Sync project root and are intentionally not part
+/// of the Roblox DataModel mirror. Existing project choices are preserved:
+/// `.stylua.toml` is only created when missing, and `aftman.toml` is merged
+/// only when the `[tools]` table does not already define `stylua`.
+pub fn write_project_tooling_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+    fs::create_dir_all(root)?;
+    let mut changed = false;
+    changed |= write_stylua_toml_if_missing(root)?;
+    changed |= write_aftman_stylua_if_missing_or_merge(root)?;
+    Ok(changed)
+}
+
+pub fn write_stylua_toml_if_missing(root: &Path) -> io::Result<bool> {
+    fs::create_dir_all(root)?;
+    let p = root.join(STYLUA_TOML);
+    if p.exists() {
+        return Ok(false);
+    }
+    fs::write(&p, STYLUA_TOML_TEMPLATE)?;
+    Ok(true)
+}
+
+pub fn write_aftman_stylua_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+    fs::create_dir_all(root)?;
+    let p = root.join(AFTMAN_TOML);
+    if !p.exists() {
+        fs::write(&p, AFTMAN_TOML_TEMPLATE)?;
+        return Ok(true);
+    }
+
+    let existing = fs::read_to_string(&p)?;
+    let merged = merge_aftman_stylua_tool(&existing);
+    if merged == existing {
+        return Ok(false);
+    }
+    fs::write(&p, merged)?;
+    Ok(true)
+}
+
+fn merge_aftman_stylua_tool(existing: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut tools_header_index = None;
+    let mut in_tools = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_tools = trimmed == "[tools]";
+            if in_tools && tools_header_index.is_none() {
+                tools_header_index = Some(index);
+            }
+            continue;
+        }
+
+        if in_tools && toml_key(trimmed) == Some("stylua") {
+            return existing.to_string();
+        }
+    }
+
+    let mut merged = String::new();
+    if let Some(index) = tools_header_index {
+        for (line_index, line) in lines.iter().enumerate() {
+            merged.push_str(line);
+            merged.push('\n');
+            if line_index == index {
+                merged.push_str(STYLUA_TOOL_LINE);
+                merged.push('\n');
+            }
+        }
+    } else {
+        merged.push_str(existing);
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        if !merged.ends_with("\n\n") {
+            merged.push('\n');
+        }
+        merged.push_str("[tools]\n");
+        merged.push_str(STYLUA_TOOL_LINE);
+        merged.push('\n');
+    }
+    merged
+}
+
+fn toml_key(trimmed_line: &str) -> Option<&str> {
+    let before_comment = trimmed_line.split('#').next()?.trim();
+    let (key, _) = before_comment.split_once('=')?;
+    Some(key.trim().trim_matches(|c| c == '"' || c == '\''))
 }
 
 pub fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
@@ -901,7 +1057,7 @@ fn walk_children(dir: &Path, parent_is_script: bool) -> io::Result<Vec<Value>> {
             continue;
         }
         // The script-with-children init file describes the parent, not a child.
-        if parent_is_script && parse_init_file(name_str).is_some() {
+        if parent_is_script && is_init_file(name_str) {
             continue;
         }
         let p = e.path();
@@ -918,6 +1074,28 @@ fn walk_children(dir: &Path, parent_is_script: bool) -> io::Result<Vec<Value>> {
 }
 
 fn build_whitelisted_node(path: &Path) -> io::Result<Option<Value>> {
+    if path.is_dir() {
+        if let Some(target) = default_project_path(path)? {
+            if target.exists() {
+                let name = path_to_instance_meta(path)?
+                    .map(|inst| inst.name)
+                    .or_else(|| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| name.to_string())
+                    });
+                return build_whitelisted_node_at(&target, name);
+            }
+        }
+    }
+
+    build_whitelisted_node_at(path, None)
+}
+
+fn build_whitelisted_node_at(
+    path: &Path,
+    name_override: Option<String>,
+) -> io::Result<Option<Value>> {
     let Some(inst) = path_to_instance_meta(path)? else {
         return Ok(None);
     };
@@ -948,10 +1126,33 @@ fn build_whitelisted_node(path: &Path) -> io::Result<Option<Value>> {
 
     Ok(Some(json!({
         "class": inst.class,
-        "name": inst.name,
+        "name": name_override.unwrap_or(inst.name),
         "properties": Value::Object(props),
         "children": children,
     })))
+}
+
+fn default_project_path(dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let project_file = dir.join(ROJO_PROJECT_FILE);
+    if !project_file.is_file() {
+        return Ok(None);
+    }
+
+    let text = fs::read_to_string(project_file)?;
+    let value: Value = serde_json::from_str(&text).map_err(io::Error::other)?;
+    let Some(path) = value
+        .get("tree")
+        .and_then(|tree| tree.get("$path"))
+        .and_then(|path| path.as_str())
+    else {
+        return Ok(None);
+    };
+
+    if path.is_empty() || Path::new(path).is_absolute() || path.split('/').any(|seg| seg == "..") {
+        return Ok(None);
+    }
+
+    Ok(Some(dir.join(path)))
 }
 
 /// Read the `init (...).luau` file inside a script-with-children directory.
@@ -966,9 +1167,10 @@ fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> String {
         let Some(name_str) = fname.to_str() else {
             continue;
         };
-        let Some((class, _)) = parse_init_file(name_str) else {
-            continue;
-        };
+        let class = parse_init_file(name_str)
+            .map(|(class, _)| class)
+            .or_else(|| parse_plain_init_file(name_str));
+        let Some(class) = class else { continue };
         if sc.map(|want| want == class).unwrap_or(true) {
             return fs::read_to_string(entry.path()).unwrap_or_default();
         }
@@ -1275,6 +1477,53 @@ mod tests {
     }
 
     #[test]
+    fn project_tooling_defaults_are_created() {
+        let d = TempDir::new("tooling-defaults");
+        assert!(write_project_tooling_if_missing_or_merge(d.path()).unwrap());
+
+        let stylua = fs::read_to_string(d.path().join(STYLUA_TOML)).unwrap();
+        assert!(stylua.contains("indent_type = \"Tabs\""));
+        assert!(stylua.contains("collapse_simple_statement = \"Never\""));
+
+        let aftman = fs::read_to_string(d.path().join(AFTMAN_TOML)).unwrap();
+        assert!(aftman.contains("[tools]"));
+        assert!(aftman.contains(STYLUA_TOOL_LINE));
+
+        assert!(!write_project_tooling_if_missing_or_merge(d.path()).unwrap());
+    }
+
+    #[test]
+    fn aftman_merge_adds_stylua_to_existing_tools() {
+        let d = TempDir::new("aftman-merge");
+        let p = d.path().join(AFTMAN_TOML);
+        fs::write(
+            &p,
+            "# existing\n\n[tools]\nwally = \"UpliftGames/wally@0.3.2\"\n",
+        )
+        .unwrap();
+
+        assert!(write_aftman_stylua_if_missing_or_merge(d.path()).unwrap());
+        let merged = fs::read_to_string(&p).unwrap();
+        assert!(merged.contains("wally = \"UpliftGames/wally@0.3.2\""));
+        assert!(merged.contains(STYLUA_TOOL_LINE));
+        assert!(
+            merged.find(STYLUA_TOOL_LINE).unwrap() < merged.find("wally =").unwrap(),
+            "stylua should be inserted inside [tools]; got:\n{merged}"
+        );
+    }
+
+    #[test]
+    fn aftman_merge_preserves_existing_stylua() {
+        let d = TempDir::new("aftman-existing");
+        let p = d.path().join(AFTMAN_TOML);
+        let existing = "[tools]\nstylua = \"JohnnyMorganz/StyLua@2.4.1\"\nwally = \"UpliftGames/wally@0.3.2\"\n";
+        fs::write(&p, existing).unwrap();
+
+        assert!(!write_aftman_stylua_if_missing_or_merge(d.path()).unwrap());
+        assert_eq!(fs::read_to_string(&p).unwrap(), existing);
+    }
+
+    #[test]
     fn empty_project_emits_no_services() {
         let d = TempDir::new("empty");
         let services = emit_services(d.path()).unwrap();
@@ -1331,6 +1580,73 @@ mod tests {
         assert_eq!(net_node["children"].as_array().unwrap().len(), 1);
         let helper = find_child(net_node, "Helper").unwrap();
         assert_eq!(helper["class"], "ModuleScript");
+    }
+
+    #[test]
+    fn emits_wally_plain_init_folder_as_module_script() {
+        let d = TempDir::new("wally-init");
+        let pkg = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Packages")
+            .join("_Index")
+            .join("sleitnick_net@0.2.0")
+            .join("net");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("init.lua"), b"return { create = function() end }").unwrap();
+        fs::write(pkg.join("Client.lua"), b"return {}").unwrap();
+
+        let services = emit_services(d.path()).unwrap();
+        let rs_node = find_service(&services, "ReplicatedStorage").unwrap();
+        let packages = find_child(rs_node, "Packages").unwrap();
+        let index = find_child(packages, "_Index").unwrap();
+        let version = find_child(index, "sleitnick_net@0.2.0").unwrap();
+        let net = find_child(version, "net").unwrap();
+
+        assert_eq!(net["class"], "ModuleScript");
+        assert_eq!(
+            net["properties"]["Source"],
+            "return { create = function() end }"
+        );
+        assert!(find_child(net, "init").is_none());
+        assert_eq!(find_child(net, "Client").unwrap()["class"], "ModuleScript");
+    }
+
+    #[test]
+    fn emits_wally_default_project_path_as_package_root_module() {
+        let d = TempDir::new("wally-default-project");
+        let pkg = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Packages")
+            .join("_Index")
+            .join("evaera_promise@4.0.0")
+            .join("promise");
+        let lib = pkg.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            pkg.join("default.project.json"),
+            br#"{"name":"promise","tree":{"$path":"lib"}}"#,
+        )
+        .unwrap();
+        fs::write(lib.join("init.lua"), b"return { status = 'ok' }").unwrap();
+        fs::write(lib.join("Error.lua"), b"return {}").unwrap();
+
+        let services = emit_services(d.path()).unwrap();
+        let rs_node = find_service(&services, "ReplicatedStorage").unwrap();
+        let packages = find_child(rs_node, "Packages").unwrap();
+        let index = find_child(packages, "_Index").unwrap();
+        let version = find_child(index, "evaera_promise@4.0.0").unwrap();
+        let promise = find_child(version, "promise").unwrap();
+
+        assert_eq!(promise["class"], "ModuleScript");
+        assert_eq!(promise["name"], "promise");
+        assert_eq!(promise["properties"]["Source"], "return { status = 'ok' }");
+        assert!(find_child(promise, "init").is_none());
+        assert_eq!(
+            find_child(promise, "Error").unwrap()["class"],
+            "ModuleScript"
+        );
     }
 
     #[test]

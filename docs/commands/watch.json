@@ -1,0 +1,14 @@
+{
+  "name": "watch",
+  "title": "rosync watch",
+  "category": "Live diagnostics",
+  "description": "Streams raw daemon WebSocket frames for debugging sync traffic.",
+  "usage": "rosync watch [--port <port>] [--compact]",
+  "examples": [
+    "rosync watch",
+    "rosync watch --compact"
+  ],
+  "notes": [
+    "Use this for debugging daemon/plugin traffic; `rosync tail` is better for Studio output."
+  ]
+}

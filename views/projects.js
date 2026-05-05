@@ -1,69 +1,114 @@
 // views/projects.js — list+detail Projects view with sidebar-friendly shell,
 // per-project controls, and a throttled activity tail for the served project.
 import { daemonJson, daemonWS } from "../bridge.js";
-import { pickFolderCmd, openFolderEnsuredCmd } from "../platform.js";
+import {
+  pickFolderCmd,
+  openFolderEnsuredCmd,
+  writeFileFromB64Cmd,
+  readFileCmd,
+  shQuote,
+  psEncodedCmd,
+  psQuote,
+  IS_WINDOWS,
+} from "../platform.js";
 
 const MAX_PROJECT_LOG_LINES = 100;
 const MAX_PROJECT_PARSED_OPS_PER_SECOND = 20;
 const RAW_OP_RE = /"type"\s*:\s*"op"/;
+const DEFAULT_WALLY_FOLDER = "ReplicatedStorage/Assets/Packages";
+const DEFAULT_WALLY_FILE = `[package]
+name = "game/project"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]
+React = "jsdotlua/react@17.1.0"
+ReactRoblox = "jsdotlua/react-roblox@17.1.0"
+Red = "red-blox/red@2.3.0"
+Future = "red-blox/future@^1.0.0"
+Guard = "red-blox/guard@1.0.1"
+Promise = "evaera/promise@4.0.0"
+Ratelimit = "red-blox/ratelimit@^1.0.0"
+Signal = "red-blox/signal@^2.0.0"
+GoodSignal = "stravant/goodsignal@0.3.1"
+Trove = "sleitnick/trove@1.4.0"
+Spring = "brittonfischer/spring@0.1.0"
+ReactSpring = "chriscerie/react-spring@2.0.0"
+Spr = "blackjackiee/spr@1.1.3"
+Reflex = "littensy/reflex@4.3.1"
+ReactReflex = "littensy/react-reflex@0.3.6"
+Sift = "csqrl/sift@0.0.9"
+Conch = "alicesaidhi/conch@0.3.1"
+Conch_ui = "alicesaidhi/conch-ui@0.3.1"
+Chrono = "parihsz/chrono@1.2.4"
+RthroScaler = "egomoose/rthro-scaler@0.3.0"
+ObjectCache = "pyseph/objectcache@1.4.6"
+observers = "sleitnick/observers@0.5.0"
+topbarplus = "1foreverhd/topbarplus@3.4.0"
+`;
 
 export function mountProjects(root, api) {
   root.innerHTML = `
-    <header class="page-header">
-      <div class="page-titles">
-        <h1 class="page-title">Projects</h1>
-        <p class="page-sub">Manage your Roblox Studio projects in sync.</p>
-      </div>
-      <div class="page-actions">
-        <button id="proj-toggle-add" class="primary" type="button">+ Add Project</button>
-      </div>
-    </header>
+    <div class="projects-topbar">
+      <header class="page-header">
+        <div class="page-titles">
+          <h1 class="page-title">Projects</h1>
+          <p class="page-sub">Manage your Roblox Studio projects in sync.</p>
+        </div>
+        <div class="page-actions">
+          <button id="proj-toggle-add" class="primary" type="button">+ Add Project</button>
+        </div>
+      </header>
 
-    <div id="proj-add-panel" class="add-panel" hidden>
-      <div class="row">
-        <input id="proj-path" class="path-input" type="text" placeholder="/absolute/path/to/project" spellcheck="false" />
-        <button id="proj-pick" type="button" title="Pick folder">Browse…</button>
+      <div id="proj-add-panel" class="add-panel" hidden>
+        <div class="row">
+          <input id="proj-path" class="path-input" type="text" placeholder="/absolute/path/to/project" spellcheck="false" />
+          <button id="proj-pick" type="button" title="Pick folder">Browse…</button>
+        </div>
+        <div class="row">
+          <input id="proj-game-id" type="text" placeholder="Game ID (optional)" spellcheck="false" inputmode="numeric" />
+          <input id="proj-group-id" type="text" placeholder="Group ID (optional)" spellcheck="false" inputmode="numeric" />
+          <input id="proj-place-ids" type="text" placeholder="Place IDs (comma-separated)" spellcheck="false" />
+        </div>
+        <div class="add-actions">
+          <button id="proj-cancel-add" type="button">Cancel</button>
+          <button id="proj-add" class="primary" type="button">Add Project</button>
+        </div>
       </div>
-      <div class="row">
-        <input id="proj-game-id" type="text" placeholder="Game ID (optional)" spellcheck="false" inputmode="numeric" />
-        <input id="proj-group-id" type="text" placeholder="Group ID (optional)" spellcheck="false" inputmode="numeric" />
-        <input id="proj-place-ids" type="text" placeholder="Place IDs (comma-separated)" spellcheck="false" />
-      </div>
-      <div class="add-actions">
-        <button id="proj-cancel-add" type="button">Cancel</button>
-        <button id="proj-add" class="primary" type="button">Add Project</button>
+
+      <div class="search-toolbar">
+        <div class="search-wrap">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <circle cx="7.25" cy="7.25" r="4.5"/>
+            <path d="m13.5 13.5-3.05-3.05" stroke-linecap="round"/>
+          </svg>
+          <input id="proj-search" type="search" placeholder="Search projects…" spellcheck="false" />
+        </div>
+        <div class="filter-pills" role="tablist" aria-label="Filter projects">
+          <button class="pill" data-filter="all" aria-pressed="true">All</button>
+          <button class="pill" data-filter="connected" aria-pressed="false">Serving</button>
+          <button class="pill" data-filter="needs-setup" aria-pressed="false">Needs Setup</button>
+        </div>
       </div>
     </div>
 
-    <div class="search-toolbar">
-      <div class="search-wrap">
-        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <circle cx="7.25" cy="7.25" r="4.5"/>
-          <path d="m13.5 13.5-3.05-3.05" stroke-linecap="round"/>
-        </svg>
-        <input id="proj-search" type="search" placeholder="Search projects…" spellcheck="false" />
+    <div class="projects-scroll">
+      <div class="workspace" id="proj-workspace" data-mode="list">
+        <div class="ws-list">
+          <ul id="proj-list" class="project-list"></ul>
+          <button id="proj-add-tile" class="add-tile" type="button">
+            <span class="add-tile-icon">${plusSVG()}</span>
+            <span class="add-tile-text">
+              <span class="add-tile-title">Add your project</span>
+              <span class="add-tile-sub">Click to add a Roblox Studio project</span>
+            </span>
+          </button>
+          <div id="proj-empty" class="empty" hidden>No projects yet — click "Add Project" above to get started.</div>
+          <div id="proj-empty-filter" class="empty" hidden>No projects match the current filter.</div>
+        </div>
+        <aside class="ws-detail" id="proj-detail" aria-live="polite"></aside>
       </div>
-      <div class="filter-pills" role="tablist" aria-label="Filter projects">
-        <button class="pill" data-filter="all" aria-pressed="true">All</button>
-        <button class="pill" data-filter="connected" aria-pressed="false">Serving</button>
-        <button class="pill" data-filter="needs-setup" aria-pressed="false">Needs Setup</button>
-      </div>
-    </div>
-
-    <div class="workspace" id="proj-workspace" data-mode="list">
-      <div class="ws-list">
-        <ul id="proj-list" class="project-list"></ul>
-        <button id="proj-add-tile" class="add-tile" type="button">
-          <span class="add-tile-icon">${plusSVG()}</span>
-          <span class="add-tile-text">
-            <span class="add-tile-title">Add your project</span>
-            <span class="add-tile-sub">Click to add a Roblox Studio project</span>
-          </span>
-        </button>
-        <div id="proj-empty" class="empty" hidden>No projects yet — click "Add Project" above to get started.</div>
-        <div id="proj-empty-filter" class="empty" hidden>No projects match the current filter.</div>
-      </div>
-      <aside class="ws-detail" id="proj-detail" aria-live="polite"></aside>
     </div>
   `;
 
@@ -183,6 +228,7 @@ export function mountProjects(root, api) {
         <div class="chips">
           ${p.gameId ? `<span class="chip"><span class="lbl">Game ID</span> ${escapeHTML(String(p.gameId))}</span>` : ""}
           ${p.groupId ? `<span class="chip"><span class="lbl">Group ID</span> ${escapeHTML(String(p.groupId))}</span>` : ""}
+          ${p.wallyEnabled ? `<span class="chip"><span class="lbl">Wally</span> ${escapeHTML(shortStudioPath(p.wallyFolder || DEFAULT_WALLY_FOLDER))}</span>` : ""}
           <span class="chip chip-status is-${st.kind}">
             <span class="dot ${st.dot}"></span>
             ${escapeHTML(st.label)}
@@ -277,8 +323,7 @@ export function mountProjects(root, api) {
       spawnSession(p);
     });
     $detail.querySelector('[data-act="edit"]').addEventListener("click", () => {
-      editingId = p.id;
-      renderDetail();
+      beginEdit(p);
     });
     renderActivityLog();
   }
@@ -293,6 +338,10 @@ export function mountProjects(root, api) {
     const summary = (snapshotByProject.get(p.id) || {}).label || (st.kind === "ok" ? "Up to date" : "—");
     const isActive = p.id === s.activeProjectId;
     const daemonOk = !!api.getDaemonBase();
+    const wallyEnabled = !!p.wallyEnabled;
+    const wallyFolder = p.wallyFolder || (wallyEnabled ? DEFAULT_WALLY_FOLDER : "");
+    const wallyFile = p.wallyFile || DEFAULT_WALLY_FILE;
+    const wallyTomlPath = wallyTomlPathForFolder(p.path, wallyFolder || DEFAULT_WALLY_FOLDER);
 
     $detail.innerHTML = `
       <div class="detail-head">
@@ -331,6 +380,25 @@ export function mountProjects(root, api) {
             <label>Place IDs (comma-separated)
               <input type="text" data-field="placeIds" spellcheck="false" />
             </label>
+            <div class="project-wally-block">
+              <label class="project-toggle-row">
+                <input type="checkbox" data-field="wallyEnabled" ${wallyEnabled ? "checked" : ""} />
+                <span>Enable Wally</span>
+              </label>
+              <div class="project-wally-settings" data-wally-settings ${wallyEnabled ? "" : "hidden"}>
+                <label>Required* Wally Folder
+                  <input type="text" data-field="wallyFolder" spellcheck="false" placeholder="${escapeHTML(DEFAULT_WALLY_FOLDER)}" />
+                </label>
+                <label>Wally File
+                  <textarea data-field="wallyFile" spellcheck="false" rows="16"></textarea>
+                </label>
+                <div class="project-hint" data-wally-target>Writes to ${escapeHTML(wallyTomlPath)}</div>
+                <div class="project-wally-actions">
+                  <button data-act="wally-install" type="button">Wally Install</button>
+                  <span class="project-hint" data-wally-install-status></span>
+                </div>
+              </div>
+            </div>
             <div class="row project-edit-actions">
               <button class="primary" data-act="save" type="button">Save</button>
               <button data-act="cancel" type="button">Cancel</button>
@@ -357,9 +425,27 @@ export function mountProjects(root, api) {
     const $g = $detail.querySelector('[data-field="gameId"]');
     const $group = $detail.querySelector('[data-field="groupId"]');
     const $pl = $detail.querySelector('[data-field="placeIds"]');
+    const $wallyEnabled = $detail.querySelector('[data-field="wallyEnabled"]');
+    const $wallySettings = $detail.querySelector("[data-wally-settings]");
+    const $wallyFolder = $detail.querySelector('[data-field="wallyFolder"]');
+    const $wallyFile = $detail.querySelector('[data-field="wallyFile"]');
+    const $wallyTarget = $detail.querySelector("[data-wally-target]");
+    const $wallyInstall = $detail.querySelector('[data-act="wally-install"]');
+    const $wallyInstallStatus = $detail.querySelector("[data-wally-install-status]");
     $g.value = p.gameId || "";
     $group.value = p.groupId || "";
     $pl.value = placeIdsStr;
+    $wallyFolder.value = wallyFolder;
+    $wallyFile.value = wallyFile;
+
+    function refreshWallySettings() {
+      const enabled = $wallyEnabled.checked;
+      $wallySettings.hidden = !enabled;
+      const folder = normalizeStudioPath($wallyFolder.value || DEFAULT_WALLY_FOLDER);
+      $wallyTarget.textContent = `Writes to ${wallyTomlPathForFolder(p.path, folder)}`;
+    }
+    $wallyEnabled.addEventListener("change", refreshWallySettings);
+    $wallyFolder.addEventListener("input", refreshWallySettings);
 
     $detail.querySelector('[data-act="back"]').addEventListener("click", () => {
       editingId = null;
@@ -375,7 +461,23 @@ export function mountProjects(root, api) {
       renderDetail();
     });
     $detail.querySelector('[data-act="save"]').addEventListener("click", () => {
-      saveEdit(p.id, $g.value.trim(), $group.value.trim(), parsePlaceIds($pl.value));
+      saveEdit(p.id, {
+        gameId: $g.value.trim(),
+        groupId: $group.value.trim(),
+        placeIds: parsePlaceIds($pl.value),
+        wallyEnabled: $wallyEnabled.checked,
+        wallyFolder: normalizeStudioPath($wallyFolder.value),
+        wallyFile: $wallyFile.value,
+      });
+    });
+    $wallyInstall.addEventListener("click", () => {
+      installWallyFromEdit(p, {
+        enabled: $wallyEnabled.checked,
+        folder: normalizeStudioPath($wallyFolder.value),
+        file: $wallyFile.value,
+        button: $wallyInstall,
+        statusEl: $wallyInstallStatus,
+      });
     });
     $detail.querySelector('[data-act="open-folder"]').addEventListener("click", () => openFolder(p.path));
     $detail.querySelector('[data-act="snapshot"]').addEventListener("click", () => snapshotNow(p.id));
@@ -420,24 +522,71 @@ export function mountProjects(root, api) {
     renderDetail();
   }
 
-  async function saveEdit(id, gameId, groupId, placeIds) {
+  async function beginEdit(p) {
+    editingId = p.id;
+    renderDetail();
+    try {
+      await hydrateProjectConfig(p.id);
+      renderDetail();
+    } catch (e) {
+      console.warn("hydrate project config failed", e);
+    }
+  }
+
+  async function saveEdit(id, form) {
     const s = api.getState();
     const prev = (s.projects || []).find((p) => p.id === id);
+    if (!prev) return;
+    const placeIds = Array.isArray(form.placeIds) ? form.placeIds : [];
     const prevGameId = (prev && prev.gameId) || null;
     const prevGroupId = (prev && prev.groupId) || null;
     const prevPlaceIds = (prev && Array.isArray(prev.placeIds)) ? prev.placeIds.join(",") : "";
-    const nextGameId = gameId || null;
-    const nextGroupId = groupId || null;
+    const nextGameId = form.gameId || null;
+    const nextGroupId = form.groupId || null;
     const nextPlaceIdsStr = placeIds.join(",");
+    const nextWallyEnabled = !!form.wallyEnabled;
+    const nextWallyFolder = normalizeStudioPath(form.wallyFolder);
+    const nextWallyFile = String(form.wallyFile || "").trimEnd() + "\n";
+
+    if (nextWallyEnabled && !nextWallyFolder) {
+      api.toast("Wally folder is required");
+      const input = $detail.querySelector('[data-field="wallyFolder"]');
+      if (input) input.focus();
+      return;
+    }
+    if (nextWallyEnabled && !nextWallyFile.trim()) {
+      api.toast("Wally file is required");
+      const input = $detail.querySelector('[data-field="wallyFile"]');
+      if (input) input.focus();
+      return;
+    }
+
     const changedLaunchArgs =
       (prevGameId !== nextGameId) ||
       (prevGroupId !== nextGroupId) ||
       (prevPlaceIds !== nextPlaceIdsStr);
 
     const next = (s.projects || []).map((p) =>
-      p.id === id ? { ...p, gameId: nextGameId, groupId: nextGroupId, placeIds } : p
+      p.id === id ? {
+        ...p,
+        gameId: nextGameId,
+        groupId: nextGroupId,
+        placeIds,
+        wallyEnabled: nextWallyEnabled,
+        wallyFolder: nextWallyEnabled ? nextWallyFolder : "",
+        wallyFile: nextWallyEnabled ? nextWallyFile : "",
+      } : p
     );
     api.setState({ projects: next });
+
+    try {
+      await saveProjectConfig(next.find((p) => p.id === id));
+    } catch (e) {
+      console.warn("save project config failed", e);
+      api.toast(`ro-sync.json write failed: ${e.message}`);
+      return;
+    }
+
     editingId = null;
     render();
 
@@ -470,6 +619,9 @@ export function mountProjects(root, api) {
       gameId: $gameId.value.trim() || null,
       groupId: $groupId.value.trim() || null,
       placeIds: parsePlaceIds($placeIds.value),
+      wallyEnabled: false,
+      wallyFolder: "",
+      wallyFile: "",
     };
     const next = [...(s.projects || []), proj];
     api.setState({ projects: next });
@@ -546,6 +698,146 @@ export function mountProjects(root, api) {
       await api.t64("t64:exec", { command: openFolderEnsuredCmd(p) });
     } catch (e) {
       api.toast("Open folder failed");
+    }
+  }
+
+  async function hydrateProjectConfig(id) {
+    const s = api.getState();
+    const proj = (s.projects || []).find((p) => p.id === id);
+    if (!proj) return;
+
+    let cfg = {};
+    try {
+      const raw = await readTextFile(api, joinProjectFile(proj.path, "ro-sync.json"));
+      if (raw && raw.trim()) cfg = JSON.parse(raw);
+    } catch {
+      cfg = {};
+    }
+
+    const wallyEnabled = Boolean(cfg.wallyEnabled ?? proj.wallyEnabled);
+    const wallyFolder = normalizeStudioPath(cfg.wallyFolder ?? proj.wallyFolder ?? "");
+    let wallyFile = typeof cfg.wallyFile === "string" ? cfg.wallyFile : (proj.wallyFile || "");
+    if (wallyEnabled && !wallyFile) {
+      try {
+        wallyFile = await readTextFile(api, wallyTomlPathForFolder(proj.path, wallyFolder || DEFAULT_WALLY_FOLDER));
+      } catch {
+        wallyFile = "";
+      }
+    }
+    if (wallyEnabled && !wallyFile) wallyFile = DEFAULT_WALLY_FILE;
+
+    const next = (s.projects || []).map((p) => {
+      if (p.id !== id) return p;
+      return {
+        ...p,
+        gameId: cfg.gameId ?? p.gameId ?? null,
+        groupId: cfg.groupId ?? p.groupId ?? null,
+        placeIds: Array.isArray(cfg.placeIds) ? cfg.placeIds : (Array.isArray(p.placeIds) ? p.placeIds : []),
+        wallyEnabled,
+        wallyFolder,
+        wallyFile,
+      };
+    });
+    api.setState({ projects: next });
+  }
+
+  async function saveProjectConfig(proj) {
+    if (!proj) return;
+    const cfgPath = joinProjectFile(proj.path, "ro-sync.json");
+    let existing = {};
+    try {
+      const raw = await readTextFile(api, cfgPath);
+      if (raw && raw.trim()) existing = JSON.parse(raw);
+    } catch {
+      existing = {};
+    }
+
+    const merged = {
+      ...existing,
+      name: existing.name || proj.name || basename(proj.path),
+      gameId: proj.gameId || null,
+      groupId: proj.groupId || null,
+      placeIds: Array.isArray(proj.placeIds) ? proj.placeIds : [],
+      wallyEnabled: !!proj.wallyEnabled,
+      version: existing.version || 1,
+    };
+
+    if (proj.wallyEnabled) {
+      merged.wallyFolder = normalizeStudioPath(proj.wallyFolder || DEFAULT_WALLY_FOLDER);
+      merged.wallyFile = String(proj.wallyFile || DEFAULT_WALLY_FILE).trimEnd() + "\n";
+      const tomlPath = wallyTomlPathForFolder(proj.path, merged.wallyFolder);
+      await writeTextFile(api, tomlPath, merged.wallyFile);
+    } else {
+      delete merged.wallyFolder;
+      delete merged.wallyFile;
+    }
+
+    await writeTextFile(api, cfgPath, JSON.stringify(merged, null, 2) + "\n");
+  }
+
+  async function installWallyFromEdit(proj, form) {
+    if (!form.enabled) {
+      api.toast("Enable Wally first");
+      return;
+    }
+
+    const folder = normalizeStudioPath(form.folder);
+    const file = String(form.file || "").trimEnd() + "\n";
+    if (!folder) {
+      api.toast("Wally folder is required");
+      const input = $detail.querySelector('[data-field="wallyFolder"]');
+      if (input) input.focus();
+      return;
+    }
+    if (!file.trim()) {
+      api.toast("Wally file is required");
+      const input = $detail.querySelector('[data-field="wallyFile"]');
+      if (input) input.focus();
+      return;
+    }
+
+    const tomlPath = wallyTomlPathForFolder(proj.path, folder);
+    const cwd = dirnamePath(tomlPath);
+    const button = form.button;
+    const statusEl = form.statusEl;
+    if (button) button.disabled = true;
+    if (statusEl) statusEl.textContent = "Saving Wally config...";
+    const s = api.getState();
+    const wasActive = s.activeProjectId === proj.id;
+
+    try {
+      const nextProj = { ...proj, wallyEnabled: true, wallyFolder: folder, wallyFile: file };
+      api.setState({
+        projects: (s.projects || []).map((p) => p.id === proj.id ? nextProj : p),
+      });
+      await saveProjectConfig(nextProj);
+      if (wasActive && typeof api.killDaemon === "function") {
+        if (statusEl) statusEl.textContent = "Pausing sync for Wally install...";
+        try { await api.killDaemon(); } catch (e) { console.warn("killDaemon", e); }
+      }
+      if (statusEl) statusEl.textContent = "Running wally install...";
+      const res = await api.t64("t64:exec", {
+        command: wallyInstallCmd(cwd),
+        timeoutMs: 2 * 60_000,
+      });
+      if (res && res.code !== 0 && res.code != null) {
+        throw new Error((res.stderr || res.stdout || `exit ${res.code}`).trim());
+      }
+      const summary = summarizeWallyInstall(res);
+      if (wasActive && typeof api.ensureDaemon === "function") {
+        if (statusEl) statusEl.textContent = `${summary}; restarting sync...`;
+        try { await api.ensureDaemon(); } catch (e) { console.warn("ensureDaemon", e); }
+      }
+      if (statusEl) statusEl.textContent = wasActive
+        ? `${summary}; accept disk when Studio asks`
+        : summary;
+      api.toast(summary);
+    } catch (e) {
+      const msg = `Wally install failed: ${e.message}`;
+      if (statusEl) statusEl.textContent = msg;
+      api.toast(msg);
+    } finally {
+      if (button) button.disabled = false;
     }
   }
 
@@ -786,6 +1078,18 @@ export function mountProjects(root, api) {
     }
     renderList();
   });
+  $detail.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-copy-path]");
+    if (!btn) return;
+    const path = btn.dataset.copyPath || "";
+    if (!path) return;
+    try {
+      await navigator.clipboard.writeText(path);
+      api.toast && api.toast("Path copied");
+    } catch {
+      api.toast && api.toast("Could not copy path");
+    }
+  });
 
   const offState = api.onBus("state", render);
   const offUp = api.onBus("daemon:up", refreshStatuses);
@@ -822,6 +1126,83 @@ function escapeHTML(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 }
+function b64EncodeUnicode(text) {
+  return btoa(unescape(encodeURIComponent(String(text))));
+}
+async function writeTextFile(api, absPath, text) {
+  return api.t64("t64:exec", {
+    command: writeFileFromB64Cmd(absPath, b64EncodeUnicode(text)),
+  });
+}
+async function readTextFile(api, absPath) {
+  const res = await api.t64("t64:exec", { command: readFileCmd(absPath) });
+  return (res && typeof res.stdout === "string") ? res.stdout : "";
+}
+function joinProjectFile(projectPath, relPath) {
+  const root = String(projectPath || "").replace(/[\\/]+$/, "");
+  const rel = String(relPath || "").replace(/^[\\/]+/, "").replace(/[\\/]+/g, pathSepFor(root));
+  return `${root}${pathSepFor(root)}${rel}`;
+}
+function pathSepFor(projectPath) {
+  return /^[A-Za-z]:[\\/]/.test(String(projectPath || "")) || String(projectPath || "").includes("\\")
+    ? "\\"
+    : "/";
+}
+function normalizeStudioPath(path) {
+  return String(path || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\/{2,}/g, "/");
+}
+function wallyTomlPathForFolder(projectPath, studioFolder) {
+  const normalized = normalizeStudioPath(studioFolder || DEFAULT_WALLY_FOLDER);
+  const parts = normalized.split("/").filter(Boolean);
+  const parent = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+  return joinProjectFile(projectPath, parent ? `${parent}/wally.toml` : "wally.toml");
+}
+function dirnamePath(path) {
+  const s = String(path || "").replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i >= 0 ? s.slice(0, i) : ".";
+}
+function wallyInstallCmd(cwd) {
+  if (IS_WINDOWS) {
+    return psEncodedCmd(
+      `$aftmanBin = Join-Path $env:USERPROFILE '.aftman\\bin'; ` +
+      `$env:PATH = "$aftmanBin;$env:LOCALAPPDATA\\aftman\\bin;$env:PATH"; ` +
+      `Set-Location -LiteralPath ${psQuote(cwd)}; ` +
+      `$wally = Get-Command wally -ErrorAction SilentlyContinue; ` +
+      `if ($wally) { & $wally.Source install; exit $LASTEXITCODE }; ` +
+      `$aftman = Get-Command aftman -ErrorAction SilentlyContinue; ` +
+      `if ($aftman) { & $aftman.Source run wally install; exit $LASTEXITCODE }; ` +
+      `Write-Error 'wally not found on PATH and aftman is not available'; exit 127`
+    );
+  }
+  const script =
+    `export PATH="$HOME/.aftman/bin:$HOME/.local/share/aftman/bin:$HOME/.wally/bin:$PATH"; ` +
+    `cd ${shQuote(cwd)} && ` +
+    `if command -v wally >/dev/null 2>&1; then wally install; ` +
+    `elif command -v aftman >/dev/null 2>&1; then aftman run wally install; ` +
+    `else echo "wally not found on PATH and aftman is not available" >&2; exit 127; fi`;
+  return `if [ -x /bin/zsh ]; then /bin/zsh -lc ${shQuote(script)}; elif [ -x /bin/bash ]; then /bin/bash -lc ${shQuote(script)}; else /bin/sh -c ${shQuote(script)}; fi`;
+}
+function summarizeWallyInstall(res) {
+  const out = `${res?.stdout || ""}\n${res?.stderr || ""}`.trim();
+  const installed = out.match(/Installed\s+(\d+)\s+packages?/i);
+  const downloaded = out.match(/Downloaded\s+(\d+)\s+packages?/i);
+  if (installed && downloaded) return `Wally installed ${installed[1]} packages (${downloaded[1]} downloaded)`;
+  if (installed) return `Wally installed ${installed[1]} packages`;
+  if (downloaded) return `Wally install complete (${downloaded[1]} downloaded)`;
+  return "Wally install complete";
+}
+function shortStudioPath(path) {
+  const normalized = normalizeStudioPath(path);
+  if (!normalized) return "enabled";
+  const parts = normalized.split("/");
+  if (parts.length <= 2) return normalized;
+  return `${parts[0]}/…/${parts[parts.length - 1]}`;
+}
 function formatRelative(ts) {
   if (!ts) return "";
   const t = typeof ts === "number" ? ts : Date.parse(ts);
@@ -846,13 +1227,23 @@ function pluginStatusLabel(isActive, daemonOk, st) {
 function renderActivityLine(entry) {
   const rendered = activitySummary(entry.frame);
   if (!rendered) return null;
-  const line = document.createElement("span");
-  line.className = "project-log-line";
-  line.innerHTML =
-    `<span class="project-log-time">${formatClock(entry.at)}</span>` +
-    `<span class="project-log-kind ${rendered.cls}">${escapeHTML(rendered.kind)}</span>` +
-    `<span class="project-log-msg">${escapeHTML(rendered.msg)}</span>`;
-  return line;
+  const card = document.createElement("article");
+  card.className = `project-log-card ${rendered.cls}`;
+  const meta = Array.isArray(rendered.meta) ? rendered.meta.filter(Boolean) : [];
+  card.innerHTML =
+    `<div class="project-log-card-head">` +
+      `<span class="project-log-kind">${escapeHTML(rendered.kind)}</span>` +
+      `<span class="project-log-time">${formatClock(entry.at)}</span>` +
+    `</div>` +
+    `<div class="project-log-title">${escapeHTML(rendered.title)}</div>` +
+    (rendered.path ? (
+      `<div class="project-log-path-row">` +
+        `<div class="project-log-path">${escapeHTML(rendered.path)}</div>` +
+        `<button class="project-log-copy" data-copy-path="${escapeHTML(rendered.path)}">Copy path</button>` +
+      `</div>`
+    ) : "") +
+    (meta.length ? `<div class="project-log-meta">${meta.map((item) => `<span>${escapeHTML(item)}</span>`).join("")}</div>` : "");
+  return card;
 }
 function activitySummary(frame) {
   if (!frame || typeof frame !== "object") return null;
@@ -863,13 +1254,22 @@ function activitySummary(frame) {
     : t.includes("sync") ? "is-ok"
     : t.includes("plugin") ? "is-warn"
     : "is-info";
-  let msg = "";
-  if (t === "initial-choice-needed") msg = "initial sync needs a choice";
-  else if (t === "initial-choice-made") msg = `initial sync: ${frame.choice || "?"}`;
-  else if (t === "config-changed") msg = "project config reloaded";
-  else if (t === "conflict") msg = `conflict at ${frame.path || "?"}`;
-  else msg = frame.message || frame.msg || JSON.stringify(frame);
-  return { kind: t, cls, msg };
+  let title = "";
+  let path = "";
+  const meta = [];
+  if (t === "initial-choice-needed") title = "Initial sync needs a source choice";
+  else if (t === "initial-choice-made") {
+    title = "Initial sync choice applied";
+    meta.push(`choice ${frame.choice || "?"}`);
+  } else if (t === "config-changed") title = "Project config reloaded";
+  else if (t === "conflict") {
+    title = "Sync conflict detected";
+    path = frame.path || "";
+  } else if (t === "busy") {
+    title = frame.message || frame.msg || "Daemon event burst collapsed";
+    meta.push("log throttle");
+  } else title = frame.message || frame.msg || JSON.stringify(frame);
+  return { kind: t, cls, title, path, meta };
 }
 function activityOpSummary(frame) {
   const innerOp = frame && frame.op;
@@ -877,15 +1277,18 @@ function activityOpSummary(frame) {
   const kind = String(innerOp.op || "op").toLowerCase();
   const pathArr = Array.isArray(innerOp.path) ? innerOp.path : [];
   const pathStr = pathArr.join("/");
+  const meta = ["filesystem watcher"];
+  const node = innerOp.node && typeof innerOp.node === "object" ? innerOp.node : null;
+  if (node && node.class) meta.push(`class ${node.class}`);
   if (kind === "rename") {
     const from = Array.isArray(innerOp.from) ? innerOp.from.join("/") : "?";
     const to = Array.isArray(innerOp.to) ? innerOp.to.join("/") : "?";
-    return { kind, cls: "is-fs", msg: `${from} -> ${to}` };
+    return { kind, cls: "is-fs", title: "Renamed synced path", path: to, meta: [`from ${from}`] };
   }
-  if (kind === "delete") return { kind, cls: "is-fs", msg: pathStr || "unknown path" };
-  if (kind === "set") return { kind, cls: "is-fs", msg: pathStr || "unknown path" };
-  if (kind === "update") return { kind, cls: "is-fs", msg: pathStr || "unknown path" };
-  return { kind, cls: "is-info", msg: pathStr || JSON.stringify(innerOp) };
+  if (kind === "delete") return { kind, cls: "is-fs", title: "Deleted synced path", path: pathStr || "unknown path", meta };
+  if (kind === "set") return { kind, cls: "is-fs", title: "Created or replaced synced path", path: pathStr || "unknown path", meta };
+  if (kind === "update") return { kind, cls: "is-fs", title: "Updated synced path", path: pathStr || "unknown path", meta };
+  return { kind, cls: "is-info", title: "Daemon operation", path: pathStr, meta: [JSON.stringify(innerOp)] };
 }
 function formatClock(ts) {
   const d = new Date(ts || Date.now());

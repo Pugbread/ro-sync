@@ -107,7 +107,6 @@ pub async fn request(port: u16, op: &str, args: Value) -> Result<Value, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{SinkExt as _, StreamExt as _};
     use std::net::SocketAddr;
     use tokio_tungstenite::tungstenite;
 

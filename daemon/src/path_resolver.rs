@@ -1,8 +1,8 @@
 //! `rosync path` — translate between Studio instance paths and Ro-Sync files.
 
 use crate::fs_map::{
-    classify_script_file, decode_name, encode_name, instance_to_path, parse_disambiguated,
-    parse_init_file, path_to_instance_meta, InstanceDescriptor, META_FILE,
+    classify_script_file, decode_name, encode_name, instance_to_path, is_init_file,
+    parse_disambiguated, path_to_instance_meta, InstanceDescriptor, META_FILE,
 };
 use crate::snapshot::{SYNCED_SERVICES, TREE_JSON};
 use clap::ValueEnum;
@@ -160,7 +160,7 @@ fn fs_to_studio(
         let is_last = idx + 1 == components.len();
         let cur = project.join(components[..=idx].iter().collect::<PathBuf>());
 
-        if parse_init_file(component).is_some() {
+        if is_init_file(component) {
             if !is_last {
                 return Err(format!(
                     "path: init file {} describes its parent instance and cannot have children",
@@ -185,7 +185,7 @@ fn fs_to_studio(
             decode_fs_stem(&stem)
         } else if component.contains('.') {
             return Err(format!(
-                "path: {} is not a syncable script file (.luau, .server.luau, .client.luau)",
+                "path: {} is not a syncable script file (.luau/.lua, .server.*, .client.*)",
                 cur.display()
             ));
         } else {

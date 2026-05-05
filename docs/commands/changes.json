@@ -1,0 +1,14 @@
+{
+  "name": "changes",
+  "title": "rosync changes",
+  "category": "Live inspection",
+  "description": "Alias for `rosync diff`, intended for reviewing what a resync would change.",
+  "usage": "rosync changes [--project <path>] [--port <port>] [--depth <n>] [--raw]",
+  "examples": [
+    "rosync changes --project .",
+    "rosync changes --project . --raw"
+  ],
+  "notes": [
+    "Only compares synced services, so random project files are ignored."
+  ]
+}

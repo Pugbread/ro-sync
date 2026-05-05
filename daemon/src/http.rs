@@ -1,7 +1,6 @@
 use axum::body::Bytes;
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -17,7 +16,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::{Any, CorsLayer};
@@ -25,7 +24,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
 use crate::diff;
 use crate::fs_map::{
-    classify_script_file, encode_name, instance_to_path, normalize_line_endings,
+    classify_script_file, encode_name, instance_to_path, is_init_file, normalize_line_endings,
     parse_disambiguated, parse_init_file, path_to_instance_meta, InstanceDescriptor, PathInstance,
     ScriptClass, META_FILE,
 };
@@ -59,7 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/poll", get(poll))
         .route("/events", get(events))
         .route("/ws", get(crate::ws::ws_upgrade))
-        .route("/resolve", post(resolve))
+        .route("/resolve", get(resolve_list).post(resolve))
         .route("/initial-compare", post(initial_compare))
         .route("/initial-decision", get(initial_decision))
         .route("/initial-choice", post(initial_choice))
@@ -181,6 +180,10 @@ struct Hello {
     group_id: Option<String>,
     #[serde(rename = "placeIds")]
     place_ids: Vec<String>,
+    #[serde(rename = "wallyEnabled")]
+    wally_enabled: bool,
+    #[serde(rename = "wallyFolder")]
+    wally_folder: Option<String>,
 }
 
 async fn hello(State(state): State<AppState>) -> Json<Hello> {
@@ -191,6 +194,8 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         game_id: state.game_id.read().unwrap().clone(),
         group_id: state.group_id.read().unwrap().clone(),
         place_ids: state.place_ids.read().unwrap().clone(),
+        wally_enabled: *state.wally_enabled.read().unwrap(),
+        wally_folder: state.wally_folder.read().unwrap().clone(),
     })
 }
 
@@ -204,6 +209,35 @@ struct InitialCompareBody {
     studio_stats: Stats,
     #[serde(rename = "studioSnapshot", default)]
     studio_snapshot: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InitialComparison {
+    summary: InitialComparisonSummary,
+    #[serde(rename = "newFiles")]
+    new_files: Vec<diff::DiffItem>,
+    #[serde(rename = "changedFiles")]
+    changed_files: Vec<diff::ChangedItem>,
+    #[serde(rename = "removedFiles")]
+    removed_files: Vec<diff::DiffItem>,
+}
+
+impl InitialComparison {
+    fn is_clean(&self) -> bool {
+        self.summary.new_files == 0
+            && self.summary.changed_files == 0
+            && self.summary.removed_files == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InitialComparisonSummary {
+    #[serde(rename = "newFiles")]
+    new_files: usize,
+    #[serde(rename = "changedFiles")]
+    changed_files: usize,
+    #[serde(rename = "removedFiles")]
+    removed_files: usize,
 }
 
 async fn initial_compare(
@@ -241,15 +275,19 @@ async fn initial_compare(
         }));
     }
 
+    let mut comparison = None;
     if !body.studio_snapshot.is_empty() {
-        match initial_snapshots_match(state.canonical_project.as_path(), &body.studio_snapshot) {
-            Ok(true) => {
+        match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot)
+        {
+            Ok(report) if report.is_clean() => {
                 return Json(json!({
                     "action": "in-sync",
                     "diskStats": disk_stats,
                 }));
             }
-            Ok(false) => {}
+            Ok(report) => {
+                comparison = Some(report);
+            }
             Err(e) => {
                 return Json(json!({
                     "ok": false,
@@ -276,35 +314,22 @@ async fn initial_compare(
 
     // Both non-empty → park a pending decision and tell the plugin to drive the UI.
     let choice_id = new_choice_id();
-    let (tx, rx) = oneshot::channel::<Choice>();
     let pending = PendingInitial {
         choice_id: choice_id.clone(),
         disk_stats,
         studio_stats: body.studio_stats,
-        waker: Some(tx),
+        choice: None,
     };
     {
         let mut slot = state.pending_initial.lock().unwrap();
         *slot = Some(pending);
-    }
-    // Stash the receiver under the same choice_id so /initial-decision can
-    // await it. (The waker is stored on PendingInitial; the receiver lives on
-    // the SSE side — we keep it here in a second slot so the long-poll endpoint
-    // can find it by choice_id.)
-    {
-        let mut rxs = PENDING_RX.lock().unwrap();
-        rxs.retain(|(_, _, ready)| !ready.load(std::sync::atomic::Ordering::Relaxed));
-        rxs.push((
-            choice_id.clone(),
-            rx,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ));
     }
     let evt = json!({
         "type": "initial-choice-needed",
         "choiceId": choice_id,
         "diskStats": disk_stats,
         "studioStats": body.studio_stats,
+        "comparison": comparison.clone(),
     });
     if let Ok(s) = serde_json::to_string(&evt) {
         let _ = state.events.send(s);
@@ -313,61 +338,34 @@ async fn initial_compare(
         "action": "decide",
         "choiceId": choice_id,
         "diskStats": disk_stats,
+        "comparison": comparison,
     }))
 }
 
+#[cfg(test)]
 fn initial_snapshots_match(root: &Path, studio_services: &[Value]) -> Result<bool, String> {
+    Ok(initial_snapshot_comparison(root, studio_services)?.is_clean())
+}
+
+fn initial_snapshot_comparison(
+    root: &Path,
+    studio_services: &[Value],
+) -> Result<InitialComparison, String> {
     let local_services =
         snapshot::emit_services(root).map_err(|e| format!("scan {}: {e}", root.display()))?;
     let local = diff::collect_local_nodes(&local_services);
     let studio = diff::collect_local_nodes(studio_services);
-    Ok(diff::compare(&local, &studio).is_clean())
-}
-
-// Parked oneshot receivers keyed by choice_id. Using a module-scope static so
-// the axum handler doesn't have to Send a !Send oneshot::Receiver through the
-// AppState. The third tuple slot ("consumed" flag) lets us evict stale entries
-// on the next compare.
-type PendingRxEntry = (
-    String,
-    oneshot::Receiver<Choice>,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-);
-static PENDING_RX: once_cell_stub::Lazy<std::sync::Mutex<Vec<PendingRxEntry>>> =
-    once_cell_stub::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
-
-// Tiny hand-rolled once_cell shim so we don't add a dep.
-mod once_cell_stub {
-    use std::cell::UnsafeCell;
-    use std::sync::Once;
-
-    pub struct Lazy<T> {
-        once: Once,
-        cell: UnsafeCell<Option<T>>,
-        init: fn() -> T,
-    }
-
-    unsafe impl<T: Send + Sync> Sync for Lazy<T> {}
-
-    impl<T> Lazy<T> {
-        pub const fn new(init: fn() -> T) -> Self {
-            Self {
-                once: Once::new(),
-                cell: UnsafeCell::new(None),
-                init,
-            }
-        }
-    }
-
-    impl<T> std::ops::Deref for Lazy<T> {
-        type Target = T;
-        fn deref(&self) -> &T {
-            self.once.call_once(|| unsafe {
-                *self.cell.get() = Some((self.init)());
-            });
-            unsafe { (*self.cell.get()).as_ref().unwrap() }
-        }
-    }
+    let report = diff::compare(&local, &studio);
+    Ok(InitialComparison {
+        summary: InitialComparisonSummary {
+            new_files: report.summary.added,
+            changed_files: report.summary.changed,
+            removed_files: report.summary.removed,
+        },
+        new_files: report.added,
+        changed_files: report.changed,
+        removed_files: report.removed,
+    })
 }
 
 #[derive(Deserialize)]
@@ -380,70 +378,41 @@ async fn initial_decision(
     State(state): State<AppState>,
     Query(params): Query<InitialDecisionParams>,
 ) -> impl IntoResponse {
-    // Validate that the pending decision still matches.
-    {
-        let slot = state.pending_initial.lock().unwrap();
-        match slot.as_ref() {
-            Some(p) if p.choice_id == params.choice_id => {}
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "unknown choiceId" })),
-                )
+    let started = Instant::now();
+    loop {
+        let choice = {
+            let mut slot = state.pending_initial.lock().unwrap();
+            match slot.as_mut() {
+                Some(p) if p.choice_id == params.choice_id => p.choice,
+                _ => {
+                    return Json(json!({
+                        "choice": "stale",
+                        "error": "unknown choiceId",
+                    }))
                     .into_response();
-            }
-        }
-    }
-
-    // Pull the receiver out of the side table.
-    let rx_opt = {
-        let mut rxs = PENDING_RX.lock().unwrap();
-        let idx = rxs.iter().position(|(id, _, _)| id == &params.choice_id);
-        idx.map(|i| rxs.remove(i))
-    };
-    let Some((id, mut rx, _consumed)) = rx_opt else {
-        // No receiver (already taken by an earlier long-poll that timed out and
-        // dropped it). Tell the plugin to keep polling; if the decision has
-        // since been made, the /initial-choice handler will have cleared the
-        // PendingInitial — but we can still detect that separately.
-        let slot = state.pending_initial.lock().unwrap();
-        if slot.is_none() {
-            // Decision already delivered elsewhere and PendingInitial cleared —
-            // but we can't know *what* was chosen. The plugin should drop its
-            // current choiceId and re-run /initial-compare.
-            return Json(json!({ "error": "unknown choiceId" })).into_response();
-        }
-        return Json(json!({ "pending": true })).into_response();
-    };
-
-    // Borrow &mut rx so `timeout` doesn't consume it; restore on timeout.
-    let sleep = tokio::time::sleep(Duration::from_secs(60));
-    tokio::pin!(sleep);
-    tokio::select! {
-        res = &mut rx => {
-            match res {
-                Ok(choice) => {
-                    let s = match choice {
-                        Choice::Disk => "disk",
-                        Choice::Studio => "studio",
-                        Choice::Cancel => "cancel",
-                    };
-                    Json(json!({ "choice": s })).into_response()
-                }
-                Err(_) => {
-                    // Sender dropped without sending — treat as still-pending.
-                    Json(json!({ "pending": true })).into_response()
                 }
             }
-        }
-        _ = &mut sleep => {
-            // Timeout — return the receiver so the plugin's reconnect finds it.
-            let mut rxs = PENDING_RX.lock().unwrap();
-            if !rxs.iter().any(|(other, _, _)| other == &id) {
-                rxs.push((id, rx, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))));
+        };
+
+        if let Some(choice) = choice {
+            {
+                let mut slot = state.pending_initial.lock().unwrap();
+                if slot.as_ref().map(|p| p.choice_id.as_str()) == Some(params.choice_id.as_str()) {
+                    *slot = None;
+                }
             }
-            Json(json!({ "pending": true })).into_response()
+            let s = match choice {
+                Choice::Disk => "disk",
+                Choice::Studio => "studio",
+                Choice::Cancel => "cancel",
+            };
+            return Json(json!({ "choice": s })).into_response();
         }
+
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Json(json!({ "pending": true })).into_response();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -470,10 +439,12 @@ async fn initial_choice(
         }
     };
 
-    let waker = {
+    {
         let mut slot = state.pending_initial.lock().unwrap();
         match slot.as_mut() {
-            Some(p) if p.choice_id == body.choice_id => p.waker.take(),
+            Some(p) if p.choice_id == body.choice_id => {
+                p.choice = Some(choice);
+            }
             _ => {
                 return Json(json!({
                     "ok": false,
@@ -481,14 +452,6 @@ async fn initial_choice(
                 }));
             }
         }
-    };
-
-    if let Some(tx) = waker {
-        let _ = tx.send(choice);
-    }
-    {
-        let mut slot = state.pending_initial.lock().unwrap();
-        *slot = None;
     }
 
     let choice_str = match choice {
@@ -516,7 +479,18 @@ async fn initial_choice(
 // filesystem is empty, so it should send its current Studio state back as an
 // initial push instead of applying our (empty) snapshot over its live tree.
 
-async fn snapshot(State(state): State<AppState>) -> Json<Value> {
+#[derive(Deserialize, Default)]
+struct SnapshotParams {
+    #[serde(default)]
+    strict: bool,
+    #[serde(rename = "forcePrune", default)]
+    force_prune: bool,
+}
+
+async fn snapshot(
+    State(state): State<AppState>,
+    Query(params): Query<SnapshotParams>,
+) -> Json<Value> {
     let services = match snapshot::emit_services(state.canonical_project.as_path()) {
         Ok(s) => s,
         Err(e) => {
@@ -527,7 +501,8 @@ async fn snapshot(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "services": services,
         "bootstrap": bootstrap,
-        "strict": false,
+        "strict": params.strict,
+        "forcePrune": params.force_prune,
     }))
 }
 
@@ -699,6 +674,13 @@ async fn events(
 // /resolve
 // ---------------------------------------------------------------------------
 
+async fn resolve_list(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "conflicts": state.conflict.list(),
+    }))
+}
+
 #[derive(Deserialize)]
 struct ResolveBody {
     path: String,
@@ -737,6 +719,11 @@ async fn resolve(
         Resolved::WriteFs(bytes) => {
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
+            }
+            {
+                let canon = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+                let deadline = Instant::now() + Duration::from_millis(PUSH_QUIET_MS);
+                state.push_quiet.lock().unwrap().insert(canon, deadline);
             }
             if let Err(e) = std::fs::write(&target, &bytes) {
                 return Json(json!({ "ok": false, "error": format!("write: {e}") }));
@@ -937,6 +924,7 @@ fn apply_set(
                 .map(|((_, m), nb)| (nb.as_slice(), *m));
             match conflicts.on_studio_push(&target, &bytes, current_ref) {
                 StudioDecision::Apply => {
+                    ctx.mark_quiet(&target);
                     std::fs::write(&target, &bytes)
                         .map_err(|e| format!("write {}: {e}", target.display()))?;
                     conflicts.record_sync(&target, hash(&bytes), fs_mtime(&target));
@@ -958,11 +946,35 @@ fn apply_set(
             let init_path = target.join(&init_name);
             let raw_bytes = source.unwrap_or_default().into_bytes();
             let bytes = normalize_line_endings(&raw_bytes).into_owned();
-            std::fs::write(&init_path, &bytes)
-                .map_err(|e| format!("write {}: {e}", init_path.display()))?;
-            conflicts.record_sync(&init_path, hash(&bytes), fs_mtime(&init_path));
-            ctx.mark_quiet(&init_path);
-            applied += 1;
+            let current = if init_path.is_file() {
+                Some((
+                    std::fs::read(&init_path).unwrap_or_default(),
+                    fs_mtime(&init_path),
+                ))
+            } else {
+                None
+            };
+            let normalized_current: Option<Vec<u8>> = current
+                .as_ref()
+                .map(|(b, _)| normalize_line_endings(b).into_owned());
+            let current_ref = current
+                .as_ref()
+                .zip(normalized_current.as_ref())
+                .map(|((_, m), nb)| (nb.as_slice(), *m));
+            match conflicts.on_studio_push(&init_path, &bytes, current_ref) {
+                StudioDecision::Apply => {
+                    ctx.mark_quiet(&init_path);
+                    std::fs::write(&init_path, &bytes)
+                        .map_err(|e| format!("write {}: {e}", init_path.display()))?;
+                    conflicts.record_sync(&init_path, hash(&bytes), fs_mtime(&init_path));
+                    ctx.mark_quiet(&init_path);
+                    applied += 1;
+                }
+                StudioDecision::NoChange => {}
+                StudioDecision::Conflict => {
+                    return Ok(ApplyOutcome::Conflict(init_path));
+                }
+            }
             if let Some(kids) = children {
                 let mut child_segs: Vec<String> = parent_segs.to_vec();
                 child_segs.push(name.to_string());
@@ -1044,6 +1056,7 @@ fn apply_update(
                 .map(|((_, m), nb)| (nb.as_slice(), *m));
             match conflicts.on_studio_push(&target, &bytes, current_ref) {
                 StudioDecision::Apply => {
+                    ctx.mark_quiet(&target);
                     std::fs::write(&target, &bytes)
                         .map_err(|e| format!("write {}: {e}", target.display()))?;
                     conflicts.record_sync(&target, hash(&bytes), fs_mtime(&target));
@@ -1265,7 +1278,7 @@ fn children_exist(dir: &Path) -> bool {
             it.flatten().any(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|n| n != META_FILE && parse_init_file(n).is_none())
+                    .map(|n| n != META_FILE && !is_init_file(n))
                     .unwrap_or(false)
             })
         })
@@ -1326,8 +1339,8 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
         }
         OpKind::Add | OpKind::Update => {
             let fname = segs.last()?.clone();
-            // Skip the `init (...).luau` files — they describe their parent dir.
-            if parse_init_file(&fname).is_some() {
+            // Skip init files — they describe their parent dir.
+            if is_init_file(&fname) {
                 // Translate into an update of the parent dir (Source on the script-with-children).
                 let parent_path = op.path.parent()?;
                 let parent_inst = path_to_instance_meta(parent_path).ok().flatten()?;
@@ -1507,6 +1520,75 @@ mod tests {
         assert!(!ws.join("Box").exists());
     }
 
+    #[test]
+    fn bootstrap_skips_unchanged_script_with_children_sources() {
+        let d = TempDir::new("bootstrap-unchanged-script-dir");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+
+        let controller = d.path().join("ReplicatedStorage").join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        std::fs::write(controller.join("init (Controller).luau"), "print('same')\n").unwrap();
+        std::fs::write(controller.join("Child.luau"), "return {}\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "Controller",
+                "class": "ModuleScript",
+                "properties": { "Source": "print('same')\r\n" },
+                "children": [{
+                    "name": "Child",
+                    "class": "ModuleScript",
+                    "properties": { "Source": "return {}\r\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
+        assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn bootstrap_applies_changed_script_with_children_source_once() {
+        let d = TempDir::new("bootstrap-changed-script-dir");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+
+        let controller = d.path().join("ReplicatedStorage").join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        let init_path = controller.join("init (Controller).luau");
+        std::fs::write(&init_path, "print('old')\n").unwrap();
+        std::fs::write(controller.join("Child.luau"), "return {}\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "Controller",
+                "class": "ModuleScript",
+                "properties": { "Source": "print('new')\n" },
+                "children": [{
+                    "name": "Child",
+                    "class": "ModuleScript",
+                    "properties": { "Source": "return {}\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(
+            std::fs::read_to_string(init_path).unwrap(),
+            "print('new')\n"
+        );
+    }
+
     // POST /tree writes body to `.tree.json.tmp` then atomically renames it to
     // `tree.json`. Verifies round-trip bytes and that the watcher ignores both
     // paths so the write never bounces back as an op.
@@ -1602,6 +1684,52 @@ mod tests {
         })];
 
         assert!(!initial_snapshots_match(d.path(), &studio).unwrap());
+    }
+
+    #[test]
+    fn initial_snapshot_comparison_groups_changes_and_ignores_unsynced_junk() {
+        let d = TempDir::new("initial-summary");
+        std::fs::write(d.path().join("notes.md"), "not synced").unwrap();
+        std::fs::create_dir_all(d.path().join("Plans")).unwrap();
+        std::fs::write(d.path().join("Plans").join("Loose.luau"), "return 'junk'").unwrap();
+
+        let rs = d.path().join("ReplicatedStorage");
+        std::fs::create_dir_all(&rs).unwrap();
+        std::fs::write(rs.join("Config.luau"), "return 'disk'\n").unwrap();
+        std::fs::write(rs.join("LocalOnly.luau"), "return true\n").unwrap();
+
+        let studio = vec![json!({
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "properties": {},
+            "children": [
+                {
+                    "class": "ModuleScript",
+                    "name": "Config",
+                    "properties": { "Source": "return 'studio'\n" },
+                    "children": []
+                },
+                {
+                    "class": "ModuleScript",
+                    "name": "StudioOnly",
+                    "properties": { "Source": "return false\n" },
+                    "children": []
+                }
+            ]
+        })];
+
+        let report = initial_snapshot_comparison(d.path(), &studio).unwrap();
+        assert_eq!(report.summary.new_files, 1);
+        assert_eq!(report.new_files[0].path, "ReplicatedStorage/LocalOnly");
+        assert_eq!(report.summary.changed_files, 1);
+        assert_eq!(report.changed_files[0].path, "ReplicatedStorage/Config");
+        assert_eq!(report.summary.removed_files, 1);
+        assert_eq!(report.removed_files[0].path, "ReplicatedStorage/StudioOnly");
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("notes.md"));
+        assert!(!json.contains("Plans"));
+        assert!(!json.contains("Loose"));
     }
 
     // `writelog` reads a test-only home override at call-time, so pointing it

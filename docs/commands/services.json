@@ -1,0 +1,14 @@
+{
+  "name": "services",
+  "title": "rosync services",
+  "category": "Live inspection",
+  "description": "Lists Ro Sync service roots and whether each exists on disk and in live Studio.",
+  "usage": "rosync services [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync services --project .",
+    "rosync services --project . --raw"
+  ],
+  "notes": [
+    "Uses the fixed synced service allowlist rather than scanning arbitrary top-level folders."
+  ]
+}

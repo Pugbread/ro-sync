@@ -1,0 +1,21 @@
+{
+  "name": "monetization",
+  "title": "rosync monetization",
+  "category": "Open Cloud",
+  "description": "Discovers, lists, creates, edits, and uploads images for Roblox game passes and developer products through Open Cloud.",
+  "usage": "rosync monetization gamepass discover [--project <path>]\nrosync monetization gamepass list [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--raw]\nrosync monetization gamepass create [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--description <text>] [--image <file>] [--not-for-sale] (<entry>... | --name <name> --price <robux>)\nrosync monetization gamepass edit [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) [--new-name <name>] [--price <robux>] [--description <text>] [--for-sale true|false]\nrosync monetization gamepass image [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) <file>\nrosync monetization gamepass images [--project <path>] [--universe-id <id>] [--api-key-env <name>] <dir>\n# Replace gamepass with product, dp, devproduct, gp, pass, or gamepasses as needed.",
+  "examples": [
+    "rosync monetization gamepass create \"VIP 499 robux\" --project .",
+    "rosync monetization product create \"Coins Small 49 robux, Coins Large 399 robux\" --project .",
+    "rosync monetization gp edit --name VIP --price 699 --project .",
+    "rosync monetization dp image --name \"Coins Small\" ./coins-small.png --project .",
+    "rosync monetization product images ./icons --project ."
+  ],
+  "notes": [
+    "Uses multipart/form-data and Roblox Open Cloud API keys.",
+    "Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, project env files, then the Ro Sync widget Secrets store.",
+    "Universe discovery checks --universe-id, ROBLOX_UNIVERSE_ID, UNIVERSE_ID, GAMEID, GAME_ID, project env files, then ro-sync.json gameId.",
+    "discover reports likely monetization config files but does not guess project-specific code writes when schema is ambiguous.",
+    "images matches files to assets by normalized filename, such as coins-small.png to Coins Small."
+  ]
+}

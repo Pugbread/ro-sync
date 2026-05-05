@@ -1,0 +1,18 @@
+{
+  "name": "context",
+  "title": "rosync context",
+  "category": "Command registry",
+  "description": "Prints a compact LLM-oriented project context snapshot as JSON.",
+  "usage": "rosync context [--project <path>] [--port <port>] [--full-commands]",
+  "examples": [
+    "rosync context --project .",
+    "rosync context --project . --full-commands",
+    "rosync context --project . --port 7878"
+  ],
+  "notes": [
+    "Does not mutate disk or Studio.",
+    "Includes project config, synced services, tree summary, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.",
+    "Includes LLM command-use policy so agents know to use `rosync commands --compact` and `rosync commands <name>` instead of dumping the full registry.",
+    "Use `--full-commands` only when the caller needs the complete embedded command registry in the same response."
+  ]
+}

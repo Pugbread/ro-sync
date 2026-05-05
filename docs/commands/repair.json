@@ -1,0 +1,16 @@
+{
+  "name": "repair",
+  "title": "rosync repair",
+  "category": "Maintenance",
+  "description": "Rebuilds generated Ro Sync metadata.",
+  "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]",
+  "examples": [
+    "rosync repair tree --project .",
+    "rosync repair sourcemap --project .",
+    "rosync repair sourcemap --project . --output .luau-sourcemap.json"
+  ],
+  "notes": [
+    "`repair tree` refreshes `tree.json` from live Studio.",
+    "`repair sourcemap` rebuilds luau-lsp sourcemap JSON from synced service folders."
+  ]
+}

@@ -6,10 +6,13 @@
 //!   * `Foo.luau`            → ModuleScript named `Foo`
 //!   * `Foo.server.luau`     → Script          named `Foo`
 //!   * `Foo.client.luau`     → LocalScript     named `Foo`
+//!   * Wally-style `.lua`, `.server.lua`, and `.client.lua` files are accepted
+//!     with the same class mapping.
 //!   * `Foo/` (dir)          → Folder          named `Foo`
 //!   * `Foo/init (Foo).luau` → the folder IS a ModuleScript named `Foo` whose children
-//!                             are the other entries in the folder. `.server.luau` /
-//!                             `.client.luau` variants pick Script / LocalScript.
+//!                             are the other entries in the folder. `.lua`,
+//!                             `.server.*`, and `.client.*` variants are accepted.
+//!   * `Foo/init.lua`        → Wally/Rojo-style equivalent of `Foo/init (Foo).luau`.
 //!   * Sibling name collisions are broken with numeric suffixes.
 //!   * Unsafe characters in instance names are percent-encoded.
 
@@ -77,21 +80,27 @@ impl ScriptClass {
 
 /// Classify a file name as a script, returning `(class, stem_without_ext)`.
 ///
-/// Order matters: `.server.luau` and `.client.luau` must be tried before the
-/// plain `.luau` suffix.
+/// Order matters: class-specific suffixes must be tried before plain module
+/// suffixes so `Foo.server.lua` does not become a ModuleScript named
+/// `Foo.server`.
 pub fn classify_script_file(file_name: &str) -> Option<(ScriptClass, String)> {
-    if let Some(stem) = file_name.strip_suffix(".server.luau") {
-        Some((ScriptClass::Script, stem.to_string()))
-    } else if let Some(stem) = file_name.strip_suffix(".client.luau") {
-        Some((ScriptClass::LocalScript, stem.to_string()))
-    } else if let Some(stem) = file_name.strip_suffix(".luau") {
-        Some((ScriptClass::ModuleScript, stem.to_string()))
-    } else {
-        None
+    const SUFFIXES: &[(&str, ScriptClass)] = &[
+        (".server.luau", ScriptClass::Script),
+        (".client.luau", ScriptClass::LocalScript),
+        (".server.lua", ScriptClass::Script),
+        (".client.lua", ScriptClass::LocalScript),
+        (".luau", ScriptClass::ModuleScript),
+        (".lua", ScriptClass::ModuleScript),
+    ];
+    for (suffix, class) in SUFFIXES {
+        if let Some(stem) = file_name.strip_suffix(suffix) {
+            return Some((*class, stem.to_string()));
+        }
     }
+    None
 }
 
-/// Parse an `init (<Name>).{server,client,}.luau` file name. The returned name
+/// Parse an `init (<Name>).{server,client,}.{luau,lua}` file name. The returned name
 /// is the instance's *clean* name — any `[N]` disambiguation suffix inside the
 /// parentheses is stripped so the inner matches the Roblox instance name.
 pub fn parse_init_file(file_name: &str) -> Option<(ScriptClass, String)> {
@@ -105,6 +114,23 @@ pub fn parse_init_file(file_name: &str) -> Option<(ScriptClass, String)> {
         None => inner.to_string(),
     };
     Some((class, name))
+}
+
+/// Parse a Wally/Rojo-style plain init file name.
+///
+/// Unlike `init (<Name>).luau`, a plain `init.lua` does not encode the parent
+/// instance name. Callers that are inspecting a directory should use the
+/// surrounding folder's name for the resulting instance.
+pub fn parse_plain_init_file(file_name: &str) -> Option<ScriptClass> {
+    let (class, stem) = classify_script_file(file_name)?;
+    (stem == "init").then_some(class)
+}
+
+/// True for both Ro-Sync `init (<Name>).luau` and Wally/Rojo `init.lua`
+/// variants. These files describe their parent directory and should not be
+/// emitted as standalone child ModuleScripts when that parent is a script.
+pub fn is_init_file(file_name: &str) -> bool {
+    parse_init_file(file_name).is_some() || parse_plain_init_file(file_name).is_some()
 }
 
 /// Parse a `<Name> [N]` numeric disambiguation suffix off a stem. Returns the
@@ -356,27 +382,31 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
         return Ok(None);
     }
 
-    let mut init_entry: Option<(ScriptClass, String)> = None;
-    for entry in fs::read_dir(path)? {
-        let e = entry?;
-        if let Some(n) = e.file_name().to_str() {
-            if let Some(parsed) = parse_init_file(n) {
-                init_entry = Some(parsed);
-                break;
-            }
-        }
-    }
-
     let dir_name_raw = file_name.to_string();
     let dir_display = match parse_disambiguated(&dir_name_raw) {
         Some((n, _)) => n,
         None => dir_name_raw,
     };
+    let decoded_dir_name = decode_name(&dir_display);
 
+    let mut named_init: Option<(ScriptClass, String)> = None;
+    let mut plain_init: Option<ScriptClass> = None;
+    for entry in fs::read_dir(path)? {
+        let e = entry?;
+        if let Some(n) = e.file_name().to_str() {
+            if let Some(parsed) = parse_init_file(n) {
+                named_init = Some(parsed);
+            } else if let Some(sc) = parse_plain_init_file(n) {
+                plain_init = Some(sc);
+            }
+        }
+    }
+
+    let init_entry = named_init.or_else(|| plain_init.map(|sc| (sc, decoded_dir_name.clone())));
     let (name, class, script_class) = if let Some((sc, inner)) = init_entry.clone() {
         (inner, sc.class_name().to_string(), Some(sc))
     } else {
-        (decode_name(&dir_display), "Folder".to_string(), None)
+        (decoded_dir_name, "Folder".to_string(), None)
     };
 
     Ok(Some(PathInstance {
@@ -439,6 +469,13 @@ mod tests {
     }
 
     #[test]
+    fn classify_plain_lua() {
+        let (c, s) = classify_script_file("React.lua").unwrap();
+        assert_eq!(c, ScriptClass::ModuleScript);
+        assert_eq!(s, "React");
+    }
+
+    #[test]
     fn classify_server_luau() {
         let (c, s) = classify_script_file("Main.server.luau").unwrap();
         assert_eq!(c, ScriptClass::Script);
@@ -453,9 +490,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_non_luau() {
+    fn classify_lua_script_variants() {
+        let (c, s) = classify_script_file("Main.server.lua").unwrap();
+        assert_eq!(c, ScriptClass::Script);
+        assert_eq!(s, "Main");
+
+        let (c, s) = classify_script_file("UI.client.lua").unwrap();
+        assert_eq!(c, ScriptClass::LocalScript);
+        assert_eq!(s, "UI");
+    }
+
+    #[test]
+    fn classify_rejects_non_script_files() {
         assert!(classify_script_file("README.md").is_none());
-        assert!(classify_script_file("x.lua").is_none());
+        assert!(classify_script_file("wally.toml").is_none());
     }
 
     #[test]
@@ -472,8 +520,29 @@ mod tests {
             parse_init_file("init (UI).client.luau"),
             Some((ScriptClass::LocalScript, "UI".to_string()))
         );
+        assert_eq!(
+            parse_init_file("init (Package).lua"),
+            Some((ScriptClass::ModuleScript, "Package".to_string()))
+        );
+        assert_eq!(
+            parse_init_file("init (ServerPackage).server.lua"),
+            Some((ScriptClass::Script, "ServerPackage".to_string()))
+        );
         assert_eq!(parse_init_file("foo.luau"), None);
         assert_eq!(parse_init_file("init ().luau"), None);
+        assert_eq!(
+            parse_plain_init_file("init.lua"),
+            Some(ScriptClass::ModuleScript)
+        );
+        assert_eq!(
+            parse_plain_init_file("init.luau"),
+            Some(ScriptClass::ModuleScript)
+        );
+        assert_eq!(
+            parse_plain_init_file("init.server.lua"),
+            Some(ScriptClass::Script)
+        );
+        assert!(is_init_file("init.lua"));
     }
 
     #[test]
@@ -731,6 +800,17 @@ mod tests {
     }
 
     #[test]
+    fn path_to_instance_wally_lua_module_script() {
+        let d = TempDir::new("wally-lua");
+        let p = d.path().join("React.lua");
+        fs::write(&p, b"return require(script.Parent._Index.react)").unwrap();
+        let inst = path_to_instance_meta(&p).unwrap().unwrap();
+        assert_eq!(inst.name, "React");
+        assert_eq!(inst.class, "ModuleScript");
+        assert!(!inst.is_dir);
+    }
+
+    #[test]
     fn path_to_instance_folder_default() {
         let d = TempDir::new("folder");
         let p = d.path().join("Shared");
@@ -751,6 +831,20 @@ mod tests {
         fs::write(p.join("Helper.luau"), b"return {}").unwrap();
         let inst = path_to_instance_meta(&p).unwrap().unwrap();
         assert_eq!(inst.name, "Net");
+        assert_eq!(inst.class, "ModuleScript");
+        assert!(inst.is_script_with_children);
+        assert_eq!(inst.script_class, Some(ScriptClass::ModuleScript));
+    }
+
+    #[test]
+    fn path_to_instance_wally_plain_init_script_with_children() {
+        let d = TempDir::new("wally-swc");
+        let p = d.path().join("net");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("init.lua"), b"return {}").unwrap();
+        fs::write(p.join("client.lua"), b"return {}").unwrap();
+        let inst = path_to_instance_meta(&p).unwrap().unwrap();
+        assert_eq!(inst.name, "net");
         assert_eq!(inst.class, "ModuleScript");
         assert!(inst.is_script_with_children);
         assert_eq!(inst.script_class, Some(ScriptClass::ModuleScript));

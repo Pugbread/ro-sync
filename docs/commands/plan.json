@@ -1,0 +1,18 @@
+{
+  "name": "plan",
+  "title": "rosync plan",
+  "category": "Command registry",
+  "description": "Builds a read-only JSON plan for a mutating command without executing it.",
+  "usage": "rosync plan set --path <studio-path> --prop <property> --value <json>\nrosync plan new --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>]\nrosync plan rm --path <studio-path>\nrosync plan mv --from <studio-path> --to <parent-path> [--force]\nrosync plan resolve --path <filesystem-path> (--disk | --studio)",
+  "examples": [
+    "rosync plan set --path ReplicatedStorage/Config --prop Source --value '\"return {}\"'",
+    "rosync plan new --path ReplicatedStorage --class Folder --name Shared",
+    "rosync plan rm --path Workspace/OldPart",
+    "rosync plan resolve --path ReplicatedStorage/Client/UIController.client.luau --studio"
+  ],
+  "notes": [
+    "Does not mutate disk or Studio.",
+    "Returns `mutates`, `requires`, `risks`, and an `executeCommand` string.",
+    "Use this before running risky write commands from an LLM workflow."
+  ]
+}

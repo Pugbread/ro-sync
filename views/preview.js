@@ -2,7 +2,7 @@
 //
 // Mount once at app boot. Subscribes to the "batch-preview" bus event fanned
 // out by app.js from the daemon WebSocket stream. Shape:
-//   { summary: { added, updated, removed }, ops: [...], source?: "daemon"|"heuristic" }
+//   { summary: { added, updated, removed }, ops: [...], source?: "daemon" }
 //
 // On Accept, POSTs {accept:true} to <daemonBase>/batch-decision (ignoring 404s
 // so this is harmless until the daemon implements the endpoint).
@@ -55,10 +55,7 @@ export function mountPreviewModal(api) {
     $added.textContent = String(a);
     $updated.textContent = String(u);
     $removed.textContent = String(r);
-    $sub.textContent =
-      data && data.source === "heuristic"
-        ? `${a + u + r} ops arrived rapidly — confirm before applying.`
-        : `The daemon wants to apply ${a + u + r} ops.`;
+    $sub.textContent = `The daemon wants to apply ${a + u + r} ops.`;
     $list.innerHTML = "";
     const ops = Array.isArray(data && data.ops) ? data.ops : [];
     currentOps = ops;

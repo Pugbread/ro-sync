@@ -1,0 +1,19 @@
+{
+  "name": "commands",
+  "title": "rosync commands",
+  "category": "Command registry",
+  "description": "Prints generated command docs as JSON, either as a compact LLM index, one command entry, or the full registry.",
+  "usage": "rosync commands [command-name] [--compact]",
+  "examples": [
+    "rosync commands --compact",
+    "rosync commands get",
+    "rosync commands resolve",
+    "rosync commands upload --compact"
+  ],
+  "notes": [
+    "This is the LLM-facing replacement for scraping `--help` text.",
+    "Prefer `--compact` for choosing commands. Prefer `rosync commands <name>` for exact usage.",
+    "Plain `rosync commands` prints the full registry and should be reserved for explicit full-doc requests.",
+    "The output is embedded from `docs/client-commands.generated.json`, which is rebuilt from `docs/commands/*.json`."
+  ]
+}

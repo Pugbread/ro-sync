@@ -369,10 +369,13 @@ export function writeFileFromB64Cmd(absPath, b64) {
   if (IS_WINDOWS) {
     const ps =
       `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(absPath)}); ` +
+      `$dir = Split-Path -Parent $p; ` +
+      `if ($dir) { [IO.Directory]::CreateDirectory($dir) | Out-Null }; ` +
       `[IO.File]::WriteAllBytes($p, [Convert]::FromBase64String(${psQuote(b64)}))`;
     return psEncodedCmd(ps);
   }
-  return `echo ${posixQuote(b64)} | base64 -d > ${posixQuote(absPath)}`;
+  const q = posixQuote(absPath);
+  return `mkdir -p "$(dirname ${q})" && echo ${posixQuote(b64)} | base64 -d > ${q}`;
 }
 
 // Read a text file's full contents to stdout (empty if missing).

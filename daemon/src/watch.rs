@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 const DEBOUNCE_MS: u64 = 150;
-const CHANNEL_CAP: usize = 1024;
+// Wally installs can touch several thousand files in one burst. Keep enough
+// backlog for the Studio plugin to drain those changes instead of receiving a
+// lagged frame and re-entering the initial overwrite handshake.
+const CHANNEL_CAP: usize = 16384;
 
 /// Substrings / name fragments we never want to propagate. Matches are
 /// case-sensitive and applied to the final path component (except `.git`,
@@ -48,6 +51,8 @@ const BLACKLISTED: &[&str] = &[
 /// would bounce back as ops. Matched only at the project root — nested files
 /// with these names (unlikely, but allowed) are unaffected.
 const ROOT_RESERVED: &[&str] = &[
+    ".stylua.toml",
+    "aftman.toml",
     "ro-sync.json",
     "ro-sync.md",
     "CLAUDE.md",
@@ -244,9 +249,8 @@ pub(crate) fn is_blacklisted(p: &Path) -> bool {
     false
 }
 
-/// True if `path` is one of the daemon-authored root files (ro-sync.json,
-/// ro-sync.md, CLAUDE.md, AGENTS.md, tree.json) sitting directly at the
-/// project root. Used to prevent a feedback loop from our own emit-tree /
+/// True if `path` is one of the daemon-authored root files sitting directly at
+/// the project root. Used to prevent a feedback loop from our own emit-tree /
 /// config writes.
 pub(crate) fn is_root_reserved(path: &Path, root: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -396,6 +400,8 @@ mod tests {
     #[test]
     fn root_reserved_filters_daemon_authored_files() {
         let root = PathBuf::from("/tmp/proj");
+        assert!(is_root_reserved(&root.join(".stylua.toml"), &root));
+        assert!(is_root_reserved(&root.join("aftman.toml"), &root));
         assert!(is_root_reserved(&root.join("ro-sync.json"), &root));
         assert!(is_root_reserved(&root.join("ro-sync.md"), &root));
         assert!(is_root_reserved(&root.join("CLAUDE.md"), &root));

@@ -19,12 +19,26 @@ pub struct ProjectConfig {
     pub group_id: Option<String>,
     #[serde(rename = "placeIds", default)]
     pub place_ids: Vec<String>,
+    #[serde(rename = "wallyEnabled", default, skip_serializing_if = "is_false")]
+    pub wally_enabled: bool,
+    #[serde(
+        rename = "wallyFolder",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wally_folder: Option<String>,
+    #[serde(rename = "wallyFile", default, skip_serializing_if = "Option::is_none")]
+    pub wally_file: Option<String>,
     #[serde(default = "default_version")]
     pub version: u32,
 }
 
 fn default_version() -> u32 {
     CONFIG_VERSION
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ProjectConfig {
@@ -39,6 +53,9 @@ impl ProjectConfig {
             game_id: None,
             group_id: None,
             place_ids: Vec::new(),
+            wally_enabled: false,
+            wally_folder: None,
+            wally_file: None,
             version: CONFIG_VERSION,
         }
     }
@@ -163,6 +180,34 @@ mod tests {
         assert_eq!(cfg.game_id.as_deref(), Some("1234567890"));
         assert_eq!(cfg.group_id.as_deref(), Some("333"));
         assert_eq!(cfg.place_ids, vec!["111".to_string(), "222".to_string()]);
+        assert!(!cfg.wally_enabled);
+        assert!(cfg.wally_folder.is_none());
+        assert!(cfg.wally_file.is_none());
+    }
+
+    #[test]
+    fn reads_and_writes_wally_settings() {
+        let d = TempDir::new("wally");
+        let text = r#"{"name":"MyProj","wallyEnabled":true,"wallyFolder":"ReplicatedStorage/Assets/Packages","wallyFile":"[dependencies]\nReact = \"jsdotlua/react@17.1.0\"\n","version":1}"#;
+        fs::write(d.path().join(CONFIG_FILE), text).unwrap();
+
+        let cfg = load_or_create(d.path()).unwrap();
+        assert!(cfg.wally_enabled);
+        assert_eq!(
+            cfg.wally_folder.as_deref(),
+            Some("ReplicatedStorage/Assets/Packages")
+        );
+        assert!(cfg
+            .wally_file
+            .as_deref()
+            .unwrap_or("")
+            .contains("jsdotlua/react"));
+
+        write(d.path(), &cfg).unwrap();
+        let round_trip = fs::read_to_string(d.path().join(CONFIG_FILE)).unwrap();
+        assert!(round_trip.contains("\"wallyEnabled\": true"));
+        assert!(round_trip.contains("\"wallyFolder\""));
+        assert!(round_trip.contains("\"wallyFile\""));
     }
 
     #[test]

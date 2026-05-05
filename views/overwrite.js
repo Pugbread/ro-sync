@@ -2,7 +2,7 @@
 //
 // Mount once at app boot. It subscribes to two bus events (fanned out by
 // app.js from the daemon WebSocket stream):
-//   - initial-choice-needed : { choiceId, diskStats, studioStats }
+//   - initial-choice-needed : { choiceId, diskStats, studioStats, comparison? }
 //   - initial-choice-made   : { choiceId, ... }  (dismiss if still showing)
 // On button click it POSTs {choiceId, choice} to <daemonBase>/initial-choice.
 
@@ -15,26 +15,31 @@ export function mountOverwriteModal(api) {
   overlay.setAttribute("aria-modal", "true");
   overlay.setAttribute("aria-labelledby", "ow-title");
   overlay.innerHTML = `
-    <div class="modal-card" role="document">
-      <h2 class="modal-title" id="ow-title">Initial sync — choose source of truth</h2>
-      <p class="modal-sub">The daemon and the Studio plugin are both populated. Pick which side overwrites the other.</p>
-      <div class="modal-compare">
-        <div class="compare-card" data-side="disk">
-          <div class="compare-label">Disk</div>
-          <div class="compare-stat"><span class="n" data-f="diskScripts">—</span> scripts</div>
-          <div class="compare-stat"><span class="n" data-f="diskInstances">—</span> instances</div>
-        </div>
-        <div class="compare-vs">vs</div>
-        <div class="compare-card" data-side="studio">
-          <div class="compare-label">Studio</div>
-          <div class="compare-stat"><span class="n" data-f="studioScripts">—</span> scripts</div>
-          <div class="compare-stat"><span class="n" data-f="studioInstances">—</span> instances</div>
+    <div class="modal-card initial-card" role="document">
+      <div class="initial-hero">
+        <div class="initial-icon" aria-hidden="true">RS</div>
+        <div class="initial-copy">
+          <h2 class="modal-title" id="ow-title">Choose source of truth</h2>
+          <p class="modal-sub">Only paths managed by Ro Sync are compared. Pick which side should overwrite the synced tree.</p>
         </div>
       </div>
-      <div class="modal-actions">
-        <button class="primary" data-act="disk">Keep Disk (overwrite Studio)</button>
-        <button class="primary" data-act="studio">Keep Studio (overwrite Disk)</button>
-        <button data-act="cancel">Cancel</button>
+      <div class="initial-summary" data-summary hidden>
+        <div class="initial-summary-head">
+          <span>Synced path changes</span>
+          <span data-summary-total>—</span>
+        </div>
+        <div class="initial-summary-groups" data-summary-groups></div>
+      </div>
+      <div class="initial-decision">
+        <div class="initial-decision-copy">
+          <strong>Resolve the initial sync</strong>
+          <span>Keep Disk pushes local synced files to Studio. Keep Studio writes the Studio tree back to disk.</span>
+        </div>
+        <div class="modal-actions">
+          <button class="primary" data-act="disk">Keep Disk</button>
+          <button class="primary" data-act="studio">Keep Studio</button>
+          <button data-act="cancel">Cancel</button>
+        </div>
       </div>
       <p class="modal-err" data-err hidden></p>
     </div>
@@ -42,10 +47,9 @@ export function mountOverwriteModal(api) {
   document.body.appendChild(overlay);
 
   const $card = overlay.querySelector(".modal-card");
-  const $diskScripts = overlay.querySelector('[data-f="diskScripts"]');
-  const $diskInstances = overlay.querySelector('[data-f="diskInstances"]');
-  const $studioScripts = overlay.querySelector('[data-f="studioScripts"]');
-  const $studioInstances = overlay.querySelector('[data-f="studioInstances"]');
+  const $summary = overlay.querySelector("[data-summary]");
+  const $summaryTotal = overlay.querySelector("[data-summary-total]");
+  const $summaryGroups = overlay.querySelector("[data-summary-groups]");
   const $err = overlay.querySelector("[data-err]");
   const buttons = overlay.querySelectorAll("[data-act]");
 
@@ -54,12 +58,7 @@ export function mountOverwriteModal(api) {
 
   function open(data) {
     currentChoiceId = data.choiceId || null;
-    const d = data.diskStats || {};
-    const s = data.studioStats || {};
-    $diskScripts.textContent = numOrDash(d.scriptCount);
-    $diskInstances.textContent = numOrDash(d.instanceCount);
-    $studioScripts.textContent = numOrDash(s.scriptCount);
-    $studioInstances.textContent = numOrDash(s.instanceCount);
+    renderComparison(data.comparison);
     $err.hidden = true;
     $err.textContent = "";
     setBusy(false);
@@ -79,6 +78,96 @@ export function mountOverwriteModal(api) {
     busy = b;
     buttons.forEach((btn) => { btn.disabled = b; });
     $card.classList.toggle("is-busy", b);
+  }
+
+  function renderComparison(comparison) {
+    const groups = comparisonGroups(comparison);
+    const total = groups.reduce((sum, group) => sum + group.items.length, 0);
+    if (!total) {
+      $summary.hidden = false;
+      $summaryTotal.textContent = "unavailable";
+      $summaryGroups.innerHTML = `
+        <div class="initial-summary-fallback">
+          This daemon did not send a synced-path summary. Rebuild and restart
+          the Ro Sync daemon to see New Files, Changed Files, and Removed Files.
+        </div>
+      `;
+      return;
+    }
+
+    $summary.hidden = false;
+    $summaryTotal.textContent = `${total} ${total === 1 ? "path" : "paths"}`;
+    $summaryGroups.innerHTML = groups
+      .filter((group) => group.items.length > 0)
+      .map(renderComparisonGroup)
+      .join("");
+  }
+
+  function comparisonGroups(comparison) {
+    if (!comparison || typeof comparison !== "object") return [];
+    return [
+      {
+        title: "New Files",
+        hint: "on disk only",
+        mark: "+",
+        cls: "is-new",
+        items: Array.isArray(comparison.newFiles) ? comparison.newFiles : [],
+      },
+      {
+        title: "Changed Files",
+        hint: "different source or class",
+        mark: "~",
+        cls: "is-changed",
+        items: Array.isArray(comparison.changedFiles) ? comparison.changedFiles : [],
+      },
+      {
+        title: "Removed Files",
+        hint: "in Studio only",
+        mark: "-",
+        cls: "is-removed",
+        items: Array.isArray(comparison.removedFiles) ? comparison.removedFiles : [],
+      },
+    ];
+  }
+
+  function renderComparisonGroup(group) {
+    const limit = 8;
+    const visible = group.items.slice(0, limit);
+    const more = group.items.length - visible.length;
+    return `
+      <section class="initial-summary-group">
+        <div class="initial-summary-label">
+          <span>${escape(group.title)}</span>
+          <span>${group.items.length} · ${escape(group.hint)}</span>
+        </div>
+        <ul>
+          ${visible.map((item) => renderComparisonItem(group, item)).join("")}
+          ${more > 0 ? `<li class="initial-summary-more">+${more} more</li>` : ""}
+        </ul>
+      </section>
+    `;
+  }
+
+  function renderComparisonItem(group, item) {
+    const path = item && item.path ? item.path : "(unknown)";
+    const meta = comparisonItemMeta(group, item || {});
+    return `
+      <li class="${group.cls}">
+        <span class="initial-summary-mark">${escape(group.mark)}</span>
+        <span class="initial-summary-path">${escape(path)}</span>
+        <span class="initial-summary-meta">${escape(meta)}</span>
+      </li>
+    `;
+  }
+
+  function comparisonItemMeta(group, item) {
+    if (group.title === "Changed Files") {
+      const reasons = [];
+      if (item.sourceChanged) reasons.push("source");
+      if (item.classChanged) reasons.push("class");
+      return reasons.length ? reasons.join(", ") : "changed";
+    }
+    return item.class || item.kind || "";
   }
 
   async function submit(choice) {
@@ -157,6 +246,11 @@ export function mountOverwriteModal(api) {
   });
 }
 
-function numOrDash(n) {
-  return typeof n === "number" && Number.isFinite(n) ? String(n) : "—";
+function escape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

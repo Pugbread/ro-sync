@@ -1,0 +1,14 @@
+{
+  "name": "props",
+  "title": "rosync props",
+  "category": "Live inspection",
+  "description": "Prints inspectable live Studio properties for one instance.",
+  "usage": "rosync props --path <studio-path> [--port <port>] [--raw]",
+  "examples": [
+    "rosync props --path Workspace/Baseplate",
+    "rosync props --path ReplicatedStorage/Client/UIController --raw"
+  ],
+  "notes": [
+    "This is a focused view over `rosync get --path <path>`."
+  ]
+}

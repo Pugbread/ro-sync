@@ -2,15 +2,78 @@
   "schemaVersion": 1,
   "source": "docs/commands/*.json",
   "categories": [
+    "Command registry",
     "Offline inspection",
     "Open Cloud",
     "Live inspection",
+    "Path tools",
+    "Studio control",
+    "Conflict resolution",
     "Live diagnostics",
+    "Maintenance",
     "Project docs",
     "Live writes",
     "Daemon"
   ],
   "commands": [
+    {
+      "name": "commands",
+      "title": "rosync commands",
+      "category": "Command registry",
+      "description": "Prints generated command docs as JSON, either as a compact LLM index, one command entry, or the full registry.",
+      "usage": "rosync commands [command-name] [--compact]",
+      "examples": [
+        "rosync commands --compact",
+        "rosync commands get",
+        "rosync commands resolve",
+        "rosync commands upload --compact"
+      ],
+      "notes": [
+        "This is the LLM-facing replacement for scraping `--help` text.",
+        "Prefer `--compact` for choosing commands. Prefer `rosync commands <name>` for exact usage.",
+        "Plain `rosync commands` prints the full registry and should be reserved for explicit full-doc requests.",
+        "The output is embedded from `docs/client-commands.generated.json`, which is rebuilt from `docs/commands/*.json`."
+      ],
+      "slug": "commands"
+    },
+    {
+      "name": "context",
+      "title": "rosync context",
+      "category": "Command registry",
+      "description": "Prints a compact LLM-oriented project context snapshot as JSON.",
+      "usage": "rosync context [--project <path>] [--port <port>] [--full-commands]",
+      "examples": [
+        "rosync context --project .",
+        "rosync context --project . --full-commands",
+        "rosync context --project . --port 7878"
+      ],
+      "notes": [
+        "Does not mutate disk or Studio.",
+        "Includes project config, synced services, tree summary, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.",
+        "Includes LLM command-use policy so agents know to use `rosync commands --compact` and `rosync commands <name>` instead of dumping the full registry.",
+        "Use `--full-commands` only when the caller needs the complete embedded command registry in the same response."
+      ],
+      "slug": "context"
+    },
+    {
+      "name": "plan",
+      "title": "rosync plan",
+      "category": "Command registry",
+      "description": "Builds a read-only JSON plan for a mutating command without executing it.",
+      "usage": "rosync plan set --path <studio-path> --prop <property> --value <json>\nrosync plan new --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>]\nrosync plan rm --path <studio-path>\nrosync plan mv --from <studio-path> --to <parent-path> [--force]\nrosync plan resolve --path <filesystem-path> (--disk | --studio)",
+      "examples": [
+        "rosync plan set --path ReplicatedStorage/Config --prop Source --value '\"return {}\"'",
+        "rosync plan new --path ReplicatedStorage --class Folder --name Shared",
+        "rosync plan rm --path Workspace/OldPart",
+        "rosync plan resolve --path ReplicatedStorage/Client/UIController.client.luau --studio"
+      ],
+      "notes": [
+        "Does not mutate disk or Studio.",
+        "Returns `mutates`, `requires`, `risks`, and an `executeCommand` string.",
+        "Use this before running risky write commands from an LLM workflow."
+      ],
+      "slug": "plan"
+    },
     {
       "name": "query",
       "title": "rosync query",
@@ -47,16 +110,19 @@
       "name": "lint",
       "title": "rosync lint",
       "category": "Offline inspection",
-      "description": "Runs `luau-lsp analyze` against a project or path with an optional Ro Sync sourcemap.",
-      "usage": "rosync lint [--project <path>] [--path <file-or-dir>] [--luau-lsp <path>] [--no-sourcemap] [-- <luau-lsp args>...]",
+      "description": "Runs `luau-lsp analyze` against a project or one or more paths with a Ro Sync sourcemap, Roblox definitions, and dependency-aware diagnostic filtering.",
+      "usage": "rosync lint [--project <path>] [--path <file-or-dir>]... [--ignore <glob>]... [--scope-only|--owned-only] [--summary] [--luau-lsp <path>] [--no-sourcemap] [--no-vendor-ignores] [-- <luau-lsp args>...]",
       "examples": [
         "rosync lint --project .",
-        "rosync lint --project . --path ServerScriptService/Foo.server.luau",
-        "rosync lint --project . --no-sourcemap"
+        "rosync lint --project . --path ServerScriptService/Foo.server.luau --path ReplicatedStorage/Shared",
+        "rosync lint --project . --path ServerScriptService --owned-only --summary",
+        "rosync lint --project . --no-sourcemap --no-vendor-ignores"
       ],
       "notes": [
         "If `--luau-lsp` is omitted, Ro Sync checks `ROSYNC_LUAU_LSP` and then `PATH`.",
-        "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`."
+        "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`.",
+        "Default vendor ignores hide diagnostics under common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.codex`, and `.vscode`; pass `--no-vendor-ignores` to disable them.",
+        "`--scope-only` / `--owned-only` requires at least one `--path` and filters captured diagnostics down to those requested paths while preserving non-diagnostic luau-lsp log lines."
       ],
       "slug": "lint"
     },
@@ -77,6 +143,28 @@
         "Use `--auth bearer` for OAuth tokens instead of API keys."
       ],
       "slug": "upload"
+    },
+    {
+      "name": "monetization",
+      "title": "rosync monetization",
+      "category": "Open Cloud",
+      "description": "Discovers, lists, creates, edits, and uploads images for Roblox game passes and developer products through Open Cloud.",
+      "usage": "rosync monetization gamepass discover [--project <path>]\nrosync monetization gamepass list [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--raw]\nrosync monetization gamepass create [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--description <text>] [--image <file>] [--not-for-sale] (<entry>... | --name <name> --price <robux>)\nrosync monetization gamepass edit [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) [--new-name <name>] [--price <robux>] [--description <text>] [--for-sale true|false]\nrosync monetization gamepass image [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) <file>\nrosync monetization gamepass images [--project <path>] [--universe-id <id>] [--api-key-env <name>] <dir>\n# Replace gamepass with product, dp, devproduct, gp, pass, or gamepasses as needed.",
+      "examples": [
+        "rosync monetization gamepass create \"VIP 499 robux\" --project .",
+        "rosync monetization product create \"Coins Small 49 robux, Coins Large 399 robux\" --project .",
+        "rosync monetization gp edit --name VIP --price 699 --project .",
+        "rosync monetization dp image --name \"Coins Small\" ./coins-small.png --project .",
+        "rosync monetization product images ./icons --project ."
+      ],
+      "notes": [
+        "Uses multipart/form-data and Roblox Open Cloud API keys.",
+        "Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, project env files, then the Ro Sync widget Secrets store.",
+        "Universe discovery checks --universe-id, ROBLOX_UNIVERSE_ID, UNIVERSE_ID, GAMEID, GAME_ID, project env files, then ro-sync.json gameId.",
+        "discover reports likely monetization config files but does not guess project-specific code writes when schema is ambiguous.",
+        "images matches files to assets by normalized filename, such as coins-small.png to Coins Small."
+      ],
+      "slug": "monetization"
     },
     {
       "name": "get",
@@ -155,6 +243,188 @@
         "Reports items added locally, removed locally, and scripts whose `Source` differs."
       ],
       "slug": "diff"
+    },
+    {
+      "name": "changes",
+      "title": "rosync changes",
+      "category": "Live inspection",
+      "description": "Alias for `rosync diff`, intended for reviewing what a resync would change.",
+      "usage": "rosync changes [--project <path>] [--port <port>] [--depth <n>] [--raw]",
+      "examples": [
+        "rosync changes --project .",
+        "rosync changes --project . --raw"
+      ],
+      "notes": [
+        "Only compares synced services, so random project files are ignored."
+      ],
+      "slug": "changes"
+    },
+    {
+      "name": "services",
+      "title": "rosync services",
+      "category": "Live inspection",
+      "description": "Lists Ro Sync service roots and whether each exists on disk and in live Studio.",
+      "usage": "rosync services [--project <path>] [--port <port>] [--raw]",
+      "examples": [
+        "rosync services --project .",
+        "rosync services --project . --raw"
+      ],
+      "notes": [
+        "Uses the fixed synced service allowlist rather than scanning arbitrary top-level folders."
+      ],
+      "slug": "services"
+    },
+    {
+      "name": "meta",
+      "title": "rosync meta",
+      "category": "Path tools",
+      "description": "Shows the Studio path, class, filesystem path, and existence status for a syncable path.",
+      "usage": "rosync meta [--project <path>] [--from auto|studio|fs] [--raw] <target>",
+      "examples": [
+        "rosync meta --project . ReplicatedStorage/Client/UIController",
+        "rosync meta --project . --from fs ReplicatedStorage/Client/UIController.client.luau"
+      ],
+      "notes": [
+        "Requires `tree.json`, so connect Studio once before using it on new projects."
+      ],
+      "slug": "meta"
+    },
+    {
+      "name": "props",
+      "title": "rosync props",
+      "category": "Live inspection",
+      "description": "Prints inspectable live Studio properties for one instance.",
+      "usage": "rosync props --path <studio-path> [--port <port>] [--raw]",
+      "examples": [
+        "rosync props --path Workspace/Baseplate",
+        "rosync props --path ReplicatedStorage/Client/UIController --raw"
+      ],
+      "notes": [
+        "This is a focused view over `rosync get --path <path>`."
+      ],
+      "slug": "props"
+    },
+    {
+      "name": "source",
+      "title": "rosync source",
+      "category": "Live inspection",
+      "description": "Prints script source from live Studio or from the synced disk file.",
+      "usage": "rosync source --path <path> [--project <path>] [--port <port>] [--disk] [--raw]",
+      "examples": [
+        "rosync source --path ReplicatedStorage/Client/UIController",
+        "rosync source --project . --path ReplicatedStorage/Client/UIController --disk"
+      ],
+      "notes": [
+        "Without `--disk`, reads the live Studio `Source` property through the plugin."
+      ],
+      "slug": "source"
+    },
+    {
+      "name": "where",
+      "title": "rosync where",
+      "category": "Path tools",
+      "description": "Finds live Studio instances by name substring and, when possible, resolves a target path to disk.",
+      "usage": "rosync where [--project <path>] [--port <port>] [--under <studio-path>] [--raw] <target>",
+      "examples": [
+        "rosync where UIController --project .",
+        "rosync where Controller --under ReplicatedStorage/Client"
+      ],
+      "notes": [
+        "Combines a live name search with local path translation when `--project` is supplied."
+      ],
+      "slug": "where"
+    },
+    {
+      "name": "open",
+      "title": "rosync open",
+      "category": "Studio control",
+      "description": "Selects one or more Studio instances by path.",
+      "usage": "rosync open [--port <port>] [--raw] <studio-path>...",
+      "examples": [
+        "rosync open ReplicatedStorage/Client/UIController",
+        "rosync open Workspace/Baseplate ReplicatedStorage/Client"
+      ],
+      "notes": [
+        "This is a shorthand over `rosync select set --paths '[...]'`."
+      ],
+      "slug": "open"
+    },
+    {
+      "name": "conflicts",
+      "title": "rosync conflicts",
+      "category": "Conflict resolution",
+      "description": "Lists parked source conflicts waiting for a Keep Disk or Keep Studio decision.",
+      "usage": "rosync conflicts [--port <port>] [--raw]",
+      "examples": [
+        "rosync conflicts",
+        "rosync conflicts --raw"
+      ],
+      "notes": [
+        "Only source conflicts parked by the daemon conflict engine are shown."
+      ],
+      "slug": "conflicts"
+    },
+    {
+      "name": "resolve",
+      "title": "rosync resolve",
+      "category": "Conflict resolution",
+      "description": "Resolves one parked conflict by keeping either disk or Studio content.",
+      "usage": "rosync resolve --path <filesystem-path> (--disk | --studio) [--port <port>] [--raw]",
+      "examples": [
+        "rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --studio",
+        "rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --disk"
+      ],
+      "notes": [
+        "`--studio` writes Studio bytes to disk; `--disk` pushes disk bytes back to Studio."
+      ],
+      "slug": "resolve"
+    },
+    {
+      "name": "tail",
+      "title": "rosync tail",
+      "category": "Live diagnostics",
+      "description": "Streams Studio output, warning, and error messages until interrupted.",
+      "usage": "rosync tail [--project <path>] [--port <port>] [--since <duration>] [--level info|warn|error] [--limit <n>] [--raw]",
+      "examples": [
+        "rosync tail",
+        "rosync tail --level warn --since 5m"
+      ],
+      "notes": [
+        "Equivalent to `rosync logs --tail`."
+      ],
+      "slug": "tail"
+    },
+    {
+      "name": "watch",
+      "title": "rosync watch",
+      "category": "Live diagnostics",
+      "description": "Streams raw daemon WebSocket frames for debugging sync traffic.",
+      "usage": "rosync watch [--port <port>] [--compact]",
+      "examples": [
+        "rosync watch",
+        "rosync watch --compact"
+      ],
+      "notes": [
+        "Use this for debugging daemon/plugin traffic; `rosync tail` is better for Studio output."
+      ],
+      "slug": "watch"
+    },
+    {
+      "name": "repair",
+      "title": "rosync repair",
+      "category": "Maintenance",
+      "description": "Rebuilds generated Ro Sync metadata.",
+      "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]",
+      "examples": [
+        "rosync repair tree --project .",
+        "rosync repair sourcemap --project .",
+        "rosync repair sourcemap --project . --output .luau-sourcemap.json"
+      ],
+      "notes": [
+        "`repair tree` refreshes `tree.json` from live Studio.",
+        "`repair sourcemap` rebuilds luau-lsp sourcemap JSON from synced service folders."
+      ],
+      "slug": "repair"
     },
     {
       "name": "find",

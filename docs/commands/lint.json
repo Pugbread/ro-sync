@@ -2,15 +2,18 @@
   "name": "lint",
   "title": "rosync lint",
   "category": "Offline inspection",
-  "description": "Runs `luau-lsp analyze` against a project or path with an optional Ro Sync sourcemap.",
-  "usage": "rosync lint [--project <path>] [--path <file-or-dir>] [--luau-lsp <path>] [--no-sourcemap] [-- <luau-lsp args>...]",
+  "description": "Runs `luau-lsp analyze` against a project or one or more paths with a Ro Sync sourcemap, Roblox definitions, and dependency-aware diagnostic filtering.",
+  "usage": "rosync lint [--project <path>] [--path <file-or-dir>]... [--ignore <glob>]... [--scope-only|--owned-only] [--summary] [--luau-lsp <path>] [--no-sourcemap] [--no-vendor-ignores] [-- <luau-lsp args>...]",
   "examples": [
     "rosync lint --project .",
-    "rosync lint --project . --path ServerScriptService/Foo.server.luau",
-    "rosync lint --project . --no-sourcemap"
+    "rosync lint --project . --path ServerScriptService/Foo.server.luau --path ReplicatedStorage/Shared",
+    "rosync lint --project . --path ServerScriptService --owned-only --summary",
+    "rosync lint --project . --no-sourcemap --no-vendor-ignores"
   ],
   "notes": [
     "If `--luau-lsp` is omitted, Ro Sync checks `ROSYNC_LUAU_LSP` and then `PATH`.",
-    "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`."
+    "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`.",
+    "Default vendor ignores hide diagnostics under common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.codex`, and `.vscode`; pass `--no-vendor-ignores` to disable them.",
+    "`--scope-only` / `--owned-only` requires at least one `--path` and filters captured diagnostics down to those requested paths while preserving non-diagnostic luau-lsp log lines."
   ]
 }

@@ -3,9 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tokio::sync::oneshot;
 
-use crate::fs_map::{classify_script_file, parse_init_file, META_FILE};
+use crate::fs_map::{classify_script_file, is_init_file, META_FILE};
 use crate::project_config::CONFIG_FILE;
 use crate::snapshot::{RO_SYNC_MD, SYNCED_SERVICES, TREE_JSON};
 
@@ -35,14 +34,14 @@ pub struct PendingInitial {
     pub choice_id: String,
     pub disk_stats: Stats,
     pub studio_stats: Stats,
-    pub waker: Option<oneshot::Sender<Choice>>,
+    pub choice: Option<Choice>,
 }
 
 /// Walk the project root and count tracked scripts + instances.
 ///
-/// * script_count: files whose extension is `.luau`, `.server.luau`, or
-///   `.client.luau` (excluding the script-with-children `init (...)` files,
-///   since those are counted as part of their parent directory's instance).
+/// * script_count: `.luau`/`.lua` scripts and their `.server.*` / `.client.*`
+///   variants (excluding the script-with-children `init (...)` files, since
+///   those are counted as part of their parent directory's instance).
 /// * instance_count: every filesystem node that `path_to_instance_meta`
 ///   recognises as an instance (scripts + directories + meta-driven instances).
 pub fn compute_disk_stats(root: &Path) -> std::io::Result<Stats> {
@@ -90,9 +89,9 @@ fn walk(dir: &Path, scripts: &mut u32, instances: &mut u32) -> std::io::Result<(
             Err(_) => continue,
         };
         if file_type.is_file() {
-            // An on-disk script instance is a .luau/.server.luau/.client.luau
-            // file whose name isn't the parent dir's `init (...)` marker.
-            if classify_script_file(name).is_some() && parse_init_file(name).is_none() {
+            // An on-disk script instance is a Luau/Lua script file whose name
+            // isn't the parent dir's `init (...)` marker.
+            if classify_script_file(name).is_some() && !is_init_file(name) {
                 *scripts += 1;
                 *instances += 1;
             }
@@ -169,14 +168,15 @@ mod tests {
         fs::create_dir_all(&rs).unwrap();
         fs::write(rs.join("Config.luau"), b"return {}").unwrap();
         fs::write(rs.join("Main.server.luau"), b"-- svr").unwrap();
+        fs::write(rs.join("React.lua"), b"return {}").unwrap();
         let shared = rs.join("Shared");
         fs::create_dir(&shared).unwrap();
         fs::write(shared.join("Util.luau"), b"return {}").unwrap();
 
         let s = compute_disk_stats(d.path()).unwrap();
-        assert_eq!(s.script_count, 3);
-        // instances: ReplicatedStorage, Config, Main, Shared, Util = 5
-        assert_eq!(s.instance_count, 5);
+        assert_eq!(s.script_count, 4);
+        // instances: ReplicatedStorage, Config, Main, React, Shared, Util = 6
+        assert_eq!(s.instance_count, 6);
     }
 
     #[test]

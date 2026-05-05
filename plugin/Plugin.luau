@@ -609,6 +609,7 @@ end
 
 local WATCHED_SET = {}
 for _, name in ipairs(WATCHED_SERVICES) do WATCHED_SET[name] = true end
+local wallyRootSegments: {string}? = nil
 
 local function isUnderWatched(inst)
 	local cur = inst
@@ -630,6 +631,30 @@ local function pathFromRoot(inst)
 		cur = cur.Parent
 	end
 	return segs
+end
+
+local function splitStudioPath(path: string): {string}
+	local out = {}
+	for seg in tostring(path or ""):gmatch("[^/]+") do
+		table.insert(out, seg)
+	end
+	return out
+end
+
+local function pathStartsWith(path: {string}, prefix: {string}?): boolean
+	if not prefix or #prefix == 0 or #path < #prefix then
+		return false
+	end
+	for i, seg in ipairs(prefix) do
+		if path[i] ~= seg then
+			return false
+		end
+	end
+	return true
+end
+
+local function isGeneratedDiskRoot(inst): boolean
+	return pathStartsWith(pathFromRoot(inst), wallyRootSegments)
 end
 
 local function resolvePath(path)
@@ -719,12 +744,15 @@ end
 -- re-emitted a service as class="Folder" — this turned into data loss.
 local MAX_SAFE_DESTROY_DESCENDANTS = 0
 
-local function canSafelyDestroy(inst: Instance): (boolean, string)
+local function canSafelyDestroy(inst: Instance, allowDescendants: boolean?): (boolean, string)
 	if inst == game then
 		return false, "root DataModel"
 	end
 	if inst.Parent == game then
 		return false, "top-level service"
+	end
+	if allowDescendants == true then
+		return true, ""
 	end
 	local n = countDescendants(inst, MAX_SAFE_DESTROY_DESCENDANTS + 1)
 	if n > MAX_SAFE_DESTROY_DESCENDANTS then
@@ -756,7 +784,7 @@ local function applyNode(parent, node, opts)
 		inst = existing
 	else
 		if existing then
-			local safe, reason = canSafelyDestroy(existing)
+			local safe, reason = canSafelyDestroy(existing, opts and opts.forcePrune == true)
 			if not safe then
 				log(string.format(
 					"SAFETY: refusing to destroy %s (%s → %s) — %s. Keeping existing, skipping new.",
@@ -794,7 +822,7 @@ local function applyNode(parent, node, opts)
 			-- and never appear in disk payloads — skipping them here prevents
 			-- a disk-driven apply from wiping Studio-only state.
 			if ALLOWED_CLASSES[child.ClassName] and not wanted[child.Name] then
-				local safe, reason = canSafelyDestroy(child)
+				local safe, reason = canSafelyDestroy(child, opts and opts.forcePrune == true)
 				if safe then
 					child:Destroy()
 				else
@@ -825,7 +853,7 @@ local function applyOp(op)
 	elseif kind == "delete" or kind == "remove" then
 		local target = resolvePath(op.path)
 		if target and target ~= game then
-			local safe, reason = canSafelyDestroy(target)
+			local safe, reason = canSafelyDestroy(target, op.forcePrune == true)
 			if safe then
 				target:Destroy()
 			else
@@ -895,6 +923,7 @@ local function applySnapshot(snap)
 	local ok, err = pcall(function()
 		if snap and snap.services then
 			local strict = snap.strict == true
+			local forcePrune = snap.forcePrune == true
 			for _, node in ipairs(snap.services) do
 				local svc = game:GetService(node.name)
 				if svc then
@@ -904,12 +933,12 @@ local function applySnapshot(snap)
 					local wanted = {}
 					for _, child in ipairs(node.children or {}) do
 						wanted[child.name] = true
-						applyNode(svc, child, { strict = strict })
+						applyNode(svc, child, { strict = strict, forcePrune = forcePrune })
 					end
 					if strict then
 						for _, existing in ipairs(svc:GetChildren()) do
 							if ALLOWED_CLASSES[existing.ClassName] and not wanted[existing.Name] then
-								local safe, reason = canSafelyDestroy(existing)
+								local safe, reason = canSafelyDestroy(existing, forcePrune)
 								if safe then
 									existing:Destroy()
 								else
@@ -1227,6 +1256,10 @@ end
 onDescendantAdded = function(inst)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
+	if isGeneratedDiskRoot(inst) then
+		markTreeDirty()
+		return
+	end
 	if SUPPRESS_CLASSES[inst.ClassName] then return end
 	-- Any Studio-side addition — synced OR Studio-authoritative — changes the
 	-- skeleton. Mark dirty so pushTreeSkeleton picks it up on the next tick.
@@ -1260,6 +1293,7 @@ onDescendantRemoving = function(inst)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
 	markTreeDirty()
+	if isGeneratedDiskRoot(inst) then return end
 	-- `Removing` fires top-down as children are re-parented to nil: by the
 	-- time it's the pass-through container's turn, its syncable children have
 	-- already been detached and `hasSyncableDescendant` returns false. Use
@@ -1279,6 +1313,7 @@ end
 onChanged = function(inst, prop)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
+	if isGeneratedDiskRoot(inst) then return end
 	-- Parent changes are observed via ChildAdded/ChildRemoved on the
 	-- surrounding instances; emitting here would double-report moves.
 	if prop == "Parent" then return end
@@ -1361,6 +1396,7 @@ connectInstance = function(inst)
 end
 
 connectTree = function(inst)
+	if isGeneratedDiskRoot(inst) then return end
 	connectInstance(inst)
 	for _, child in ipairs(inst:GetChildren()) do
 		connectTree(child)
@@ -1383,10 +1419,18 @@ local function hookService(svc)
 	-- each can be torn down on removal. We skip the service's own Changed
 	-- signal (its properties aren't part of the sync surface).
 	table.insert(serviceConnections, svc.ChildAdded:Connect(function(child)
+		if isGeneratedDiskRoot(child) then
+			markTreeDirty()
+			return
+		end
 		onDescendantAdded(child)
 		connectTree(child)
 	end))
 	table.insert(serviceConnections, svc.ChildRemoved:Connect(function(child)
+		if isGeneratedDiskRoot(child) then
+			markTreeDirty()
+			return
+		end
 		onDescendantRemoving(child)
 		disconnectTree(child)
 	end))
@@ -1411,8 +1455,9 @@ end
 -- Studio stats (for initial-compare)
 --------------------------------------------------------------------------------
 
--- Initial-compare stats: daemon compares disk counts vs. Studio counts to
--- decide push-vs-pull. We count what will actually be materialized on disk —
+-- Initial-compare stats are now only a legacy/empty-side signal; the daemon
+-- uses the Studio snapshot for real local-vs-Studio differences. We count what
+-- will actually be materialized on disk:
 -- ALLOWED classes plus pass-through containers (non-ALLOWED instances that
 -- have an ALLOWED descendant). Parts / Models with no scripts underneath are
 -- Studio-authoritative (tree.json only) and don't count.
@@ -2939,9 +2984,12 @@ local function doPushPath()
 	return true
 end
 
-local function doPullPath()
+local function doPullPath(strictDisk: boolean?)
 	log("initial-compare → pull: applying disk snapshot to Studio")
-	local ok, snap = httpJson("/snapshot", "GET")
+	local snapshotPath = strictDisk == true
+		and "/snapshot?strict=true&forcePrune=true"
+		or "/snapshot"
+	local ok, snap = httpJson(snapshotPath, "GET")
 	if not ok then
 		log("snapshot err: " .. tostring(snap))
 		setPill("error", "snapshot failed")
@@ -2986,6 +3034,9 @@ local function waitForDecision(choiceId, gen)
 		elseif not resp.Success then
 			if resp.StatusCode == 408 or resp.StatusCode == 204 then
 				-- idle timeout, re-issue
+			elseif resp.StatusCode == 404 then
+				log(string.format("decision HTTP 404 for stale choice %s; re-comparing", tostring(choiceId)))
+				return "stale"
 			else
 				log(string.format("decision HTTP %d", resp.StatusCode))
 				task.wait(2)
@@ -3007,13 +3058,39 @@ local function waitForDecision(choiceId, gen)
 	return nil
 end
 
+local function countArray(value)
+	if type(value) ~= "table" then
+		return 0
+	end
+	return #value
+end
+
+local function describeInitialComparison(comparison)
+	if type(comparison) ~= "table" then
+		return "synced-path summary unavailable"
+	end
+
+	local summary = comparison.summary
+	if type(summary) == "table" then
+		local newFiles = tonumber(summary.newFiles) or 0
+		local changedFiles = tonumber(summary.changedFiles) or 0
+		local removedFiles = tonumber(summary.removedFiles) or 0
+		return string.format("%d new, %d changed, %d removed synced paths",
+			newFiles, changedFiles, removedFiles)
+	end
+
+	return string.format("%d new, %d changed, %d removed synced paths",
+		countArray(comparison.newFiles),
+		countArray(comparison.changedFiles),
+		countArray(comparison.removedFiles))
+end
+
 -- Assigned to the forward-declared local at the top of the HTTP helpers
 -- section so wsLoop's lagged-resync path can reach it without a circular decl.
 runInitialCompare = function()
 	local studioStats = collectStudioStats()
 	local studioSnapshot = collectSnapshot()
-	log(string.format("initial-compare: scripts=%d instances=%d",
-		studioStats.scriptCount, studioStats.instanceCount))
+	log("initial-compare: comparing synced paths")
 	local ok, resp = httpJson("/initial-compare", "POST", {
 		studioStats = studioStats,
 		studioSnapshot = studioSnapshot,
@@ -3042,22 +3119,25 @@ runInitialCompare = function()
 		if doPullPath() then startHooksAndWs() end
 	elseif action == "decide" then
 		local choiceId = resp.choiceId
-		local diskStats = resp.diskStats or {}
-		log(string.format("decide: studio=%s/%s disk=%s/%s",
-			tostring(studioStats.scriptCount), tostring(studioStats.instanceCount),
-			tostring(diskStats.scriptCount), tostring(diskStats.instanceCount)))
+		log("decide: " .. describeInitialComparison(resp.comparison))
 		decisionGeneration += 1
 		local gen = decisionGeneration
 		task.spawn(function()
 			local choice = waitForDecision(choiceId, gen)
 			if gen ~= decisionGeneration then return end
 			if choice == "disk" then
-				if doPullPath() then startHooksAndWs() end
+				if doPullPath(true) then startHooksAndWs() end
 			elseif choice == "studio" then
 				if doPushPath() then startHooksAndWs() end
 			elseif choice == "cancel" then
 				log("decision: cancel")
 				disconnect("cancelled by user")
+			elseif choice == "stale" then
+				log("decision: stale choice; restarting initial compare")
+				busy = true
+				setPill("connecting")
+				setBanner(nil)
+				runInitialCompare()
 			else
 				log("decision: unknown/aborted")
 				disconnect("decision aborted")
@@ -3097,6 +3177,25 @@ local function probePort(port, gameId)
 		return true, url, hello
 	end
 	return false, url, hello
+end
+
+local function refreshDaemonConfig(url)
+	wallyRootSegments = nil
+	local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
+	if not ok or not resp.Success then
+		return
+	end
+	local hello
+	local decOk = pcall(function()
+		hello = HttpService:JSONDecode(resp.Body or "")
+	end)
+	if not decOk or type(hello) ~= "table" then
+		return
+	end
+	if hello.wallyEnabled == true and type(hello.wallyFolder) == "string" and hello.wallyFolder ~= "" then
+		wallyRootSegments = splitStudioPath(hello.wallyFolder)
+		log("wally generated root: " .. table.concat(wallyRootSegments, "/"))
+	end
 end
 
 local function discoverDaemon(gameId)
@@ -3232,6 +3331,7 @@ startConnect = function()
 
 		baseUrl = trimTrailingSlash(chosenUrl)
 		connectedPort = chosenPort
+		refreshDaemonConfig(baseUrl)
 		setPill("connecting")
 
 		-- Initial-sync handshake before hooks + ws

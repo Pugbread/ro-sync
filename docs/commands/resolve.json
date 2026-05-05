@@ -1,0 +1,14 @@
+{
+  "name": "resolve",
+  "title": "rosync resolve",
+  "category": "Conflict resolution",
+  "description": "Resolves one parked conflict by keeping either disk or Studio content.",
+  "usage": "rosync resolve --path <filesystem-path> (--disk | --studio) [--port <port>] [--raw]",
+  "examples": [
+    "rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --studio",
+    "rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --disk"
+  ],
+  "notes": [
+    "`--studio` writes Studio bytes to disk; `--disk` pushes disk bytes back to Studio."
+  ]
+}

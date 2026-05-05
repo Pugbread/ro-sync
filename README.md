@@ -14,7 +14,7 @@ Studio session.
 - Keeps non-file-backed Roblox instances Studio-authoritative and exposes their shape through `tree.json`.
 - Runs a local Rust daemon that bridges the Terminal 64 widget, Roblox Studio plugin, filesystem watcher, and CLI.
 - Provides a sidebar widget UI with searchable projects, serving controls, per-project status, recent activity, and one-click Terminal 64 session spawning.
-- Provides a Docs tab generated from the same command catalogue used by the agent Markdown.
+- Provides a Docs tab generated from the same command catalogue used by `rosync commands`.
 - Installs a Rojo-built Roblox Studio plugin package, `plugin/Plugin.rbxm`, from the widget settings page.
 - Generates `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` so Codex and Claude Code start with the same Ro Sync CLI instructions.
 
@@ -35,14 +35,15 @@ node scripts/build-command-docs.mjs
 The builder writes:
 
 - `docs/client-commands.generated.json` for the widget Docs tab.
-- `docs/client-commands.md`, which is bundled into generated `ro-sync.md`.
+- `docs/client-commands.md`, a full Markdown reference kept out of default agent startup context.
 
 Common starting points:
 
 ```sh
 rosync refresh --project .
-rosync status --project .
-rosync diff --project .
+rosync context --project .
+rosync commands --compact
+rosync status --project . --raw
 rosync path --project . Workspace/Camera
 rosync upload ./icon.png --project .
 ```
@@ -56,8 +57,9 @@ Ro Sync keeps one canonical agent entrypoint:
 - Codex reads `AGENTS.md`.
 - Claude Code reads `CLAUDE.md`, which imports `@AGENTS.md`.
 - `AGENTS.md` contains a regenerated Ro Sync block sourced from `ro-sync.md`.
-- The command reference inside `ro-sync.md` is generated from
-  `docs/commands/*.json`.
+- `ro-sync.md` contains compact LLM-first command guidance and points agents
+  to `rosync commands --compact` plus `rosync commands <name>` for on-demand
+  usage JSON.
 
 The generated context tells agents to use `rosync` first, including
 `rosync upload`, before searching for unrelated Roblox upload tools.
@@ -68,6 +70,36 @@ Sync generated block in `AGENTS.md`, ensures `CLAUDE.md` imports `@AGENTS.md`,
 and updates `ro-sync.md` when it is a generated Ro Sync file. Custom content in
 `AGENTS.md` outside the marker block and custom content in `CLAUDE.md` are left
 in place.
+
+## Project Tooling
+
+`rosync serve` and `rosync refresh` also ensure each served project has a small
+local toolchain baseline:
+
+- `.stylua.toml` is created when missing, using Ro Sync's Luau formatting defaults.
+- `aftman.toml` is created or merged so `[tools]` includes
+  `stylua = "JohnnyMorganz/StyLua@2.4.1"`.
+- Existing project choices are preserved. Ro Sync does not overwrite an
+  existing `.stylua.toml`, and it does not replace existing Aftman tools such as
+  Wally.
+
+These root-level tooling files are ignored by the filesystem watcher so they do
+not sync into Studio.
+
+`rosync lint` wraps `luau-lsp analyze` with Ro Sync defaults:
+
+```sh
+rosync lint --project .
+rosync lint --project . --path ServerScriptService --path ReplicatedStorage/Shared
+rosync lint --project . --path ServerScriptService --owned-only --summary
+```
+
+The command loads bundled Roblox definitions when available, passes a generated
+Ro Sync sourcemap by default, supports repeated `--path`, and hides diagnostics
+from common dependency/tooling folders such as `Packages`, `_Index`,
+`Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.codex`, and `.vscode`.
+Use `--ignore <glob>` for project-specific generated/vendor paths, or
+`--no-vendor-ignores` when you intentionally want dependency diagnostics.
 
 ## Requirements
 

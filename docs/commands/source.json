@@ -1,0 +1,14 @@
+{
+  "name": "source",
+  "title": "rosync source",
+  "category": "Live inspection",
+  "description": "Prints script source from live Studio or from the synced disk file.",
+  "usage": "rosync source --path <path> [--project <path>] [--port <port>] [--disk] [--raw]",
+  "examples": [
+    "rosync source --path ReplicatedStorage/Client/UIController",
+    "rosync source --project . --path ReplicatedStorage/Client/UIController --disk"
+  ],
+  "notes": [
+    "Without `--disk`, reads the live Studio `Source` property through the plugin."
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "meta",
+  "title": "rosync meta",
+  "category": "Path tools",
+  "description": "Shows the Studio path, class, filesystem path, and existence status for a syncable path.",
+  "usage": "rosync meta [--project <path>] [--from auto|studio|fs] [--raw] <target>",
+  "examples": [
+    "rosync meta --project . ReplicatedStorage/Client/UIController",
+    "rosync meta --project . --from fs ReplicatedStorage/Client/UIController.client.luau"
+  ],
+  "notes": [
+    "Requires `tree.json`, so connect Studio once before using it on new projects."
+  ]
+}

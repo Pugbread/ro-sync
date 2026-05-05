@@ -1,0 +1,14 @@
+{
+  "name": "where",
+  "title": "rosync where",
+  "category": "Path tools",
+  "description": "Finds live Studio instances by name substring and, when possible, resolves a target path to disk.",
+  "usage": "rosync where [--project <path>] [--port <port>] [--under <studio-path>] [--raw] <target>",
+  "examples": [
+    "rosync where UIController --project .",
+    "rosync where Controller --under ReplicatedStorage/Client"
+  ],
+  "notes": [
+    "Combines a live name search with local path translation when `--project` is supplied."
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "conflicts",
+  "title": "rosync conflicts",
+  "category": "Conflict resolution",
+  "description": "Lists parked source conflicts waiting for a Keep Disk or Keep Studio decision.",
+  "usage": "rosync conflicts [--port <port>] [--raw]",
+  "examples": [
+    "rosync conflicts",
+    "rosync conflicts --raw"
+  ],
+  "notes": [
+    "Only source conflicts parked by the daemon conflict engine are shown."
+  ]
+}

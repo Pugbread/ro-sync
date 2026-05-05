@@ -3,6 +3,7 @@
 const DOCS_BUNDLE_REL = "docs/client-commands.generated.json";
 
 export function mountDocs(root, api) {
+  root.classList.add("view-docs");
   root.innerHTML = `
     <div class="docs-shell">
       <div class="page-header docs-header">
@@ -19,7 +20,6 @@ export function mountDocs(root, api) {
           </svg>
           <input id="docs-search" type="search" placeholder="Search commands" autocomplete="off" />
         </div>
-        <div class="filter-pills docs-filters" role="tablist" aria-label="Command categories"></div>
       </div>
       <div class="docs-grid">
         <aside class="docs-index" aria-label="Commands"></aside>
@@ -30,27 +30,14 @@ export function mountDocs(root, api) {
 
   const $summary = root.querySelector("[data-docs-summary]");
   const $search = root.querySelector("#docs-search");
-  const $filters = root.querySelector(".docs-filters");
   const $index = root.querySelector(".docs-index");
   const $results = root.querySelector(".docs-results");
 
   let commands = [];
-  let categories = [];
-  let selectedCategory = "All";
-
-  function renderFilters() {
-    const names = ["All", ...categories];
-    $filters.innerHTML = names.map((name) => `
-      <button class="pill docs-filter" type="button" role="tab" aria-selected="${name === selectedCategory ? "true" : "false"}" aria-pressed="${name === selectedCategory ? "true" : "false"}" data-category="${escapeAttr(name)}">
-        ${escape(name)}
-      </button>
-    `).join("");
-  }
 
   function filteredCommands() {
     const q = $search.value.trim().toLowerCase();
     return commands.filter((command) => {
-      if (selectedCategory !== "All" && command.category !== selectedCategory) return false;
       if (!q) return true;
       const haystack = [
         command.title,
@@ -124,19 +111,16 @@ export function mountDocs(root, api) {
     `;
   }
 
-  $filters.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-category]");
-    if (!button) return;
-    selectedCategory = button.dataset.category || "All";
-    renderFilters();
-    render();
-  });
-
   $index.addEventListener("click", (event) => {
     const button = event.target.closest("[data-slug]");
     if (!button) return;
     const el = root.querySelector(`#docs-${cssEscape(button.dataset.slug)}`);
-    if (el) el.scrollIntoView({ block: "start", behavior: "smooth" });
+    if (el) {
+      $results.scrollTo({
+        top: el.offsetTop,
+        behavior: "smooth",
+      });
+    }
   });
 
   $results.addEventListener("click", async (event) => {
@@ -156,8 +140,6 @@ export function mountDocs(root, api) {
   loadDocs(api).then((bundle) => {
     if (cancelled) return;
     commands = Array.isArray(bundle.commands) ? bundle.commands : [];
-    categories = Array.isArray(bundle.categories) ? bundle.categories : [];
-    renderFilters();
     render();
   }).catch((e) => {
     if (cancelled) return;
@@ -165,7 +147,10 @@ export function mountDocs(root, api) {
     $results.innerHTML = `<div class="empty docs-empty">Could not load command docs: ${escape(e.message)}</div>`;
   });
 
-  return () => { cancelled = true; };
+  return () => {
+    cancelled = true;
+    root.classList.remove("view-docs");
+  };
 }
 
 async function loadDocs(api) {

@@ -1,0 +1,14 @@
+{
+  "name": "tail",
+  "title": "rosync tail",
+  "category": "Live diagnostics",
+  "description": "Streams Studio output, warning, and error messages until interrupted.",
+  "usage": "rosync tail [--project <path>] [--port <port>] [--since <duration>] [--level info|warn|error] [--limit <n>] [--raw]",
+  "examples": [
+    "rosync tail",
+    "rosync tail --level warn --since 5m"
+  ],
+  "notes": [
+    "Equivalent to `rosync logs --tail`."
+  ]
+}

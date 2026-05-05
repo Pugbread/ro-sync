@@ -1,5 +1,5 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use futures::StreamExt as _;
+use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -28,6 +28,8 @@ use conflict::{ConflictEngine, FsDecision};
 use initial_sync::PendingInitial;
 use watch::{Op, OpKind, Watch};
 use ws::{PendingRoutes, RequestEnvelope};
+
+const COMMANDS_BUNDLE_JSON: &str = include_str!("../../docs/client-commands.generated.json");
 
 #[derive(Parser, Debug)]
 #[command(
@@ -64,6 +66,12 @@ pub struct Cli {
 pub enum Command {
     /// Run the HTTP/WebSocket sync daemon.
     Serve(ServeArgs),
+    /// Print machine-readable command docs from the generated command registry.
+    Commands(CommandsArgs),
+    /// Print an LLM-oriented project context snapshot as JSON.
+    Context(ContextArgs),
+    /// Build a read-only JSON plan for a mutating command.
+    Plan(PlanArgs),
     /// Match a selector against the plugin-emitted `tree.json` skeleton.
     Query(QueryArgs),
     /// Translate between Studio instance paths and syncable filesystem paths.
@@ -81,8 +89,34 @@ pub enum Command {
     Snapshot(SnapshotArgs),
     /// Compare local scripts/folders against the live Studio syncable tree.
     Diff(DiffArgs),
+    /// Alias for `diff`, with wording aimed at resync reviews.
+    Changes(DiffArgs),
+    /// Select one or more Studio instances and print the resulting selection count.
+    Open(OpenArgs),
+    /// Locate matching instances in Studio by name, and optionally translate a path.
+    Where(WhereArgs),
+    /// Print properties for one live Studio instance.
+    Props(PropsArgs),
+    /// Print script source from Studio or disk.
+    Source(SourceArgs),
+    /// Show sync metadata for a Studio or filesystem path.
+    Meta(MetaArgs),
+    /// List synced services and whether they exist locally / in Studio.
+    Services(ServicesArgs),
+    /// List parked two-way source conflicts.
+    Conflicts(ConflictsArgs),
+    /// Resolve a parked conflict with either the disk or Studio version.
+    Resolve(ResolveArgs),
+    /// Alias for `logs --tail`.
+    Tail(TailArgs),
+    /// Stream raw daemon WebSocket frames.
+    Watch(WatchArgs),
+    /// Rebuild generated sync metadata.
+    Repair(RepairArgs),
     /// Upload assets through Roblox Open Cloud Assets.
     Upload(UploadArgs),
+    /// Create, edit, list, and upload images for Roblox game passes / developer products.
+    Monetization(MonetizationArgs),
     /// Upload an image through Roblox Open Cloud Assets.
     #[command(hide = true)]
     Img(ImgArgs),
@@ -142,6 +176,269 @@ pub enum Command {
     FindAttr(FindAttrArgs),
     /// Run luau-lsp's standalone analyzer against the project or a file path.
     Lint(LintArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CommandsArgs {
+    /// Optional command name. If omitted, prints the full command registry.
+    pub name: Option<String>,
+    /// Print a compact LLM-oriented command index instead of full command docs.
+    #[arg(long)]
+    pub compact: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ContextArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Include the full command registry. Omitted by default to keep context compact.
+    #[arg(long = "full-commands")]
+    pub full_commands: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlanArgs {
+    #[command(subcommand)]
+    pub command: PlanCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlanCommand {
+    /// Plan a Studio property write.
+    Set(PlanSetArgs),
+    /// Plan creating a new instance.
+    New(PlanNewArgs),
+    /// Plan destroying an instance.
+    Rm(PlanRmArgs),
+    /// Plan reparenting an instance.
+    Mv(PlanMvArgs),
+    /// Plan resolving a parked source conflict.
+    Resolve(PlanResolveArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlanSetArgs {
+    #[arg(long)]
+    pub path: String,
+    #[arg(long)]
+    pub prop: String,
+    /// Value as a JSON literal.
+    #[arg(long)]
+    pub value: String,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlanNewArgs {
+    #[arg(long)]
+    pub path: String,
+    #[arg(long)]
+    pub class: String,
+    #[arg(long)]
+    pub name: Option<String>,
+    /// JSON object of initial properties.
+    #[arg(long)]
+    pub props: Option<String>,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlanRmArgs {
+    #[arg(long)]
+    pub path: String,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlanMvArgs {
+    #[arg(long)]
+    pub from: String,
+    #[arg(long)]
+    pub to: String,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlanResolveArgs {
+    #[arg(long)]
+    pub path: String,
+    #[arg(long, conflicts_with = "studio")]
+    pub disk: bool,
+    #[arg(long, conflicts_with = "disk")]
+    pub studio: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct OpenArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Studio path(s) to select.
+    #[arg(required = true)]
+    pub paths: Vec<String>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct WhereArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Name substring or path to inspect.
+    pub target: String,
+    /// Restrict live search to this subtree.
+    #[arg(long)]
+    pub under: Option<String>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PropsArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    #[arg(long)]
+    pub path: String,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct SourceArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Studio path or filesystem path.
+    #[arg(long)]
+    pub path: String,
+    /// Read from disk instead of live Studio.
+    #[arg(long)]
+    pub disk: bool,
+    /// Print JSON instead of the source text.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MetaArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Studio path or filesystem path.
+    pub target: String,
+    #[arg(long, value_enum, default_value_t = path_resolver::PathInputKind::Auto)]
+    pub from: path_resolver::PathInputKind,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ServicesArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ConflictsArgs {
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ResolveArgs {
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    #[arg(long)]
+    pub path: String,
+    /// Keep disk/local bytes and push them to Studio.
+    #[arg(long, conflicts_with = "studio")]
+    pub disk: bool,
+    /// Keep Studio bytes and write them to disk.
+    #[arg(long, conflicts_with = "disk")]
+    pub studio: bool,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct TailArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long, value_enum, default_value_t = LogLevel::Info)]
+    pub level: LogLevel,
+    #[arg(long, default_value_t = 200)]
+    pub limit: u32,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct WatchArgs {
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Print compact one-line summaries instead of JSON frames.
+    #[arg(long)]
+    pub compact: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct RepairArgs {
+    #[command(subcommand)]
+    pub command: RepairCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepairCommand {
+    /// Refresh `tree.json` from the live Studio tree.
+    Tree(RepairTreeArgs),
+    /// Regenerate luau-lsp sourcemap JSON.
+    Sourcemap(RepairSourcemapArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct RepairTreeArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Max recursion depth for the live Studio tree request.
+    #[arg(long, default_value_t = 128)]
+    pub depth: u32,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct RepairSourcemapArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Output path. Defaults to `<project>/sourcemap.json`.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -438,6 +735,167 @@ impl UploadAssetType {
             UploadAssetType::Mesh => "Mesh",
             UploadAssetType::Model => "Model",
             UploadAssetType::Video => "Video",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationArgs {
+    #[command(subcommand)]
+    pub command: MonetizationCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonetizationCommand {
+    /// Game pass operations.
+    #[command(alias = "gamepasses", alias = "gp", alias = "pass")]
+    Gamepass(MonetizationAssetArgs),
+    /// Developer product operations.
+    #[command(alias = "products", alias = "dp", alias = "devproduct")]
+    Product(MonetizationAssetArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationAssetArgs {
+    #[command(subcommand)]
+    pub command: MonetizationAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonetizationAction {
+    /// Discover project monetization config references.
+    Discover(MonetizationDiscoverArgs),
+    /// List assets from Roblox Open Cloud.
+    List(MonetizationCommonArgs),
+    /// Create one or more assets.
+    Create(MonetizationCreateArgs),
+    /// Edit an asset by id or resolved name.
+    Edit(MonetizationEditArgs),
+    /// Upload one explicit image to one asset.
+    Image(MonetizationImageArgs),
+    /// Upload every supported image in a directory, matched by normalized filename.
+    Images(MonetizationImagesArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct MonetizationCommonArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long = "universe-id")]
+    pub universe_id: Option<String>,
+    #[arg(long = "api-key-env")]
+    pub api_key_env: Option<String>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationDiscoverArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationCreateArgs {
+    #[command(flatten)]
+    pub common: MonetizationCommonArgs,
+    /// Entry like `VIP 499 robux`; can contain comma-separated entries.
+    pub entries: Vec<String>,
+    /// Explicit single-asset name.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Explicit single-asset price in Robux.
+    #[arg(long)]
+    pub price: Option<u64>,
+    #[arg(long)]
+    pub description: Option<String>,
+    #[arg(long)]
+    pub image: Option<PathBuf>,
+    #[arg(long = "not-for-sale")]
+    pub not_for_sale: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationEditArgs {
+    #[command(flatten)]
+    pub common: MonetizationCommonArgs,
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Existing asset name to resolve through the list API when --id is omitted.
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long = "new-name")]
+    pub new_name: Option<String>,
+    #[arg(long)]
+    pub price: Option<u64>,
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Set sale state. Example: `--for-sale true`.
+    #[arg(long = "for-sale")]
+    pub for_sale: Option<bool>,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationImageArgs {
+    #[command(flatten)]
+    pub common: MonetizationCommonArgs,
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Existing asset name to resolve through the list API when --id is omitted.
+    #[arg(long)]
+    pub name: Option<String>,
+    pub file: PathBuf,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MonetizationImagesArgs {
+    #[command(flatten)]
+    pub common: MonetizationCommonArgs,
+    pub dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonetizationKind {
+    Gamepass,
+    Product,
+}
+
+impl MonetizationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gamepass => "gamepass",
+            Self::Product => "product",
+        }
+    }
+
+    fn id_field(self) -> &'static str {
+        match self {
+            Self::Gamepass => "gamePassId",
+            Self::Product => "productId",
+        }
+    }
+
+    fn create_image_field(self) -> &'static str {
+        "imageFile"
+    }
+
+    fn update_image_field(self) -> &'static str {
+        match self {
+            Self::Gamepass => "file",
+            Self::Product => "imageFile",
+        }
+    }
+
+    fn base_url(self, universe_id: &str) -> String {
+        match self {
+            Self::Gamepass => format!(
+                "https://apis.roblox.com/game-passes/v1/universes/{universe_id}/game-passes"
+            ),
+            Self::Product => format!(
+                "https://apis.roblox.com/developer-products/v2/universes/{universe_id}/developer-products"
+            ),
         }
     }
 }
@@ -899,10 +1357,24 @@ pub struct LintArgs {
     /// Project directory. Defaults to the current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    /// File or directory to analyze. Relative paths are resolved from
-    /// `--project` when provided, otherwise from the current working directory.
+    /// File or directory to analyze. May be repeated. Relative paths are
+    /// resolved from `--project` when provided, otherwise from the current
+    /// working directory.
+    #[arg(long = "path")]
+    pub paths: Vec<PathBuf>,
+    /// Additional luau-lsp diagnostic ignore glob. May be repeated.
+    #[arg(long = "ignore")]
+    pub ignores: Vec<String>,
+    /// Disable Ro Sync's default dependency/vendor diagnostic ignores.
+    #[arg(long = "no-vendor-ignores")]
+    pub no_vendor_ignores: bool,
+    /// Only print diagnostics for the requested --path scopes. Alias:
+    /// --owned-only.
+    #[arg(long = "scope-only", alias = "owned-only")]
+    pub scope_only: bool,
+    /// Print diagnostic counts by category and file after analysis.
     #[arg(long)]
-    pub path: Option<PathBuf>,
+    pub summary: bool,
     /// Path to a luau-lsp executable. If omitted, `ROSYNC_LUAU_LSP` is checked,
     /// then `luau-lsp` is resolved from PATH.
     #[arg(long = "luau-lsp")]
@@ -937,6 +1409,8 @@ pub struct AppState {
     pub game_id: Arc<RwLock<Option<String>>>,
     pub group_id: Arc<RwLock<Option<String>>>,
     pub place_ids: Arc<RwLock<Vec<String>>>,
+    pub wally_enabled: Arc<RwLock<bool>>,
+    pub wally_folder: Arc<RwLock<Option<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
     /// `spawn_watch_bridge` drops watcher ops for paths whose deadline hasn't
@@ -954,13 +1428,16 @@ pub struct AppState {
 }
 
 /// Duration of the per-path quiet window after a `/push` write.
-pub const PUSH_QUIET_MS: u64 = 200;
+pub const PUSH_QUIET_MS: u64 = 1500;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Commands(args)) => run_commands(args),
+        Some(Command::Context(args)) => run_context(args),
+        Some(Command::Plan(args)) => run_plan(args),
         Some(Command::Query(args)) => run_query(args),
         Some(Command::Path(args)) => run_path(args),
         Some(Command::Serve(args)) => run_serve(args).await,
@@ -970,7 +1447,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Tree(args)) => run_tree(args).await,
         Some(Command::Snapshot(args)) => run_snapshot(args).await,
         Some(Command::Diff(args)) => run_diff(args).await,
+        Some(Command::Changes(args)) => run_changes(args).await,
+        Some(Command::Open(args)) => run_open(args).await,
+        Some(Command::Where(args)) => run_where(args).await,
+        Some(Command::Props(args)) => run_props(args).await,
+        Some(Command::Source(args)) => run_source(args).await,
+        Some(Command::Meta(args)) => run_meta(args).await,
+        Some(Command::Services(args)) => run_services(args).await,
+        Some(Command::Conflicts(args)) => run_conflicts(args).await,
+        Some(Command::Resolve(args)) => run_resolve(args).await,
+        Some(Command::Tail(args)) => run_tail(args).await,
+        Some(Command::Watch(args)) => run_watch(args).await,
+        Some(Command::Repair(args)) => run_repair(args).await,
         Some(Command::Upload(args)) => run_upload(args).await,
+        Some(Command::Monetization(args)) => run_monetization(args).await,
         Some(Command::Img(args)) => run_img(args).await,
         Some(Command::Imgs(args)) => run_imgs(args).await,
         Some(Command::Find(args)) => run_find(args).await,
@@ -1029,6 +1519,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&args.project) {
         eprintln!("rosync: failed to write Codex context: {e}");
     }
+    if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&args.project) {
+        eprintln!("rosync: failed to write project tooling files: {e}");
+    }
 
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
     let mut cfg = match project_config::load_or_create(&args.project) {
@@ -1074,6 +1567,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         game_id: Arc::new(RwLock::new(cfg.game_id.clone())),
         group_id: Arc::new(RwLock::new(cfg.group_id.clone())),
         place_ids: Arc::new(RwLock::new(cfg.place_ids.clone())),
+        wally_enabled: Arc::new(RwLock::new(cfg.wally_enabled)),
+        wally_folder: Arc::new(RwLock::new(cfg.wally_folder.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
         request_tx,
@@ -1082,6 +1577,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     spawn_watch_bridge(
         watcher,
+        canonical_project.clone(),
         tx.clone(),
         conflict_engine.clone(),
         push_quiet.clone(),
@@ -1173,6 +1669,307 @@ fn run_path(args: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_commands(args: CommandsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON)
+        .map_err(|e| format!("commands: embedded command registry is invalid: {e}"))?;
+    if args.compact {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&compact_command_registry(
+                &bundle,
+                args.name.as_deref()
+            )?)?
+        );
+        return Ok(());
+    }
+    let Some(name) = args.name.as_deref() else {
+        println!("{}", serde_json::to_string_pretty(&bundle)?);
+        return Ok(());
+    };
+    let commands = bundle
+        .get("commands")
+        .and_then(|value| value.as_array())
+        .ok_or("commands: embedded registry missing commands array")?;
+    let Some(command) = commands
+        .iter()
+        .find(|command| command.get("name").and_then(|value| value.as_str()) == Some(name))
+    else {
+        return Err(format!("commands: unknown command {name:?}").into());
+    };
+    println!("{}", serde_json::to_string_pretty(command)?);
+    Ok(())
+}
+
+fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(args.project.as_deref(), "context")?;
+    let canonical_project = std::fs::canonicalize(&project).unwrap_or_else(|_| project.clone());
+    let command_bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON)
+        .map_err(|e| format!("context: embedded command registry is invalid: {e}"))?;
+    let command_names = command_names_from_bundle(&command_bundle);
+    let config = match project_config::read_from_disk(&project) {
+        Ok(Some(cfg)) => serde_json::json!({
+            "ok": true,
+            "name": cfg.name,
+            "gameId": cfg.game_id,
+            "groupId": cfg.group_id,
+            "placeIds": cfg.place_ids,
+            "wallyEnabled": cfg.wally_enabled,
+            "wallyFolder": cfg.wally_folder,
+            "version": cfg.version,
+        }),
+        Ok(None) => serde_json::json!({ "ok": false, "missing": true }),
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    };
+    let daemon_hello = fetch_daemon_hello(args.port);
+    let daemon_project_mismatch = match &daemon_hello {
+        Ok(value) => daemon_project_mismatch(value, &canonical_project),
+        Err(_) => serde_json::Value::Null,
+    };
+    let daemon = match daemon_hello {
+        Ok(value) => serde_json::json!({
+            "reachable": true,
+            "hello": value,
+            "projectMismatch": daemon_project_mismatch,
+        }),
+        Err(e) => serde_json::json!({ "reachable": false, "error": e }),
+    };
+    let conflicts = match http_get_json(args.port, "/resolve") {
+        Ok(value) => {
+            let count = value
+                .get("conflicts")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len())
+                .unwrap_or(0);
+            serde_json::json!({ "reachable": true, "count": count, "response": value })
+        }
+        Err(e) => serde_json::json!({ "reachable": false, "error": e }),
+    };
+
+    let mut commands = serde_json::json!({
+        "count": command_names.len(),
+        "names": command_names,
+        "registryCommand": "rosync commands",
+        "compactRegistryCommand": "rosync commands --compact",
+        "singleCommandExample": "rosync commands get",
+        "llmPolicy": {
+            "startup": "Use `rosync context --project .` once, then `rosync commands --compact` only when choosing command families.",
+            "lookup": "Use `rosync commands <name>` for exact flags. Avoid plain `rosync commands` unless a full registry dump is explicitly needed.",
+            "cheapFirst": ["query", "path", "meta", "services", "status --raw"],
+            "targetedReads": ["get --prop", "props", "source --disk", "source"],
+            "expensiveReads": ["changes", "diff --raw", "snapshot", "get without --prop", "logs --tail", "watch"],
+            "mutationRule": "Use `rosync plan` before supported writes and explicit preflight/list commands before upload or monetization writes."
+        },
+    });
+    if args.full_commands {
+        commands["registry"] = command_bundle;
+    }
+
+    let context = serde_json::json!({
+        "schema": "ro-sync.context.v1",
+        "generatedAtUnix": unix_secs(),
+        "project": {
+            "path": project.display().to_string(),
+            "canonicalPath": canonical_project.display().to_string(),
+            "exists": project.exists(),
+            "isDirectory": project.is_dir(),
+            "config": config,
+        },
+        "daemon": {
+            "port": args.port,
+            "status": daemon,
+        },
+        "sync": {
+            "services": context_services(&project),
+            "tree": context_tree_summary(&project),
+            "files": context_project_files(&project),
+            "conflicts": conflicts,
+        },
+        "commands": commands,
+        "nextActions": [
+            "Use `rosync commands <name>` for exact command usage JSON.",
+            "Use `rosync plan <operation>` before mutating Studio or disk from an LLM workflow.",
+            "Use `rosync status --raw` or `rosync doctor --raw` when a health check is needed.",
+            "Use `rosync changes --raw` before choosing Keep Disk or Keep Studio."
+        ],
+    });
+
+    println!("{}", serde_json::to_string_pretty(&context)?);
+    Ok(())
+}
+
+fn run_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = match args.command {
+        PlanCommand::Set(args) => plan_set(args)?,
+        PlanCommand::New(args) => plan_new(args)?,
+        PlanCommand::Rm(args) => plan_rm(args),
+        PlanCommand::Mv(args) => plan_mv(args),
+        PlanCommand::Resolve(args) => plan_resolve(args)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&plan)?);
+    Ok(())
+}
+
+fn plan_set(args: PlanSetArgs) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let value: serde_json::Value = serde_json::from_str(&args.value)
+        .map_err(|e| format!("plan set: --value must be a JSON literal ({e})"))?;
+    let mut risks = Vec::new();
+    if args.prop == "Parent" {
+        risks.push("raw Parent writes are blocked by `rosync set`; use `rosync mv` instead");
+    }
+    Ok(plan_json(
+        "set",
+        serde_json::json!({
+            "path": args.path,
+            "prop": args.prop,
+            "value": value,
+        }),
+        vec!["studio"],
+        vec!["studio_connected"],
+        risks,
+        format!(
+            "rosync set --path {} --prop {} --value {}",
+            shell_quote(&args.path),
+            shell_quote(&args.prop),
+            shell_quote(&args.value)
+        ),
+    ))
+}
+
+fn plan_new(args: PlanNewArgs) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let props = match args.props.as_deref() {
+        Some(raw) => {
+            let parsed: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| format!("plan new: --props must be a JSON object ({e})"))?;
+            if !parsed.is_object() {
+                return Err("plan new: --props must be a JSON object".into());
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+    let mut command = format!(
+        "rosync new --path {} --class {}",
+        shell_quote(&args.path),
+        shell_quote(&args.class)
+    );
+    if let Some(name) = &args.name {
+        command.push_str(&format!(" --name {}", shell_quote(name)));
+    }
+    if let Some(raw) = &args.props {
+        command.push_str(&format!(" --props {}", shell_quote(raw)));
+    }
+    Ok(plan_json(
+        "new",
+        serde_json::json!({
+            "parentPath": args.path,
+            "class": args.class,
+            "name": args.name,
+            "props": props,
+        }),
+        vec!["studio"],
+        vec!["studio_connected"],
+        Vec::new(),
+        command,
+    ))
+}
+
+fn plan_rm(args: PlanRmArgs) -> serde_json::Value {
+    plan_json(
+        "rm",
+        serde_json::json!({ "path": args.path }),
+        vec!["studio"],
+        vec!["studio_connected"],
+        vec!["destructive: destroys the target instance in Studio"],
+        format!("rosync rm --path {}", shell_quote(&args.path)),
+    )
+}
+
+fn plan_mv(args: PlanMvArgs) -> serde_json::Value {
+    let mut risks = Vec::new();
+    if service_segment(&args.from) != service_segment(&args.to) && !args.force {
+        risks.push("cross-service move will be rejected unless `--force` is supplied");
+    }
+    let mut command = format!(
+        "rosync mv --from {} --to {}",
+        shell_quote(&args.from),
+        shell_quote(&args.to)
+    );
+    if args.force {
+        command.push_str(" --force");
+    }
+    plan_json(
+        "mv",
+        serde_json::json!({
+            "from": args.from,
+            "to": args.to,
+            "force": args.force,
+        }),
+        vec!["studio"],
+        vec!["studio_connected"],
+        risks,
+        command,
+    )
+}
+
+fn plan_resolve(args: PlanResolveArgs) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let choice = match (args.disk, args.studio) {
+        (true, false) => "disk",
+        (false, true) => "studio",
+        _ => return Err("plan resolve: pass exactly one of --disk or --studio".into()),
+    };
+    let mut command = format!("rosync resolve --path {}", shell_quote(&args.path));
+    if args.disk {
+        command.push_str(" --disk");
+    } else {
+        command.push_str(" --studio");
+    }
+    Ok(plan_json(
+        "resolve",
+        serde_json::json!({
+            "path": args.path,
+            "choice": choice,
+        }),
+        vec!["disk", "studio"],
+        vec!["daemon_reachable", "parked_conflict"],
+        Vec::new(),
+        command,
+    ))
+}
+
+fn plan_json(
+    op: &str,
+    args: serde_json::Value,
+    mutates: Vec<&str>,
+    requires: Vec<&str>,
+    risks: Vec<&str>,
+    command: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "ro-sync.plan.v1",
+        "ok": true,
+        "readOnly": true,
+        "createdAtUnix": unix_secs(),
+        "operation": op,
+        "args": args,
+        "mutates": mutates,
+        "requires": requires,
+        "risks": risks,
+        "executeCommand": command,
+        "notes": [
+            "This plan does not execute anything.",
+            "Review `mutates`, `requires`, and `risks` before running `executeCommand`."
+        ],
+    })
+}
+
+fn service_segment(path: &str) -> Option<&str> {
+    path.split('/').find(|part| !part.is_empty())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 async fn run_upload(args: UploadArgs) -> Result<(), Box<dyn std::error::Error>> {
     run_upload_inner(args).await
 }
@@ -1219,6 +2016,246 @@ async fn run_imgs(args: ImgsArgs) -> Result<(), Box<dyn std::error::Error>> {
         raw: args.raw,
     })
     .await
+}
+
+async fn run_monetization(args: MonetizationArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        MonetizationCommand::Gamepass(args) => {
+            run_monetization_asset(MonetizationKind::Gamepass, args).await
+        }
+        MonetizationCommand::Product(args) => {
+            run_monetization_asset(MonetizationKind::Product, args).await
+        }
+    }
+}
+
+async fn run_monetization_asset(
+    kind: MonetizationKind,
+    args: MonetizationAssetArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        MonetizationAction::Discover(args) => run_monetization_discover(kind, args),
+        MonetizationAction::List(args) => run_monetization_list(kind, args).await,
+        MonetizationAction::Create(args) => run_monetization_create(kind, args).await,
+        MonetizationAction::Edit(args) => run_monetization_edit(kind, args).await,
+        MonetizationAction::Image(args) => run_monetization_image(kind, args).await,
+        MonetizationAction::Images(args) => run_monetization_images(kind, args).await,
+    }
+}
+
+fn run_monetization_discover(
+    kind: MonetizationKind,
+    args: MonetizationDiscoverArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(args.project.as_deref(), "monetization discover")?;
+    let hits = discover_monetization_files(&project)?;
+    let value = serde_json::json!({
+        "ok": true,
+        "kind": kind.label(),
+        "project": project.display().to_string(),
+        "universeId": resolve_monetization_universe_id(args.project.as_deref()).ok(),
+        "credentialSources": monetization_credential_sources(args.project.as_deref()),
+        "matches": hits,
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+async fn run_monetization_list(
+    kind: MonetizationKind,
+    args: MonetizationCommonArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (universe_id, api_key) = monetization_context(&args)?;
+    let value = monetization_list_api(kind, &universe_id, &api_key).await?;
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        let items = monetization_items_from_response(kind, &value);
+        if items.is_empty() {
+            println!("no {} entries returned", kind.label());
+        } else {
+            for item in items {
+                println!(
+                    "{}\t{}\t{}",
+                    item.id.unwrap_or_else(|| "?".into()),
+                    item.price
+                        .map(|price| price.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    item.name.unwrap_or_else(|| "?".into())
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_monetization_create(
+    kind: MonetizationKind,
+    args: MonetizationCreateArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (universe_id, api_key) = monetization_context(&args.common)?;
+    let specs = monetization_create_specs(&args)?;
+    let existing = monetization_list_api(kind, &universe_id, &api_key).await?;
+    let existing_names = monetization_items_from_response(kind, &existing)
+        .into_iter()
+        .filter_map(|item| item.name)
+        .map(|name| normalize_monetization_name(&name))
+        .collect::<std::collections::HashSet<_>>();
+    let mut results = Vec::new();
+    for spec in specs {
+        if existing_names.contains(&normalize_monetization_name(&spec.name)) {
+            results.push(serde_json::json!({
+                "ok": false,
+                "kind": kind.label(),
+                "name": spec.name,
+                "price": spec.price,
+                "error": "asset with this normalized name already exists",
+            }));
+            continue;
+        }
+        match monetization_create_one(kind, &universe_id, &api_key, &args, &spec).await {
+            Ok(value) => results.push(serde_json::json!({
+                "ok": true,
+                "kind": kind.label(),
+                "name": spec.name,
+                "price": spec.price,
+                "id": monetization_id_from_value(kind, &value),
+                "response": value,
+            })),
+            Err(e) => results.push(serde_json::json!({
+                "ok": false,
+                "kind": kind.label(),
+                "name": spec.name,
+                "price": spec.price,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    let ok = results.iter().all(|value| value["ok"] == true);
+    let out = serde_json::json!({ "ok": ok, "results": results });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    if !ok {
+        return Err("monetization create: one or more entries failed".into());
+    }
+    Ok(())
+}
+
+async fn run_monetization_edit(
+    kind: MonetizationKind,
+    args: MonetizationEditArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (universe_id, api_key) = monetization_context(&args.common)?;
+    let id =
+        resolve_monetization_asset_id(kind, &universe_id, &api_key, args.id, args.name).await?;
+    let value = monetization_update_one(kind, &universe_id, &api_key, &id, |mut form| {
+        if let Some(name) = &args.new_name {
+            form = form.text("name", name.clone());
+        }
+        if let Some(price) = args.price {
+            form = form.text("price", price.to_string());
+        }
+        if let Some(description) = &args.description {
+            form = form.text("description", description.clone());
+        }
+        if let Some(for_sale) = args.for_sale {
+            form = form.text("isForSale", for_sale.to_string());
+        }
+        form
+    })
+    .await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "kind": kind.label(),
+            "id": id,
+            "response": value,
+        }))?
+    );
+    Ok(())
+}
+
+async fn run_monetization_image(
+    kind: MonetizationKind,
+    args: MonetizationImageArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (universe_id, api_key) = monetization_context(&args.common)?;
+    let id =
+        resolve_monetization_asset_id(kind, &universe_id, &api_key, args.id, args.name).await?;
+    let value = monetization_update_image(kind, &universe_id, &api_key, &id, &args.file).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "kind": kind.label(),
+            "id": id,
+            "file": args.file,
+            "response": value,
+        }))?
+    );
+    Ok(())
+}
+
+async fn run_monetization_images(
+    kind: MonetizationKind,
+    args: MonetizationImagesArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (universe_id, api_key) = monetization_context(&args.common)?;
+    let list = monetization_list_api(kind, &universe_id, &api_key).await?;
+    let items = monetization_items_from_response(kind, &list);
+    let mut by_name = HashMap::new();
+    for item in items {
+        if let (Some(id), Some(name)) = (item.id, item.name) {
+            by_name.insert(normalize_monetization_name(&name), id);
+        }
+    }
+    let mut results = Vec::new();
+    let mut entries = std::fs::read_dir(&args.dir)
+        .map_err(|e| format!("monetization images: read {}: {e}", args.dir.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_file() || !is_supported_image_path(&path) {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let key = normalize_monetization_name(stem);
+        let Some(id) = by_name.get(&key).cloned() else {
+            results.push(serde_json::json!({
+                "ok": false,
+                "file": path,
+                "error": "no asset matched normalized filename",
+            }));
+            continue;
+        };
+        match monetization_update_image(kind, &universe_id, &api_key, &id, &path).await {
+            Ok(value) => results.push(serde_json::json!({
+                "ok": true,
+                "id": id,
+                "file": path,
+                "response": value,
+            })),
+            Err(e) => results.push(serde_json::json!({
+                "ok": false,
+                "id": id,
+                "file": path,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    let ok = results.iter().all(|value| value["ok"] == true);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({ "ok": ok, "results": results }))?
+    );
+    if !ok {
+        return Err("monetization images: one or more images failed".into());
+    }
+    Ok(())
 }
 
 async fn run_upload_inner(args: UploadArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1349,6 +2386,564 @@ struct UploadJob {
 struct UploadMedia {
     asset_type: UploadAssetType,
     content_type: String,
+}
+
+#[derive(Clone, Debug)]
+struct MonetizationCreateSpec {
+    name: String,
+    price: u64,
+}
+
+#[derive(Clone, Debug)]
+struct MonetizationListedItem {
+    id: Option<String>,
+    name: Option<String>,
+    price: Option<u64>,
+}
+
+fn monetization_context(
+    args: &MonetizationCommonArgs,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let universe_id = args
+        .universe_id
+        .clone()
+        .or_else(|| resolve_monetization_universe_id(args.project.as_deref()).ok())
+        .ok_or("monetization: missing universe id. Pass --universe-id, set ROBLOX_UNIVERSE_ID/GAMEID, or set ro-sync.json gameId.")?;
+    let api_key =
+        resolve_monetization_api_key(args.project.as_deref(), args.api_key_env.as_deref())?;
+    Ok((universe_id, api_key))
+}
+
+fn resolve_monetization_universe_id(project: Option<&std::path::Path>) -> Result<String, String> {
+    for env_name in ["ROBLOX_UNIVERSE_ID", "UNIVERSE_ID", "GAMEID", "GAME_ID"] {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    for (key, value) in read_project_env_values(project) {
+        if matches!(
+            key.as_str(),
+            "ROBLOX_UNIVERSE_ID" | "UNIVERSE_ID" | "GAMEID" | "GAME_ID"
+        ) && !value.trim().is_empty()
+        {
+            return Ok(value.trim().to_string());
+        }
+    }
+
+    let root = match project {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    project_config::read_from_disk(&root)
+        .map_err(|e| e.to_string())?
+        .and_then(|cfg| cfg.game_id)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "no universe id found".to_string())
+}
+
+fn resolve_monetization_api_key(
+    project: Option<&std::path::Path>,
+    preferred_env: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut env_names = Vec::new();
+    if let Some(env_name) = preferred_env {
+        env_names.push(env_name.to_string());
+    }
+    for env_name in [
+        "ROBLOX_API_KEY",
+        "CLOUD_API_KEY",
+        "ROBLOX_OPEN_CLOUD_API_KEY",
+    ] {
+        if !env_names.iter().any(|existing| existing == env_name) {
+            env_names.push(env_name.to_string());
+        }
+    }
+
+    for env_name in &env_names {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    let env_values = read_project_env_values(project);
+    for env_name in &env_names {
+        if let Some((_, value)) = env_values
+            .iter()
+            .find(|(key, value)| key == env_name && !value.trim().is_empty())
+        {
+            return Ok(value.trim().to_string());
+        }
+    }
+
+    if let Some(value) = find_widget_secret("robloxCloudApiKey") {
+        return Ok(value);
+    }
+
+    Err(format!(
+        "monetization: missing Roblox Open Cloud API key. Set one of {}, add it to an env file, or save it in Ro Sync Settings > Secrets.",
+        env_names.join(", ")
+    )
+    .into())
+}
+
+fn monetization_credential_sources(project: Option<&std::path::Path>) -> Vec<String> {
+    let env_values = read_project_env_values(project);
+    let mut sources = Vec::new();
+    for env_name in [
+        "ROBLOX_API_KEY",
+        "CLOUD_API_KEY",
+        "ROBLOX_OPEN_CLOUD_API_KEY",
+        "ROBLOX_UNIVERSE_ID",
+        "UNIVERSE_ID",
+        "GAMEID",
+        "GAME_ID",
+    ] {
+        if std::env::var(env_name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            sources.push(format!("env:{env_name}"));
+        }
+        if env_values
+            .iter()
+            .any(|(key, value)| key == env_name && !value.trim().is_empty())
+        {
+            sources.push(format!("project-env:{env_name}"));
+        }
+    }
+    if find_widget_secret("robloxCloudApiKey").is_some() {
+        sources.push("widget-secret:robloxCloudApiKey".to_string());
+    }
+    sources
+}
+
+fn read_project_env_values(project: Option<&std::path::Path>) -> Vec<(String, String)> {
+    let root = match project {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let mut values = Vec::new();
+    for file_name in ["info.env", ".env", ".env.local"] {
+        let path = root.join(file_name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().trim_start_matches("export ").to_string();
+            let value = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            if !key.is_empty() {
+                values.push((key, value));
+            }
+        }
+    }
+    values
+}
+
+fn monetization_create_specs(
+    args: &MonetizationCreateArgs,
+) -> Result<Vec<MonetizationCreateSpec>, Box<dyn std::error::Error>> {
+    if let Some(name) = &args.name {
+        let price = args
+            .price
+            .ok_or("monetization create: --price is required with --name")?;
+        if !args.entries.is_empty() {
+            return Err(
+                "monetization create: use either entries or --name/--price, not both".into(),
+            );
+        }
+        return Ok(vec![MonetizationCreateSpec {
+            name: name.trim().to_string(),
+            price,
+        }]);
+    }
+    if args.price.is_some() {
+        return Err("monetization create: --price requires --name".into());
+    }
+
+    let mut specs = Vec::new();
+    for raw in &args.entries {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            specs.push(parse_monetization_create_entry(entry)?);
+        }
+    }
+    if specs.is_empty() {
+        return Err("monetization create: provide at least one entry like `VIP 499 robux` or --name/--price".into());
+    }
+    Ok(specs)
+}
+
+fn parse_monetization_create_entry(
+    entry: &str,
+) -> Result<MonetizationCreateSpec, Box<dyn std::error::Error>> {
+    let mut tokens: Vec<&str> = entry.split_whitespace().collect();
+    while tokens
+        .last()
+        .is_some_and(|token| token.eq_ignore_ascii_case("robux"))
+    {
+        tokens.pop();
+    }
+    let Some(price_token) = tokens.pop() else {
+        return Err(format!("invalid monetization entry {entry:?}: missing price").into());
+    };
+    let price = price_token
+        .parse::<u64>()
+        .map_err(|_| format!("invalid monetization entry {entry:?}: price must be a number"))?;
+    let name = tokens.join(" ").trim().to_string();
+    if name.is_empty() {
+        return Err(format!("invalid monetization entry {entry:?}: missing name").into());
+    }
+    Ok(MonetizationCreateSpec { name, price })
+}
+
+async fn monetization_list_api(
+    kind: MonetizationKind,
+    universe_id: &str,
+    api_key: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let url = format!("{}/creator", kind.base_url(universe_id));
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("x-api-key", api_key)
+        .send()
+        .await?;
+    monetization_response(response, "list").await
+}
+
+async fn monetization_create_one(
+    kind: MonetizationKind,
+    universe_id: &str,
+    api_key: &str,
+    args: &MonetizationCreateArgs,
+    spec: &MonetizationCreateSpec,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut form = reqwest::multipart::Form::new()
+        .text("name", spec.name.clone())
+        .text("price", spec.price.to_string())
+        .text("isForSale", (!args.not_for_sale).to_string());
+    if let Some(description) = &args.description {
+        form = form.text("description", description.clone());
+    }
+    if let Some(image) = &args.image {
+        form = add_file_part(form, kind.create_image_field(), image)?;
+    }
+    let response = reqwest::Client::new()
+        .post(kind.base_url(universe_id))
+        .header("x-api-key", api_key)
+        .multipart(form)
+        .send()
+        .await?;
+    monetization_response(response, "create").await
+}
+
+async fn monetization_update_one<F>(
+    kind: MonetizationKind,
+    universe_id: &str,
+    api_key: &str,
+    id: &str,
+    build_form: F,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>>
+where
+    F: FnOnce(reqwest::multipart::Form) -> reqwest::multipart::Form,
+{
+    let form = build_form(reqwest::multipart::Form::new());
+    let response = reqwest::Client::new()
+        .patch(format!("{}/{}", kind.base_url(universe_id), id))
+        .header("x-api-key", api_key)
+        .multipart(form)
+        .send()
+        .await?;
+    monetization_response(response, "update").await
+}
+
+async fn monetization_update_image(
+    kind: MonetizationKind,
+    universe_id: &str,
+    api_key: &str,
+    id: &str,
+    file: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let form = add_file_part(
+        reqwest::multipart::Form::new(),
+        kind.update_image_field(),
+        file,
+    )?;
+    let response = reqwest::Client::new()
+        .patch(format!("{}/{}", kind.base_url(universe_id), id))
+        .header("x-api-key", api_key)
+        .multipart(form)
+        .send()
+        .await?;
+    monetization_response(response, "image").await
+}
+
+fn add_file_part(
+    form: reqwest::multipart::Form,
+    field: &'static str,
+    path: &std::path::Path,
+) -> Result<reqwest::multipart::Form, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("monetization: read image {}: {e}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string();
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+    Ok(form.part(field, part))
+}
+
+async fn monetization_response(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let status = response.status();
+    let text = response.text().await?;
+    if status.is_success() {
+        if text.trim().is_empty() {
+            return Ok(serde_json::json!({ "status": status.as_u16() }));
+        }
+        return serde_json::from_str(&text).map_err(|e| {
+            format!("monetization {label}: expected JSON response, got {text:?}: {e}").into()
+        });
+    }
+    let body = if text.trim().is_empty() {
+        "<empty response>".to_string()
+    } else {
+        text
+    };
+    Err(format!("monetization {label}: Roblox API returned {status}: {body}").into())
+}
+
+async fn resolve_monetization_asset_id(
+    kind: MonetizationKind,
+    universe_id: &str,
+    api_key: &str,
+    id: Option<String>,
+    name: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(id) = id {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return Ok(id);
+        }
+    }
+    let name = name.ok_or("monetization: pass --id or --name")?;
+    let key = normalize_monetization_name(&name);
+    let list = monetization_list_api(kind, universe_id, api_key).await?;
+    let mut matches = monetization_items_from_response(kind, &list)
+        .into_iter()
+        .filter(|item| {
+            item.name
+                .as_deref()
+                .map(normalize_monetization_name)
+                .is_some_and(|item_key| item_key == key)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| a.id.cmp(&b.id));
+    if matches.len() > 1 {
+        return Err(format!(
+            "monetization: name {name:?} matched multiple {} entries; pass --id",
+            kind.label()
+        )
+        .into());
+    }
+    matches
+        .pop()
+        .and_then(|item| item.id)
+        .ok_or_else(|| format!("monetization: no {} named {name:?} found", kind.label()).into())
+}
+
+fn monetization_items_from_response(
+    kind: MonetizationKind,
+    value: &serde_json::Value,
+) -> Vec<MonetizationListedItem> {
+    let mut out = Vec::new();
+    collect_monetization_items(kind, value, &mut out);
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    out.dedup_by(|a, b| a.id == b.id && a.name == b.name);
+    out
+}
+
+fn collect_monetization_items(
+    kind: MonetizationKind,
+    value: &serde_json::Value,
+    out: &mut Vec<MonetizationListedItem>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_monetization_items(kind, value, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let id = monetization_id_from_value(kind, value);
+            let name = map
+                .get("name")
+                .or_else(|| map.get("displayName"))
+                .and_then(json_scalar_to_string);
+            if id.is_some() || name.is_some() {
+                let price = map
+                    .get("price")
+                    .or_else(|| map.get("priceInRobux"))
+                    .and_then(json_u64);
+                out.push(MonetizationListedItem { id, name, price });
+            }
+            for child in map.values() {
+                collect_monetization_items(kind, child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn monetization_id_from_value(kind: MonetizationKind, value: &serde_json::Value) -> Option<String> {
+    let map = value.as_object()?;
+    for key in [kind.id_field(), "id", "assetId"] {
+        if let Some(id) = map.get(key).and_then(json_scalar_to_string) {
+            if !id.trim().is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(value) => value.as_u64(),
+        serde_json::Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn normalize_monetization_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_supported_image_path(path: &std::path::Path) -> bool {
+    matches!(
+        upload_extension(path).as_str(),
+        "png" | "jpg" | "jpeg" | "bmp" | "tga"
+    )
+}
+
+fn discover_monetization_files(
+    project: &std::path::Path,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    discover_monetization_files_inner(project, project, &mut out)?;
+    out.sort_by_key(|value| value["path"].as_str().map(str::to_string));
+    Ok(out)
+}
+
+fn discover_monetization_files_inner(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("monetization discover: read {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| {
+            matches!(
+                name,
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "tools"
+                    | "dist"
+                    | "build"
+                    | ".cursor"
+                    | ".vscode"
+                    | ".DS_Store"
+            )
+        }) {
+            continue;
+        }
+        if path.is_dir() {
+            discover_monetization_files_inner(root, &path, out)?;
+            continue;
+        }
+        let Some(ext) = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+        else {
+            continue;
+        };
+        if !matches!(ext.as_str(), "luau" | "lua" | "json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let matches = [
+            "GamePass",
+            "Gamepass",
+            "DeveloperProduct",
+            "ProductId",
+            "GamePassId",
+            "MarketplaceService",
+            "ProcessReceipt",
+            "PromptGamePassPurchase",
+        ]
+        .iter()
+        .filter(|needle| text.contains(**needle))
+        .copied()
+        .collect::<Vec<_>>();
+        if matches.is_empty() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        out.push(serde_json::json!({
+            "path": rel,
+            "matches": matches,
+        }));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1763,13 +3358,22 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let target = match args.path {
-        Some(path) if path.is_absolute() => path,
-        Some(path) => project.join(path),
-        None => project.clone(),
+    if args.scope_only && args.paths.is_empty() {
+        return Err("lint: --scope-only requires at least one --path".into());
+    }
+
+    let targets = if args.paths.is_empty() {
+        vec![project.clone()]
+    } else {
+        args.paths
+            .iter()
+            .map(|path| lint_target_path(&project, path))
+            .collect()
     };
-    if !target.exists() {
-        return Err(format!("lint: path does not exist: {}", target.display()).into());
+    for target in &targets {
+        if !target.exists() {
+            return Err(format!("lint: path does not exist: {}", target.display()).into());
+        }
     }
 
     let luau_lsp = resolve_luau_lsp(args.luau_lsp);
@@ -1791,23 +3395,65 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &definitions {
         cmd.arg(format!("--definitions={}", path.display()));
     }
-    cmd.args(args.extra_args)
-        .arg(&target)
-        .current_dir(&project)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
 
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            cleanup_sourcemap(&sourcemap);
-            print_luau_lsp_missing(&luau_lsp);
-            std::process::exit(127);
+    if !args.no_vendor_ignores && !extra_args_include_ignore(&args.extra_args) {
+        for pattern in DEFAULT_LINT_VENDOR_IGNORES {
+            cmd.arg(format!("--ignore={pattern}"));
         }
-        Err(e) => {
-            cleanup_sourcemap(&sourcemap);
-            return Err(format!("lint: failed to run {}: {e}", luau_lsp.to_string_lossy()).into());
+    }
+    for pattern in &args.ignores {
+        cmd.arg(format!("--ignore={pattern}"));
+    }
+
+    cmd.args(&args.extra_args)
+        .args(&targets)
+        .current_dir(&project)
+        .stdin(Stdio::null());
+
+    let capture_output = args.scope_only || args.summary;
+    let status = if capture_output {
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                cleanup_sourcemap(&sourcemap);
+                print_luau_lsp_missing(&luau_lsp);
+                std::process::exit(127);
+            }
+            Err(e) => {
+                cleanup_sourcemap(&sourcemap);
+                return Err(
+                    format!("lint: failed to run {}: {e}", luau_lsp.to_string_lossy()).into(),
+                );
+            }
+        };
+        let mut combined = String::new();
+        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        let rendered = if args.scope_only {
+            filter_lint_output_to_targets(&project, &targets, &combined)
+        } else {
+            combined
+        };
+        print!("{rendered}");
+        if args.summary {
+            print_lint_summary(&rendered);
+        }
+        output.status
+    } else {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        match cmd.status() {
+            Ok(status) => status,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                cleanup_sourcemap(&sourcemap);
+                print_luau_lsp_missing(&luau_lsp);
+                std::process::exit(127);
+            }
+            Err(e) => {
+                cleanup_sourcemap(&sourcemap);
+                return Err(
+                    format!("lint: failed to run {}: {e}", luau_lsp.to_string_lossy()).into(),
+                );
+            }
         }
     };
 
@@ -1816,6 +3462,134 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+const DEFAULT_LINT_VENDOR_IGNORES: &[&str] = &[
+    "**/Packages/**",
+    "**/_Index/**",
+    "**/Madwork*/**",
+    "**/PlayerModule/**",
+    "**/node_modules/**",
+    "**/.codex/**",
+    "**/.vscode/**",
+    "**/tools/**",
+];
+
+fn lint_target_path(project: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project.join(path)
+    }
+}
+
+fn extra_args_include_ignore(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--ignore" || arg.starts_with("--ignore="))
+}
+
+#[derive(Debug)]
+struct LintDiagnostic {
+    path: PathBuf,
+    file_label: String,
+    category: String,
+}
+
+fn filter_lint_output_to_targets(
+    project: &std::path::Path,
+    targets: &[PathBuf],
+    output: &str,
+) -> String {
+    let scopes: Vec<PathBuf> = targets
+        .iter()
+        .map(|target| normalize_existing_path(target))
+        .collect();
+    let mut filtered = String::new();
+    for line in output.lines() {
+        match parse_lint_diagnostic(project, line) {
+            Some(diag) if lint_path_in_scopes(&diag.path, &scopes) => {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+            Some(_) => {}
+            None => {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+        }
+    }
+    filtered
+}
+
+fn lint_path_in_scopes(path: &std::path::Path, scopes: &[PathBuf]) -> bool {
+    scopes.iter().any(|scope| {
+        if scope.is_dir() {
+            path.starts_with(scope)
+        } else {
+            path == scope
+        }
+    })
+}
+
+fn normalize_existing_path(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn parse_lint_diagnostic(project: &std::path::Path, line: &str) -> Option<LintDiagnostic> {
+    let (file_part, rest) = line.split_once('(')?;
+    let (location, message) = rest.split_once("): ")?;
+    if !location
+        .split(',')
+        .all(|part| part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (category, _) = message.split_once(':')?;
+    let file_path = std::path::Path::new(file_part);
+    let absolute = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        project.join(file_path)
+    };
+    Some(LintDiagnostic {
+        path: normalize_existing_path(&absolute),
+        file_label: file_part.to_string(),
+        category: category.trim().to_string(),
+    })
+}
+
+fn print_lint_summary(output: &str) {
+    let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
+    for line in output.lines() {
+        let Some(diag) = parse_lint_diagnostic(std::path::Path::new("."), line) else {
+            continue;
+        };
+        *by_category.entry(diag.category).or_insert(0) += 1;
+        *by_file.entry(diag.file_label).or_insert(0) += 1;
+    }
+    let total: usize = by_category.values().sum();
+    if total == 0 {
+        println!("\nSummary: 0 diagnostics");
+        return;
+    }
+    println!("\nSummary: {total} diagnostic{}", plural_s(total));
+    println!("By category:");
+    for (category, count) in by_category {
+        println!("  {count:>4} {category}");
+    }
+    println!("By file:");
+    for (file, count) in by_file {
+        println!("  {count:>4} {file}");
+    }
+}
+
+fn plural_s(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn write_temp_sourcemap(project: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -2572,6 +4346,417 @@ async fn run_diff(args: DiffArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_changes(args: DiffArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_diff(args).await
+}
+
+async fn run_open(args: OpenArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = serde_json::Value::Array(
+        args.paths
+            .iter()
+            .map(|path| serde_json::Value::String(path.clone()))
+            .collect(),
+    );
+    let resp = remote::request(
+        args.port,
+        "select_set",
+        serde_json::json!({ "paths": paths }),
+    )
+    .await?;
+    print_response(&resp, args.raw, |v| {
+        let count = v.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("ok: opened {count} instance(s)");
+        for path in &args.paths {
+            println!("  {path}");
+        }
+    });
+    ok_or_err(&resp)
+}
+
+async fn run_where(args: WhereArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut out = serde_json::Map::new();
+    if let Some(project) = args.project.as_deref() {
+        if let Ok(resolved) =
+            path_resolver::resolve(project, &args.target, path_resolver::PathInputKind::Auto)
+        {
+            out.insert(
+                "path".into(),
+                serde_json::json!({
+                    "studioPath": resolved.studio_path_string(),
+                    "class": resolved.class,
+                    "fsPath": resolved.fs_path,
+                    "fsExists": resolved.fs_exists,
+                }),
+            );
+        }
+    }
+
+    let mut req_args = serde_json::Map::new();
+    req_args.insert(
+        "name".into(),
+        serde_json::Value::String(args.target.clone()),
+    );
+    if let Some(under) = &args.under {
+        req_args.insert("under".into(), serde_json::Value::String(under.clone()));
+    }
+    let resp = remote::request(args.port, "find", serde_json::Value::Object(req_args)).await?;
+    if let Ok(value) = response_value_or_err(&resp, "where find") {
+        out.insert("matches".into(), value);
+    } else {
+        out.insert(
+            "liveError".into(),
+            serde_json::Value::String(
+                resp.get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("live search failed")
+                    .to_string(),
+            ),
+        );
+    }
+
+    let value = serde_json::Value::Object(out);
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    if let Some(path) = value.get("path") {
+        let studio = path
+            .get("studioPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let fs = path.get("fsPath").and_then(|v| v.as_str()).unwrap_or("?");
+        println!("Path:");
+        println!("  Studio: {studio}");
+        println!("  Disk:   {fs}");
+    }
+    println!("Matches:");
+    print_find(
+        value
+            .get("matches")
+            .unwrap_or(&serde_json::Value::Array(vec![])),
+    );
+    Ok(())
+}
+
+async fn run_props(args: PropsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = remote::request(args.port, "get", serde_json::json!({ "path": args.path })).await?;
+    let value = response_value_or_err(&resp, "props get")?;
+    let props = value
+        .get("properties")
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&props)?);
+    } else if let Some(map) = props.as_object() {
+        if map.is_empty() {
+            println!("(no inspectable properties)");
+        } else {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                println!("{key} = {}", format_pretty_value(&map[key]));
+            }
+        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(&props)?);
+    }
+    Ok(())
+}
+
+async fn run_source(args: SourceArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.disk {
+        let project = project_or_cwd(args.project.as_deref(), "source")?;
+        let resolved =
+            path_resolver::resolve(&project, &args.path, path_resolver::PathInputKind::Auto)
+                .map_err(|e| format!("source: {e}"))?;
+        let source_path = disk_source_path(&resolved.fs_path)
+            .ok_or_else(|| format!("source: no source file at {}", resolved.fs_path.display()))?;
+        let source = std::fs::read_to_string(&source_path)
+            .map_err(|e| format!("source: read {}: {e}", source_path.display()))?;
+        if args.raw {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": "disk",
+                    "studioPath": resolved.studio_path_string(),
+                    "fsPath": source_path,
+                    "text": source,
+                }))?
+            );
+        } else {
+            print!("{source}");
+        }
+        return Ok(());
+    }
+
+    let resp = remote::request(
+        args.port,
+        "get",
+        serde_json::json!({ "path": args.path, "prop": "Source" }),
+    )
+    .await?;
+    let source = response_value_or_err(&resp, "source get")?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": "studio",
+                "path": args.path,
+                "text": source,
+            }))?
+        );
+    } else if let Some(text) = source.as_str() {
+        print!("{text}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&source)?);
+    }
+    Ok(())
+}
+
+async fn run_meta(args: MetaArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(args.project.as_deref(), "meta")?;
+    let resolved = path_resolver::resolve(&project, &args.target, args.from)
+        .map_err(|e| format!("meta: {e}"))?;
+    let value = serde_json::json!({
+        "studioPath": resolved.studio_path_string(),
+        "class": resolved.class,
+        "fsPath": resolved.fs_path,
+        "fsExists": resolved.fs_exists,
+        "syncedService": resolved.studio_path.first().cloned(),
+    });
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Studio: {}", resolved.studio_path_string());
+        println!("Class:   {}", resolved.class);
+        println!("Disk:    {}", resolved.fs_path.display());
+        println!("Exists:  {}", resolved.fs_exists);
+    }
+    Ok(())
+}
+
+async fn run_services(args: ServicesArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(args.project.as_deref(), "services")?;
+    let mut live = std::collections::BTreeSet::new();
+    if let Ok(resp) = remote::request(
+        args.port,
+        "tree",
+        serde_json::json!({ "path": "", "depth": 1 }),
+    )
+    .await
+    {
+        if let Ok(tree) = response_value_or_err(&resp, "services tree") {
+            collect_live_service_names(&tree, &mut live);
+        }
+    }
+    let rows: Vec<serde_json::Value> = snapshot::SYNCED_SERVICES
+        .iter()
+        .map(|service| {
+            let path = project.join(service);
+            serde_json::json!({
+                "name": service,
+                "disk": path.is_dir(),
+                "studio": live.contains(*service),
+                "path": path,
+            })
+        })
+        .collect();
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        for row in rows {
+            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let disk = if row.get("disk").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "disk"
+            } else {
+                "----"
+            };
+            let studio = if row.get("studio").and_then(|v| v.as_bool()).unwrap_or(false) {
+                "studio"
+            } else {
+                "------"
+            };
+            println!("{name:24} {disk:4} {studio:6}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_conflicts(args: ConflictsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let value = http_get_json(args.port, "/resolve").map_err(|e| format!("conflicts: {e}"))?;
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let conflicts = value
+        .get("conflicts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if conflicts.is_empty() {
+        println!("no parked conflicts");
+        return Ok(());
+    }
+    println!("{} parked conflict(s):", conflicts.len());
+    for item in conflicts {
+        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let fs = item.get("fsHash").and_then(|v| v.as_str()).unwrap_or("");
+        let studio = item
+            .get("studioHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        println!("  {path}");
+        println!("    disk   {}", short_hash(fs));
+        println!("    studio {}", short_hash(studio));
+    }
+    Ok(())
+}
+
+async fn run_resolve(args: ResolveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let choice = match (args.disk, args.studio) {
+        (true, false) => "disk",
+        (false, true) => "studio",
+        _ => return Err("resolve: pass exactly one of --disk or --studio".into()),
+    };
+    let value = http_post_json(
+        args.port,
+        "/resolve",
+        &serde_json::json!({ "path": args.path, "choice": choice }),
+    )
+    .await
+    .map_err(|e| format!("resolve: {e}"))?;
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let action = value
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("resolved");
+        println!(
+            "ok: {action} {}",
+            value.get("path").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    } else {
+        let err = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed");
+        return Err(err.to_string().into());
+    }
+    Ok(())
+}
+
+async fn run_tail(args: TailArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_logs(LogsArgs {
+        project: args.project,
+        port: args.port,
+        since: args.since,
+        level: args.level,
+        limit: args.limit,
+        tail: true,
+        raw: args.raw,
+    })
+    .await
+}
+
+async fn run_watch(args: WatchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("ws://127.0.0.1:{}/ws", args.port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({ "type": "hello", "clientId": "rosync-watch" }).to_string(),
+    ))
+    .await?;
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                eprintln!();
+                return Ok(());
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { return Ok(()); };
+                let msg = msg?;
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                    if args.compact {
+                        print_ws_frame_compact(&text);
+                    } else {
+                        println!("{text}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_repair(args: RepairArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        RepairCommand::Tree(args) => run_repair_tree(args).await,
+        RepairCommand::Sourcemap(args) => run_repair_sourcemap(args),
+    }
+}
+
+async fn run_repair_tree(args: RepairTreeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(args.project.as_deref(), "repair tree")?;
+    let resp = remote::request(
+        args.port,
+        "tree",
+        serde_json::json!({ "path": "", "depth": args.depth }),
+    )
+    .await?;
+    let tree = response_value_or_err(&resp, "repair tree")?;
+    if diff::has_truncated_tree(&tree) {
+        return Err(format!(
+            "repair tree: live tree was truncated at --depth {}; rerun with a larger --depth",
+            args.depth
+        )
+        .into());
+    }
+    let output = project.join(snapshot::TREE_JSON);
+    std::fs::write(
+        &output,
+        format!("{}\n", serde_json::to_string_pretty(&tree)?),
+    )
+    .map_err(|e| format!("repair tree: write {}: {e}", output.display()))?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "output": output,
+            }))?
+        );
+    } else {
+        println!("ok: wrote {}", output.display());
+    }
+    Ok(())
+}
+
+fn run_repair_sourcemap(args: RepairSourcemapArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(args.project.as_deref(), "repair sourcemap")?;
+    let output = args
+        .output
+        .unwrap_or_else(|| project.join("sourcemap.json"));
+    let map = sourcemap::generate(&project)
+        .map_err(|e| format!("repair sourcemap: generate {}: {e}", project.display()))?;
+    std::fs::write(
+        &output,
+        format!("{}\n", serde_json::to_string_pretty(&map)?),
+    )
+    .map_err(|e| format!("repair sourcemap: write {}: {e}", output.display()))?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "output": output,
+            }))?
+        );
+    } else {
+        println!("ok: wrote {}", output.display());
+    }
+    Ok(())
+}
+
 async fn run_find(args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut req_args = serde_json::Map::new();
     if let Some(c) = &args.class_name {
@@ -3137,6 +5322,22 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("only the Ro Sync marker block was regenerated"),
     });
 
+    let stylua_existed = project.join(snapshot::STYLUA_TOML).exists();
+    let stylua_changed = snapshot::write_stylua_toml_if_missing(&project)?;
+    files.push(RefreshFileStatus {
+        path: snapshot::STYLUA_TOML,
+        status: refresh_file_status(stylua_existed, stylua_changed),
+        note: Some("Luau formatter config ensured"),
+    });
+
+    let aftman_existed = project.join(snapshot::AFTMAN_TOML).exists();
+    let aftman_changed = snapshot::write_aftman_stylua_if_missing_or_merge(&project)?;
+    files.push(RefreshFileStatus {
+        path: snapshot::AFTMAN_TOML,
+        status: refresh_file_status(aftman_existed, aftman_changed),
+        note: Some("StyLua tool pin ensured"),
+    });
+
     let changed = files
         .iter()
         .filter(|file| file.status == "created" || file.status == "updated")
@@ -3437,6 +5638,29 @@ fn http_get_json(port: u16, path: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(body).map_err(|e| format!("parse response JSON: {e}"))
 }
 
+async fn http_post_json(
+    port: u16,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {url}: {e}"))?;
+    let status = resp.status();
+    let value = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse response JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("{status}: {value}"));
+    }
+    Ok(value)
+}
+
 fn format_duration_short(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -3447,6 +5671,335 @@ fn format_duration_short(d: Duration) -> String {
         format!("{}h", secs / 3600)
     } else {
         format!("{}d", secs / 86_400)
+    }
+}
+
+fn project_or_cwd(
+    project: Option<&std::path::Path>,
+    context: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match project {
+        Some(path) => Ok(path.to_path_buf()),
+        None => {
+            std::env::current_dir().map_err(|e| format!("{context}: current directory: {e}").into())
+        }
+    }
+}
+
+fn command_names_from_bundle(bundle: &serde_json::Value) -> Vec<String> {
+    bundle
+        .get("commands")
+        .and_then(|value| value.as_array())
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|command| {
+                    command
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn daemon_project_mismatch(
+    hello: &serde_json::Value,
+    canonical_project: &std::path::Path,
+) -> serde_json::Value {
+    let Some(daemon_project) = hello.get("project").and_then(|value| value.as_str()) else {
+        return serde_json::Value::Null;
+    };
+    let daemon_path = std::path::Path::new(daemon_project);
+    let daemon_canonical =
+        std::fs::canonicalize(daemon_path).unwrap_or_else(|_| daemon_path.to_path_buf());
+    let mismatch = daemon_canonical != canonical_project;
+    serde_json::json!({
+        "mismatch": mismatch,
+        "daemonProject": daemon_project,
+        "daemonCanonicalPath": daemon_canonical.display().to_string(),
+        "requestedCanonicalPath": canonical_project.display().to_string(),
+    })
+}
+
+fn compact_command_registry(
+    bundle: &serde_json::Value,
+    name: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let commands = bundle
+        .get("commands")
+        .and_then(|value| value.as_array())
+        .ok_or("commands: embedded registry missing commands array")?;
+    let mut rows = Vec::new();
+    for command in commands {
+        let command_name = command
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if name.is_some_and(|needle| needle != command_name) {
+            continue;
+        }
+        rows.push(serde_json::json!({
+            "name": command_name,
+            "category": command.get("category").and_then(|value| value.as_str()).unwrap_or(""),
+            "summary": command.get("description").and_then(|value| value.as_str()).unwrap_or(""),
+            "outputCost": command_output_cost(command_name),
+            "safety": command_safety_class(command_name),
+            "requires": command_requirements(command_name),
+            "preferBefore": command_prefer_before(command_name),
+            "usageLookup": format!("rosync commands {command_name}"),
+        }));
+    }
+    if name.is_some() && rows.is_empty() {
+        return Err(format!("commands: unknown command {name:?}").into());
+    }
+    Ok(serde_json::json!({
+        "schema": "ro-sync.commands.compact.v1",
+        "count": rows.len(),
+        "rules": [
+            "Use this compact index for command choice; use `rosync commands <name>` for exact flags.",
+            "Avoid plain `rosync commands` unless the full registry is explicitly needed.",
+            "Prefer cheap/offline commands before live reads; prefer plan/preflight before mutating commands.",
+            "Avoid stream commands (`watch`, `tail`, `logs --tail`) in delegated agents unless explicitly requested."
+        ],
+        "commands": rows,
+    }))
+}
+
+fn command_output_cost(name: &str) -> &'static str {
+    match name {
+        "commands" => "high-full-or-low-single",
+        "context" | "plan" | "query" | "path" | "meta" | "services" | "where" | "open"
+        | "classinfo" | "enums" | "enum" | "ping" | "version" => "low",
+        "status" | "doctor" | "ls" | "tree" | "props" | "source" | "find" | "find-attr"
+        | "logs" | "conflicts" | "resolve" | "lint" | "upload" | "monetization" | "set" | "new"
+        | "rm" | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo"
+        | "refresh" => "medium",
+        "diff" | "changes" | "snapshot" | "get" | "eval" | "call" | "tail" | "watch" => {
+            "high-or-streaming"
+        }
+        _ => "unknown",
+    }
+}
+
+fn command_safety_class(name: &str) -> &'static str {
+    match name {
+        "set" | "new" | "rm" | "mv" | "attr" | "tag" | "save" | "waypoint" | "undo" | "redo" => {
+            "mutates-studio"
+        }
+        "resolve" => "mutates-disk-or-studio",
+        "eval" | "call" => "risky-live-execution",
+        "select" | "open" => "mutates-studio-selection",
+        "upload" | "monetization" => "open-cloud-mutating",
+        "refresh" | "snapshot" => "writes-local-files",
+        "tail" | "watch" => "streaming-read",
+        _ => "read-only",
+    }
+}
+
+fn command_requirements(name: &str) -> Vec<&'static str> {
+    match name {
+        "query" | "path" | "meta" | "services" | "source" | "lint" => vec!["project"],
+        "upload" | "monetization" => vec!["project", "roblox-open-cloud-credential"],
+        "commands" | "context" | "plan" | "snapshot" | "diff" | "changes" | "status" | "doctor"
+        | "refresh" => vec!["project"],
+        _ => vec!["daemon", "studio-plugin"],
+    }
+}
+
+fn command_prefer_before(name: &str) -> Vec<&'static str> {
+    match name {
+        "get" | "props" => vec!["meta", "get --prop when possible"],
+        "source" => vec![
+            "meta",
+            "source --disk before live source when checking local code",
+        ],
+        "diff" | "changes" => vec!["status --raw", "services --raw"],
+        "snapshot" => vec!["tree --depth 3", "changes"],
+        "set" | "new" | "rm" | "mv" => vec!["plan"],
+        "resolve" => vec!["conflicts", "changes", "plan resolve"],
+        "attr" | "tag" | "call" | "eval" | "select" | "save" => {
+            vec!["status --raw", "waypoint for multi-step edits"]
+        }
+        "upload" => vec!["enumerate exact files", "use --manifest for bulk uploads"],
+        "monetization" => vec![
+            "monetization discover",
+            "monetization list",
+            "prefer --id over --name",
+        ],
+        "watch" | "tail" | "logs" => vec!["logs --limit 50 unless streaming is requested"],
+        _ => Vec::new(),
+    }
+}
+
+fn context_services(project: &std::path::Path) -> Vec<serde_json::Value> {
+    snapshot::SYNCED_SERVICES
+        .iter()
+        .map(|service| {
+            let path = project.join(service);
+            serde_json::json!({
+                "name": service,
+                "diskPath": path.display().to_string(),
+                "exists": path.is_dir(),
+            })
+        })
+        .collect()
+}
+
+fn context_tree_summary(project: &std::path::Path) -> serde_json::Value {
+    let path = project.join(snapshot::TREE_JSON);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return serde_json::json!({ "ok": false, "missing": true, "path": path.display().to_string() });
+        }
+        Err(e) => {
+            return serde_json::json!({ "ok": false, "error": e.to_string(), "path": path.display().to_string() });
+        }
+    };
+    let tree: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(tree) => tree,
+        Err(e) => {
+            return serde_json::json!({ "ok": false, "error": format!("parse: {e}"), "path": path.display().to_string() });
+        }
+    };
+    let services = tree
+        .get("children")
+        .and_then(|value| value.as_array())
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|child| child.get("name").and_then(|value| value.as_str()))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "nodes": count_tree_nodes(&tree),
+        "services": services,
+    })
+}
+
+fn count_tree_nodes(node: &serde_json::Value) -> usize {
+    1 + node
+        .get("children")
+        .and_then(|value| value.as_array())
+        .map(|children| children.iter().map(count_tree_nodes).sum::<usize>())
+        .unwrap_or(0)
+}
+
+fn context_project_files(project: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "projectConfig": file_summary(&project.join(project_config::CONFIG_FILE)),
+        "treeJson": file_summary(&project.join(snapshot::TREE_JSON)),
+        "sourcemapJson": file_summary(&project.join("sourcemap.json")),
+        "roSyncMd": file_summary(&project.join("ro-sync.md")),
+        "agentsMd": file_summary(&project.join("AGENTS.md")),
+        "claudeMd": file_summary(&project.join("CLAUDE.md")),
+        "codexConfig": file_summary(&project.join(".codex").join("config.toml")),
+    })
+}
+
+fn file_summary(path: &std::path::Path) -> serde_json::Value {
+    let metadata = std::fs::metadata(path).ok();
+    let modified_unix = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    serde_json::json!({
+        "path": path.display().to_string(),
+        "exists": metadata.is_some(),
+        "bytes": metadata.as_ref().map(|metadata| metadata.len()),
+        "modifiedUnix": modified_unix,
+    })
+}
+
+fn disk_source_path(path: &std::path::Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut candidates = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().find(|child| {
+        child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::fs_map::parse_init_file)
+            .is_some()
+    })
+}
+
+fn collect_live_service_names(
+    node: &serde_json::Value,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    let is_root = node.get("class").and_then(|v| v.as_str()) == Some("DataModel");
+    if is_root {
+        if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+            for child in children {
+                if let Some(name) = child.get("name").and_then(|v| v.as_str()) {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn short_hash(hash: &str) -> &str {
+    if hash.len() > 12 {
+        &hash[..12]
+    } else {
+        hash
+    }
+}
+
+fn print_ws_frame_compact(text: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        println!("{text}");
+        return;
+    };
+    let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+    match kind {
+        "op" => {
+            let op = value.get("op").unwrap_or(&serde_json::Value::Null);
+            let op_kind = op
+                .get("op")
+                .or_else(|| op.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("op");
+            let path = op
+                .get("path")
+                .and_then(|v| v.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .unwrap_or_default();
+            println!("{op_kind:12} {path}");
+        }
+        "request" => {
+            let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("request     {op}");
+        }
+        "response" => {
+            let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("response    ok={ok}");
+        }
+        other => println!("{other:12} {text}"),
     }
 }
 
@@ -3939,6 +6492,7 @@ fn diff_kind_label(kind: diff::DiffKind) -> &'static str {
 /// event type rather than a propagation op.
 fn spawn_watch_bridge(
     watcher: Watch,
+    root: PathBuf,
     events: broadcast::Sender<String>,
     conflicts: Arc<ConflictEngine>,
     push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>>,
@@ -3951,6 +6505,9 @@ fn spawn_watch_bridge(
         loop {
             match rx.recv().await {
                 Ok(op) => {
+                    if is_synced_service_root_op(&op, &root) {
+                        continue;
+                    }
                     if is_push_quiet(&push_quiet, &op.path) {
                         continue;
                     }
@@ -3968,6 +6525,24 @@ fn spawn_watch_bridge(
             }
         }
     });
+}
+
+fn is_synced_service_root_op(op: &Op, root: &std::path::Path) -> bool {
+    if op.content.is_some() {
+        return false;
+    }
+    let Ok(rel) = op.path.strip_prefix(root) else {
+        return false;
+    };
+    if rel.components().count() != 1 {
+        return false;
+    }
+    let Some(name) = rel.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    snapshot::SYNCED_SERVICES
+        .iter()
+        .any(|service| *service == name)
 }
 
 fn is_push_quiet(
@@ -4047,11 +6622,15 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
     let prev_group_id = state.group_id.read().unwrap().clone();
     let prev_place_ids = state.place_ids.read().unwrap().clone();
     let prev_name = state.project_name.read().unwrap().clone();
+    let prev_wally_enabled = *state.wally_enabled.read().unwrap();
+    let prev_wally_folder = state.wally_folder.read().unwrap().clone();
 
     let changed = prev_game_id != cfg.game_id
         || prev_group_id != cfg.group_id
         || prev_place_ids != cfg.place_ids
-        || prev_name != cfg.name;
+        || prev_name != cfg.name
+        || prev_wally_enabled != cfg.wally_enabled
+        || prev_wally_folder != cfg.wally_folder;
     if !changed {
         return Some(());
     }
@@ -4060,6 +6639,8 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
     *state.game_id.write().unwrap() = cfg.game_id.clone();
     *state.group_id.write().unwrap() = cfg.group_id.clone();
     *state.place_ids.write().unwrap() = cfg.place_ids.clone();
+    *state.wally_enabled.write().unwrap() = cfg.wally_enabled;
+    *state.wally_folder.write().unwrap() = cfg.wally_folder.clone();
 
     let evt = serde_json::json!({
         "type": "config-changed",
@@ -4067,6 +6648,8 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
         "gameId": cfg.game_id,
         "groupId": cfg.group_id,
         "placeIds": cfg.place_ids,
+        "wallyEnabled": cfg.wally_enabled,
+        "wallyFolder": cfg.wally_folder,
     });
     if let Ok(s) = serde_json::to_string(&evt) {
         let _ = state.events.send(s);
@@ -4351,6 +6934,26 @@ mod tier2_tests {
     }
 
     #[test]
+    fn synced_service_root_directory_ops_are_filtered() {
+        let root = PathBuf::from("/tmp/ro-sync-test-project");
+        let service_op = Op {
+            kind: OpKind::Update,
+            path: root.join("ReplicatedStorage"),
+            from: None,
+            content: None,
+        };
+        let script_op = Op {
+            kind: OpKind::Update,
+            path: root.join("ReplicatedStorage").join("Client.luau"),
+            from: None,
+            content: Some(b"return {}".to_vec()),
+        };
+
+        assert!(is_synced_service_root_op(&service_op, &root));
+        assert!(!is_synced_service_root_op(&script_op, &root));
+    }
+
+    #[test]
     fn status_args_parse_raw_project_and_port() {
         let cli = Cli::try_parse_from([
             "rosync",
@@ -4378,6 +6981,197 @@ mod tier2_tests {
         };
         assert_eq!(args.project.unwrap(), PathBuf::from("."));
         assert!(args.raw);
+    }
+
+    #[test]
+    fn lint_args_parse_multiple_paths_and_scope_flags() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "lint",
+            "--project",
+            ".",
+            "--path",
+            "ReplicatedStorage/Client",
+            "--path",
+            "ServerScriptService/Server",
+            "--ignore",
+            "**/Generated/**",
+            "--scope-only",
+            "--summary",
+        ])
+        .unwrap();
+        let Some(Command::Lint(args)) = cli.command else {
+            panic!("expected lint command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(
+            args.paths,
+            vec![
+                PathBuf::from("ReplicatedStorage/Client"),
+                PathBuf::from("ServerScriptService/Server")
+            ]
+        );
+        assert_eq!(args.ignores, vec!["**/Generated/**"]);
+        assert!(args.scope_only);
+        assert!(args.summary);
+        assert!(!args.no_vendor_ignores);
+
+        let cli =
+            Cli::try_parse_from(["rosync", "lint", "--owned-only", "--path", "A.luau"]).unwrap();
+        let Some(Command::Lint(args)) = cli.command else {
+            panic!("expected lint command");
+        };
+        assert!(args.scope_only);
+    }
+
+    #[test]
+    fn lint_scope_filter_keeps_only_requested_diagnostics() {
+        let root = std::env::temp_dir().join(format!(
+            "rosync-lint-filter-{}-{}",
+            std::process::id(),
+            unix_nanos()
+        ));
+        let owned = root.join("ReplicatedStorage").join("Client");
+        let vendor = root.join("ReplicatedStorage").join("Packages");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(owned.join("Main.luau"), "local x: number = \"bad\"\n").unwrap();
+        std::fs::write(vendor.join("Dep.luau"), "local y: number = \"bad\"\n").unwrap();
+
+        let output = "\
+[INFO] sourcemap loaded
+ReplicatedStorage/Client/Main.luau(1,1): TypeError: owned
+ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
+";
+        let filtered = filter_lint_output_to_targets(&root, &[owned], output);
+        assert!(filtered.contains("[INFO] sourcemap loaded"));
+        assert!(filtered.contains("Client/Main.luau"));
+        assert!(!filtered.contains("Packages/Dep.luau"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commands_registry_contains_command_docs() {
+        let bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON).unwrap();
+        let commands = bundle["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|command| command["name"] == "commands"));
+        assert!(commands.iter().any(|command| command["name"] == "context"));
+        assert!(commands.iter().any(|command| command["name"] == "plan"));
+        assert!(commands
+            .iter()
+            .any(|command| command["name"] == "monetization"));
+        assert!(commands.iter().any(|command| command["name"] == "get"));
+
+        let cli = Cli::try_parse_from(["rosync", "commands", "get"]).unwrap();
+        let Some(Command::Commands(args)) = cli.command else {
+            panic!("expected commands command");
+        };
+        assert_eq!(args.name.as_deref(), Some("get"));
+        assert!(!args.compact);
+
+        let cli = Cli::try_parse_from(["rosync", "commands", "--compact"]).unwrap();
+        let Some(Command::Commands(args)) = cli.command else {
+            panic!("expected commands command");
+        };
+        assert!(args.compact);
+        let compact = compact_command_registry(&bundle, Some("set")).unwrap();
+        assert_eq!(compact["commands"][0]["name"], "set");
+        assert_eq!(compact["commands"][0]["safety"], "mutates-studio");
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "context",
+            "--project",
+            ".",
+            "--port",
+            "9001",
+            "--full-commands",
+        ])
+        .unwrap();
+        let Some(Command::Context(args)) = cli.command else {
+            panic!("expected context command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.port, 9001);
+        assert!(args.full_commands);
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "plan",
+            "set",
+            "--path",
+            "ReplicatedStorage/Config",
+            "--prop",
+            "Source",
+            "--value",
+            "\"return {}\"",
+        ])
+        .unwrap();
+        let Some(Command::Plan(args)) = cli.command else {
+            panic!("expected plan command");
+        };
+        match args.command {
+            PlanCommand::Set(args) => {
+                assert_eq!(args.path, "ReplicatedStorage/Config");
+                assert_eq!(args.prop, "Source");
+            }
+            _ => panic!("expected plan set"),
+        }
+    }
+
+    #[test]
+    fn new_client_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "source",
+            "--project",
+            ".",
+            "--path",
+            "ReplicatedStorage/Client/App",
+            "--disk",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Source(args)) = cli.command else {
+            panic!("expected source command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.path, "ReplicatedStorage/Client/App");
+        assert!(args.disk);
+        assert!(args.raw);
+
+        let cli =
+            Cli::try_parse_from(["rosync", "resolve", "--path", "a.luau", "--studio"]).unwrap();
+        let Some(Command::Resolve(args)) = cli.command else {
+            panic!("expected resolve command");
+        };
+        assert_eq!(args.path, "a.luau");
+        assert!(args.studio);
+        assert!(!args.disk);
+
+        let cli =
+            Cli::try_parse_from(["rosync", "repair", "sourcemap", "--output", "map.json"]).unwrap();
+        let Some(Command::Repair(args)) = cli.command else {
+            panic!("expected repair command");
+        };
+        match args.command {
+            RepairCommand::Sourcemap(args) => {
+                assert_eq!(args.output.unwrap(), PathBuf::from("map.json"));
+            }
+            RepairCommand::Tree(_) => panic!("expected repair sourcemap command"),
+        }
+
+        let cli = Cli::try_parse_from(["rosync", "repair", "tree", "--depth", "32"]).unwrap();
+        let Some(Command::Repair(args)) = cli.command else {
+            panic!("expected repair command");
+        };
+        match args.command {
+            RepairCommand::Tree(args) => {
+                assert_eq!(args.depth, 32);
+            }
+            RepairCommand::Sourcemap(_) => panic!("expected repair tree command"),
+        }
     }
 
     #[test]
@@ -4474,6 +7268,63 @@ mod tier2_tests {
         );
         assert_eq!(args.concurrency, 4);
         assert!(args.raw);
+    }
+
+    #[test]
+    fn monetization_args_parse_aliases_and_create_entry() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "monetization",
+            "gp",
+            "create",
+            "VIP 499 robux",
+            "--project",
+            ".",
+        ])
+        .unwrap();
+        let Some(Command::Monetization(args)) = cli.command else {
+            panic!("expected monetization command");
+        };
+        let MonetizationCommand::Gamepass(args) = args.command else {
+            panic!("expected gamepass command");
+        };
+        let MonetizationAction::Create(args) = args.command else {
+            panic!("expected create command");
+        };
+        assert_eq!(args.common.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.entries, vec!["VIP 499 robux".to_string()]);
+
+        let spec = parse_monetization_create_entry("Coins Small 49 robux").unwrap();
+        assert_eq!(spec.name, "Coins Small");
+        assert_eq!(spec.price, 49);
+    }
+
+    #[test]
+    fn monetization_args_parse_product_image_by_name() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "monetization",
+            "dp",
+            "image",
+            "--name",
+            "Coins Small",
+            "coins-small.png",
+            "--project",
+            ".",
+        ])
+        .unwrap();
+        let Some(Command::Monetization(args)) = cli.command else {
+            panic!("expected monetization command");
+        };
+        let MonetizationCommand::Product(args) = args.command else {
+            panic!("expected product command");
+        };
+        let MonetizationAction::Image(args) = args.command else {
+            panic!("expected image command");
+        };
+        assert_eq!(args.name.as_deref(), Some("Coins Small"));
+        assert_eq!(args.file, PathBuf::from("coins-small.png"));
+        assert_eq!(args.common.project.unwrap(), PathBuf::from("."));
     }
 
     #[test]

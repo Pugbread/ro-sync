@@ -1,0 +1,14 @@
+{
+  "name": "open",
+  "title": "rosync open",
+  "category": "Studio control",
+  "description": "Selects one or more Studio instances by path.",
+  "usage": "rosync open [--port <port>] [--raw] <studio-path>...",
+  "examples": [
+    "rosync open ReplicatedStorage/Client/UIController",
+    "rosync open Workspace/Baseplate ReplicatedStorage/Client"
+  ],
+  "notes": [
+    "This is a shorthand over `rosync select set --paths '[...]'`."
+  ]
+}

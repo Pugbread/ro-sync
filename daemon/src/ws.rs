@@ -32,9 +32,10 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -297,6 +298,17 @@ async fn send_loop(
                         // project root so `/private/tmp` / `/tmp` round-trip
                         // cleanly on macOS.
                         let root = state.canonical_project.as_path();
+                        if is_synced_service_root_op(&op, root) {
+                            continue;
+                        }
+                        if is_push_quiet(&state.push_quiet, &op.path) {
+                            continue;
+                        }
+                        if let Some(from) = &op.from {
+                            if is_push_quiet(&state.push_quiet, from) {
+                                continue;
+                            }
+                        }
                         if let Some(po) = fs_op_to_plugin_op(root, &op) {
                             if !send_ws_msg(&mut sender, &ServerMsg::Op { op: po }).await {
                                 break;
@@ -365,6 +377,41 @@ fn has_type(s: &str, kind: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_push_quiet(
+    push_quiet: &Arc<Mutex<HashMap<std::path::PathBuf, Instant>>>,
+    path: &std::path::Path,
+) -> bool {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let now = Instant::now();
+    let mut guard = push_quiet.lock().unwrap();
+    guard.retain(|_, deadline| *deadline > now);
+    if let Some(deadline) = guard.get(&canon) {
+        return *deadline > now;
+    }
+    if let Some(deadline) = guard.get(path) {
+        return *deadline > now;
+    }
+    false
+}
+
+fn is_synced_service_root_op(op: &crate::watch::Op, root: &Path) -> bool {
+    if op.content.is_some() {
+        return false;
+    }
+    let Ok(rel) = op.path.strip_prefix(root) else {
+        return false;
+    };
+    if rel.components().count() != 1 {
+        return false;
+    }
+    let Some(name) = rel.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    crate::snapshot::SYNCED_SERVICES
+        .iter()
+        .any(|service| *service == name)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -408,6 +455,8 @@ mod tests {
             game_id: Arc::new(RwLock::new(None)),
             group_id: Arc::new(RwLock::new(None)),
             place_ids: Arc::new(RwLock::new(Vec::new())),
+            wally_enabled: Arc::new(RwLock::new(false)),
+            wally_folder: Arc::new(RwLock::new(None)),
             pending_initial: Arc::new(Mutex::new(None)),
             push_quiet: Arc::new(Mutex::new(HashMap::<PathBuf, std::time::Instant>::new())),
             request_tx,

@@ -109,15 +109,18 @@ export function mountActive(root, api) {
     const kind = String(innerOp.op || "").toLowerCase();
     const pathArr = Array.isArray(innerOp.path) ? innerOp.path : [];
     const pathStr = pathArr.join("/");
+    const meta = ["filesystem watcher"];
+    const node = innerOp.node && typeof innerOp.node === "object" ? innerOp.node : null;
+    if (node && node.class) meta.push(`class ${node.class}`);
     if (kind === "rename") {
       const from = Array.isArray(innerOp.from) ? innerOp.from.join("/") : "?";
       const to = Array.isArray(innerOp.to) ? innerOp.to.join("/") : "?";
-      return { kind, cls: "lv-fs", chip: "", msg: `rename ${from} → ${to}` };
+      return { kind, cls: "lv-fs", title: "Renamed synced path", path: to, meta: [`from ${from}`] };
     }
-    if (kind === "delete") return { kind, cls: "lv-fs", chip: "", msg: `delete ${pathStr}` };
-    if (kind === "set")    return { kind, cls: "lv-fs", chip: "", msg: `set ${pathStr}` };
-    if (kind === "update") return { kind, cls: "lv-fs", chip: "", msg: `update ${pathStr}` };
-    return { kind: kind || "op", cls: "lv-info", chip: "", msg: pathStr || JSON.stringify(innerOp) };
+    if (kind === "delete") return { kind, cls: "lv-fs", title: "Deleted synced path", path: pathStr, meta };
+    if (kind === "set") return { kind, cls: "lv-fs", title: "Created or replaced synced path", path: pathStr, meta };
+    if (kind === "update") return { kind, cls: "lv-fs", title: "Updated synced path", path: pathStr, meta };
+    return { kind: kind || "op", cls: "lv-info", title: "Daemon operation", path: pathStr, meta: [JSON.stringify(innerOp)] };
   }
 
   function eventLine(frame) {
@@ -127,39 +130,60 @@ export function mountActive(root, api) {
       : t.includes("plugin") ? "lv-studio"
       : "lv-info";
     // Short one-liner for known events; fall back to stringified frame.
-    let msg = "";
-    if (t === "initial-choice-needed") msg = "initial sync needs a choice";
-    else if (t === "initial-choice-made") msg = `initial sync: ${frame.choice || "?"}`;
-    else if (t === "config-changed") msg = "project config reloaded";
-    else if (t === "conflict") msg = `conflict @ ${frame.path || "?"}`;
-    else msg = frame.message || frame.msg || JSON.stringify(frame);
-    return { kind: t, cls, chip: "", msg };
+    let title = "";
+    let path = "";
+    const meta = [];
+    if (t === "initial-choice-needed") title = "Initial sync needs a source choice";
+    else if (t === "initial-choice-made") {
+      title = "Initial sync choice applied";
+      meta.push(`choice ${frame.choice || "?"}`);
+    } else if (t === "config-changed") title = "Project config reloaded";
+    else if (t === "conflict") {
+      title = "Sync conflict detected";
+      path = frame.path || "";
+    } else if (t === "busy") title = frame.message || frame.msg || "Daemon event burst collapsed";
+    else title = frame.message || frame.msg || JSON.stringify(frame);
+    return { kind: t, cls, title, path, meta };
   }
 
   function renderLine(frame) {
-    const line = document.createElement("span");
-    line.className = "line";
     const time = new Date(Date.now()).toLocaleTimeString();
     const rendered = frame && frame.type === "op"
       ? opLine(frame)
       : eventLine(frame || {});
     if (!rendered) return;
-    line.innerHTML =
-      `<span class="t">${time}</span> ` +
-      `<span class="${rendered.cls}">[${escape(rendered.kind)}]</span>${rendered.chip} ` +
-      `<span>${escape(rendered.msg)}</span>`;
-    return line;
+    return renderLogCard(rendered, time);
   }
 
   function droppedLine(count) {
-    const line = document.createElement("span");
-    line.className = "line";
-    const time = new Date(Date.now()).toLocaleTimeString();
-    line.innerHTML =
-      `<span class="t">${time}</span> ` +
-      `<span class="lv-info">[busy]</span> ` +
-      `<span>collapsed ${count} daemon events while the log was saturated</span>`;
-    return line;
+    return renderLogCard({
+      kind: "busy",
+      cls: "lv-info",
+      title: `Collapsed ${count} daemon events while the log was saturated`,
+      path: "",
+      meta: ["log throttle"],
+    }, new Date(Date.now()).toLocaleTimeString());
+  }
+
+  function renderLogCard(rendered, time) {
+    const card = document.createElement("article");
+    card.className = `log-card ${rendered.cls}`;
+    const meta = Array.isArray(rendered.meta) ? rendered.meta.filter(Boolean) : [];
+    card.innerHTML = `
+      <div class="log-card-head">
+        <span class="log-kind">${escape(rendered.kind || "event")}</span>
+        <span class="log-time">${escape(time)}</span>
+      </div>
+      <div class="log-title">${escape(rendered.title || "Daemon event")}</div>
+      ${rendered.path ? `
+        <div class="log-path-row">
+          <div class="log-path">${escape(rendered.path)}</div>
+          <button class="log-copy" data-copy-path="${escape(rendered.path)}">Copy path</button>
+        </div>
+      ` : ""}
+      ${meta.length ? `<div class="log-meta">${meta.map((item) => `<span>${escape(item)}</span>`).join("")}</div>` : ""}
+    `;
+    return card;
   }
 
   function isNearBottom() {
@@ -342,6 +366,18 @@ export function mountActive(root, api) {
     opCount = 0;
     $ops.textContent = "0";
   });
+  $log.addEventListener("click", async (event) => {
+    const btn = event.target.closest("[data-copy-path]");
+    if (!btn) return;
+    const path = btn.dataset.copyPath || "";
+    if (!path) return;
+    try {
+      await navigator.clipboard.writeText(path);
+      api.toast && api.toast("Path copied");
+    } catch {
+      api.toast && api.toast("Could not copy path");
+    }
+  });
   $live.addEventListener("click", () => {
     liveEnabled = !liveEnabled;
     $live.textContent = liveEnabled ? "Stop live log" : "Start live log";
@@ -389,5 +425,7 @@ export function mountActive(root, api) {
 }
 
 function escape(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
 }

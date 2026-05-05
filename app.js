@@ -566,7 +566,7 @@ onT64("t64:init", (payload) => {
 const ENABLE_APP_REALTIME_STREAM = true;
 // Server frames are serde-tagged with `type`:
 //   {type:"op", op:{op:"set"|"delete"|"update"|"rename", path:[...], ...}}
-//       → bufferOp(innerOp) for the burst-preview heuristic
+//       → skipped here; the plugin consumes sync ops directly
 //   {type:"<event-name>", ...}   ← daemon forwards state.events frames with
 //       their ORIGINAL top-level type ("initial-choice-needed",
 //       "initial-choice-made", "config-changed", "conflict", "batch-preview")
@@ -576,94 +576,15 @@ const ENABLE_APP_REALTIME_STREAM = true;
 let appWS = null;
 const RAW_OP_RE = /"type"\s*:\s*"op"/;
 
-// Heuristic collector: any op burst where >5 ops arrive within 500ms triggers
-// a synthetic "batch-preview" bus event, so the preview modal can gate large
-// auto-applied changes even before the daemon emits batch-preview natively.
-// Only {type:"op"} frames feed this — control/event frames are routed directly
-// to the bus without passing through here.
-const opBuffer = [];
-let opFlushTimer = null;
-let droppedBufferedOps = 0;
-const MAX_OP_BUFFER = 200;
-let rawOpCount = 0;
-let rawOpFlushTimer = null;
-// While an initial sync is in flight, hundreds-to-thousands of ops flood the
-// stream legitimately. The >5-ops-in-500ms heuristic would pop the preview
-// modal every burst, creating an infinite accept loop. Suppress until ops
-// quiet down for ~3s after the user's initial-choice.
-let suppressHeuristicUntil = 0;
-let lastOpTs = 0;
-function suppressHeuristic(ms) {
-  suppressHeuristicUntil = Math.max(suppressHeuristicUntil, Date.now() + ms);
-}
-on("initial-choice-needed", () => suppressHeuristic(60_000));
-on("initial-choice-made", () => suppressHeuristic(60_000));
-function bufferOp(data) {
-  if (document.hidden) return;
-  lastOpTs = Date.now();
-  // During bootstrap, extend suppression with a rolling 5s trailing window
-  // so the last burst doesn't immediately pop a preview modal.
-  if (Date.now() < suppressHeuristicUntil) {
-    suppressHeuristicUntil = Math.max(suppressHeuristicUntil, Date.now() + 5_000);
-    return;
-  }
-  opBuffer.push(data);
-  if (opBuffer.length > MAX_OP_BUFFER) {
-    const drop = opBuffer.length - MAX_OP_BUFFER;
-    opBuffer.splice(0, drop);
-    droppedBufferedOps += drop;
-  }
-  if (!opFlushTimer) opFlushTimer = setTimeout(flushOpBuffer, 500);
-}
-function flushOpBuffer() {
-  opFlushTimer = null;
-  const ops = opBuffer.splice(0);
-  if (ops.length <= 5) return;
-  if (Date.now() < suppressHeuristicUntil) return;
-  let added = 0, updated = 0, removed = 0;
-  for (const op of ops) {
-    // bufferOp stores the INNER plugin-shape op, where `op.op` is the kind
-    // string ("set" / "delete" / "update" / "rename"). "set" covers both
-    // additions and property updates; treat it as "added" for display.
-    const k = String((op && op.op) || "").toLowerCase();
-    if (k === "delete" || k === "remove") removed++;
-    else if (k === "set" || k === "add" || k === "create") added++;
-    else updated++;
-  }
-  emit("batch-preview", {
-    source: "heuristic",
-    summary: { added, updated, removed, dropped: droppedBufferedOps },
-    ops,
-  });
-  droppedBufferedOps = 0;
-}
-
+// Op frames are intentionally skipped on the app-level stream so large file
+// bursts do not force the Terminal 64 host to JSON-parse every source payload.
+// Older builds also synthesized a "batch-preview" modal from rapid op bursts;
+// that made normal Codex/multiedit syncs look suspicious. When the daemon is
+// alive, filesystem sync is the source of truth, so only native daemon control
+// events should ask for a decision.
 function shouldSkipRawAppFrame(raw) {
   if (typeof raw !== "string" || !RAW_OP_RE.test(raw)) return false;
-  if (document.hidden) return true;
-
-  const now = Date.now();
-  lastOpTs = now;
-  if (now < suppressHeuristicUntil) {
-    suppressHeuristicUntil = Math.max(suppressHeuristicUntil, now + 5_000);
-    return true;
-  }
-
-  rawOpCount++;
-  if (!rawOpFlushTimer) rawOpFlushTimer = setTimeout(flushRawOpHeuristic, 500);
   return true;
-}
-
-function flushRawOpHeuristic() {
-  rawOpFlushTimer = null;
-  const count = rawOpCount;
-  rawOpCount = 0;
-  if (count <= 5 || Date.now() < suppressHeuristicUntil) return;
-  emit("batch-preview", {
-    source: "heuristic",
-    summary: { added: 0, updated: count, removed: 0, dropped: 0 },
-    ops: [],
-  });
 }
 
 function openAppStream() {
@@ -680,9 +601,8 @@ function openAppStream() {
         const t = data.type;
         if (!t) return;
         if (t === "op") {
-          // Store the INNER plugin-shape op so downstream consumers look at
-          // `op.op` (kind), `op.path` (array), etc. without re-unwrapping.
-          if (data.op && typeof data.op === "object") bufferOp(data.op);
+          // Sync ops are applied by the plugin. The app-level stream only
+          // exists for control events, so never turn op volume into a prompt.
           return;
         }
         // Transport-only frames — not surfaced to views.
@@ -729,7 +649,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     getState,
     toast,
   });
-  // Mount the batch-preview threshold modal at app-level.
+  // Mount the daemon-sourced batch-preview modal at app-level.
   mountPreviewModal({
     onBus: on,
     getDaemonBase,
