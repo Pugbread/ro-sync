@@ -60,6 +60,9 @@ Ro Sync keeps one canonical agent entrypoint:
 - `ro-sync.md` contains compact LLM-first command guidance and points agents
   to `rosync commands --compact` plus `rosync commands <name>` for on-demand
   usage JSON.
+- When Wally is enabled, `AGENTS.md` also embeds the resolved Wally package
+  configuration from `ro-sync.json` / `wally.toml` so agents can reason about
+  `Packages` requires without opening the project settings first.
 
 The generated context tells agents to use `rosync` first, including
 `rosync upload`, before searching for unrelated Roblox upload tools.

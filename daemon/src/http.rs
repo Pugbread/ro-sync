@@ -525,12 +525,18 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
     let ctx = PushCtx {
         conflicts: state.conflict.as_ref(),
         push_quiet: state.push_quiet.as_ref(),
+        force_overwrite: false,
     };
     let mut res = PushApplyResult::default();
 
     if body.bootstrap {
+        let bootstrap_ctx = PushCtx {
+            conflicts: state.conflict.as_ref(),
+            push_quiet: state.push_quiet.as_ref(),
+            force_overwrite: true,
+        };
         for svc in &body.services {
-            match apply_service_node(root, svc, &ctx) {
+            match apply_service_node(root, svc, &bootstrap_ctx) {
                 Ok(n) => res.applied += n,
                 Err(e) => res.errors.push(format!("bootstrap: {e}")),
             }
@@ -584,6 +590,7 @@ pub(crate) fn apply_push_ops(state: &AppState, ops: &[Value]) -> PushApplyResult
     let ctx = PushCtx {
         conflicts: state.conflict.as_ref(),
         push_quiet: state.push_quiet.as_ref(),
+        force_overwrite: false,
     };
     let mut out = PushApplyResult::default();
     apply_ops_into(root, ops, &ctx, &mut out);
@@ -596,6 +603,7 @@ pub(crate) fn apply_push_ops(state: &AppState, ops: &[Value]) -> PushApplyResult
 pub(crate) struct PushCtx<'a> {
     pub conflicts: &'a crate::conflict::ConflictEngine,
     pub push_quiet: &'a Mutex<HashMap<PathBuf, Instant>>,
+    pub force_overwrite: bool,
 }
 
 impl<'a> PushCtx<'a> {
@@ -844,7 +852,6 @@ fn apply_set(
     node: &Value,
     ctx: &PushCtx<'_>,
 ) -> Result<ApplyOutcome, String> {
-    let conflicts = ctx.conflicts;
     let name = node
         .get("name")
         .and_then(|v| v.as_str())
@@ -907,34 +914,10 @@ fn apply_set(
             // bytes and cached hashes line up regardless of checkout style.
             let raw_bytes = source.unwrap_or_default().into_bytes();
             let bytes = normalize_line_endings(&raw_bytes).into_owned();
-            let current = if target.is_file() {
-                Some((
-                    std::fs::read(&target).unwrap_or_default(),
-                    fs_mtime(&target),
-                ))
-            } else {
-                None
-            };
-            let normalized_current: Option<Vec<u8>> = current
-                .as_ref()
-                .map(|(b, _)| normalize_line_endings(b).into_owned());
-            let current_ref = current
-                .as_ref()
-                .zip(normalized_current.as_ref())
-                .map(|((_, m), nb)| (nb.as_slice(), *m));
-            match conflicts.on_studio_push(&target, &bytes, current_ref) {
-                StudioDecision::Apply => {
-                    ctx.mark_quiet(&target);
-                    std::fs::write(&target, &bytes)
-                        .map_err(|e| format!("write {}: {e}", target.display()))?;
-                    conflicts.record_sync(&target, hash(&bytes), fs_mtime(&target));
-                    ctx.mark_quiet(&target);
-                    applied += 1;
-                }
-                StudioDecision::NoChange => {}
-                StudioDecision::Conflict => {
-                    return Ok(ApplyOutcome::Conflict(target));
-                }
+            match apply_source_bytes(&target, &bytes, ctx)? {
+                SourceWriteOutcome::Applied => applied += 1,
+                SourceWriteOutcome::Skipped => {}
+                SourceWriteOutcome::Conflict(path) => return Ok(ApplyOutcome::Conflict(path)),
             }
         }
         (Some(sc), true) => {
@@ -946,34 +929,10 @@ fn apply_set(
             let init_path = target.join(&init_name);
             let raw_bytes = source.unwrap_or_default().into_bytes();
             let bytes = normalize_line_endings(&raw_bytes).into_owned();
-            let current = if init_path.is_file() {
-                Some((
-                    std::fs::read(&init_path).unwrap_or_default(),
-                    fs_mtime(&init_path),
-                ))
-            } else {
-                None
-            };
-            let normalized_current: Option<Vec<u8>> = current
-                .as_ref()
-                .map(|(b, _)| normalize_line_endings(b).into_owned());
-            let current_ref = current
-                .as_ref()
-                .zip(normalized_current.as_ref())
-                .map(|((_, m), nb)| (nb.as_slice(), *m));
-            match conflicts.on_studio_push(&init_path, &bytes, current_ref) {
-                StudioDecision::Apply => {
-                    ctx.mark_quiet(&init_path);
-                    std::fs::write(&init_path, &bytes)
-                        .map_err(|e| format!("write {}: {e}", init_path.display()))?;
-                    conflicts.record_sync(&init_path, hash(&bytes), fs_mtime(&init_path));
-                    ctx.mark_quiet(&init_path);
-                    applied += 1;
-                }
-                StudioDecision::NoChange => {}
-                StudioDecision::Conflict => {
-                    return Ok(ApplyOutcome::Conflict(init_path));
-                }
+            match apply_source_bytes(&init_path, &bytes, ctx)? {
+                SourceWriteOutcome::Applied => applied += 1,
+                SourceWriteOutcome::Skipped => {}
+                SourceWriteOutcome::Conflict(path) => return Ok(ApplyOutcome::Conflict(path)),
             }
             if let Some(kids) = children {
                 let mut child_segs: Vec<String> = parent_segs.to_vec();
@@ -1003,6 +962,52 @@ fn apply_set(
         }
     }
     Ok(ApplyOutcome::Applied(applied))
+}
+
+enum SourceWriteOutcome {
+    Applied,
+    Skipped,
+    Conflict(PathBuf),
+}
+
+fn apply_source_bytes(
+    target: &Path,
+    bytes: &[u8],
+    ctx: &PushCtx<'_>,
+) -> Result<SourceWriteOutcome, String> {
+    let conflicts = ctx.conflicts;
+    if ctx.force_overwrite {
+        ctx.mark_quiet(target);
+        std::fs::write(target, bytes).map_err(|e| format!("write {}: {e}", target.display()))?;
+        conflicts.record_sync(target, hash(bytes), fs_mtime(target));
+        ctx.mark_quiet(target);
+        return Ok(SourceWriteOutcome::Applied);
+    }
+
+    let current = if target.is_file() {
+        Some((std::fs::read(target).unwrap_or_default(), fs_mtime(target)))
+    } else {
+        None
+    };
+    let normalized_current: Option<Vec<u8>> = current
+        .as_ref()
+        .map(|(b, _)| normalize_line_endings(b).into_owned());
+    let current_ref = current
+        .as_ref()
+        .zip(normalized_current.as_ref())
+        .map(|((_, m), nb)| (nb.as_slice(), *m));
+    match conflicts.on_studio_push(target, bytes, current_ref) {
+        StudioDecision::Apply => {
+            ctx.mark_quiet(target);
+            std::fs::write(target, bytes)
+                .map_err(|e| format!("write {}: {e}", target.display()))?;
+            conflicts.record_sync(target, hash(bytes), fs_mtime(target));
+            ctx.mark_quiet(target);
+            Ok(SourceWriteOutcome::Applied)
+        }
+        StudioDecision::NoChange => Ok(SourceWriteOutcome::Skipped),
+        StudioDecision::Conflict => Ok(SourceWriteOutcome::Conflict(target.to_path_buf())),
+    }
 }
 
 fn apply_delete(root: &Path, segs: &[String], ctx: &PushCtx<'_>) -> Result<usize, String> {
@@ -1489,6 +1494,18 @@ mod tests {
         PushCtx {
             conflicts: engine,
             push_quiet: quiet,
+            force_overwrite: false,
+        }
+    }
+
+    fn force_harness<'a>(
+        engine: &'a ConflictEngine,
+        quiet: &'a Mutex<HashMap<PathBuf, Instant>>,
+    ) -> PushCtx<'a> {
+        PushCtx {
+            conflicts: engine,
+            push_quiet: quiet,
+            force_overwrite: true,
         }
     }
 
@@ -1587,6 +1604,45 @@ mod tests {
             std::fs::read_to_string(init_path).unwrap(),
             "print('new')\n"
         );
+    }
+
+    #[test]
+    fn bootstrap_force_overwrites_sources_without_diffing_existing_files() {
+        let d = TempDir::new("bootstrap-force-overwrite-script-dir");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = force_harness(&engine, &quiet);
+
+        let controller = d.path().join("ReplicatedStorage").join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        let init_path = controller.join("init (Controller).luau");
+        let child_path = controller.join("Child.luau");
+        std::fs::write(&init_path, "print('same')\n").unwrap();
+        std::fs::write(&child_path, "return {}\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "Controller",
+                "class": "ModuleScript",
+                "properties": { "Source": "print('same')\r\n" },
+                "children": [{
+                    "name": "Child",
+                    "class": "ModuleScript",
+                    "properties": { "Source": "return {}\r\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(
+            std::fs::read_to_string(init_path).unwrap(),
+            "print('same')\n"
+        );
+        assert_eq!(std::fs::read_to_string(child_path).unwrap(), "return {}\n");
     }
 
     // POST /tree writes body to `.tree.json.tmp` then atomically renames it to

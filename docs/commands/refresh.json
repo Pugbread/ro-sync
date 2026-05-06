@@ -9,6 +9,7 @@
     "rosync refresh --project . --raw"
   ],
   "notes": [
-    "Updates `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside generated blocks."
+    "Updates `ro-sync.md`, `AGENTS.md`, `CLAUDE.md`, and `.codex/config.toml` while preserving project notes outside generated blocks.",
+    "When Wally is enabled or a `wally.toml` is present, the regenerated `AGENTS.md` block embeds the resolved Wally settings and package config."
   ]
 }
