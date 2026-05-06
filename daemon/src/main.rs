@@ -1425,6 +1425,10 @@ pub struct AppState {
     /// outbound mpsc sender is stashed here so the plugin's response frame
     /// can be steered back to the right connection.
     pub pending_routes: PendingRoutes,
+    /// The single active Roblox Studio plugin WebSocket connection. CLI/watch
+    /// clients are allowed to come and go, but only one plugin may own the live
+    /// Studio bridge at a time.
+    pub active_plugin: Arc<Mutex<Option<u64>>>,
 }
 
 /// Duration of the per-path quiet window after a `/push` write.
@@ -1573,6 +1577,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         push_quiet: push_quiet.clone(),
         request_tx,
         pending_routes: Arc::new(Mutex::new(HashMap::new())),
+        active_plugin: Arc::new(Mutex::new(None)),
     };
 
     spawn_watch_bridge(
@@ -1593,8 +1598,44 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(serve_shutdown_signal(tx.clone()))
+        .await?;
     Ok(())
+}
+
+async fn serve_shutdown_signal(events: broadcast::Sender<String>) {
+    wait_for_shutdown_signal().await;
+    let _ = events.send(
+        serde_json::json!({
+            "type": "shutdown",
+            "reason": "daemon shutting down",
+        })
+        .to_string(),
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = async {
+            if let Some(signal) = terminate.as_mut() {
+                signal.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -4663,7 +4704,8 @@ async fn run_watch(args: WatchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("ws://127.0.0.1:{}/ws", args.port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({ "type": "hello", "clientId": "rosync-watch" }).to_string(),
+        serde_json::json!({ "type": "hello", "clientId": "rosync-watch", "role": "watch" })
+            .to_string(),
     ))
     .await?;
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());

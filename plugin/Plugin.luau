@@ -2845,6 +2845,15 @@ local function wsLoop(gen)
 					log("ws: daemon broadcast lagged — will resync via /initial-compare")
 					lagged = true
 					pcall(function() client:Close() end)
+				elseif kind == "shutdown" then
+					log("ws: daemon shutdown — " .. tostring(msg.reason or "?"))
+					connected = false
+					busy = false
+					wsGeneration += 1
+					disconnectHooks()
+					setPill("idle")
+					setBanner(nil)
+					pcall(function() client:Close() end)
 				elseif kind == "pong" then
 					-- liveness already refreshed above
 				elseif kind == "ping" then
@@ -2875,7 +2884,7 @@ local function wsLoop(gen)
 
 			-- Announce ourselves. If the initial Send fails outright, bail and
 			-- let the outer backoff loop retry.
-			local helloOk = wsSend(client, { type = "hello", clientId = clientId })
+			local helloOk = wsSend(client, { type = "hello", clientId = clientId, role = "plugin" })
 			if helloOk then
 				wsBackoff = WS_BACKOFF_START
 				lastPongClock = os.clock()

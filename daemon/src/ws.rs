@@ -16,6 +16,7 @@
 //     {"type":"op","op":<plugin-shape op>}
 //     {"type":"ping"}            // 10-second heartbeat
 //     {"type":"pong"}            // reply to client ping
+//     {"type":"shutdown","reason":"..."} // daemon/plugin session is closing
 //     {"type":"lagged"}          // broadcast overflow; close follows
 //     {"type":"push-result", ok, applied, skipped, conflicts, errors}
 //     {"type":"error","error":"..."}
@@ -68,6 +69,8 @@ pub enum ClientMsg {
         #[serde(rename = "clientId", default)]
         #[allow(dead_code)]
         client_id: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
     },
     Push {
         #[serde(default)]
@@ -100,6 +103,9 @@ pub enum ServerMsg {
     },
     Ping,
     Pong,
+    Shutdown {
+        reason: String,
+    },
     Lagged,
     PushResult {
         ok: bool,
@@ -165,6 +171,10 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // closed", which the mpsc flags automatically once the receiver is dropped.
     let mut routes = state.pending_routes.lock().unwrap();
     routes.retain(|_, sink| !sink.is_closed());
+    let mut active = state.active_plugin.lock().unwrap();
+    if *active == Some(conn_id) {
+        *active = None;
+    }
 }
 
 async fn recv_loop(
@@ -173,6 +183,7 @@ async fn recv_loop(
     out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     conn_id: u64,
 ) {
+    let mut rejecting = false;
     while let Some(frame) = receiver.next().await {
         let frame = match frame {
             Ok(f) => f,
@@ -180,7 +191,33 @@ async fn recv_loop(
         };
         match frame {
             Message::Text(txt) => match serde_json::from_str::<ClientMsg>(&txt) {
-                Ok(ClientMsg::Hello { .. }) => {}
+                _ if rejecting => {}
+                Ok(ClientMsg::Hello { client_id, role }) => {
+                    if is_plugin_client(role.as_deref(), client_id.as_deref()) {
+                        let already_active = {
+                            let mut active = state.active_plugin.lock().unwrap();
+                            match *active {
+                                Some(existing) if existing != conn_id => true,
+                                _ => {
+                                    *active = Some(conn_id);
+                                    false
+                                }
+                            }
+                        };
+                        if already_active {
+                            let _ = send_server_msg(
+                                &out_tx,
+                                &ServerMsg::Shutdown {
+                                    reason: "another Roblox Studio plugin is already connected"
+                                        .into(),
+                                },
+                            );
+                            let _ = out_tx.send(Message::Close(None));
+                            rejecting = true;
+                            continue;
+                        }
+                    }
+                }
                 Ok(ClientMsg::Pong) => {}
                 Ok(ClientMsg::Ping) => {
                     let _ = send_server_msg(&out_tx, &ServerMsg::Pong);
@@ -358,6 +395,19 @@ fn send_server_msg(
     out_tx.send(Message::Text(s)).map_err(|_| ())
 }
 
+fn is_plugin_client(role: Option<&str>, client_id: Option<&str>) -> bool {
+    match role {
+        Some("plugin") | Some("studio-plugin") | Some("roblox-plugin") => return true,
+        Some("cli") | Some("watch") | Some("agent") => return false,
+        Some(_) | None => {}
+    }
+
+    !matches!(
+        client_id.unwrap_or(""),
+        "rosync-cli" | "rosync-watch" | "cli" | "watch"
+    )
+}
+
 async fn send_ws_msg(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     msg: &ServerMsg,
@@ -461,6 +511,7 @@ mod tests {
             push_quiet: Arc::new(Mutex::new(HashMap::<PathBuf, std::time::Instant>::new())),
             request_tx,
             pending_routes: Arc::new(Mutex::new(HashMap::new())),
+            active_plugin: Arc::new(Mutex::new(None)),
         };
 
         let app = crate::http::router(state.clone());
@@ -597,6 +648,45 @@ mod tests {
             echoed.is_none(),
             "CLI must not receive its own request back"
         );
+    }
+
+    #[tokio::test]
+    async fn second_plugin_connection_is_rejected() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        first
+            .send(tungstenite::Message::Text(
+                r#"{"type":"hello","clientId":"studio-a","role":"plugin"}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        second
+            .send(tungstenite::Message::Text(
+                r#"{"type":"hello","clientId":"studio-b","role":"plugin"}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        let shutdown = recv_until_type(&mut second, "shutdown", Duration::from_secs(3))
+            .await
+            .expect("second plugin should be told to shut down");
+        assert_eq!(
+            shutdown["reason"],
+            "another Roblox Studio plugin is already connected"
+        );
+
+        first
+            .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        let pong = recv_until_type(&mut first, "pong", Duration::from_secs(3))
+            .await
+            .expect("first plugin should remain connected");
+        assert_eq!(pong["type"], "pong");
     }
 
     /// End-to-end test using the `remote::request` client against a real

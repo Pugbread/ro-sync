@@ -45,7 +45,7 @@ pub async fn request(port: u16, op: &str, args: Value) -> Result<Value, String> 
         .map_err(|e| format!("connect {url}: {e}"))?;
 
     ws.send(Message::Text(
-        r#"{"type":"hello","clientId":"rosync-cli"}"#.into(),
+        r#"{"type":"hello","clientId":"rosync-cli","role":"cli"}"#.into(),
     ))
     .await
     .map_err(|e| format!("send hello: {e}"))?;
