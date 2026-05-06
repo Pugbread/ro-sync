@@ -692,16 +692,34 @@ local function isEchoing(): boolean
 	return (os.clock() - lastRemoteApplyClock) < ECHO_GUARD_WINDOW
 end
 
-local function writeScriptSource(inst, newSource: string)
+local function normalizeSourceForCompare(source: string): string
+	if not source:find("\r", 1, true) then
+		return source
+	end
+	return (source:gsub("\r\n", "\n"):gsub("\r", "\n"))
+end
+
+local function sourcesMatchForApply(currentSource: string, newSource: string): boolean
+	if currentSource == newSource then
+		return true
+	end
+	return normalizeSourceForCompare(currentSource) == normalizeSourceForCompare(newSource)
+end
+
+local function writeScriptSource(inst, newSource: string): boolean
+	if sourcesMatchForApply(readScriptSource(inst), newSource) then
+		return false
+	end
 	if ScriptEditorService then
 		local ok = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(inst, function(_old)
 				return newSource
 			end)
 		end)
-		if ok then return end
+		if ok then return true end
 	end
 	pcall(function() inst.Source = newSource end)
+	return true
 end
 
 -- Source is the only property we round-trip. Scripts get rewritten via
