@@ -29,7 +29,7 @@ local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
 local PROBE_TIMEOUT_SECONDS = 2
 local MAX_LOG_LINES = 200
-local SOURCE_WRITE_CONCURRENCY = 8
+local SOURCE_WRITE_CONCURRENCY = 16
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
