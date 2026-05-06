@@ -29,6 +29,7 @@ local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
 local PROBE_TIMEOUT_SECONDS = 2
 local MAX_LOG_LINES = 200
+local SOURCE_WRITE_CONCURRENCY = 8
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
@@ -706,29 +707,87 @@ local function sourcesMatchForApply(currentSource: string, newSource: string): b
 	return normalizeSourceForCompare(currentSource) == normalizeSourceForCompare(newSource)
 end
 
-local function writeScriptSource(inst, newSource: string): boolean
-	if sourcesMatchForApply(readScriptSource(inst), newSource) then
-		return false
-	end
+local function applyScriptSource(inst, newSource: string): boolean
+	lastRemoteApplyClock = os.clock()
 	if ScriptEditorService then
 		local ok = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(inst, function(_old)
 				return newSource
 			end)
 		end)
+		lastRemoteApplyClock = os.clock()
 		if ok then return true end
 	end
 	pcall(function() inst.Source = newSource end)
+	lastRemoteApplyClock = os.clock()
 	return true
+end
+
+local function writeScriptSource(inst, newSource: string): boolean
+	if sourcesMatchForApply(readScriptSource(inst), newSource) then
+		return false
+	end
+	return applyScriptSource(inst, newSource)
+end
+
+local function queueScriptSourceWrite(queue, inst, newSource: string): boolean
+	if sourcesMatchForApply(readScriptSource(inst), newSource) then
+		return false
+	end
+	table.insert(queue, {
+		inst = inst,
+		source = newSource,
+	})
+	return true
+end
+
+local function flushScriptSourceWrites(queue): number
+	local total = #queue
+	if total == 0 then
+		return 0
+	end
+
+	local nextIndex = 0
+	local finishedWorkers = 0
+	local workers = math.min(SOURCE_WRITE_CONCURRENCY, total)
+	local applied = 0
+
+	for _ = 1, workers do
+		task.spawn(function()
+			while true do
+				nextIndex += 1
+				local job = queue[nextIndex]
+				if not job then
+					break
+				end
+				if applyScriptSource(job.inst, job.source) then
+					applied += 1
+				end
+			end
+			finishedWorkers += 1
+		end)
+	end
+
+	while finishedWorkers < workers do
+		lastRemoteApplyClock = os.clock()
+		task.wait()
+	end
+
+	return applied
 end
 
 -- Source is the only property we round-trip. Scripts get rewritten via
 -- ScriptEditorService so Studio's editor sees the new text; everything else
 -- is silently dropped — non-script props are Studio-authoritative.
-local function applyProperties(inst, props)
+local function applyProperties(inst, props, opts)
 	if type(props) ~= "table" then return end
 	if props.Source ~= nil and inst:IsA("LuaSourceContainer") then
-		writeScriptSource(inst, tostring(props.Source or ""))
+		local source = tostring(props.Source or "")
+		if opts and opts.sourceWrites then
+			queueScriptSourceWrite(opts.sourceWrites, inst, source)
+		else
+			writeScriptSource(inst, source)
+		end
 	end
 end
 
@@ -827,7 +886,7 @@ local function applyNode(parent, node, opts)
 			inst.Parent = parent
 		end
 	end
-	applyProperties(inst, node.properties)
+	applyProperties(inst, node.properties, opts)
 	local wanted = {}
 	for _, c in ipairs(node.children or {}) do
 		wanted[c.name] = true
@@ -942,6 +1001,12 @@ local function applySnapshot(snap)
 		if snap and snap.services then
 			local strict = snap.strict == true
 			local forcePrune = snap.forcePrune == true
+			local sourceWrites = {}
+			local applyOpts = {
+				strict = strict,
+				forcePrune = forcePrune,
+				sourceWrites = sourceWrites,
+			}
 			for _, node in ipairs(snap.services) do
 				local svc = game:GetService(node.name)
 				if svc then
@@ -951,7 +1016,7 @@ local function applySnapshot(snap)
 					local wanted = {}
 					for _, child in ipairs(node.children or {}) do
 						wanted[child.name] = true
-						applyNode(svc, child, { strict = strict, forcePrune = forcePrune })
+						applyNode(svc, child, applyOpts)
 					end
 					if strict then
 						for _, existing in ipairs(svc:GetChildren()) do
@@ -968,6 +1033,14 @@ local function applySnapshot(snap)
 						end
 					end
 				end
+			end
+			if #sourceWrites > 0 then
+				local appliedSources = flushScriptSourceWrites(sourceWrites)
+				log(string.format(
+					"snapshot source writes: %d/%d applied with %d workers",
+					appliedSources,
+					#sourceWrites,
+					math.min(SOURCE_WRITE_CONCURRENCY, #sourceWrites)))
 			end
 		elseif snap and snap.ops then
 			for _, op in ipairs(snap.ops) do applyOp(op) end
