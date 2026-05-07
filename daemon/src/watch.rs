@@ -31,19 +31,21 @@ const DEBOUNCE_MS: u64 = 150;
 const CHANNEL_CAP: usize = 16384;
 
 /// Substrings / name fragments we never want to propagate. Matches are
-/// case-sensitive and applied to the final path component (except `.git`,
-/// `.codex`, and `.vscode`, which match any ancestor component).
+/// case-sensitive and applied to the final path component (except generated /
+/// vendor tooling directories, which match any ancestor component).
 const BLACKLISTED: &[&str] = &[
     ".DS_Store",
     ".git",
     ".codex",
     ".vscode",
+    "tools",
     "~$",
     ".#",
     ".swp",
     ".swo",
     ".meta.json",
     ".tree.json.tmp",
+    ".luaurc",
 ];
 
 /// Reserved filenames the daemon itself writes at the project root. Watching
@@ -52,6 +54,7 @@ const BLACKLISTED: &[&str] = &[
 /// with these names (unlikely, but allowed) are unaffected.
 const ROOT_RESERVED: &[&str] = &[
     ".stylua.toml",
+    ".luaurc",
     "aftman.toml",
     "ro-sync.json",
     "ro-sync.md",
@@ -220,8 +223,8 @@ fn classify_rename(from: &Path, to: &Path) -> Option<Op> {
 }
 
 /// Returns true if any component of the path matches a blacklisted fragment
-/// (either a fixed name like `.DS_Store`/`.git`/`.codex`/`.vscode`, or a substring
-/// pattern for editor swap files).
+/// (either a fixed name like `.DS_Store` / generated tooling dirs, or a
+/// substring pattern for editor swap files).
 pub(crate) fn is_blacklisted(p: &Path) -> bool {
     // Ancestor-wide matches: bail early if any component is a blacklisted
     // directory or file name.
@@ -229,7 +232,7 @@ pub(crate) fn is_blacklisted(p: &Path) -> bool {
         let Some(s) = comp.as_os_str().to_str() else {
             continue;
         };
-        if s == ".DS_Store" || s == ".git" || s == ".codex" || s == ".vscode" {
+        if s == ".DS_Store" || s == ".git" || s == ".codex" || s == ".vscode" || s == "tools" {
             return true;
         }
     }

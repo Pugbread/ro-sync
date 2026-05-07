@@ -82,12 +82,15 @@ local toolchain baseline:
 - `.stylua.toml` is created when missing, using Ro Sync's Luau formatting defaults.
 - `aftman.toml` is created or merged so `[tools]` includes
   `stylua = "JohnnyMorganz/StyLua@2.4.1"`.
+- `tools/luau-lsp/roblox/globalTypes.d.luau` is restored from Ro Sync's
+  bundled Roblox definitions, and `.luaurc` is merged so editor-side
+  `luau-lsp` can load those definitions too.
 - Existing project choices are preserved. Ro Sync does not overwrite an
-  existing `.stylua.toml`, and it does not replace existing Aftman tools such as
-  Wally.
+  existing `.stylua.toml`, does not replace existing Aftman tools such as
+  Wally, and only appends the Ro Sync definitions path to `.luaurc`.
 
-These root-level tooling files are ignored by the filesystem watcher so they do
-not sync into Studio.
+These tooling files are ignored by the filesystem watcher so they do not sync
+into Studio.
 
 `rosync lint` wraps `luau-lsp analyze` with Ro Sync defaults:
 

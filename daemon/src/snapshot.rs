@@ -25,6 +25,8 @@ pub const CODEX_DIR: &str = ".codex";
 pub const CODEX_CONFIG_TOML: &str = "config.toml";
 pub const STYLUA_TOML: &str = ".stylua.toml";
 pub const AFTMAN_TOML: &str = "aftman.toml";
+pub const LUAURC: &str = ".luaurc";
+pub const ROBLOX_DEFINITIONS_PATH: &str = "tools/luau-lsp/roblox/globalTypes.d.luau";
 
 /// Claude Code resolves `@path` references as inline imports. New projects
 /// import AGENTS.md so Claude Code and Codex route through one canonical file.
@@ -88,6 +90,7 @@ const AFTMAN_TOML_TEMPLATE: &str = concat!(
     "[tools]\n",
     "stylua = \"JohnnyMorganz/StyLua@2.4.1\"\n",
 );
+const ROBLOX_GLOBAL_TYPES: &str = include_str!("../../tools/luau-lsp/roblox/globalTypes.d.luau");
 const DEFAULT_WALLY_FOLDER: &str = "ReplicatedStorage/Packages";
 
 /// Top-level services mirrored under the project root. Order drives the
@@ -704,6 +707,8 @@ pub fn write_project_tooling_if_missing_or_merge(root: &Path) -> io::Result<bool
     let mut changed = false;
     changed |= write_stylua_toml_if_missing(root)?;
     changed |= write_aftman_stylua_if_missing_or_merge(root)?;
+    changed |= write_roblox_definitions_if_missing_or_update(root)?;
+    changed |= write_luaurc_definitions_if_missing_or_merge(root)?;
     Ok(changed)
 }
 
@@ -731,6 +736,65 @@ pub fn write_aftman_stylua_if_missing_or_merge(root: &Path) -> io::Result<bool> 
         return Ok(false);
     }
     fs::write(&p, merged)?;
+    Ok(true)
+}
+
+pub fn write_roblox_definitions_if_missing_or_update(root: &Path) -> io::Result<bool> {
+    fs::create_dir_all(root)?;
+    let p = root.join(ROBLOX_DEFINITIONS_PATH);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if p.exists() && fs::read_to_string(&p)? == ROBLOX_GLOBAL_TYPES {
+        return Ok(false);
+    }
+    fs::write(&p, ROBLOX_GLOBAL_TYPES)?;
+    Ok(true)
+}
+
+pub fn write_luaurc_definitions_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+    fs::create_dir_all(root)?;
+    let p = root.join(LUAURC);
+    let mut config = if p.exists() {
+        let existing = fs::read_to_string(&p)?;
+        serde_json::from_str::<Value>(&existing).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse {}: {e}", p.display()),
+            )
+        })?
+    } else {
+        json!({
+            "languageMode": "nonstrict",
+        })
+    };
+
+    let object = config.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must contain a JSON object", p.display()),
+        )
+    })?;
+
+    let definitions = object
+        .entry("definitions")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let definitions = definitions.as_array_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}.definitions must be an array", p.display()),
+        )
+    })?;
+
+    let definition = Value::String(ROBLOX_DEFINITIONS_PATH.to_string());
+    if definitions.iter().any(|value| value == &definition) {
+        return Ok(false);
+    }
+    definitions.push(definition);
+
+    let text = serde_json::to_string_pretty(&config)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(&p, format!("{text}\n"))?;
     Ok(true)
 }
 
@@ -1615,7 +1679,31 @@ mod tests {
         assert!(aftman.contains("[tools]"));
         assert!(aftman.contains(STYLUA_TOOL_LINE));
 
+        let luaurc = fs::read_to_string(d.path().join(LUAURC)).unwrap();
+        assert!(luaurc.contains("\"languageMode\""));
+        assert!(luaurc.contains(ROBLOX_DEFINITIONS_PATH));
+        assert!(d.path().join(ROBLOX_DEFINITIONS_PATH).is_file());
+
         assert!(!write_project_tooling_if_missing_or_merge(d.path()).unwrap());
+    }
+
+    #[test]
+    fn luaurc_merge_preserves_existing_config_and_adds_definitions() {
+        let d = TempDir::new("luaurc-merge");
+        let p = d.path().join(LUAURC);
+        fs::write(
+            &p,
+            "{\n  \"languageMode\": \"strict\",\n  \"diagnostics\": {\"unused-local\": \"ignore\"}\n}\n",
+        )
+        .unwrap();
+
+        assert!(write_luaurc_definitions_if_missing_or_merge(d.path()).unwrap());
+        let merged = fs::read_to_string(&p).unwrap();
+        assert!(merged.contains("\"languageMode\": \"strict\""));
+        assert!(merged.contains("\"diagnostics\""));
+        assert!(merged.contains(ROBLOX_DEFINITIONS_PATH));
+
+        assert!(!write_luaurc_definitions_if_missing_or_merge(d.path()).unwrap());
     }
 
     #[test]

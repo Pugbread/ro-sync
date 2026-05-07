@@ -5380,6 +5380,22 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("StyLua tool pin ensured"),
     });
 
+    let definitions_existed = project.join(snapshot::ROBLOX_DEFINITIONS_PATH).exists();
+    let definitions_changed = snapshot::write_roblox_definitions_if_missing_or_update(&project)?;
+    files.push(RefreshFileStatus {
+        path: snapshot::ROBLOX_DEFINITIONS_PATH,
+        status: refresh_file_status(definitions_existed, definitions_changed),
+        note: Some("Roblox Luau definitions ensured"),
+    });
+
+    let luaurc_existed = project.join(snapshot::LUAURC).exists();
+    let luaurc_changed = snapshot::write_luaurc_definitions_if_missing_or_merge(&project)?;
+    files.push(RefreshFileStatus {
+        path: snapshot::LUAURC,
+        status: refresh_file_status(luaurc_existed, luaurc_changed),
+        note: Some("luau-lsp Roblox definitions wired"),
+    });
+
     let changed = files
         .iter()
         .filter(|file| file.status == "created" || file.status == "updated")
