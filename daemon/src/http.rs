@@ -1294,9 +1294,9 @@ fn children_exist(dir: &Path) -> bool {
 // Filesystem op → plugin op translation
 // ---------------------------------------------------------------------------
 
-/// Convert a watcher `Op` into a plugin-facing op (`set` / `delete` / `update`).
-/// Directories (add/update) produce `set` ops with a minimal node envelope;
-/// leaf scripts produce `set` ops carrying `properties.Source`.
+/// Convert a watcher `Op` into a plugin-facing op (`set` / `delete` / `update` /
+/// `rename`). Directories (add/update) produce `set` ops with a minimal node
+/// envelope; leaf scripts produce `set` ops carrying `properties.Source`.
 pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
     let rel = op.path.strip_prefix(root).ok()?;
     let segs: Vec<String> = rel
@@ -1603,6 +1603,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(init_path).unwrap(),
             "print('new')\n"
+        );
+    }
+
+    #[test]
+    fn fs_rename_op_to_plugin_uses_from_and_to_paths() {
+        let d = TempDir::new("fs-rename-op");
+        let from = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Shared")
+            .join("OldName.luau");
+        let to = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Shared")
+            .join("NewName.luau");
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: None,
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("rename plugin op");
+
+        assert_eq!(plugin_op["op"], "rename");
+        assert_eq!(
+            plugin_op["from"],
+            serde_json::json!(["ReplicatedStorage", "Shared", "OldName"])
+        );
+        assert_eq!(
+            plugin_op["to"],
+            serde_json::json!(["ReplicatedStorage", "Shared", "NewName"])
         );
     }
 

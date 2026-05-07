@@ -678,6 +678,15 @@ local function resolvePath(path)
 	return cur
 end
 
+local function parentPath(path)
+	if type(path) ~= "table" or #path <= 1 then return nil end
+	local parent = {}
+	for i = 1, #path - 1 do
+		parent[i] = path[i]
+	end
+	return parent
+end
+
 --------------------------------------------------------------------------------
 -- Applying daemon ops (FS -> Studio)
 --------------------------------------------------------------------------------
@@ -950,8 +959,26 @@ local function applyOp(op)
 			writeScriptSource(target, tostring(props.Source or ""))
 		end
 	elseif kind == "rename" then
-		local target = resolvePath(op.path)
-		if target and op.name then target.Name = op.name end
+		if type(op.from) == "table" and type(op.to) == "table" then
+			local target = resolvePath(op.from)
+			if not target or target == game then return end
+
+			local toPath = op.to
+			local newName = toPath[#toPath]
+			local newParentPath = parentPath(toPath)
+			if newParentPath then
+				local newParent = resolvePath(newParentPath)
+				if newParent and target.Parent ~= newParent then
+					target.Parent = newParent
+				end
+			end
+			if newName and target.Name ~= newName then
+				target.Name = newName
+			end
+		else
+			local target = resolvePath(op.path)
+			if target and op.name then target.Name = op.name end
+		end
 	elseif kind == "move" then
 		local target = resolvePath(op.from)
 		local newParent = resolvePath(op.to)
