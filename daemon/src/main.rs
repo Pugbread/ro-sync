@@ -1412,6 +1412,10 @@ pub struct AppState {
     pub wally_enabled: Arc<RwLock<bool>>,
     pub wally_folder: Arc<RwLock<Option<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
+    /// Deadline after a user chooses "keep Studio" during initial sync.
+    /// Bootstrap pushes inside this window prune disk-only paths even if an
+    /// older already-loaded plugin does not send the newer strict flags.
+    pub strict_bootstrap_until: Arc<Mutex<Option<Instant>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
     /// `spawn_watch_bridge` drops watcher ops for paths whose deadline hasn't
     /// passed yet — prevents our own writes from being re-emitted as FS
@@ -1574,6 +1578,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         wally_enabled: Arc::new(RwLock::new(cfg.wally_enabled)),
         wally_folder: Arc::new(RwLock::new(cfg.wally_folder.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
+        strict_bootstrap_until: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
         request_tx,
         pending_routes: Arc::new(Mutex::new(HashMap::new())),

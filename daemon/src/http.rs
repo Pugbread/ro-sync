@@ -514,6 +514,17 @@ async fn initial_choice(
         }
     }
 
+    {
+        let mut strict_until = state.strict_bootstrap_until.lock().unwrap();
+        *strict_until = match choice {
+            // Keep Studio resolves initial drift by pushing the live Studio
+            // tree to disk and pruning disk-only scoped paths. Store this in
+            // the daemon too so already-loaded older plugins still resolve.
+            Choice::Studio => Some(Instant::now() + Duration::from_secs(300)),
+            Choice::Disk | Choice::Cancel => None,
+        };
+    }
+
     let choice_str = match choice {
         Choice::Disk => "disk",
         Choice::Studio => "studio",
@@ -525,6 +536,18 @@ async fn initial_choice(
     }
 
     Json(json!({ "ok": true }))
+}
+
+fn strict_bootstrap_active(state: &AppState) -> bool {
+    let mut strict_until = state.strict_bootstrap_until.lock().unwrap();
+    match *strict_until {
+        Some(deadline) if deadline >= Instant::now() => true,
+        Some(_) => {
+            *strict_until = None;
+            false
+        }
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +609,7 @@ struct PushBody {
 
 async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json<Value> {
     let root = state.canonical_project.as_path();
+    let strict_from_initial_choice = body.bootstrap && strict_bootstrap_active(&state);
     let ctx = PushCtx {
         conflicts: state.conflict.as_ref(),
         push_quiet: state.push_quiet.as_ref(),
@@ -600,8 +624,8 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
             conflicts: state.conflict.as_ref(),
             push_quiet: state.push_quiet.as_ref(),
             force_overwrite: true,
-            strict: body.strict,
-            force_prune: body.force_prune,
+            strict: body.strict || strict_from_initial_choice,
+            force_prune: body.force_prune || strict_from_initial_choice,
         };
         for svc in &body.services {
             match apply_service_node(root, svc, &bootstrap_ctx) {
