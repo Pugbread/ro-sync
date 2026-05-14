@@ -35,7 +35,7 @@ local SOURCE_WRITE_CONCURRENCY = 16
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "1.0.2"
+local PLUGIN_VERSION_STRING = "1.0.3"
 local PLUGIN_PROTOCOL_VERSION = 1
 
 --------------------------------------------------------------------------------
@@ -2465,24 +2465,45 @@ local function runTransmitSource(src: string): any
 	local moduleScript = Instance.new("ModuleScript")
 	moduleScript.Name = "__RoSyncTransmitSource"
 	moduleScript.Archivable = false
+	moduleScript.Parent = game:GetService("CoreGui")
 
-	local wrapperSource = "return function(script, require)\n" .. src .. "\nend"
-	local writeOk, writeErr = pcall(function()
-		if ScriptEditorService then
+	local wrapperSource = "return (function(script, require)\n" .. src .. "\nend)"
+	local function sourceMatches(): boolean
+		local okSource, source = pcall(function()
+			return moduleScript.Source
+		end)
+		if okSource and source == wrapperSource then
+			return true
+		end
+		return readScriptSource(moduleScript) == wrapperSource
+	end
+
+	local writeOk = false
+	local writeErr = nil
+	if ScriptEditorService then
+		writeOk, writeErr = pcall(function()
 			ScriptEditorService:UpdateSourceAsync(moduleScript, function()
 				return wrapperSource
 			end)
-		else
+		end)
+	end
+	if not writeOk or not sourceMatches() then
+		writeOk, writeErr = pcall(function()
 			moduleScript.Source = wrapperSource
-		end
-	end)
+		end)
+	end
+	if writeOk and not sourceMatches() then
+		writeOk = false
+		writeErr = "source write did not apply"
+	end
 	if not writeOk then
 		moduleScript:Destroy()
 		error("source write: " .. tostring(writeErr))
 	end
 
-	moduleScript.Parent = game:GetService("CoreGui")
-	local requireOk, callbackOrErr = pcall(require, moduleScript)
+	local requireOk, callbackOrErr = pcall(function()
+		return require(moduleScript)
+	end)
 	if not requireOk then
 		moduleScript:Destroy()
 		error("compile: " .. tostring(callbackOrErr))
