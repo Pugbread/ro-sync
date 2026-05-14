@@ -35,7 +35,7 @@ local SOURCE_WRITE_CONCURRENCY = 16
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "1.0.4"
+local PLUGIN_VERSION_STRING = "1.0.5"
 local PLUGIN_PROTOCOL_VERSION = 1
 
 --------------------------------------------------------------------------------
@@ -2459,6 +2459,16 @@ end
 local function runTransmitSource(src: string): any
 	if src == "" then return nil end
 
+	local function collectResults(results: {any})
+		if not results[1] then error("runtime: " .. tostring(results[2])) end
+		local n = results.n - 1
+		if n == 0 then return nil end
+		if n == 1 then return results[2] end
+		local out = {}
+		for i = 1, n do out[i] = results[i + 1] end
+		return out
+	end
+
 	-- Photobooth render scripts are usually written for Studio's command bar.
 	-- Run them through a real LuaSourceContainer instead of a custom sandbox so
 	-- bindings see the same script/require environment.
@@ -2472,32 +2482,22 @@ local function runTransmitSource(src: string): any
 			return wrapperSource
 		end)
 	end)
-	if not writeOk then
-		moduleScript:Destroy()
-		error("source write: " .. tostring(writeErr))
+	if writeOk then
+		local requireOk, callbackOrErr = pcall(function()
+			return require(moduleScript)
+		end)
+		if requireOk and typeof(callbackOrErr) == "function" then
+			local moduleResults = table.pack(pcall(callbackOrErr, moduleScript, require))
+			moduleScript:Destroy()
+			return collectResults(moduleResults)
+		end
+		writeErr = callbackOrErr
 	end
-
-	local requireOk, callbackOrErr = pcall(function()
-		return require(moduleScript)
-	end)
-	if not requireOk then
-		moduleScript:Destroy()
-		error("compile: " .. tostring(callbackOrErr))
-	end
-	if typeof(callbackOrErr) ~= "function" then
-		moduleScript:Destroy()
-		error("compile: transmit source did not compile to a function")
-	end
-
-	local results = table.pack(pcall(callbackOrErr, moduleScript, require))
 	moduleScript:Destroy()
-	if not results[1] then error("runtime: " .. tostring(results[2])) end
-	local n = results.n - 1
-	if n == 0 then return nil end
-	if n == 1 then return results[2] end
-	local out = {}
-	for i = 1, n do out[i] = results[i + 1] end
-	return out
+
+	local fn, compileErr = loadstring(src, "rosync-transmit")
+	if not fn then error("compile: " .. tostring(compileErr)) end
+	return collectResults(table.pack(pcall(fn)))
 end
 
 local function isEmptyContentValue(value: any): boolean
