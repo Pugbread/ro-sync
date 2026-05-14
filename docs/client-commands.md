@@ -1222,8 +1222,8 @@ rosync transmit --project . --source 'local Photobooth = require(game.ServerStor
 
 **Notes**
 
-- The plugin accepts EditableImage instances directly and can also read ImageLabel/ImageButton content through AssetService.
-- Photobooth captures usually come back as MeshParts. Ro Sync reads the MeshPart texture as the rendered image, preferring TextureContent and falling back to TextureID.
+- The plugin accepts EditableImage objects directly and can also read ImageLabel/ImageButton content through AssetService.
+- Photobooth captures may return MeshParts with object-backed TextureContent. Ro Sync reads Content.Object directly when it is already an EditableImage, otherwise it falls back to CreateEditableImageAsync for TextureContent or TextureID.
 - If --source or --source-file returns images, those are captured. If --from is supplied, Ro Sync also walks that Studio subtree after the source runs and captures any image-like instances found there.
 - The command writes PNG files locally. Use `rosync upload` afterwards when you want to publish the edited images to Roblox Open Cloud.
 - This executes Luau in Studio, so treat it like `rosync eval`: inspect render scripts first and avoid destructive code.

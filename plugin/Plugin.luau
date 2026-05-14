@@ -2523,7 +2523,21 @@ local function isEmptyContentValue(value: any): boolean
 	return ok and (valueString == "" or valueString == "Content()")
 end
 
-local function editableFromContentValue(content: any, context: string): Instance
+local function objectFromContentValue(content: any): any
+	if typeof(content) == "string" then return nil end
+
+	local object
+	local ok = pcall(function()
+		object = content.Object
+	end)
+	if ok and object ~= nil then return object end
+	return nil
+end
+
+local function editableFromContentValue(content: any, context: string): any
+	local object = objectFromContentValue(content)
+	if object ~= nil then return object end
+
 	local resolvedContent = content
 	if typeof(resolvedContent) == "string" then
 		resolvedContent = Content.fromUri(resolvedContent)
@@ -2537,7 +2551,7 @@ local function editableFromContentValue(content: any, context: string): Instance
 	error("CreateEditableImageAsync failed for " .. context .. ": " .. tostring(err))
 end
 
-local function editableFromImageGui(gui: Instance): Instance
+local function editableFromImageGui(gui: Instance): any
 	local okContent, content = pcall(function() return (gui :: any).ImageContent end)
 	if okContent and content ~= nil then
 		return editableFromContentValue(content, "ImageContent for " .. instancePathString(gui))
@@ -2549,7 +2563,7 @@ local function editableFromImageGui(gui: Instance): Instance
 	return editableFromContentValue(image, "Image for " .. instancePathString(gui))
 end
 
-local function editableFromMeshPart(meshPart: Instance): Instance?
+local function editableFromMeshPart(meshPart: Instance): any
 	local okContent, content = pcall(function() return (meshPart :: any).TextureContent end)
 	if okContent and not isEmptyContentValue(content) then
 		return editableFromContentValue(content, "TextureContent for " .. instancePathString(meshPart))
@@ -2565,17 +2579,22 @@ end
 
 local function transmitImageEntry(value: any, nameHint: string?, pathHint: string?)
 	local target = value
-	if typeof(target) ~= "Instance" then
-		return nil
-	end
-
+	local isInstance = typeof(target) == "Instance"
 	local editable = target
-	if target:IsA("ImageLabel") or target:IsA("ImageButton") then
+	if (isInstance and (target :: Instance):IsA("ImageLabel")) or (isInstance and (target :: Instance):IsA("ImageButton")) then
 		editable = editableFromImageGui(target)
-	elseif target:IsA("MeshPart") then
+	elseif isInstance and (target :: Instance):IsA("MeshPart") then
 		local meshEditable = editableFromMeshPart(target)
 		if meshEditable == nil then return nil end
 		editable = meshEditable
+	else
+		local object = objectFromContentValue(target)
+		if object ~= nil then editable = object end
+	end
+
+	local targetName = nameHint
+	if targetName == nil then
+		targetName = if isInstance then (target :: Instance).Name else typeof(target)
 	end
 
 	local size
@@ -2589,7 +2608,7 @@ local function transmitImageEntry(value: any, nameHint: string?, pathHint: strin
 	local width = math.floor(size.X)
 	local height = math.floor(size.Y)
 	if width <= 0 or height <= 0 then
-		error("invalid EditableImage size for " .. tostring(nameHint or target.Name))
+		error("invalid EditableImage size for " .. tostring(targetName))
 	end
 
 	local pixels
@@ -2597,20 +2616,20 @@ local function transmitImageEntry(value: any, nameHint: string?, pathHint: strin
 		pixels = (editable :: any):ReadPixelsBuffer(Vector2.zero, Vector2.new(width, height))
 	end)
 	if not okPixels or pixels == nil then
-		error("ReadPixelsBuffer failed for " .. tostring(nameHint or target.Name) .. ": " .. tostring(err))
+		error("ReadPixelsBuffer failed for " .. tostring(targetName) .. ": " .. tostring(err))
 	end
 
 	return {
-		name = nameHint or target.Name,
-		path = pathHint or instancePathString(target),
-		class = target.ClassName,
+		name = targetName,
+		path = pathHint or (if isInstance then instancePathString(target) else nil),
+		class = if isInstance then (target :: Instance).ClassName else typeof(target),
 		width = width,
 		height = height,
 		pixelsBase64 = encodeRemoteBuffer(pixels),
 	}
 end
 
-local function appendTransmitCandidate(value: any, out: {any}, seen: {[Instance]: boolean}, nameHint: string?, pathHint: string?)
+local function appendTransmitCandidate(value: any, out: {any}, seen: {[any]: boolean}, nameHint: string?, pathHint: string?)
 	if value == nil then return end
 	local t = typeof(value)
 	if t == "Instance" then
@@ -2629,6 +2648,11 @@ local function appendTransmitCandidate(value: any, out: {any}, seen: {[Instance]
 			if type(key) == "string" then childName = key end
 			appendTransmitCandidate(item, out, seen, childName, pathHint)
 		end
+	else
+		if seen[value] then return end
+		seen[value] = true
+		local entry = transmitImageEntry(value, nameHint, pathHint)
+		if entry then table.insert(out, entry) end
 	end
 end
 
