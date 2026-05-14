@@ -35,7 +35,7 @@ local SOURCE_WRITE_CONCURRENCY = 16
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "1.0.5"
+local PLUGIN_VERSION_STRING = "1.0.6"
 local PLUGIN_PROTOCOL_VERSION = 1
 
 --------------------------------------------------------------------------------
@@ -2469,32 +2469,9 @@ local function runTransmitSource(src: string): any
 		return out
 	end
 
-	-- Photobooth render scripts are usually written for Studio's command bar.
-	-- Run them through a real LuaSourceContainer instead of a custom sandbox so
-	-- bindings see the same script/require environment.
-	local moduleScript = Instance.new("ModuleScript")
-	moduleScript.Name = "__RoSyncTransmitSource"
-	moduleScript.Archivable = false
-
-	local wrapperSource = "return (function(script, require)\n" .. src .. "\nend)"
-	local writeOk, writeErr = pcall(function()
-		ScriptEditorService:UpdateSourceAsync(moduleScript, function()
-			return wrapperSource
-		end)
-	end)
-	if writeOk then
-		local requireOk, callbackOrErr = pcall(function()
-			return require(moduleScript)
-		end)
-		if requireOk and typeof(callbackOrErr) == "function" then
-			local moduleResults = table.pack(pcall(callbackOrErr, moduleScript, require))
-			moduleScript:Destroy()
-			return collectResults(moduleResults)
-		end
-		writeErr = callbackOrErr
-	end
-	moduleScript:Destroy()
-
+	-- Run transmit scripts in the plugin's real Studio environment. This keeps
+	-- globals such as game/workspace/require/Rect available without the old
+	-- custom sandbox getting between render code and Photobooth bindings.
 	local fn, compileErr = loadstring(src, "rosync-transmit")
 	if not fn then error("compile: " .. tostring(compileErr)) end
 	return collectResults(table.pack(pcall(fn)))
