@@ -1324,6 +1324,9 @@ fn build_whitelisted_node_at(
     } else {
         Vec::new()
     };
+    if is_folder && children.is_empty() {
+        return Ok(None);
+    }
 
     Ok(Some(json!({
         "class": inst.class,
@@ -1821,6 +1824,23 @@ mod tests {
         let util = find_child(shared_node, "Util").unwrap();
         assert_eq!(util["class"], "ModuleScript");
         assert_eq!(util["properties"]["Source"], "return 42");
+    }
+
+    #[test]
+    fn omits_folder_chains_with_no_syncable_descendants() {
+        let d = TempDir::new("empty-folder-chain");
+        let leaf = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Assets")
+            .join("EventVFX")
+            .join("Galaxy");
+        fs::create_dir_all(&leaf).unwrap();
+
+        let services = emit_services(d.path()).unwrap();
+
+        let rs_node = find_service(&services, "ReplicatedStorage").expect("service present");
+        assert_eq!(rs_node["children"].as_array().unwrap().len(), 0);
     }
 
     #[test]

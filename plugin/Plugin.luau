@@ -3292,9 +3292,10 @@ local function startHooksAndWs()
 	task.spawn(pushTreeSkeleton)
 end
 
-local function doPushPath()
+local function doPushPath(strictStudio: boolean?)
 	log("initial-compare → push: sending Studio snapshot")
 	local services = collectSnapshot()
+	local strict = strictStudio == true
 
 	-- Push one service per HTTP call. A monolithic bootstrap body of N
 	-- services could easily exceed Studio's 30s RequestAsync timeout on a
@@ -3314,6 +3315,8 @@ local function doPushPath()
 		else
 			local ok, err = httpJson("/push", "POST", {
 				bootstrap = true,
+				strict = strict,
+				forcePrune = strict,
 				services = { svc },
 			})
 			if ok then
@@ -3484,7 +3487,7 @@ runInitialCompare = function()
 			if choice == "disk" then
 				if doPullPath(true) then startHooksAndWs() end
 			elseif choice == "studio" then
-				if doPushPath() then startHooksAndWs() end
+				if doPushPath(true) then startHooksAndWs() end
 			elseif choice == "cancel" then
 				log("decision: cancel")
 				disconnect("cancelled by user")

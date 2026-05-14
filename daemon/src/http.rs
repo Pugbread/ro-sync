@@ -577,6 +577,10 @@ struct PushBody {
     #[serde(default)]
     bootstrap: bool,
     #[serde(default)]
+    strict: bool,
+    #[serde(rename = "forcePrune", default)]
+    force_prune: bool,
+    #[serde(default)]
     services: Vec<Value>,
 }
 
@@ -586,6 +590,8 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
         conflicts: state.conflict.as_ref(),
         push_quiet: state.push_quiet.as_ref(),
         force_overwrite: false,
+        strict: false,
+        force_prune: false,
     };
     let mut res = PushApplyResult::default();
 
@@ -594,6 +600,8 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
             conflicts: state.conflict.as_ref(),
             push_quiet: state.push_quiet.as_ref(),
             force_overwrite: true,
+            strict: body.strict,
+            force_prune: body.force_prune,
         };
         for svc in &body.services {
             match apply_service_node(root, svc, &bootstrap_ctx) {
@@ -651,6 +659,8 @@ pub(crate) fn apply_push_ops(state: &AppState, ops: &[Value]) -> PushApplyResult
         conflicts: state.conflict.as_ref(),
         push_quiet: state.push_quiet.as_ref(),
         force_overwrite: false,
+        strict: false,
+        force_prune: false,
     };
     let mut out = PushApplyResult::default();
     apply_ops_into(root, ops, &ctx, &mut out);
@@ -664,6 +674,8 @@ pub(crate) struct PushCtx<'a> {
     pub conflicts: &'a crate::conflict::ConflictEngine,
     pub push_quiet: &'a Mutex<HashMap<PathBuf, Instant>>,
     pub force_overwrite: bool,
+    pub strict: bool,
+    pub force_prune: bool,
 }
 
 impl<'a> PushCtx<'a> {
@@ -895,13 +907,20 @@ fn apply_service_node(root: &Path, node: &Value, ctx: &PushCtx<'_>) -> Result<us
     ctx.mark_quiet(&svc_dir);
     // Materialize children of the service node.
     let mut n = 0usize;
-    if let Some(kids) = node.get("children").and_then(|v| v.as_array()) {
-        for child in kids {
-            match apply_set(root, &[name.to_string()], child, ctx)? {
-                ApplyOutcome::Applied(k) => n += k,
-                _ => {}
-            }
+    let children = node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let wanted = wanted_child_names(&children);
+    for child in &children {
+        match apply_set(root, &[name.to_string()], child, ctx)? {
+            ApplyOutcome::Applied(k) => n += k,
+            _ => {}
         }
+    }
+    if ctx.strict && ctx.force_prune {
+        n += prune_dir_to_names(&svc_dir, &wanted, false, ctx)?;
     }
     Ok(n)
 }
@@ -932,8 +951,12 @@ fn apply_set(
     if !is_scoped_class(class) {
         return Ok(ApplyOutcome::Skipped);
     }
-    let children = node.get("children").and_then(|v| v.as_array()).cloned();
-    let has_children = children.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+    let children = node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let has_children = !children.is_empty();
     if class == "Folder" && !has_children {
         return Ok(ApplyOutcome::Skipped);
     }
@@ -943,7 +966,18 @@ fn apply_set(
 
     // If a node with this name already exists on disk, reuse its path; otherwise
     // compute a fresh fragment.
-    let existing = find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?;
+    let mut existing = find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?;
+    if let Some(fragment) = existing.as_deref() {
+        let existing_path = parent_dir.join(fragment);
+        if !existing_fragment_compatible(&existing_path, class, has_children) {
+            if ctx.force_overwrite {
+                remove_path_for_replace(&existing_path, ctx)?;
+                existing = None;
+            } else {
+                return Ok(ApplyOutcome::Skipped);
+            }
+        }
+    }
     let taken = siblings_except(&parent_dir, existing.as_deref())?;
 
     let frag = match &existing {
@@ -976,6 +1010,7 @@ fn apply_set(
 
     let sc = ScriptClass::from_class(class);
     let mut applied = 0usize;
+    let wanted = wanted_child_names(&children);
 
     match (sc, has_children) {
         (Some(_), false) => {
@@ -1003,14 +1038,15 @@ fn apply_set(
                 SourceWriteOutcome::Skipped => {}
                 SourceWriteOutcome::Conflict(path) => return Ok(ApplyOutcome::Conflict(path)),
             }
-            if let Some(kids) = children {
-                let mut child_segs: Vec<String> = parent_segs.to_vec();
-                child_segs.push(name.to_string());
-                for child in kids {
-                    if let ApplyOutcome::Applied(n) = apply_set(root, &child_segs, &child, ctx)? {
-                        applied += n;
-                    }
+            let mut child_segs: Vec<String> = parent_segs.to_vec();
+            child_segs.push(name.to_string());
+            for child in &children {
+                if let ApplyOutcome::Applied(n) = apply_set(root, &child_segs, child, ctx)? {
+                    applied += n;
                 }
+            }
+            if ctx.strict && ctx.force_prune {
+                applied += prune_dir_to_names(&target, &wanted, true, ctx)?;
             }
         }
         (None, _) => {
@@ -1018,19 +1054,110 @@ fn apply_set(
             std::fs::create_dir_all(&target)
                 .map_err(|e| format!("mkdir {}: {e}", target.display()))?;
             ctx.mark_quiet(&target);
-            if let Some(kids) = children {
-                let mut child_segs: Vec<String> = parent_segs.to_vec();
-                child_segs.push(name.to_string());
-                for child in kids {
-                    if let ApplyOutcome::Applied(n) = apply_set(root, &child_segs, &child, ctx)? {
-                        applied += n;
-                    }
+            let mut child_segs: Vec<String> = parent_segs.to_vec();
+            child_segs.push(name.to_string());
+            for child in &children {
+                if let ApplyOutcome::Applied(n) = apply_set(root, &child_segs, child, ctx)? {
+                    applied += n;
                 }
+            }
+            if ctx.strict && ctx.force_prune {
+                applied += prune_dir_to_names(&target, &wanted, false, ctx)?;
             }
             applied += 1;
         }
     }
     Ok(ApplyOutcome::Applied(applied))
+}
+
+fn wanted_child_names(children: &[Value]) -> Vec<String> {
+    children
+        .iter()
+        .filter_map(|child| {
+            child
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn existing_fragment_compatible(path: &Path, class: &str, has_children: bool) -> bool {
+    let Ok(Some(inst)) = path_to_instance_meta(path) else {
+        return false;
+    };
+    if class == "Folder" {
+        return inst.class == "Folder" && !inst.is_script_with_children;
+    }
+    if ScriptClass::from_class(class).is_some() {
+        if has_children {
+            return inst.is_dir && inst.is_script_with_children && inst.class == class;
+        }
+        return !inst.is_dir && inst.class == class;
+    }
+    false
+}
+
+fn prune_dir_to_names(
+    dir: &Path,
+    wanted_names: &[String],
+    keep_init_files: bool,
+    ctx: &PushCtx<'_>,
+) -> Result<usize, String> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if file_name == META_FILE || file_name == ".DS_Store" {
+            continue;
+        }
+        if is_init_file(&file_name) {
+            if keep_init_files {
+                continue;
+            }
+            remove_path_for_replace(&path, ctx)?;
+            removed += 1;
+            continue;
+        }
+        let Some(inst) =
+            path_to_instance_meta(&path).map_err(|e| format!("scan {}: {e}", path.display()))?
+        else {
+            continue;
+        };
+        if wanted_names.iter().any(|wanted| wanted == &inst.name) {
+            continue;
+        }
+        remove_path_for_replace(&path, ctx)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn remove_path_for_replace(path: &Path, ctx: &PushCtx<'_>) -> Result<(), String> {
+    mark_quiet_tree(path, ctx);
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).map_err(|e| format!("rmdir {}: {e}", path.display()))?;
+    } else if path.exists() {
+        std::fs::remove_file(path).map_err(|e| format!("rm {}: {e}", path.display()))?;
+    }
+    ctx.mark_quiet(path);
+    Ok(())
+}
+
+fn mark_quiet_tree(path: &Path, ctx: &PushCtx<'_>) {
+    ctx.mark_quiet(path);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            mark_quiet_tree(&entry.path(), ctx);
+        }
+    }
 }
 
 enum SourceWriteOutcome {
@@ -1798,6 +1925,8 @@ mod tests {
             conflicts: engine,
             push_quiet: quiet,
             force_overwrite: false,
+            strict: false,
+            force_prune: false,
         }
     }
 
@@ -1809,6 +1938,21 @@ mod tests {
             conflicts: engine,
             push_quiet: quiet,
             force_overwrite: true,
+            strict: false,
+            force_prune: false,
+        }
+    }
+
+    fn strict_force_harness<'a>(
+        engine: &'a ConflictEngine,
+        quiet: &'a Mutex<HashMap<PathBuf, Instant>>,
+    ) -> PushCtx<'a> {
+        PushCtx {
+            conflicts: engine,
+            push_quiet: quiet,
+            force_overwrite: true,
+            strict: true,
+            force_prune: true,
         }
     }
 
@@ -2154,6 +2298,91 @@ mod tests {
             "print('same')\n"
         );
         assert_eq!(std::fs::read_to_string(child_path).unwrap(), "return {}\n");
+    }
+
+    #[test]
+    fn bootstrap_strict_prunes_disk_only_paths_when_keeping_studio() {
+        let d = TempDir::new("bootstrap-strict-prune");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = strict_force_harness(&engine, &quiet);
+
+        let disk_only = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Assets")
+            .join("EventVFX")
+            .join("Galaxy");
+        std::fs::create_dir_all(&disk_only).unwrap();
+        std::fs::write(
+            d.path()
+                .join("ReplicatedStorage")
+                .join("ClientOnly.server.luau"),
+            "print('remove me')\n",
+        )
+        .unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": []
+        });
+
+        let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
+
+        assert!(applied >= 1);
+        assert!(!d.path().join("ReplicatedStorage").join("Assets").exists());
+        assert!(!d
+            .path()
+            .join("ReplicatedStorage")
+            .join("ClientOnly.server.luau")
+            .exists());
+    }
+
+    #[test]
+    fn bootstrap_force_replaces_stale_disk_class_when_keeping_studio() {
+        let d = TempDir::new("bootstrap-force-class-replace");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = strict_force_harness(&engine, &quiet);
+
+        let stale_folder = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Client")
+            .join("Dialog");
+        std::fs::create_dir_all(&stale_folder).unwrap();
+        std::fs::write(stale_folder.join("Child.luau"), "return {}\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "Client",
+                "class": "Folder",
+                "properties": {},
+                "children": [{
+                    "name": "Dialog",
+                    "class": "LocalScript",
+                    "properties": { "Source": "print('studio')\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        apply_service_node(d.path(), &service, &ctx).unwrap();
+
+        assert!(!stale_folder.exists());
+        assert_eq!(
+            std::fs::read_to_string(
+                d.path()
+                    .join("ReplicatedStorage")
+                    .join("Client")
+                    .join("Dialog.client.luau")
+            )
+            .unwrap(),
+            "print('studio')\n"
+        );
     }
 
     // POST /tree writes body to `.tree.json.tmp` then replaces `tree.json`.
