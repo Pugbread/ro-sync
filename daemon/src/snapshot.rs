@@ -745,7 +745,7 @@ pub fn write_project_tooling_if_missing_or_merge(root: &Path) -> io::Result<bool
     changed |= write_stylua_toml_if_missing(root)?;
     changed |= write_aftman_stylua_if_missing_or_merge(root)?;
     changed |= write_roblox_definitions_if_missing_or_update(root)?;
-    changed |= write_luaurc_definitions_if_missing_or_merge(root)?;
+    changed |= write_luaurc_if_missing_or_cleanup(root)?;
     Ok(changed)
 }
 
@@ -789,10 +789,11 @@ pub fn write_roblox_definitions_if_missing_or_update(root: &Path) -> io::Result<
     Ok(true)
 }
 
-pub fn write_luaurc_definitions_if_missing_or_merge(root: &Path) -> io::Result<bool> {
+pub fn write_luaurc_if_missing_or_cleanup(root: &Path) -> io::Result<bool> {
     fs::create_dir_all(root)?;
     let p = root.join(LUAURC);
-    let mut config = if p.exists() {
+    let existed = p.exists();
+    let mut config = if existed {
         let existing = fs::read_to_string(&p)?;
         serde_json::from_str::<Value>(&existing).map_err(|e| {
             io::Error::new(
@@ -805,6 +806,7 @@ pub fn write_luaurc_definitions_if_missing_or_merge(root: &Path) -> io::Result<b
             "languageMode": "nonstrict",
         })
     };
+    let original = config.clone();
 
     let object = config.as_object_mut().ok_or_else(|| {
         io::Error::new(
@@ -813,21 +815,23 @@ pub fn write_luaurc_definitions_if_missing_or_merge(root: &Path) -> io::Result<b
         )
     })?;
 
-    let definitions = object
-        .entry("definitions")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let definitions = definitions.as_array_mut().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}.definitions must be an array", p.display()),
-        )
-    })?;
-
     let definition = Value::String(ROBLOX_DEFINITIONS_PATH.to_string());
-    if definitions.iter().any(|value| value == &definition) {
+    if let Some(definitions) = object.get_mut("definitions") {
+        let definitions = definitions.as_array_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}.definitions must be an array", p.display()),
+            )
+        })?;
+        definitions.retain(|value| value != &definition);
+        if definitions.is_empty() {
+            object.remove("definitions");
+        }
+    }
+
+    if existed && config == original {
         return Ok(false);
     }
-    definitions.push(definition);
 
     let text = serde_json::to_string_pretty(&config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1731,14 +1735,14 @@ mod tests {
 
         let luaurc = fs::read_to_string(d.path().join(LUAURC)).unwrap();
         assert!(luaurc.contains("\"languageMode\""));
-        assert!(luaurc.contains(ROBLOX_DEFINITIONS_PATH));
+        assert!(!luaurc.contains("\"definitions\""));
         assert!(d.path().join(ROBLOX_DEFINITIONS_PATH).is_file());
 
         assert!(!write_project_tooling_if_missing_or_merge(d.path()).unwrap());
     }
 
     #[test]
-    fn luaurc_merge_preserves_existing_config_and_adds_definitions() {
+    fn luaurc_merge_preserves_existing_config_without_definitions_key() {
         let d = TempDir::new("luaurc-merge");
         let p = d.path().join(LUAURC);
         fs::write(
@@ -1747,13 +1751,32 @@ mod tests {
         )
         .unwrap();
 
-        assert!(write_luaurc_definitions_if_missing_or_merge(d.path()).unwrap());
+        assert!(!write_luaurc_if_missing_or_cleanup(d.path()).unwrap());
         let merged = fs::read_to_string(&p).unwrap();
         assert!(merged.contains("\"languageMode\": \"strict\""));
         assert!(merged.contains("\"diagnostics\""));
-        assert!(merged.contains(ROBLOX_DEFINITIONS_PATH));
+        assert!(!merged.contains("\"definitions\""));
 
-        assert!(!write_luaurc_definitions_if_missing_or_merge(d.path()).unwrap());
+        assert!(!write_luaurc_if_missing_or_cleanup(d.path()).unwrap());
+    }
+
+    #[test]
+    fn luaurc_merge_removes_generated_definitions_key() {
+        let d = TempDir::new("luaurc-generated-definitions");
+        let p = d.path().join(LUAURC);
+        fs::write(
+            &p,
+            format!(
+                "{{\n  \"definitions\": [\"{ROBLOX_DEFINITIONS_PATH}\"],\n  \"languageMode\": \"nonstrict\"\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(write_luaurc_if_missing_or_cleanup(d.path()).unwrap());
+        let merged = fs::read_to_string(&p).unwrap();
+        assert!(merged.contains("\"languageMode\": \"nonstrict\""));
+        assert!(!merged.contains("\"definitions\""));
+        assert!(!merged.contains(ROBLOX_DEFINITIONS_PATH));
     }
 
     #[test]

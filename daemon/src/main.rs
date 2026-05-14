@@ -5394,7 +5394,7 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let luaurc_existed = project.join(snapshot::LUAURC).exists();
-    let luaurc_changed = snapshot::write_luaurc_definitions_if_missing_or_merge(&project)?;
+    let luaurc_changed = snapshot::write_luaurc_if_missing_or_cleanup(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::LUAURC,
         status: refresh_file_status(luaurc_existed, luaurc_changed),
