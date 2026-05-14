@@ -4864,9 +4864,24 @@ async fn run_eval(args: EvalArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[derive(Debug, Deserialize)]
-struct TransmittedImage {
+struct TransmitPrepared {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    images: Vec<TransmitImageMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransmitImageMeta {
+    token: String,
     name: Option<String>,
     path: Option<String>,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransmittedImage {
+    name: Option<String>,
     width: u32,
     height: u32,
     #[serde(rename = "pixelsBase64")]
@@ -4914,21 +4929,105 @@ async fn run_transmit(args: TransmitArgs) -> Result<(), Box<dyn std::error::Erro
         );
     }
 
+    let timeout = Duration::from_secs_f64(args.timeout);
     let resp = remote::request_with_timeout(
         args.port,
-        "transmit",
+        "transmit_prepare",
         serde_json::Value::Object(req),
-        Duration::from_secs_f64(args.timeout),
+        timeout,
     )
     .await?;
-    let value = response_value_or_err(&resp, "transmit")?;
-    let images: Vec<TransmittedImage> = serde_json::from_value(value)
-        .map_err(|e| format!("transmit: plugin returned invalid image list: {e}"))?;
-    if images.is_empty() {
+    let value = response_value_or_err(&resp, "transmit prepare")?;
+    let prepared: TransmitPrepared = serde_json::from_value(value)
+        .map_err(|e| format!("transmit: plugin returned invalid prepare response: {e}"))?;
+    if prepared.images.is_empty() {
+        let _ = remote::request_with_timeout(
+            args.port,
+            "transmit_close",
+            serde_json::json!({
+                "sessionId": prepared.session_id,
+            }),
+            Duration::from_secs(5),
+        )
+        .await;
         return Err("transmit: plugin returned no images".into());
     }
 
-    let written = write_transmitted_images(&images, &args.output)?;
+    let output_paths = match transmit_output_paths(&prepared.images, &args.output) {
+        Ok(paths) => paths,
+        Err(e) => {
+            let _ = remote::request_with_timeout(
+                args.port,
+                "transmit_close",
+                serde_json::json!({
+                    "sessionId": prepared.session_id,
+                }),
+                Duration::from_secs(5),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    let mut written = Vec::with_capacity(prepared.images.len());
+    let mut read_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+    for (image, output_path) in prepared.images.iter().zip(output_paths.iter()) {
+        let resp = remote::request_with_timeout(
+            args.port,
+            "transmit_read",
+            serde_json::json!({
+                "sessionId": prepared.session_id,
+                "token": image.token,
+            }),
+            timeout,
+        )
+        .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_result = Err(format!(
+                    "transmit: read {}: {e}",
+                    image.name.as_deref().unwrap_or(&image.token)
+                )
+                .into());
+                break;
+            }
+        };
+        let value = match response_value_or_err(&resp, "transmit read") {
+            Ok(value) => value,
+            Err(e) => {
+                read_result = Err(e);
+                break;
+            }
+        };
+        let transmitted: TransmittedImage = match serde_json::from_value(value) {
+            Ok(image) => image,
+            Err(e) => {
+                read_result =
+                    Err(format!("transmit: plugin returned invalid image response: {e}").into());
+                break;
+            }
+        };
+        if let Err(e) = write_png_rgba(&transmitted, output_path) {
+            read_result = Err(e);
+            break;
+        }
+        written.push(output_path.clone());
+        if !args.raw {
+            println!("wrote {}", output_path.display());
+        }
+    }
+
+    let _ = remote::request_with_timeout(
+        args.port,
+        "transmit_close",
+        serde_json::json!({
+            "sessionId": prepared.session_id,
+        }),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    read_result?;
     if args.raw {
         println!(
             "{}",
@@ -4937,16 +5036,12 @@ async fn run_transmit(args: TransmitArgs) -> Result<(), Box<dyn std::error::Erro
                 "files": written,
             }))?
         );
-    } else {
-        for file in &written {
-            println!("wrote {}", file.display());
-        }
     }
     Ok(())
 }
 
-fn write_transmitted_images(
-    images: &[TransmittedImage],
+fn transmit_output_paths(
+    images: &[TransmitImageMeta],
     output: &std::path::Path,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let output_is_file = images.len() == 1
@@ -4993,7 +5088,6 @@ fn write_transmitted_images(
             let stem = unique_transmit_stem(sanitize_transmit_stem(name), &mut used_names, index);
             output.join(format!("{stem}.png"))
         };
-        write_png_rgba(image, &path)?;
         written.push(path);
     }
     Ok(written)

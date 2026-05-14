@@ -2577,7 +2577,31 @@ local function editableFromMeshPart(meshPart: Instance): any
 	return editableFromContentValue(textureId, "TextureID for " .. instancePathString(meshPart))
 end
 
+local resolveTransmitImage
+
 local function transmitImageEntry(value: any, nameHint: string?, pathHint: string?)
+	local image = resolveTransmitImage(value, nameHint, pathHint)
+	if image == nil then return nil end
+
+	local pixels
+	local okPixels, err = pcall(function()
+		pixels = (image.editable :: any):ReadPixelsBuffer(Vector2.zero, Vector2.new(image.width, image.height))
+	end)
+	if not okPixels or pixels == nil then
+		error("ReadPixelsBuffer failed for " .. tostring(image.name) .. ": " .. tostring(err))
+	end
+
+	return {
+		name = image.name,
+		path = image.path,
+		class = image.class,
+		width = image.width,
+		height = image.height,
+		pixelsBase64 = encodeRemoteBuffer(pixels),
+	}
+end
+
+resolveTransmitImage = function(value: any, nameHint: string?, pathHint: string?)
 	local target = value
 	local isInstance = typeof(target) == "Instance"
 	local editable = target
@@ -2611,21 +2635,13 @@ local function transmitImageEntry(value: any, nameHint: string?, pathHint: strin
 		error("invalid EditableImage size for " .. tostring(targetName))
 	end
 
-	local pixels
-	local okPixels, err = pcall(function()
-		pixels = (editable :: any):ReadPixelsBuffer(Vector2.zero, Vector2.new(width, height))
-	end)
-	if not okPixels or pixels == nil then
-		error("ReadPixelsBuffer failed for " .. tostring(targetName) .. ": " .. tostring(err))
-	end
-
 	return {
+		editable = editable,
 		name = targetName,
 		path = pathHint or (if isInstance then instancePathString(target) else nil),
 		class = if isInstance then (target :: Instance).ClassName else typeof(target),
 		width = width,
 		height = height,
-		pixelsBase64 = encodeRemoteBuffer(pixels),
 	}
 end
 
@@ -2656,6 +2672,43 @@ local function appendTransmitCandidate(value: any, out: {any}, seen: {[any]: boo
 	end
 end
 
+local transmitSessionCounter = 0
+local transmitSessions = {}
+
+local function appendTransmitPrepared(value: any, sessionImages: {any}, out: {any}, seen: {[any]: boolean}, nameHint: string?, pathHint: string?)
+	if value == nil then return end
+	local t = typeof(value)
+	if t == "table" then
+		local image = value.image or value.capture or value.editableImage or value.editable
+		if image ~= nil then
+			appendTransmitPrepared(image, sessionImages, out, seen, value.name or value.Name or nameHint, value.path or pathHint)
+			return
+		end
+		for key, item in pairs(value) do
+			local childName = nameHint
+			if type(key) == "string" then childName = key end
+			appendTransmitPrepared(item, sessionImages, out, seen, childName, pathHint)
+		end
+		return
+	end
+
+	if seen[value] then return end
+	seen[value] = true
+	local image = resolveTransmitImage(value, nameHint, pathHint)
+	if image == nil then return end
+
+	local index = #sessionImages + 1
+	sessionImages[index] = image
+	table.insert(out, {
+		token = tostring(index),
+		name = image.name,
+		path = image.path,
+		class = image.class,
+		width = image.width,
+		height = image.height,
+	})
+end
+
 local function appendTransmitPath(path: string, out: {any}, seen: {[Instance]: boolean})
 	local inst = resolveRemotePath(path)
 	if not inst then error("path not found: " .. path) end
@@ -2668,6 +2721,21 @@ local function appendTransmitFrom(path: string, out: {any}, seen: {[Instance]: b
 	appendTransmitCandidate(root, out, seen, nil, instancePathString(root))
 	for _, inst in ipairs(root:GetDescendants()) do
 		appendTransmitCandidate(inst, out, seen, nil, instancePathString(inst))
+	end
+end
+
+local function appendTransmitPreparedPath(path: string, sessionImages: {any}, out: {any}, seen: {[any]: boolean})
+	local inst = resolveRemotePath(path)
+	if not inst then error("path not found: " .. path) end
+	appendTransmitPrepared(inst, sessionImages, out, seen, nil, instancePathString(inst))
+end
+
+local function appendTransmitPreparedFrom(path: string, sessionImages: {any}, out: {any}, seen: {[any]: boolean})
+	local root = resolveRemotePath(path)
+	if not root then error("from path not found: " .. path) end
+	appendTransmitPrepared(root, sessionImages, out, seen, nil, instancePathString(root))
+	for _, inst in ipairs(root:GetDescendants()) do
+		appendTransmitPrepared(inst, sessionImages, out, seen, nil, instancePathString(inst))
 	end
 end
 
@@ -2692,6 +2760,70 @@ remoteHandlers.transmit = function(args)
 	end
 
 	return out
+end
+
+remoteHandlers.transmit_prepare = function(args)
+	local out = {}
+	local seen = {}
+	local sessionImages = {}
+
+	local source = tostring(args.source or "")
+	local result = runTransmitSource(source)
+	appendTransmitPrepared(result, sessionImages, out, seen, nil, nil)
+
+	local paths = args.paths
+	if type(paths) == "table" then
+		for _, path in ipairs(paths) do
+			appendTransmitPreparedPath(tostring(path), sessionImages, out, seen)
+		end
+	end
+
+	local fromPath = args.from
+	if fromPath ~= nil and tostring(fromPath) ~= "" then
+		appendTransmitPreparedFrom(tostring(fromPath), sessionImages, out, seen)
+	end
+
+	transmitSessionCounter += 1
+	local sessionId = tostring(transmitSessionCounter)
+	transmitSessions[sessionId] = sessionImages
+
+	return {
+		sessionId = sessionId,
+		images = out,
+	}
+end
+
+remoteHandlers.transmit_read = function(args)
+	local sessionId = tostring(args.sessionId or "")
+	local token = tostring(args.token or "")
+	local sessionImages = transmitSessions[sessionId]
+	if sessionImages == nil then error("transmit session not found: " .. sessionId) end
+
+	local image = sessionImages[tonumber(token) or -1]
+	if image == nil then error("transmit image token not found: " .. token) end
+
+	local pixels
+	local okPixels, err = pcall(function()
+		pixels = (image.editable :: any):ReadPixelsBuffer(Vector2.zero, Vector2.new(image.width, image.height))
+	end)
+	if not okPixels or pixels == nil then
+		error("ReadPixelsBuffer failed for " .. tostring(image.name) .. ": " .. tostring(err))
+	end
+
+	return {
+		name = image.name,
+		path = image.path,
+		class = image.class,
+		width = image.width,
+		height = image.height,
+		pixelsBase64 = encodeRemoteBuffer(pixels),
+	}
+end
+
+remoteHandlers.transmit_close = function(args)
+	local sessionId = tostring(args.sessionId or "")
+	transmitSessions[sessionId] = nil
+	return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -3320,6 +3452,7 @@ local REMOTE_WRITE_OPS = {
 	set = true,
 	eval = true,
 	transmit = true,
+	transmit_prepare = true,
 	undo = true,
 	redo = true,
 	save = true,
