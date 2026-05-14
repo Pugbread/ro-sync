@@ -2153,7 +2153,7 @@ local COMMON_PROPS = {
 	"Transparency", "Reflectance", "Material", "Color", "BrickColor",
 	"TopSurface", "BottomSurface", "CollisionGroup", "Shape",
 	-- MeshPart / SpecialMesh
-	"MeshId", "TextureID", "MeshScale", "Scale", "MeshType", "VertexColor",
+	"MeshId", "TextureContent", "TextureID", "MeshScale", "Scale", "MeshType", "VertexColor",
 	-- SpawnLocation
 	"Enabled", "Neutral", "AllowTeamChangeOnTouch", "Duration", "TeamColor",
 	-- Script / LocalScript / ModuleScript
@@ -2512,28 +2512,55 @@ local function runTransmitSource(src: string): any
 	return out
 end
 
+local function isEmptyContentValue(value: any): boolean
+	if value == nil then return true end
+	if typeof(value) == "string" then return value == "" end
+
+	local valueString = ""
+	local ok = pcall(function()
+		valueString = tostring(value)
+	end)
+	return ok and (valueString == "" or valueString == "Content()")
+end
+
+local function editableFromContentValue(content: any, context: string): Instance
+	local resolvedContent = content
+	if typeof(resolvedContent) == "string" then
+		resolvedContent = Content.fromUri(resolvedContent)
+	end
+
+	local editable
+	local ok, err = pcall(function()
+		editable = AssetService:CreateEditableImageAsync(resolvedContent)
+	end)
+	if ok and editable then return editable end
+	error("CreateEditableImageAsync failed for " .. context .. ": " .. tostring(err))
+end
+
 local function editableFromImageGui(gui: Instance): Instance
 	local okContent, content = pcall(function() return (gui :: any).ImageContent end)
 	if okContent and content ~= nil then
-		local editable
-		local ok, err = pcall(function()
-			editable = AssetService:CreateEditableImageAsync(content)
-		end)
-		if ok and editable then return editable end
-		error("CreateEditableImageAsync failed: " .. tostring(err))
+		return editableFromContentValue(content, "ImageContent for " .. instancePathString(gui))
 	end
 
 	local image = ""
 	pcall(function() image = tostring((gui :: any).Image or "") end)
 	if image == "" then error("image gui has no Image/ImageContent: " .. instancePathString(gui)) end
-	local editable
-	local ok, err = pcall(function()
-		editable = AssetService:CreateEditableImageAsync(Content.fromUri(image))
-	end)
-	if not ok or not editable then
-		error("CreateEditableImageAsync failed: " .. tostring(err))
+	return editableFromContentValue(image, "Image for " .. instancePathString(gui))
+end
+
+local function editableFromMeshPart(meshPart: Instance): Instance?
+	local okContent, content = pcall(function() return (meshPart :: any).TextureContent end)
+	if okContent and not isEmptyContentValue(content) then
+		return editableFromContentValue(content, "TextureContent for " .. instancePathString(meshPart))
 	end
-	return editable
+
+	local textureId = ""
+	pcall(function()
+		textureId = tostring((meshPart :: any).TextureID or "")
+	end)
+	if textureId == "" then return nil end
+	return editableFromContentValue(textureId, "TextureID for " .. instancePathString(meshPart))
 end
 
 local function transmitImageEntry(value: any, nameHint: string?, pathHint: string?)
@@ -2545,6 +2572,10 @@ local function transmitImageEntry(value: any, nameHint: string?, pathHint: strin
 	local editable = target
 	if target:IsA("ImageLabel") or target:IsA("ImageButton") then
 		editable = editableFromImageGui(target)
+	elseif target:IsA("MeshPart") then
+		local meshEditable = editableFromMeshPart(target)
+		if meshEditable == nil then return nil end
+		editable = meshEditable
 	end
 
 	local size
@@ -2927,6 +2958,7 @@ local BUILTIN_CLASS_INFO = {
 			{ name = "Name", category = "Data", type = "string" },
 			{ name = "Parent", category = "Data", type = "Instance" },
 			{ name = "MeshId", category = "Data", type = "Content" },
+			{ name = "TextureContent", category = "Appearance", type = "Content" },
 			{ name = "TextureID", category = "Appearance", type = "Content" },
 			{ name = "Size", category = "Data", type = "Vector3" },
 			{ name = "CFrame", category = "Data", type = "CFrame" },
