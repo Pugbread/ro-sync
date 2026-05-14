@@ -14,10 +14,12 @@ built with Rojo from `plugin-src/`.
 ## Build
 
 ```sh
-./plugin/build-plugin.sh
+node plugin/build-plugin.mjs
 ```
 
-The build runs Wally, then Rojo, and writes `plugin/Plugin.rbxm`.
+Run this from the repository root. On macOS / Linux,
+`./plugin/build-plugin.sh` is also available and delegates to the same Node
+builder. The build runs Wally, then Rojo, and writes `plugin/Plugin.rbxm`.
 
 ## Use
 

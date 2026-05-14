@@ -128,11 +128,35 @@ fn default_project_path(dir: &Path) -> io::Result<Option<PathBuf>> {
         return Ok(None);
     };
 
-    if path.is_empty() || Path::new(path).is_absolute() || path.split('/').any(|seg| seg == "..") {
+    let Some(relative_path) = safe_rojo_relative_path(path) else {
         return Ok(None);
+    };
+
+    Ok(Some(dir.join(relative_path)))
+}
+
+fn safe_rojo_relative_path(path: &str) -> Option<PathBuf> {
+    if path.is_empty() || Path::new(path).is_absolute() || looks_like_windows_rooted_path(path) {
+        return None;
     }
 
-    Ok(Some(dir.join(path)))
+    let mut out = PathBuf::new();
+    for segment in path.split(['/', '\\']) {
+        if segment.is_empty() || segment == ".." {
+            return None;
+        }
+        if segment != "." {
+            out.push(segment);
+        }
+    }
+    Some(out)
+}
+
+fn looks_like_windows_rooted_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || path.starts_with('\\')
+        || path.starts_with("//")
 }
 
 fn source_path_for(path: &Path, is_script_with_children: bool) -> Option<PathBuf> {
@@ -166,36 +190,21 @@ fn rel_path(root: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "rosync-sourcemap-{tag}-{}-{}",
-                std::process::id(),
-                unix_nanos()
-            ));
-            fs::create_dir_all(&p).unwrap();
-            Self(p)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("rosync-sourcemap-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn unix_nanos() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
     }
 
     #[test]
@@ -284,5 +293,19 @@ mod tests {
             "ReplicatedStorage/Packages/_Index/evaera_promise@4.0.0/promise/lib/init.lua"
         );
         assert_eq!(promise_node["children"][0]["name"], "Error");
+    }
+
+    #[test]
+    fn default_project_path_rejects_windows_parent_traversal() {
+        let d = TempDir::new("wally-default-project-traversal");
+        let package = d.path().join("ReplicatedStorage").join("Packages");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("default.project.json"),
+            r#"{"tree":{"$path":"..\\Outside"}}"#,
+        )
+        .unwrap();
+
+        assert!(default_project_path(&package).unwrap().is_none());
     }
 }

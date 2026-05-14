@@ -320,6 +320,13 @@ input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(102, 204, 255, 0.15);
 }
+input.is-drop-target {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+  box-shadow:
+    0 0 0 3px rgba(102, 204, 255, 0.18),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
 
 /* -------- View: Docs -------- */
 .docs-shell {

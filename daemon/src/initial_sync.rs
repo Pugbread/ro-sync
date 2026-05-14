@@ -96,6 +96,9 @@ fn walk(dir: &Path, scripts: &mut u32, instances: &mut u32) -> std::io::Result<(
                 *instances += 1;
             }
         } else if file_type.is_dir() {
+            if crate::fs_map::is_empty_plain_folder(&path).unwrap_or(false) {
+                continue;
+            }
             // Every nested directory is either a Folder or a script-with-children
             // instance under the new whitelist — both count once.
             *instances += 1;
@@ -125,32 +128,19 @@ pub fn new_choice_id() -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let p = std::env::temp_dir().join(format!(
-                "rosync-init-{}-{}-{:x}",
-                tag,
-                std::process::id(),
-                nanos
-            ));
-            fs::create_dir_all(&p).unwrap();
-            TempDir(p)
+            TempDir(
+                tempfile::Builder::new()
+                    .prefix(&format!("rosync-init-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 

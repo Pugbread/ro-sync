@@ -102,6 +102,10 @@ function toUtf16LEBase64(s) {
   return Buffer.from(u8).toString("base64");
 }
 
+function posixBase64DecodeStdinCmd() {
+  return `{ if base64 --help 2>&1 | grep -q -- '--decode'; then base64 --decode; else base64 -D; fi; }`;
+}
+
 // Build a `powershell -EncodedCommand <base64>` invocation. Arg tokens are all
 // bare ASCII, so no parent-shell can break them. Use for anything that would
 // otherwise need embedded " inside -Command.
@@ -361,21 +365,40 @@ export function pickFolderCmd(prompt) {
   const b64 = typeof btoa === "function"
     ? btoa(unescape(encodeURIComponent(script)))
     : Buffer.from(script, "utf8").toString("base64");
-  return `echo ${b64} | base64 -d | osascript`;
+  return `printf %s ${posixQuote(b64)} | ${posixBase64DecodeStdinCmd()} | osascript`;
 }
 
 // Write a base64-encoded UTF-8 string to `absPath`, creating/truncating.
 export function writeFileFromB64Cmd(absPath, b64) {
   if (IS_WINDOWS) {
     const ps =
+      `$ErrorActionPreference = 'Stop'; ` +
       `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(absPath)}); ` +
       `$dir = Split-Path -Parent $p; ` +
-      `if ($dir) { [IO.Directory]::CreateDirectory($dir) | Out-Null }; ` +
-      `[IO.File]::WriteAllBytes($p, [Convert]::FromBase64String(${psQuote(b64)}))`;
+      `if (-not $dir) { $dir = (Get-Location).Path }; ` +
+      `[IO.Directory]::CreateDirectory($dir) | Out-Null; ` +
+      `$tmp = Join-Path $dir ('.' + [IO.Path]::GetFileName($p) + '.' + [Diagnostics.Process]::GetCurrentProcess().Id + '.tmp'); ` +
+      `try { ` +
+      `  [IO.File]::WriteAllBytes($tmp, [Convert]::FromBase64String(${psQuote(b64)})); ` +
+      `  if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }; ` +
+      `  Move-Item -LiteralPath $tmp -Destination $p -Force ` +
+      `} catch { ` +
+      `  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }; ` +
+      `  throw ` +
+      `}`;
     return psEncodedCmd(ps);
   }
   const q = posixQuote(absPath);
-  return `mkdir -p "$(dirname ${q})" && echo ${posixQuote(b64)} | base64 -d > ${q}`;
+  return (
+    `dir=$(dirname -- ${q}) && ` +
+    `base=$(basename -- ${q}) && ` +
+    `mkdir -p "$dir" && ` +
+    `tmp="$dir/.$base.$$.tmp" && ` +
+    `trap 'rm -f "$tmp"' EXIT && ` +
+    `printf %s ${posixQuote(b64)} | ${posixBase64DecodeStdinCmd()} > "$tmp" && ` +
+    `mv -f "$tmp" ${q} && ` +
+    `trap - EXIT`
+  );
 }
 
 // Read a text file's full contents to stdout (empty if missing).
@@ -449,10 +472,10 @@ export function buildDaemonCmd() {
     return psEncodedCmd(ps);
   }
   // POSIX: cd into daemon, run build.sh, capture exit code. Prefer the user's
-  // cargo if rustup is installed under $HOME/.cargo.
+  // cargo if present on PATH; build.sh falls back to $HOME/.cargo/bin/cargo.
   return (
     `cd ${posixExpandQuote(joinShell(WIDGET_DIR_SHELL, "daemon"))} && ` +
-    `CARGO="$HOME/.cargo/bin/cargo" bash ./build.sh 2>&1; ` +
+    `bash ./build.sh 2>&1; ` +
     `echo "___EXIT:$?"`
   );
 }

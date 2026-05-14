@@ -62,6 +62,9 @@ const REQUIRED_RO_SYNC_MD_TOKENS: &[&str] = &[
     "get --prop",
     "rosync source",
     "rosync changes",
+    "Playtesting is a separate environment",
+    "AvoidSync = true",
+    "init (<Name>)",
     "conflicts",
     "writes.log",
 ];
@@ -183,6 +186,17 @@ skeleton at the project root so tooling can see the rest of the DataModel, but
 the daemon never writes those instances to disk and never pushes property
 changes to Studio.
 
+## 1b. Playtesting is a separate environment
+
+Roblox Studio playtesting clones the current edit environment. Script edits made
+while playtesting run inside that cloned playtest environment and DO NOT mirror
+back into the current edit DataModel. Ro Sync is connected to the current edit
+DataModel and this directory, not the temporary playtest clone.
+
+If you change code while a playtest is running, make the durable edit in this
+directory or in the non-playtest Studio edit view. Do not assume a script change
+made during Play/Solo/Run has synced just because it worked in the playtest.
+
 ## 2. Filesystem conventions
 
 | On disk                              | Roblox instance                                |
@@ -195,6 +209,29 @@ changes to Studio.
 | `Foo/init (Foo).server.luau`         | `Script` named `Foo` with children             |
 | `Foo/init (Foo).client.luau`         | `LocalScript` named `Foo` with children        |
 | `Foo [1].luau`, `Foo [2].luau` …     | Siblings that share the name `Foo` (1-based)   |
+
+Additional sync rules:
+
+- The project root represents `game`. Only the listed synced service
+  directories are valid roots; arbitrary folders under the project root do not
+  become children of `game`.
+- A script with children is represented by a directory plus one matching
+  `init (<Name>)` file. Edit that init file for the script's `Source`; edit
+  child files/directories for child instances.
+- `init (Name).server.luau` maps to `Script`, `init (Name).client.luau` maps to
+  `LocalScript`, and `init (Name).luau` maps to `ModuleScript`.
+- Plain Wally/Rojo package roots such as `init.lua`, `init.server.lua`, and
+  `init.client.lua` are recognized for package-style modules, but Ro Sync emits
+  its own script-with-children files as `init (<Name>).*.luau`.
+- Directories map to `Folder` unless they are script-with-children directories
+  with an `init (<Name>)` file. Empty plain directories are ignored until they
+  contain a syncable script or child directory, so placeholder folders cannot
+  shadow same-named scripts.
+- File and directory renames/moves sync as Roblox instance renames/reparents
+  when they stay under a synced service.
+- Set a boolean Studio attribute `AvoidSync = true` on a folder/instance to
+  exclude that subtree from filesystem sync. The subtree is still visible in
+  `tree.json` as an `avoidSync` boundary, but child scripts under it are ignored.
 
 Names containing characters POSIX paths can't express (`/`, control characters,
 leading `.`) are percent-encoded.
@@ -1260,6 +1297,9 @@ fn build_whitelisted_node_at(
     let Some(inst) = path_to_instance_meta(path)? else {
         return Ok(None);
     };
+    if inst.class == "Folder" && crate::fs_map::is_empty_plain_folder(path)? {
+        return Ok(None);
+    }
     let is_script = matches!(
         inst.class.as_str(),
         "Script" | "LocalScript" | "ModuleScript"
@@ -1309,11 +1349,35 @@ fn default_project_path(dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
         return Ok(None);
     };
 
-    if path.is_empty() || Path::new(path).is_absolute() || path.split('/').any(|seg| seg == "..") {
+    let Some(relative_path) = safe_rojo_relative_path(path) else {
         return Ok(None);
+    };
+
+    Ok(Some(dir.join(relative_path)))
+}
+
+fn safe_rojo_relative_path(path: &str) -> Option<std::path::PathBuf> {
+    if path.is_empty() || Path::new(path).is_absolute() || looks_like_windows_rooted_path(path) {
+        return None;
     }
 
-    Ok(Some(dir.join(path)))
+    let mut out = std::path::PathBuf::new();
+    for segment in path.split(['/', '\\']) {
+        if segment.is_empty() || segment == ".." {
+            return None;
+        }
+        if segment != "." {
+            out.push(segment);
+        }
+    }
+    Some(out)
+}
+
+fn looks_like_windows_rooted_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || path.starts_with('\\')
+        || path.starts_with("//")
 }
 
 /// Read the `init (...).luau` file inside a script-with-children directory.
@@ -1347,37 +1411,20 @@ fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "rosync-snap-{}-{}-{}",
-                tag,
-                std::process::id(),
-                rand_token()
-            ));
-            fs::create_dir_all(&p).unwrap();
-            TempDir(p)
+            TempDir(
+                tempfile::Builder::new()
+                    .prefix(&format!("rosync-snap-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn rand_token() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        format!("{:x}", nanos)
     }
 
     fn find_service<'a>(services: &'a [Value], name: &str) -> Option<&'a Value> {
@@ -1861,6 +1908,20 @@ mod tests {
             find_child(promise, "Error").unwrap()["class"],
             "ModuleScript"
         );
+    }
+
+    #[test]
+    fn default_project_path_rejects_windows_parent_traversal() {
+        let d = TempDir::new("wally-default-project-traversal");
+        let pkg = d.path().join("ReplicatedStorage").join("Packages");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("default.project.json"),
+            r#"{"tree":{"$path":"..\\Outside"}}"#,
+        )
+        .unwrap();
+
+        assert!(default_project_path(&pkg).unwrap().is_none());
     }
 
     #[test]

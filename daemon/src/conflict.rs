@@ -65,6 +65,8 @@ struct ParkedConflict {
 #[derive(Debug, Clone, Serialize)]
 pub struct Conflict {
     pub path: PathBuf,
+    pub local: String,
+    pub studio: String,
     pub fs_hash: String,
     pub fs_mtime: u64,
     pub studio_hash: String,
@@ -244,6 +246,8 @@ impl ConflictEngine {
             .iter()
             .map(|(p, c)| Conflict {
                 path: p.clone(),
+                local: String::from_utf8_lossy(&c.fs_bytes).into_owned(),
+                studio: String::from_utf8_lossy(&c.studio_bytes).into_owned(),
                 fs_hash: hex(&c.fs_hash),
                 fs_mtime: c.fs_mtime,
                 studio_hash: hex(&c.studio_hash),
@@ -324,7 +328,10 @@ mod tests {
         e.record_sync(&p("/x/a.luau"), hash(b"hello"), 100);
         let d = e.on_studio_push(&p("/x/a.luau"), b"studio-edit", Some((b"fs-edit", 200)));
         assert_eq!(d, StudioDecision::Conflict);
-        assert_eq!(e.list().len(), 1);
+        let conflicts = e.list();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].local, "fs-edit");
+        assert_eq!(conflicts[0].studio, "studio-edit");
         assert!(e.has_conflict(&p("/x/a.luau")));
     }
 

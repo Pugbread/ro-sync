@@ -1,0 +1,6 @@
+{
+  "definitions": [
+    "tools/luau-lsp/roblox/globalTypes.d.luau"
+  ],
+  "languageMode": "nonstrict"
+}

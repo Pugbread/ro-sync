@@ -2,10 +2,10 @@
 
 This directory is the Rojo-managed build project for the Studio plugin.
 
+From the repository root:
+
 ```sh
-cd plugin-src
-wally install
-rojo build plugin.project.json --output ../plugin/Plugin.rbxm
+node plugin/build-plugin.mjs
 ```
 
 `../plugin/Plugin.luau` remains the plugin's sync/daemon implementation source.

@@ -40,6 +40,8 @@ export function mountConflicts(root, api) {
   const $allStudio = root.querySelector("#cf-all-studio");
 
   let conflicts = [];
+  let disposed = false;
+  let loadSeq = 0;
 
   function updateBadge(n) {
     const badge = document.getElementById("conflicts-badge");
@@ -49,6 +51,7 @@ export function mountConflicts(root, api) {
   }
 
   async function load() {
+    const seq = ++loadSeq;
     const base = api.getDaemonBase();
     const s = api.getState();
     const proj = (s.projects || []).find((p) => p.id === s.activeProjectId);
@@ -56,14 +59,17 @@ export function mountConflicts(root, api) {
     if (!proj) { $count.textContent = "no active project"; $list.innerHTML = ""; $empty.hidden = true; return; }
     try {
       const data = await daemonJson(base, "/resolve");
+      if (disposed || seq !== loadSeq) return;
       conflicts = Array.isArray(data) ? data : (data.conflicts || []);
-      render();
+      render(seq);
     } catch (e) {
+      if (disposed || seq !== loadSeq) return;
       $count.textContent = `error: ${e.message}`;
     }
   }
 
-  async function render() {
+  async function render(seq = loadSeq) {
+    if (disposed || seq !== loadSeq) return;
     $list.innerHTML = "";
     $count.textContent = `${conflicts.length} conflict(s)`;
     updateBadge(conflicts.length);
@@ -71,6 +77,7 @@ export function mountConflicts(root, api) {
     if (!conflicts.length) return;
 
     const lib = await loadDiff();
+    if (disposed || seq !== loadSeq) return;
     for (const c of conflicts) {
       const card = document.createElement("div");
       card.className = "conflict";
@@ -135,10 +142,12 @@ export function mountConflicts(root, api) {
           choice: side,
         }),
       });
+      if (disposed) return;
       api.toast(`Kept ${side}`);
       conflicts = conflicts.filter((c) => c !== conflict);
       render();
     } catch (e) {
+      if (disposed) return;
       api.toast(`resolve failed: ${e.message}`);
     }
   }
@@ -158,7 +167,11 @@ export function mountConflicts(root, api) {
 
   load();
 
-  return () => { offUp(); offDown(); offState(); };
+  return () => {
+    disposed = true;
+    loadSeq++;
+    offUp(); offDown(); offState();
+  };
 }
 
 function span(cls, text) {

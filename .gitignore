@@ -3,6 +3,7 @@ daemon/target/
 
 # Generated plugin build inputs
 plugin-src/Packages/
+plugin-src/src/RoSync.server.luau
 
 # Runtime state & logs (contain absolute paths / project-specific data)
 state.json

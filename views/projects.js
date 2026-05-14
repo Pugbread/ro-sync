@@ -1,6 +1,7 @@
 // views/projects.js — list+detail Projects view with sidebar-friendly shell,
 // per-project controls, and a throttled activity tail for the served project.
 import { daemonJson, daemonWS } from "../bridge.js";
+import { copyText, pathFromDrop } from "./runtime.js";
 import {
   pickFolderCmd,
   openFolderEnsuredCmd,
@@ -811,10 +812,6 @@ export function mountProjects(root, api) {
         projects: (s.projects || []).map((p) => p.id === proj.id ? nextProj : p),
       });
       await saveProjectConfig(nextProj);
-      if (wasActive && typeof api.killDaemon === "function") {
-        if (statusEl) statusEl.textContent = "Pausing sync for Wally install...";
-        try { await api.killDaemon(); } catch (e) { console.warn("killDaemon", e); }
-      }
       if (statusEl) statusEl.textContent = "Running wally install...";
       const res = await api.t64("t64:exec", {
         command: wallyInstallCmd(cwd),
@@ -824,12 +821,8 @@ export function mountProjects(root, api) {
         throw new Error((res.stderr || res.stdout || `exit ${res.code}`).trim());
       }
       const summary = summarizeWallyInstall(res);
-      if (wasActive && typeof api.ensureDaemon === "function") {
-        if (statusEl) statusEl.textContent = `${summary}; restarting sync...`;
-        try { await api.ensureDaemon(); } catch (e) { console.warn("ensureDaemon", e); }
-      }
       if (statusEl) statusEl.textContent = wasActive
-        ? `${summary}; accept disk when Studio asks`
+        ? `${summary}; syncing packages`
         : summary;
       api.toast(summary);
     } catch (e) {
@@ -1050,6 +1043,19 @@ export function mountProjects(root, api) {
   function closeAddPanel() {
     $addPanel.hidden = true;
     $toggleAdd.setAttribute("aria-expanded", "false");
+    $path.classList.remove("is-drop-target");
+  }
+
+  function acceptDroppedPath(event) {
+    event.preventDefault();
+    $path.classList.remove("is-drop-target");
+    const path = pathFromDrop(event);
+    if (path) {
+      $path.value = path;
+      $path.focus();
+    } else {
+      api.toast("Drop a folder path");
+    }
   }
 
   // ---- wiring ----
@@ -1060,6 +1066,18 @@ export function mountProjects(root, api) {
   $add.addEventListener("click", add);
   $pick.addEventListener("click", pickFolder);
   $addTile.addEventListener("click", openAddPanel);
+  $path.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    $path.classList.add("is-drop-target");
+  });
+  $path.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+  });
+  $path.addEventListener("dragleave", () => {
+    $path.classList.remove("is-drop-target");
+  });
+  $path.addEventListener("drop", acceptDroppedPath);
   for (const $i of [$path, $gameId, $groupId, $placeIds]) {
     $i.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
   }
@@ -1084,7 +1102,7 @@ export function mountProjects(root, api) {
     const path = btn.dataset.copyPath || "";
     if (!path) return;
     try {
-      await navigator.clipboard.writeText(path);
+      await copyText(api, path);
       api.toast && api.toast("Path copied");
     } catch {
       api.toast && api.toast("Could not copy path");

@@ -6993,7 +6993,7 @@ mod tier2_tests {
 
     #[test]
     fn synced_service_root_directory_ops_are_filtered() {
-        let root = PathBuf::from("/tmp/ro-sync-test-project");
+        let root = PathBuf::from("ro-sync-test-project");
         let service_op = Op {
             kind: OpKind::Update,
             path: root.join("ReplicatedStorage"),
@@ -7084,11 +7084,8 @@ mod tier2_tests {
 
     #[test]
     fn lint_scope_filter_keeps_only_requested_diagnostics() {
-        let root = std::env::temp_dir().join(format!(
-            "rosync-lint-filter-{}-{}",
-            std::process::id(),
-            unix_nanos()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
         let owned = root.join("ReplicatedStorage").join("Client");
         let vendor = root.join("ReplicatedStorage").join("Packages");
         std::fs::create_dir_all(&owned).unwrap();
@@ -7105,8 +7102,6 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
         assert!(filtered.contains("[INFO] sourcemap loaded"));
         assert!(filtered.contains("Client/Main.luau"));
         assert!(!filtered.contains("Packages/Dep.luau"));
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7493,9 +7488,9 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
 
     #[test]
     fn snapshot_output_path_defaults_to_project_timestamp() {
-        let out = snapshot_output_path(None, Some(std::path::Path::new("/tmp/project")), 123)
-            .expect("path");
-        assert_eq!(out, PathBuf::from("/tmp/project/rosync-snapshot-123.json"));
+        let dir = tempfile::tempdir().unwrap();
+        let out = snapshot_output_path(None, Some(dir.path()), 123).expect("path");
+        assert_eq!(out, dir.path().join("rosync-snapshot-123.json"));
     }
 
     #[test]

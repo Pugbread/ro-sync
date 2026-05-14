@@ -9,6 +9,7 @@ import {
   checkBinaryCmd, checkCargoCmd, buildDaemonCmd, parseBuildOutput,
   joinShell,
 } from "../platform.js";
+import { copyText, platformLabel } from "./runtime.js";
 
 const RELEASES_URL = "https://github.com/Pugbread/ro-sync/releases";
 const RUSTUP_URL   = "https://rustup.rs";
@@ -337,7 +338,7 @@ export function mountSettings(root, api) {
     const base = api.getDaemonBase();
     $bin.textContent = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
     const $plat = root.querySelector("#set-platform");
-    if ($plat) $plat.textContent = PLATFORM;
+    if ($plat) $plat.textContent = platformLabel(PLATFORM);
     $port.textContent = s.daemonPort ?? DEFAULT_PORT;
     $pid.textContent = s.daemonPid ?? "—";
     $base.textContent = base || "—";
@@ -425,7 +426,7 @@ export function mountSettings(root, api) {
   $copy.addEventListener("click", async () => {
     try {
       const text = await readPluginFile();
-      await navigator.clipboard.writeText(text);
+      await copyText(api, text);
       $pluginMsg.textContent = `Copied ${text.length} chars to clipboard.`;
       api.toast("Plugin.luau copied");
     } catch (e) {

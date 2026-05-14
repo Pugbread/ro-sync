@@ -1,4 +1,5 @@
 // views/docs.js — searchable Ro Sync command reference.
+import { copyText } from "./runtime.js";
 
 const DOCS_BUNDLE_REL = "docs/client-commands.generated.json";
 
@@ -127,7 +128,7 @@ export function mountDocs(root, api) {
     const button = event.target.closest("[data-copy]");
     if (!button) return;
     try {
-      await navigator.clipboard.writeText(decodeURIComponent(button.dataset.copy || ""));
+      await copyText(api, decodeURIComponent(button.dataset.copy || ""));
       api.toast("Copied command");
     } catch (e) {
       api.toast(`copy failed: ${e.message}`);

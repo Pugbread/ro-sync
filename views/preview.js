@@ -9,6 +9,7 @@
 // On Reject, POSTs {accept:false}.
 //
 // Counts are color-coded (green/yellow/red) mirroring Argon's processor/mod.rs:184.
+import { installDocumentEscape } from "./runtime.js";
 
 export function mountPreviewModal(api) {
   // api: { onBus, getDaemonBase, getState, toast }
@@ -124,8 +125,11 @@ export function mountPreviewModal(api) {
   for (const btn of buttons) {
     btn.addEventListener("click", () => submit(btn.dataset.act === "accept"));
   }
-  overlay.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !busy) submit(false);
+  installDocumentEscape((e) => {
+    if (!overlay.hidden && !busy) {
+      e.preventDefault();
+      submit(false);
+    }
   });
 
   api.onBus("batch-preview", (data) => {

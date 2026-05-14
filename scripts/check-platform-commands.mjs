@@ -58,6 +58,11 @@ const buildPs = decodePowerShell(win.buildDaemonCmd());
 assert(buildPs.includes(".\\build.ps1"), "build command must run build.ps1");
 assert(buildPs.includes("___EXIT:"), "build command must emit exit sentinel");
 
+const winWritePs = decodePowerShell(win.writeFileFromB64Cmd("%TEMP%\\config.json", "e30="));
+assert(winWritePs.includes("[IO.File]::WriteAllBytes($tmp"), "Windows write must target temp file first");
+assert(winWritePs.includes("Remove-Item -LiteralPath $p"), "Windows write must remove existing file before replace");
+assert(winWritePs.includes("Move-Item -LiteralPath $tmp"), "Windows write must move temp file into place");
+
 const mac = await loadPlatform("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)", "mac");
 assert(mac.PLATFORM === "darwin", "Mac UA must select darwin platform");
 const macInstall = mac.pluginInstallCmd({
@@ -68,5 +73,19 @@ const macInstall = mac.pluginInstallCmd({
 });
 assert(macInstall.includes('"$HOME/Documents/Roblox/Plugins"'), "POSIX install must expand HOME");
 assert(!macInstall.includes("'$HOME/Documents/Roblox/Plugins'"), "POSIX install must not single-quote HOME");
+
+const macWrite = mac.writeFileFromB64Cmd("$HOME/project/config.json", "e30=");
+assert(macWrite.includes("base64 --decode"), "POSIX base64 decode must support GNU base64");
+assert(macWrite.includes("base64 -D"), "POSIX base64 decode must support macOS BSD base64");
+assert(macWrite.includes("> \"$tmp\""), "POSIX write must target temp file first");
+assert(macWrite.includes("mv -f \"$tmp\""), "POSIX write must replace from temp file");
+
+const macPick = mac.pickFolderCmd("Pick Folder");
+assert(macPick.includes("base64 --decode"), "macOS folder picker must support GNU base64");
+assert(macPick.includes("base64 -D"), "macOS folder picker must support BSD base64");
+
+const macBuild = mac.buildDaemonCmd();
+assert(macBuild.includes("bash ./build.sh"), "POSIX build must run build.sh");
+assert(!macBuild.includes('CARGO="$HOME/.cargo/bin/cargo"'), "POSIX build must not force home cargo");
 
 console.log("platform command checks passed");

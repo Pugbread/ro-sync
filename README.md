@@ -229,8 +229,11 @@ The shipped plugin package is `plugin/Plugin.rbxm`. To rebuild it:
 
 ```sh
 aftman install
-plugin/build-plugin.sh
+node plugin/build-plugin.mjs
 ```
+
+On macOS / Linux, `plugin/build-plugin.sh` is also available and delegates to
+the same Node builder.
 
 The Rojo project lives in `plugin-src/` and bundles React Lua / ReactRoblox
 through Wally. The React UI is in `plugin-src/src/App.luau`; the sync and daemon
@@ -275,6 +278,10 @@ The release workflow also builds and tests the daemon on `windows-2022`.
 ## Safety Rules
 
 - Filesystem sync is intentionally limited to scripts and folders.
+- Empty plain directories are ignored until they contain syncable content, so
+  placeholder folders cannot shadow same-named scripts in Studio.
+- Renaming between `.luau`, `.server.luau`, and `.client.luau` converts the
+  Studio script class instead of leaving a stale `Script`/`LocalScript`/`ModuleScript`.
 - Non-script Roblox classes do not round-trip through files.
 - `set Parent = ...` is refused by default; use `rosync mv`.
 - Cross-service moves require `--force`.

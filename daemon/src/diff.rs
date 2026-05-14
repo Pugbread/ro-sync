@@ -166,6 +166,13 @@ fn collect_snapshot_node(
         return;
     };
     let path = join_path(parent, name);
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return;
+    }
     if !is_service && is_sync_class(class) {
         out.insert(
             path.clone(),
@@ -202,6 +209,13 @@ fn collect_studio_node(
     } else {
         join_path(parent, name)
     };
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
     let mut has_syncable_child = false;
     if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
         for child in children {
@@ -382,6 +396,29 @@ mod tests {
         let studio = collect_studio_tree_nodes(&studio_tree);
         assert!(!studio.contains_key("CoreGui/PluginNoise"));
         assert_eq!(studio["ReplicatedStorage/Config"].class, "ModuleScript");
+    }
+
+    #[test]
+    fn studio_tree_ignores_avoid_sync_subtrees() {
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [
+                { "class": "Workspace", "name": "Workspace", "children": [
+                    { "class": "Folder", "name": "Ignored", "avoidSync": true, "children": [
+                        { "class": "Script", "name": "Runner", "children": [] }
+                    ] },
+                    { "class": "Folder", "name": "Included", "children": [
+                        { "class": "Script", "name": "Runner", "children": [] }
+                    ] }
+                ] }
+            ]
+        });
+
+        let studio = collect_studio_tree_nodes(&studio_tree);
+        assert!(!studio.contains_key("Workspace/Ignored"));
+        assert!(!studio.contains_key("Workspace/Ignored/Runner"));
+        assert_eq!(studio["Workspace/Included/Runner"].class, "Script");
     }
 
     #[test]

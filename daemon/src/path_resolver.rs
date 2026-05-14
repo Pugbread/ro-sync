@@ -540,35 +540,21 @@ mod tests {
     use serde_json::json;
     use std::fs;
 
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "rosync-path-{tag}-{}-{}",
-                std::process::id(),
-                unix_nanos()
-            ));
-            fs::create_dir_all(&p).unwrap();
-            Self(p)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("rosync-path-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn unix_nanos() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
     }
 
     fn write_tree(project: &Path) {

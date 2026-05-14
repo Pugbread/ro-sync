@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -24,9 +26,9 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
 use crate::diff;
 use crate::fs_map::{
-    classify_script_file, encode_name, instance_to_path, is_init_file, normalize_line_endings,
-    parse_disambiguated, parse_init_file, path_to_instance_meta, InstanceDescriptor, PathInstance,
-    ScriptClass, META_FILE,
+    classify_script_file, encode_name, instance_to_path, is_empty_plain_folder, is_init_file,
+    normalize_line_endings, parse_disambiguated, parse_init_file, path_to_instance_meta,
+    InstanceDescriptor, PathInstance, ScriptClass, META_FILE,
 };
 
 /// Roblox classes the daemon will materialize on disk. Everything else is
@@ -36,6 +38,16 @@ const SCOPED_CLASSES: &[&str] = &["Folder", "Script", "LocalScript", "ModuleScri
 fn is_scoped_class(class: &str) -> bool {
     SCOPED_CLASSES.contains(&class)
 }
+
+#[derive(Clone)]
+struct AvoidSyncCache {
+    tree_path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    paths: Vec<Vec<String>>,
+}
+
+static AVOID_SYNC_CACHE: OnceLock<Mutex<Option<AvoidSyncCache>>> = OnceLock::new();
 use crate::initial_sync::{compute_disk_stats, new_choice_id, Choice, PendingInitial, Stats};
 use crate::snapshot;
 use crate::watch::{Op, OpKind};
@@ -156,17 +168,39 @@ fn rosync_home_dir() -> Option<PathBuf> {
 
 async fn tree_post(State(state): State<AppState>, body: Bytes) -> Json<Value> {
     let root = state.canonical_project.as_path();
-    let tmp = root.join(".tree.json.tmp");
-    let final_path = root.join("tree.json");
     let bytes = body.len();
-    if let Err(e) = std::fs::write(&tmp, &body) {
-        return Json(json!({ "ok": false, "error": format!("write tmp: {e}") }));
-    }
-    if let Err(e) = std::fs::rename(&tmp, &final_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Json(json!({ "ok": false, "error": format!("rename: {e}") }));
+    if let Err(e) = write_tree_json_replace(root, &body) {
+        return Json(json!({ "ok": false, "error": format!("write tree: {e}") }));
     }
     Json(json!({ "ok": true, "bytes": bytes }))
+}
+
+fn write_tree_json_replace(root: &Path, body: &[u8]) -> io::Result<()> {
+    let tmp = root.join(".tree.json.tmp");
+    let final_path = root.join("tree.json");
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(windows)]
+        if final_path.exists() {
+            std::fs::remove_file(&final_path)?;
+        }
+
+        std::fs::rename(&tmp, &final_path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[derive(Serialize)]
@@ -353,7 +387,11 @@ fn initial_snapshot_comparison(
 ) -> Result<InitialComparison, String> {
     let local_services =
         snapshot::emit_services(root).map_err(|e| format!("scan {}: {e}", root.display()))?;
-    let local = diff::collect_local_nodes(&local_services);
+    let mut local = diff::collect_local_nodes(&local_services);
+    let ignored = avoid_sync_paths_from_nodes(studio_services);
+    if !ignored.is_empty() {
+        local.retain(|path, _| !diff_path_is_avoid_synced(path, &ignored));
+    }
     let studio = diff::collect_local_nodes(studio_services);
     let report = diff::compare(&local, &studio);
     Ok(InitialComparison {
@@ -365,6 +403,28 @@ fn initial_snapshot_comparison(
         new_files: report.added,
         changed_files: report.changed,
         removed_files: report.removed,
+    })
+}
+
+fn avoid_sync_paths_from_nodes(nodes: &[Value]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for node in nodes {
+        collect_avoid_sync_paths(node, &[], &mut out);
+    }
+    out
+}
+
+fn diff_path_is_avoid_synced(path: &str, ignored: &[Vec<String>]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    ignored.iter().any(|prefix| {
+        prefix.len() <= segs.len()
+            && prefix
+                .iter()
+                .zip(segs.iter())
+                .all(|(a, b)| a.as_str() == *b)
     })
 }
 
@@ -852,6 +912,13 @@ fn apply_set(
     node: &Value,
     ctx: &PushCtx<'_>,
 ) -> Result<ApplyOutcome, String> {
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(ApplyOutcome::Skipped);
+    }
     let name = node
         .get("name")
         .and_then(|v| v.as_str())
@@ -865,12 +932,14 @@ fn apply_set(
     if !is_scoped_class(class) {
         return Ok(ApplyOutcome::Skipped);
     }
+    let children = node.get("children").and_then(|v| v.as_array()).cloned();
+    let has_children = children.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+    if class == "Folder" && !has_children {
+        return Ok(ApplyOutcome::Skipped);
+    }
     let parent_dir = resolve_segments_to_dir(root, parent_segs)?;
     std::fs::create_dir_all(&parent_dir)
         .map_err(|e| format!("mkdir {}: {e}", parent_dir.display()))?;
-
-    let children = node.get("children").and_then(|v| v.as_array()).cloned();
-    let has_children = children.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
 
     // If a node with this name already exists on disk, reuse its path; otherwise
     // compute a fresh fragment.
@@ -1242,6 +1311,7 @@ fn find_child_fragment_by_name(dir: &Path, name: &str) -> std::io::Result<Option
     if !dir.is_dir() {
         return Ok(None);
     }
+    let mut best: Option<(String, u8)> = None;
     for entry in std::fs::read_dir(dir)? {
         let e = entry?;
         let fname = e.file_name();
@@ -1252,11 +1322,30 @@ fn find_child_fragment_by_name(dir: &Path, name: &str) -> std::io::Result<Option
         let inst = path_to_instance_meta(&e.path())?;
         if let Some(i) = inst {
             if i.name == name {
-                return Ok(Some(fstr.to_string()));
+                let priority = fragment_lookup_priority(&e.path(), &i);
+                if best.as_ref().map(|(_, p)| priority > *p).unwrap_or(true) {
+                    best = Some((fstr.to_string(), priority));
+                }
             }
         }
     }
-    Ok(None)
+    Ok(best.map(|(fragment, _)| fragment))
+}
+
+fn fragment_lookup_priority(path: &Path, inst: &PathInstance) -> u8 {
+    if inst.is_script_with_children {
+        return 4;
+    }
+    if inst.script_class.is_some() && !inst.is_dir {
+        return 3;
+    }
+    if inst.class == "Folder" && is_empty_plain_folder(path).unwrap_or(false) {
+        return 0;
+    }
+    if inst.class == "Folder" {
+        return 1;
+    }
+    2
 }
 
 fn siblings_except(dir: &Path, except: Option<&str>) -> Result<Vec<String>, String> {
@@ -1315,12 +1404,25 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
         return None;
     }
 
+    if !is_synced_service_segment(&segs[0]) {
+        return None;
+    }
+
     match op.kind {
         OpKind::Delete => {
             let target_segs = segs_to_instance_path(&segs)?;
+            if deleted_path_is_shadowed_ignored_folder(root, &segs, &op.path) {
+                return None;
+            }
+            if path_is_avoid_synced(root, &target_segs) {
+                return None;
+            }
             Some(json!({ "op": "delete", "path": target_segs }))
         }
         OpKind::Rename => {
+            if is_empty_plain_folder(&op.path).unwrap_or(false) {
+                return None;
+            }
             // `op.path` is the destination (new) path; `op.from` is the source.
             let from_path = op.from.as_ref()?;
             let from_rel = from_path.strip_prefix(root).ok()?;
@@ -1331,8 +1433,29 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
             if from_segs_fs.is_empty() {
                 return None;
             }
+            if !is_synced_service_segment(&from_segs_fs[0]) {
+                return None;
+            }
             let from_inst = segs_to_instance_path(&from_segs_fs)?;
             let to_inst = segs_to_instance_path(&segs)?;
+            if path_is_avoid_synced(root, &from_inst) || path_is_avoid_synced(root, &to_inst) {
+                return None;
+            }
+            let from_script = script_identity_from_segments(root, &from_segs_fs, from_path);
+            let to_script = script_identity_from_segments(root, &segs, &op.path);
+            if let (Some((from_path, from_class)), Some((to_path, to_class))) =
+                (from_script, to_script)
+            {
+                if from_class != to_class {
+                    return Some(json!({
+                        "op": "class_change",
+                        "path": from_path,
+                        "to": to_path,
+                        "class": to_class,
+                        "properties": { "Source": source_for_path(&op.path, op.content.as_deref()) },
+                    }));
+                }
+            }
             // Two cases the plugin handles with one op:
             //   (a) same-parent rename → just `Instance.Name = last(to_inst)`.
             //   (b) cross-parent move  → reparent + maybe rename.
@@ -1356,11 +1479,16 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                 {
                     let parent_segs_fs: Vec<String> = segs[..segs.len() - 1].to_vec();
                     let inst_segs = segs_to_instance_path(&parent_segs_fs)?;
+                    if path_is_avoid_synced(root, &inst_segs) {
+                        return None;
+                    }
                     let content = op.content.as_deref().unwrap_or(b"");
                     let source = String::from_utf8_lossy(content).to_string();
                     return Some(json!({
-                        "op": "update",
+                        "op": "class_change",
                         "path": inst_segs,
+                        "to": inst_segs,
+                        "class": parent_inst.class,
                         "properties": { "Source": source },
                     }));
                 }
@@ -1376,8 +1504,17 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
             // Scripts carry their Source; non-scripts emit an empty properties
             // map (property sync is Studio-authoritative via tree.json).
             let inst = path_to_instance_meta(&op.path).ok().flatten()?;
+            if inst.class == "Folder" && is_empty_plain_folder(&op.path).unwrap_or(false) {
+                return None;
+            }
             let parent_segs_fs: Vec<String> = segs[..segs.len() - 1].to_vec();
             let parent_inst_segs = segs_to_instance_path(&parent_segs_fs).unwrap_or_default();
+            let inst_segs = segs_to_instance_path(&segs)?;
+            if path_is_avoid_synced(root, &parent_inst_segs)
+                || path_is_avoid_synced(root, &inst_segs)
+            {
+                return None;
+            }
 
             let mut props: Map<String, Value> = Map::new();
             if !inst.is_dir {
@@ -1396,6 +1533,187 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                     "children": Value::Array(Vec::new()),
                 },
             }))
+        }
+    }
+}
+
+fn script_identity_from_segments(
+    root: &Path,
+    segs: &[String],
+    fs_path: &Path,
+) -> Option<(Vec<String>, String)> {
+    let fname = segs.last()?;
+    if let Some((script_class, _)) = parse_init_file(fname) {
+        let parent_segs = &segs[..segs.len().saturating_sub(1)];
+        let instance_path = if let Some(parent) = fs_path.parent() {
+            path_to_instance_meta(parent)
+                .ok()
+                .flatten()
+                .and_then(|inst| {
+                    let mut out = segs_to_instance_path(parent_segs)?;
+                    let last = out.last_mut()?;
+                    *last = inst.name;
+                    Some(out)
+                })
+                .or_else(|| segs_to_instance_path(parent_segs))
+        } else {
+            segs_to_instance_path(parent_segs)
+        }?;
+        return Some((instance_path, script_class.class_name().to_string()));
+    }
+
+    if let Some((script_class, _)) = classify_script_file(fname) {
+        return Some((
+            segs_to_instance_path(segs)?,
+            script_class.class_name().to_string(),
+        ));
+    }
+
+    let rel = fs_path.strip_prefix(root).ok()?;
+    let rel_segs: Vec<String> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(String::from))
+        .collect();
+    let inst = path_to_instance_meta(fs_path).ok().flatten()?;
+    if inst.script_class.is_some() {
+        return Some((segs_to_instance_path(&rel_segs)?, inst.class));
+    }
+    None
+}
+
+fn source_for_path(path: &Path, content: Option<&[u8]>) -> String {
+    if let Some(content) = content {
+        return String::from_utf8_lossy(content).to_string();
+    }
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default()
+}
+
+fn deleted_path_is_shadowed_ignored_folder(root: &Path, segs: &[String], path: &Path) -> bool {
+    if path.exists() {
+        return false;
+    }
+    let Some(fname) = segs.last() else {
+        return false;
+    };
+    if classify_script_file(fname).is_some() || is_init_file(fname) || fname == META_FILE {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent_rel) = parent.strip_prefix(root) else {
+        return false;
+    };
+    if parent_rel.as_os_str().is_empty() || !parent.is_dir() {
+        return false;
+    }
+    let instance_name = match parse_disambiguated(fname) {
+        Some((name, _)) => crate::fs_map::decode_name(&name),
+        None => crate::fs_map::decode_name(fname),
+    };
+    let Ok(Some(fragment)) = find_child_fragment_by_name(parent, &instance_name) else {
+        return false;
+    };
+    fragment != *fname
+}
+
+fn is_synced_service_segment(segment: &str) -> bool {
+    let service_name = match parse_disambiguated(segment) {
+        Some((name, _)) => crate::fs_map::decode_name(&name),
+        None => crate::fs_map::decode_name(segment),
+    };
+    snapshot::SYNCED_SERVICES
+        .iter()
+        .any(|service| *service == service_name)
+}
+
+fn path_is_avoid_synced(root: &Path, instance_path: &[String]) -> bool {
+    if instance_path.is_empty() {
+        return false;
+    }
+    let avoided = avoid_sync_paths(root);
+    avoided
+        .iter()
+        .any(|path| path.len() <= instance_path.len() && path == &instance_path[..path.len()])
+}
+
+fn avoid_sync_paths(root: &Path) -> Vec<Vec<String>> {
+    let tree_path = root.join(snapshot::TREE_JSON);
+    let meta = std::fs::metadata(&tree_path).ok();
+    let modified = meta.as_ref().and_then(|m| m.modified().ok());
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let cache = AVOID_SYNC_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.tree_path == tree_path && cached.modified == modified && cached.len == len {
+                return cached.paths.clone();
+            }
+        }
+    }
+
+    let paths = if meta.is_some() {
+        std::fs::read_to_string(&tree_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .map(|tree| {
+                let mut out = Vec::new();
+                collect_avoid_sync_paths(&tree, &[], &mut out);
+                out
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(AvoidSyncCache {
+            tree_path,
+            modified,
+            len,
+            paths: paths.clone(),
+        });
+    }
+    paths
+}
+
+fn collect_avoid_sync_paths(node: &Value, parent: &[String], out: &mut Vec<Vec<String>>) {
+    if let Some(nodes) = node.as_array() {
+        for child in nodes {
+            collect_avoid_sync_paths(child, parent, out);
+        }
+        return;
+    }
+
+    let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
+        if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+            for child in children {
+                collect_avoid_sync_paths(child, parent, out);
+            }
+        }
+        return;
+    };
+
+    let class = node.get("class").and_then(|v| v.as_str()).unwrap_or("");
+    let is_data_model_root = parent.is_empty() && class == "DataModel";
+    let mut path = parent.to_vec();
+    if !is_data_model_root {
+        path.push(name.to_string());
+    }
+
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        out.push(path);
+        return;
+    }
+
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            collect_avoid_sync_paths(child, &path, out);
         }
     }
 }
@@ -1457,34 +1775,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "rosync-http-{}-{}-{}",
-                tag,
-                std::process::id(),
-                rand_tok()
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            TempDir(std::fs::canonicalize(&p).unwrap_or(p))
+            TempDir(
+                tempfile::Builder::new()
+                    .prefix(&format!("rosync-http-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    fn rand_tok() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        format!("{:x}", n)
     }
 
     fn harness<'a>(
@@ -1640,6 +1943,181 @@ mod tests {
     }
 
     #[test]
+    fn fs_rename_op_to_plugin_converts_script_class() {
+        let d = TempDir::new("fs-rename-class-op");
+        let from = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Shared")
+            .join("CombatService.server.luau");
+        let to = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Shared")
+            .join("CombatService.luau");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(&to, "return {}\n").unwrap();
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: None,
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("class change op");
+
+        assert_eq!(plugin_op["op"], "class_change");
+        assert_eq!(
+            plugin_op["path"],
+            serde_json::json!(["ReplicatedStorage", "Shared", "CombatService"])
+        );
+        assert_eq!(
+            plugin_op["to"],
+            serde_json::json!(["ReplicatedStorage", "Shared", "CombatService"])
+        );
+        assert_eq!(plugin_op["class"], "ModuleScript");
+        assert_eq!(plugin_op["properties"]["Source"], "return {}\n");
+    }
+
+    #[test]
+    fn fs_init_update_to_plugin_converts_folder_to_script_with_children() {
+        let d = TempDir::new("fs-init-class-op");
+        let controller = d.path().join("ServerScriptService").join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        let init = controller.join("init (Controller).server.luau");
+        let source = "print('controller')\n";
+        std::fs::write(&init, source).unwrap();
+        let op = Op {
+            kind: OpKind::Update,
+            path: init,
+            from: None,
+            content: Some(source.as_bytes().to_vec()),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("class change op");
+
+        assert_eq!(plugin_op["op"], "class_change");
+        assert_eq!(
+            plugin_op["path"],
+            serde_json::json!(["ServerScriptService", "Controller"])
+        );
+        assert_eq!(plugin_op["class"], "Script");
+        assert_eq!(plugin_op["properties"]["Source"], source);
+    }
+
+    #[test]
+    fn fs_empty_folder_op_is_ignored_and_cannot_shadow_script() {
+        let d = TempDir::new("fs-empty-folder-shadow");
+        let root = d.path().join("ReplicatedStorage");
+        let empty = root.join("LuckyBlockHandler");
+        let script = root.join("LuckyBlockHandler.luau");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(&script, "return {}\n").unwrap();
+
+        let folder_op = Op {
+            kind: OpKind::Add,
+            path: empty,
+            from: None,
+            content: None,
+        };
+        assert!(fs_op_to_plugin_op(d.path(), &folder_op).is_none());
+        assert_eq!(
+            find_child_fragment_by_name(&root, "LuckyBlockHandler")
+                .unwrap()
+                .as_deref(),
+            Some("LuckyBlockHandler.luau")
+        );
+    }
+
+    #[test]
+    fn fs_delete_of_shadowing_empty_folder_does_not_delete_script() {
+        let d = TempDir::new("fs-empty-folder-delete-shadow");
+        let root = d.path().join("ReplicatedStorage");
+        let empty = root.join("LuckyBlockHandler");
+        let script = root.join("LuckyBlockHandler.luau");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(&script, "return {}\n").unwrap();
+        std::fs::remove_dir(&empty).unwrap();
+
+        let op = Op {
+            kind: OpKind::Delete,
+            path: empty,
+            from: None,
+            content: None,
+        };
+
+        assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
+    }
+
+    #[test]
+    fn fs_op_to_plugin_ignores_unknown_project_root() {
+        let d = TempDir::new("fs-unknown-root");
+        let op = Op {
+            kind: OpKind::Update,
+            path: d.path().join("RandomFolder"),
+            from: None,
+            content: None,
+        };
+
+        assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
+    }
+
+    #[test]
+    fn fs_op_to_plugin_ignores_avoid_sync_tree_paths() {
+        let d = TempDir::new("fs-avoid-sync");
+        let ignored = d.path().join("Workspace").join("Ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        let script = ignored.join("Worker.server.luau");
+        std::fs::write(&script, "print('nope')\n").unwrap();
+        std::fs::write(
+            d.path().join(snapshot::TREE_JSON),
+            serde_json::json!([
+                {
+                    "class": "Workspace",
+                    "name": "Workspace",
+                    "children": [
+                        {
+                            "class": "Folder",
+                            "name": "Ignored",
+                            "avoidSync": true,
+                            "children": [
+                                {
+                                    "class": "Script",
+                                    "name": "Worker",
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let op = Op {
+            kind: OpKind::Update,
+            path: script,
+            from: None,
+            content: Some(b"print('nope')\n".to_vec()),
+        };
+
+        assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
+    }
+
+    #[test]
+    fn fs_rename_op_to_plugin_rejects_unknown_source_root() {
+        let d = TempDir::new("fs-rename-unknown-root");
+        let op = Op {
+            kind: OpKind::Rename,
+            path: d.path().join("Workspace").join("RandomFolder"),
+            from: Some(d.path().join("RandomFolder")),
+            content: None,
+        };
+
+        assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
+    }
+
+    #[test]
     fn bootstrap_force_overwrites_sources_without_diffing_existing_files() {
         let d = TempDir::new("bootstrap-force-overwrite-script-dir");
         let engine = ConflictEngine::new();
@@ -1678,9 +2156,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(child_path).unwrap(), "return {}\n");
     }
 
-    // POST /tree writes body to `.tree.json.tmp` then atomically renames it to
-    // `tree.json`. Verifies round-trip bytes and that the watcher ignores both
-    // paths so the write never bounces back as an op.
+    // POST /tree writes body to `.tree.json.tmp` then replaces `tree.json`.
+    // Verifies round-trip bytes and that the watcher ignores both paths so the
+    // write never bounces back as an op.
     #[tokio::test]
     async fn tree_post_round_trip() {
         use crate::watch::{is_blacklisted, is_root_reserved};
@@ -1696,13 +2174,12 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&skeleton).unwrap();
 
-        // Write via the same path the handler uses.
-        let tmp = root.join(".tree.json.tmp");
         let final_path = root.join("tree.json");
-        std::fs::write(&tmp, &bytes).unwrap();
-        std::fs::rename(&tmp, &final_path).unwrap();
+        std::fs::write(&final_path, br#"{"old":true}"#).unwrap();
+        write_tree_json_replace(root, &bytes).unwrap();
 
         assert!(final_path.exists(), "tree.json should exist after rename");
+        let tmp = root.join(".tree.json.tmp");
         assert!(!tmp.exists(), ".tree.json.tmp should be gone after rename");
 
         let reloaded: Value = serde_json::from_slice(&std::fs::read(&final_path).unwrap()).unwrap();
@@ -1819,6 +2296,30 @@ mod tests {
         assert!(!json.contains("notes.md"));
         assert!(!json.contains("Plans"));
         assert!(!json.contains("Loose"));
+    }
+
+    #[test]
+    fn initial_snapshot_comparison_ignores_avoid_sync_local_subtree() {
+        let d = TempDir::new("initial-avoid-sync");
+        let ignored = d.path().join("Workspace").join("Ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("LocalOnly.server.luau"), "print('local')\n").unwrap();
+
+        let studio = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [{
+                "class": "Folder",
+                "name": "Ignored",
+                "properties": {},
+                "avoidSync": true,
+                "children": []
+            }]
+        })];
+
+        let report = initial_snapshot_comparison(d.path(), &studio).unwrap();
+        assert!(report.is_clean());
     }
 
     // `writelog` reads a test-only home override at call-time, so pointing it

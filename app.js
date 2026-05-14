@@ -153,6 +153,15 @@ async function probePort(port) {
   }
 }
 
+async function getPortOwner(port) {
+  try {
+    const own = await t64("t64:exec", { command: portOwnerCmd(port) });
+    return (own && own.stdout) ? own.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 function activeProject() {
   const s = app.state;
   return (s.projects || []).find((x) => x.id === s.activeProjectId) || null;
@@ -224,11 +233,7 @@ async function launchDaemon(projectPath, port) {
         const errTail = (errRes && errRes.stdout) ? errRes.stdout.trim() : "";
         if (errTail) logTail = logTail ? `${logTail}\n${errTail}` : errTail;
       } catch {}
-      let portOwner = "";
-      try {
-        const own = await t64("t64:exec", { command: portOwnerCmd(port) });
-        portOwner = (own && own.stdout) ? own.stdout.trim() : "";
-      } catch {}
+      const portOwner = await getPortOwner(port);
       hint =
         logTail ||
         (portOwner ? `port ${port} held by ${portOwner}` : "") ||
@@ -241,6 +246,25 @@ async function launchDaemon(projectPath, port) {
     console.error("launch daemon failed", e);
     setStatus(`daemon launch failed: ${e.message}`, "err");
   }
+  return null;
+}
+
+async function scanFallbackPorts(project, preferred) {
+  for (let p = preferred + 1; p <= PORT_SCAN_MAX; p++) {
+    // Skip ports already occupied by a non-ours daemon.
+    const occ = await probePort(p);
+    if (occ && !isOwnDaemon(occ.info, project)) continue;
+    if (occ && isOwnDaemon(occ.info, project)) {
+      toast(`Port ${preferred} busy — started daemon on :${p}`);
+      return occ;
+    }
+    const hit = await launchAndWait(project, p);
+    if (hit) {
+      toast(`Port ${preferred} busy — started daemon on :${p}`);
+      return hit;
+    }
+  }
+  toast(`All ports ${preferred}–${PORT_SCAN_MAX} busy; stop another daemon first.`);
   return null;
 }
 
@@ -318,25 +342,17 @@ async function ensureDaemon() {
       hit = await launchAndWait(project, preferred);
     } else {
       // Occupied by someone we don't own — fall back to port scan.
-      hit = null;
-      let scannedPort = null;
-      for (let p = preferred + 1; p <= PORT_SCAN_MAX; p++) {
-        // Skip ports already occupied by a non-ours daemon.
-        const occ = await probePort(p);
-        if (occ && !isOwnDaemon(occ.info, project)) continue;
-        if (occ && isOwnDaemon(occ.info, project)) { hit = occ; scannedPort = p; break; }
-        hit = await launchAndWait(project, p);
-        if (hit) { scannedPort = p; break; }
-      }
-      if (hit && scannedPort) {
-        toast(`Port ${preferred} busy — started daemon on :${scannedPort}`);
-      } else if (!hit) {
-        toast(`All ports ${preferred}–${PORT_SCAN_MAX} busy; stop another daemon first.`);
-      }
+      hit = await scanFallbackPorts(project, preferred);
     }
   } else {
     // 3. No one on preferred port — just launch.
     hit = await launchAndWait(project, preferred);
+    // Browser fetch cannot distinguish a free port from a listener that is not
+    // Ro Sync (non-HTTP service, CORS-blocked HTTP, etc.). If launch failed and
+    // the OS reports a listener, scan the remaining widget port range.
+    if (!hit && await getPortOwner(preferred)) {
+      hit = await scanFallbackPorts(project, preferred);
+    }
   }
 
   if (hit) {

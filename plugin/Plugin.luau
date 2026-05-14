@@ -502,15 +502,42 @@ local ALLOWED_CLASSES = {
 	ModuleScript = true,
 }
 
+local SCRIPT_CLASSES = {
+	Script = true,
+	LocalScript = true,
+	ModuleScript = true,
+}
+
+local AVOID_SYNC_ATTRIBUTE = "AvoidSync"
+
+local function hasAvoidSyncAttribute(inst): boolean
+	local ok, value = pcall(function()
+		return inst:GetAttribute(AVOID_SYNC_ATTRIBUTE)
+	end)
+	return ok and value == true
+end
+
+local function isAvoidSyncBlocked(inst): boolean
+	local cur = inst
+	while cur and cur ~= game do
+		if hasAvoidSyncAttribute(cur) then
+			return true
+		end
+		cur = cur.Parent
+	end
+	return false
+end
+
 -- Pass-through rule: any non-ALLOWED instance (Part, Model, Tool, ValueBase,
 -- etc.) is materialized on disk as a plain directory whenever it has at least
 -- one ALLOWED descendant. The real class stays in the read-only tree.json; on
 -- disk the pathway is just `Name/`. This lets users place a script anywhere
 -- inside Studio and still have it round-trip to a file.
+local isSyncable
 local function hasSyncableDescendant(inst)
-	if ALLOWED_CLASSES[inst.ClassName] then return true end
+	if isAvoidSyncBlocked(inst) then return false end
 	for _, child in ipairs(inst:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] and hasSyncableDescendant(child) then
+		if not SUPPRESS_CLASSES[child.ClassName] and isSyncable(child) then
 			return true
 		end
 	end
@@ -519,8 +546,10 @@ end
 
 -- True if an instance needs a presence on disk — either it's directly ALLOWED,
 -- or it's a pass-through container that has at least one ALLOWED descendant.
-local function isSyncable(inst)
-	if ALLOWED_CLASSES[inst.ClassName] then return true end
+isSyncable = function(inst)
+	if isAvoidSyncBlocked(inst) then return false end
+	if inst:IsA("LuaSourceContainer") then return true end
+	if inst.ClassName == "Folder" then return hasSyncableDescendant(inst) end
 	return hasSyncableDescendant(inst)
 end
 
@@ -567,6 +596,7 @@ end
 -- have already fired their own Removing events.
 local serializeInstance
 serializeInstance = function(inst)
+	if isAvoidSyncBlocked(inst) then return nil end
 	local allowed = ALLOWED_CLASSES[inst.ClassName] == true
 	if not allowed and not SUPPRESS_CLASSES[inst.ClassName] then
 		materializedContainers[inst] = true
@@ -579,9 +609,59 @@ serializeInstance = function(inst)
 	}
 	for _, child in ipairs(inst:GetChildren()) do
 		if not SUPPRESS_CLASSES[child.ClassName]
-			and (ALLOWED_CLASSES[child.ClassName] or hasSyncableDescendant(child)) then
-			table.insert(node.children, serializeInstance(child))
+			and not isAvoidSyncBlocked(child)
+			and isSyncable(child) then
+			local childNode = serializeInstance(child)
+			if childNode then
+				table.insert(node.children, childNode)
+			end
 		end
+	end
+	if allowed and inst.ClassName == "Folder" and #node.children == 0 then
+		return nil
+	end
+	return node
+end
+
+local function avoidSyncMarker(inst)
+	local allowed = ALLOWED_CLASSES[inst.ClassName] == true
+	return {
+		class = allowed and inst.ClassName or "Folder",
+		name = inst.Name,
+		properties = {},
+		children = {},
+		avoidSync = true,
+	}
+end
+
+local serializeSnapshotInstance
+serializeSnapshotInstance = function(inst)
+	if hasAvoidSyncAttribute(inst) then
+		return avoidSyncMarker(inst)
+	end
+	if isAvoidSyncBlocked(inst) then return nil end
+	local allowed = ALLOWED_CLASSES[inst.ClassName] == true
+	if not allowed and not SUPPRESS_CLASSES[inst.ClassName] then
+		materializedContainers[inst] = true
+	end
+	local node = {
+		class = allowed and inst.ClassName or "Folder",
+		name = inst.Name,
+		properties = allowed and serializeProperties(inst) or {},
+		children = {},
+	}
+	for _, child in ipairs(inst:GetChildren()) do
+		if not SUPPRESS_CLASSES[child.ClassName]
+			and (hasAvoidSyncAttribute(child)
+				or isSyncable(child)) then
+			local childNode = serializeSnapshotInstance(child)
+			if childNode then
+				table.insert(node.children, childNode)
+			end
+		end
+	end
+	if allowed and inst.ClassName == "Folder" and #node.children == 0 then
+		return nil
 	end
 	return node
 end
@@ -596,6 +676,10 @@ local function skeletonNode(inst)
 		name = inst.Name,
 		children = {},
 	}
+	if hasAvoidSyncAttribute(inst) then
+		node.avoidSync = true
+		return node
+	end
 	for _, child in ipairs(inst:GetChildren()) do
 		if not SUPPRESS_CLASSES[child.ClassName] then
 			table.insert(node.children, skeletonNode(child))
@@ -685,6 +769,19 @@ local function parentPath(path)
 		parent[i] = path[i]
 	end
 	return parent
+end
+
+local function rootSetAllowed(op): boolean
+	if type(op.path) == "table" and #op.path > 0 then
+		return true
+	end
+	local node = op.node
+	local name = type(node) == "table" and node.name or nil
+	if type(name) == "string" and WATCHED_SET[name] == true then
+		return true
+	end
+	log("SAFETY: ignoring root set for " .. tostring(name or "?"))
+	return false
 end
 
 --------------------------------------------------------------------------------
@@ -848,6 +945,10 @@ local function canSafelyDestroy(inst: Instance, allowDescendants: boolean?): (bo
 end
 
 local function applyNode(parent, node, opts)
+	if isAvoidSyncBlocked(parent) then
+		log("AvoidSync: skipping disk apply under " .. pathOf(parent))
+		return nil
+	end
 	-- Hard safety gate: only the four classes ro-sync is designed to
 	-- round-trip ever get Instance.new()'d from disk-sourced payloads.
 	-- Receiving anything else is a daemon/schema bug — log and bail before we
@@ -859,6 +960,10 @@ local function applyNode(parent, node, opts)
 		return nil
 	end
 	local existing = parent:FindFirstChild(node.name)
+	if existing and isAvoidSyncBlocked(existing) then
+		log("AvoidSync: skipping disk apply for " .. pathOf(existing))
+		return existing
+	end
 	local inst
 	if existing and existing.ClassName == node.class then
 		inst = existing
@@ -922,9 +1027,65 @@ local function applyNode(parent, node, opts)
 	return inst
 end
 
+local function applyClassChange(op)
+	local newClass = tostring(op.class or "")
+	if not SCRIPT_CLASSES[newClass] then
+		log("class_change: unsupported class " .. newClass)
+		return
+	end
+	local target = resolvePath(op.path)
+	if not target or target == game then return end
+	if isAvoidSyncBlocked(target) then
+		log("AvoidSync: ignoring class_change for " .. pathOf(target))
+		return
+	end
+	local toPath = type(op.to) == "table" and op.to or op.path
+	local newName = toPath[#toPath] or target.Name
+	local newParent = target.Parent
+	local newParentPath = parentPath(toPath)
+	if newParentPath then
+		local resolvedParent = resolvePath(newParentPath)
+		if resolvedParent then
+			newParent = resolvedParent
+		end
+	end
+	if not newParent or isAvoidSyncBlocked(newParent) then
+		return
+	end
+	if target.ClassName == newClass then
+		if target.Parent ~= newParent then
+			target.Parent = newParent
+		end
+		if target.Name ~= newName then
+			target.Name = newName
+		end
+		applyProperties(target, op.properties, nil)
+		return
+	end
+	if not target:IsA("LuaSourceContainer") and target.ClassName ~= "Folder" then
+		log(string.format(
+			"SAFETY: refusing class_change for %s (%s -> %s)",
+			pathOf(target), target.ClassName, newClass))
+		return
+	end
+	local ok, replacement = pcall(function() return Instance.new(newClass) end)
+	if not ok then
+		log("class_change: unknown class " .. newClass)
+		return
+	end
+	replacement.Name = newName
+	replacement.Parent = newParent
+	for _, child in ipairs(target:GetChildren()) do
+		child.Parent = replacement
+	end
+	applyProperties(replacement, op.properties, nil)
+	target:Destroy()
+end
+
 local function applyOp(op)
 	local kind = op.op or op.type
 	if kind == "set" or kind == "replace" then
+		if not rootSetAllowed(op) then return end
 		local parent
 		if op.path and #op.path > 0 then
 			parent = resolvePath(op.path)
@@ -935,10 +1096,18 @@ local function applyOp(op)
 			log("set: parent path not found")
 			return
 		end
+		if isAvoidSyncBlocked(parent) then
+			log("AvoidSync: ignoring set under " .. pathOf(parent))
+			return
+		end
 		applyNode(parent, op.node, { strict = op.strict == true })
 	elseif kind == "delete" or kind == "remove" then
 		local target = resolvePath(op.path)
 		if target and target ~= game then
+			if isAvoidSyncBlocked(target) then
+				log("AvoidSync: ignoring delete for " .. pathOf(target))
+				return
+			end
 			local safe, reason = canSafelyDestroy(target, op.forcePrune == true)
 			if safe then
 				target:Destroy()
@@ -951,6 +1120,10 @@ local function applyOp(op)
 	elseif kind == "update" then
 		local target = resolvePath(op.path)
 		if not target then return end
+		if isAvoidSyncBlocked(target) then
+			log("AvoidSync: ignoring update for " .. pathOf(target))
+			return
+		end
 		-- Post-scope-down: update ops carry at most a Source string for a
 		-- script. Name changes arrive as separate `rename` ops; every other
 		-- property is Studio-authoritative and must not be applied here.
@@ -958,16 +1131,26 @@ local function applyOp(op)
 		if type(props) == "table" and props.Source ~= nil and target:IsA("LuaSourceContainer") then
 			writeScriptSource(target, tostring(props.Source or ""))
 		end
+	elseif kind == "class_change" then
+		applyClassChange(op)
 	elseif kind == "rename" then
 		if type(op.from) == "table" and type(op.to) == "table" then
 			local target = resolvePath(op.from)
 			if not target or target == game then return end
+			if isAvoidSyncBlocked(target) then
+				log("AvoidSync: ignoring rename for " .. pathOf(target))
+				return
+			end
 
 			local toPath = op.to
 			local newName = toPath[#toPath]
 			local newParentPath = parentPath(toPath)
 			if newParentPath then
 				local newParent = resolvePath(newParentPath)
+				if newParent and isAvoidSyncBlocked(newParent) then
+					log("AvoidSync: ignoring rename into " .. pathOf(newParent))
+					return
+				end
 				if newParent and target.Parent ~= newParent then
 					target.Parent = newParent
 				end
@@ -977,12 +1160,14 @@ local function applyOp(op)
 			end
 		else
 			local target = resolvePath(op.path)
-			if target and op.name then target.Name = op.name end
+			if target and op.name and not isAvoidSyncBlocked(target) then target.Name = op.name end
 		end
 	elseif kind == "move" then
 		local target = resolvePath(op.from)
 		local newParent = resolvePath(op.to)
-		if target and newParent then target.Parent = newParent end
+		if target and newParent and not isAvoidSyncBlocked(target) and not isAvoidSyncBlocked(newParent) then
+			target.Parent = newParent
+		end
 	else
 		log("unknown op: " .. tostring(kind))
 	end
@@ -1353,6 +1538,7 @@ local lastKnownName: {[Instance]: string} = {}
 local onDescendantAdded
 local onDescendantRemoving
 local onChanged
+local onAvoidSyncChanged
 local connectInstance
 local connectTree
 local disconnectInstance
@@ -1363,6 +1549,7 @@ local disconnectTree
 -- implicitly materializes every pass-through ancestor and descendant node.
 local function recordMaterializedContainers(inst)
 	if SUPPRESS_CLASSES[inst.ClassName] then return end
+	if isAvoidSyncBlocked(inst) then return end
 	if not ALLOWED_CLASSES[inst.ClassName] then
 		materializedContainers[inst] = true
 	end
@@ -1374,6 +1561,10 @@ end
 onDescendantAdded = function(inst)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
+	if isAvoidSyncBlocked(inst) then
+		markTreeDirty()
+		return
+	end
 	if isGeneratedDiskRoot(inst) then
 		markTreeDirty()
 		return
@@ -1410,6 +1601,10 @@ end
 onDescendantRemoving = function(inst)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
+	if isAvoidSyncBlocked(inst) then
+		markTreeDirty()
+		return
+	end
 	markTreeDirty()
 	if isGeneratedDiskRoot(inst) then return end
 	-- `Removing` fires top-down as children are re-parented to nil: by the
@@ -1432,6 +1627,12 @@ onChanged = function(inst, prop)
 	if isEchoing() then return end
 	if not isUnderWatched(inst) then return end
 	if isGeneratedDiskRoot(inst) then return end
+	if isAvoidSyncBlocked(inst) then
+		if prop == "Name" then
+			markTreeDirty()
+		end
+		return
+	end
 	-- Parent changes are observed via ChildAdded/ChildRemoved on the
 	-- surrounding instances; emitting here would double-report moves.
 	if prop == "Parent" then return end
@@ -1476,6 +1677,24 @@ onChanged = function(inst, prop)
 	-- on a plain property edit.
 end
 
+onAvoidSyncChanged = function(inst)
+	if isEchoing() then return end
+	if not isUnderWatched(inst) then return end
+	markTreeDirty()
+	if hasAvoidSyncAttribute(inst) then
+		log("AvoidSync: ignoring " .. pathOf(inst))
+		return
+	end
+	connectTree(inst)
+	if isSyncable(inst) and inst.Parent then
+		queueOp({
+			op = "set",
+			path = pathFromRoot(inst.Parent),
+			node = serializeInstance(inst),
+		})
+	end
+end
+
 disconnectInstance = function(inst)
 	local bucket = connections[inst]
 	if not bucket then return end
@@ -1503,6 +1722,9 @@ connectInstance = function(inst)
 	table.insert(bucket, inst.Changed:Connect(function(prop)
 		onChanged(inst, prop)
 	end))
+	table.insert(bucket, inst:GetAttributeChangedSignal(AVOID_SYNC_ATTRIBUTE):Connect(function()
+		onAvoidSyncChanged(inst)
+	end))
 	table.insert(bucket, inst.ChildAdded:Connect(function(child)
 		onDescendantAdded(child)
 		connectTree(child)
@@ -1516,6 +1738,7 @@ end
 connectTree = function(inst)
 	if isGeneratedDiskRoot(inst) then return end
 	connectInstance(inst)
+	if isAvoidSyncBlocked(inst) then return end
 	for _, child in ipairs(inst:GetChildren()) do
 		connectTree(child)
 	end
@@ -1625,7 +1848,10 @@ local function collectSnapshot()
 	for _, name in ipairs(WATCHED_SERVICES) do
 		local ok, svc = pcall(function() return game:GetService(name) end)
 		if ok and svc then
-			table.insert(services, serializeInstance(svc))
+			local node = serializeSnapshotInstance(svc)
+			if node then
+				table.insert(services, node)
+			end
 		end
 	end
 	return services
@@ -2968,7 +3194,10 @@ local function wsLoop(gen)
 					handleRemoteRequest(client, msg)
 				elseif kind == "error" then
 					log("ws error: " .. tostring(msg.error or "?"))
-				elseif kind == "conflict" or kind == "config-changed"
+				elseif kind == "config-changed" then
+					applyWallyConfig(msg.wallyEnabled, msg.wallyFolder)
+					log("ws event: " .. kind)
+				elseif kind == "conflict"
 					or kind == "initial-choice-needed" or kind == "initial-choice-made" then
 					-- Events forwarded from daemon.state.events. The plugin's
 					-- initial-sync path uses HTTP /initial-decision polling, so
@@ -3285,6 +3514,8 @@ local function trimTrailingSlash(s)
 	return (s:gsub("/+$", ""))
 end
 
+local applyWallyConfig
+
 local function probePort(port, gameId)
 	-- Returns (matched: bool, url: string?, hello: table?)
 	local url = string.format("http://127.0.0.1:%d", port)
@@ -3306,6 +3537,14 @@ local function probePort(port, gameId)
 	return false, url, hello
 end
 
+applyWallyConfig = function(wallyEnabled, wallyFolder)
+	wallyRootSegments = nil
+	if wallyEnabled == true and type(wallyFolder) == "string" and wallyFolder ~= "" then
+		wallyRootSegments = splitStudioPath(wallyFolder)
+		log("wally generated root: " .. table.concat(wallyRootSegments, "/"))
+	end
+end
+
 local function refreshDaemonConfig(url)
 	wallyRootSegments = nil
 	local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
@@ -3319,10 +3558,7 @@ local function refreshDaemonConfig(url)
 	if not decOk or type(hello) ~= "table" then
 		return
 	end
-	if hello.wallyEnabled == true and type(hello.wallyFolder) == "string" and hello.wallyFolder ~= "" then
-		wallyRootSegments = splitStudioPath(hello.wallyFolder)
-		log("wally generated root: " .. table.concat(wallyRootSegments, "/"))
-	end
+	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
 end
 
 local function discoverDaemon(gameId)

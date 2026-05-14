@@ -152,14 +152,14 @@ pub fn parse_disambiguated(stem: &str) -> Option<(String, usize)> {
 // ---------------------------------------------------------------------------
 
 fn needs_escape(ch: char) -> bool {
-    // Portable-everywhere: POSIX separators, NUL, control chars, plus the
-    // characters Windows forbids in filenames (<>:"|?*). We apply the union on
-    // every platform so that a project authored on macOS and later opened on
-    // Windows (or vice-versa) doesn't produce paths that are legal on one but
-    // unwriteable on the other.
+    // Portable-everywhere: POSIX separators, NUL, control chars, our `%`
+    // escape marker, plus characters Windows forbids in filenames (<>:"|?*).
+    // We apply this union on every platform so that a project authored on macOS
+    // and later opened on Windows (or vice-versa) doesn't produce paths that
+    // are legal on one but unwriteable on the other.
     matches!(
         ch,
-        '/' | '\\' | '\0' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+        '/' | '\\' | '\0' | '%' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
     ) || (ch as u32) < 0x20
 }
 
@@ -305,7 +305,7 @@ pub fn instance_to_path(inst: &InstanceDescriptor, taken: &[String]) -> PathFrag
     };
 
     let base = make_fragment(&encoded);
-    if !taken.iter().any(|t| t == &base) {
+    if !fragment_taken(taken, &base) {
         return PathFragment {
             fragment: base,
             is_dir,
@@ -314,7 +314,7 @@ pub fn instance_to_path(inst: &InstanceDescriptor, taken: &[String]) -> PathFrag
 
     for n in 1..10_000 {
         let candidate = make_fragment(&format!("{} [{}]", encoded, n));
-        if !taken.iter().any(|t| t == &candidate) {
+        if !fragment_taken(taken, &candidate) {
             return PathFragment {
                 fragment: candidate,
                 is_dir,
@@ -325,6 +325,16 @@ pub fn instance_to_path(inst: &InstanceDescriptor, taken: &[String]) -> PathFrag
         fragment: format!("{}__{}", base, taken.len()),
         is_dir,
     }
+}
+
+fn fragment_taken(taken: &[String], candidate: &str) -> bool {
+    taken
+        .iter()
+        .any(|existing| fragments_equal(existing, candidate))
+}
+
+fn fragments_equal(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +428,26 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
     }))
 }
 
+pub fn is_empty_plain_folder(path: &Path) -> io::Result<bool> {
+    let Some(inst) = path_to_instance_meta(path)? else {
+        return Ok(false);
+    };
+    if inst.class != "Folder" || !inst.is_dir || inst.is_script_with_children {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)? {
+        let e = entry?;
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            return Ok(false);
+        };
+        if name == META_FILE || name == ".DS_Store" {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -426,37 +456,20 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "rosync-fsmap-{}-{}-{}",
-                tag,
-                std::process::id(),
-                rand_token()
-            ));
-            fs::create_dir_all(&p).unwrap();
-            TempDir(p)
+            TempDir(
+                tempfile::Builder::new()
+                    .prefix(&format!("rosync-fsmap-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn rand_token() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        format!("{:x}", nanos)
     }
 
     // ----- classify_script_file / parse_init_file / parse_disambiguated -----
@@ -598,7 +611,7 @@ mod tests {
     #[test]
     fn encode_escapes_windows_illegal_chars() {
         // <>:"|?* all forbidden on Windows — must round-trip via percent-encoding.
-        let inputs = ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"];
+        let inputs = ["a<b", "a>b", "a:b", "a\"b", "a|b", "a?b", "a*b"];
         for s in inputs {
             let enc = encode_name(s);
             assert!(
@@ -642,6 +655,13 @@ mod tests {
         let enc = encode_name(name);
         assert!(!enc.contains('/'));
         assert_eq!(decode_name(&enc), name);
+    }
+
+    #[test]
+    fn encode_escapes_percent_marker() {
+        assert_eq!(encode_name("Value%2FName"), "Value%252FName");
+        assert_eq!(decode_name(&encode_name("Value%2FName")), "Value%2FName");
+        assert_eq!(decode_name(&encode_name("%")), "%");
     }
 
     // ----- instance_to_path --------------------------------------------
@@ -759,6 +779,30 @@ mod tests {
     }
 
     #[test]
+    fn instance_to_path_avoids_case_only_collisions() {
+        let taken = vec!["Config.luau".to_string(), "Shared".to_string()];
+        let script = instance_to_path(
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "config",
+                has_children: false,
+            },
+            &taken,
+        );
+        assert_eq!(script.fragment, "config [1].luau");
+
+        let folder = instance_to_path(
+            &InstanceDescriptor {
+                class: "Folder",
+                name: "shared",
+                has_children: true,
+            },
+            &taken,
+        );
+        assert_eq!(folder.fragment, "shared [1]");
+    }
+
+    #[test]
     fn instance_to_path_collision_script_with_children_numbered() {
         let taken = vec!["Net".to_string()];
         let f = instance_to_path(
@@ -820,6 +864,9 @@ mod tests {
         assert_eq!(inst.class, "Folder");
         assert!(inst.is_dir);
         assert!(!inst.is_script_with_children);
+        assert!(is_empty_plain_folder(&p).unwrap());
+        fs::write(p.join("Child.luau"), b"return {}").unwrap();
+        assert!(!is_empty_plain_folder(&p).unwrap());
     }
 
     #[test]

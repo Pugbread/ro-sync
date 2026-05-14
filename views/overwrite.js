@@ -5,6 +5,7 @@
 //   - initial-choice-needed : { choiceId, diskStats, studioStats, comparison? }
 //   - initial-choice-made   : { choiceId, ... }  (dismiss if still showing)
 // On button click it POSTs {choiceId, choice} to <daemonBase>/initial-choice.
+import { installDocumentEscape } from "./runtime.js";
 
 export function mountOverwriteModal(api) {
   // api is { onBus, getDaemonBase, toast }.
@@ -203,8 +204,11 @@ export function mountOverwriteModal(api) {
   }
 
   // ESC treated as cancel.
-  overlay.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !busy) submit("cancel");
+  installDocumentEscape((e) => {
+    if (!overlay.hidden && !busy) {
+      e.preventDefault();
+      submit("cancel");
+    }
   });
 
   // Resolve the active project's per-project settings, if any.

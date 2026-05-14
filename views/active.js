@@ -1,5 +1,6 @@
 // views/active.js — live WS log tail, op counter, plugin connection state.
 import { daemonWS, daemonJson } from "../bridge.js";
+import { copyText } from "./runtime.js";
 
 const MAX_LINES = 200;
 const MAX_PENDING_LINES = 400;
@@ -372,7 +373,7 @@ export function mountActive(root, api) {
     const path = btn.dataset.copyPath || "";
     if (!path) return;
     try {
-      await navigator.clipboard.writeText(path);
+      await copyText(api, path);
       api.toast && api.toast("Path copied");
     } catch {
       api.toast && api.toast("Could not copy path");

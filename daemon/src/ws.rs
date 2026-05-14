@@ -809,11 +809,10 @@ mod tests {
         // Plugin-shape set op with path segments.
         assert_eq!(got["op"]["op"], "set");
 
-        // Push a synced (Folder) instance via the WS channel. Post-scope-down,
-        // the daemon only round-trips Folder + Script/LocalScript/ModuleScript,
-        // so a Folder is the minimal non-script proof that `set` ops still
-        // land on disk. No `.meta.json` should ever appear — property sync is
-        // ripped out.
+        // Push a synced Folder with a script descendant via the WS channel.
+        // Empty plain Folders are ignored, so the child script proves the
+        // container still materializes when it is needed for syncable content.
+        // No `.meta.json` should ever appear — property sync is ripped out.
         let push = serde_json::json!({
             "type": "push",
             "ops": [
@@ -824,7 +823,12 @@ mod tests {
                         "name": "Bin",
                         "class": "Folder",
                         "properties": {},
-                        "children": []
+                        "children": [{
+                            "name": "Child",
+                            "class": "ModuleScript",
+                            "properties": { "Source": "return {}\n" },
+                            "children": []
+                        }]
                     }
                 }
             ]
@@ -840,6 +844,10 @@ mod tests {
         assert!(res["applied"].as_u64().unwrap() >= 1);
         let bin_dir = svc_dir.join("Bin");
         assert!(bin_dir.is_dir(), "Bin folder should be on disk");
+        assert!(
+            bin_dir.join("Child.luau").is_file(),
+            "Child script should be on disk"
+        );
         assert!(
             !bin_dir.join(".meta.json").exists(),
             ".meta.json must not be emitted for a Folder (property sync is ripped out)"
