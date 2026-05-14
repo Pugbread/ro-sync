@@ -912,7 +912,7 @@ fn apply_service_node(root: &Path, node: &Value, ctx: &PushCtx<'_>) -> Result<us
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let wanted = wanted_child_names(&children);
+    let wanted = wanted_child_names_for_prune(&children);
     for child in &children {
         match apply_set(root, &[name.to_string()], child, ctx)? {
             ApplyOutcome::Applied(k) => n += k,
@@ -1010,7 +1010,7 @@ fn apply_set(
 
     let sc = ScriptClass::from_class(class);
     let mut applied = 0usize;
-    let wanted = wanted_child_names(&children);
+    let wanted = wanted_child_names_for_prune(&children);
 
     match (sc, has_children) {
         (Some(_), false) => {
@@ -1070,9 +1070,10 @@ fn apply_set(
     Ok(ApplyOutcome::Applied(applied))
 }
 
-fn wanted_child_names(children: &[Value]) -> Vec<String> {
+fn wanted_child_names_for_prune(children: &[Value]) -> Vec<String> {
     children
         .iter()
+        .filter(|child| node_should_keep_disk_path(child))
         .filter_map(|child| {
             child
                 .get("name")
@@ -1080,6 +1081,28 @@ fn wanted_child_names(children: &[Value]) -> Vec<String> {
                 .map(str::to_string)
         })
         .collect()
+}
+
+fn node_should_keep_disk_path(node: &Value) -> bool {
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let class = node.get("class").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_scoped_class(class) {
+        return false;
+    }
+
+    let has_children = node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .map(|children| !children.is_empty())
+        .unwrap_or(false);
+    class != "Folder" || has_children
 }
 
 fn existing_fragment_compatible(path: &Path, class: &str, has_children: bool) -> bool {
@@ -2382,6 +2405,73 @@ mod tests {
             )
             .unwrap(),
             "print('studio')\n"
+        );
+    }
+
+    #[test]
+    fn bootstrap_strict_empty_studio_folder_does_not_protect_stale_disk_tree() {
+        let d = TempDir::new("bootstrap-empty-studio-folder-prune");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = strict_force_harness(&engine, &quiet);
+
+        let client = d.path().join("ReplicatedStorage").join("Client");
+        std::fs::create_dir_all(&client).unwrap();
+        std::fs::write(client.join("DialogueText.luau"), "return {}\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "Client",
+                "class": "Folder",
+                "properties": {},
+                "children": []
+            }]
+        });
+
+        apply_service_node(d.path(), &service, &ctx).unwrap();
+
+        assert!(
+            !client.exists(),
+            "empty Studio folder should not keep stale synced disk children alive"
+        );
+    }
+
+    #[test]
+    fn bootstrap_strict_prunes_missing_nested_child_under_kept_folder() {
+        let d = TempDir::new("bootstrap-nested-prune");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = strict_force_harness(&engine, &quiet);
+
+        let client = d.path().join("ReplicatedStorage").join("Client");
+        std::fs::create_dir_all(&client).unwrap();
+        std::fs::write(client.join("DialogueText.luau"), "return {}\n").unwrap();
+        std::fs::write(client.join("WorldController.luau"), "return {}\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "Client",
+                "class": "Folder",
+                "properties": {},
+                "children": [{
+                    "name": "WorldController",
+                    "class": "ModuleScript",
+                    "properties": { "Source": "return { Studio = true }\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        apply_service_node(d.path(), &service, &ctx).unwrap();
+
+        assert!(!client.join("DialogueText.luau").exists());
+        assert_eq!(
+            std::fs::read_to_string(client.join("WorldController.luau")).unwrap(),
+            "return { Studio = true }\n"
         );
     }
 
