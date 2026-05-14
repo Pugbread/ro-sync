@@ -39,6 +39,15 @@ fn next_request_id() -> u64 {
 /// response `Value` (the full frame, including `ok`/`value`/`error`). Times
 /// out after 5s.
 pub async fn request(port: u16, op: &str, args: Value) -> Result<Value, String> {
+    request_with_timeout(port, op, args, Duration::from_secs(5)).await
+}
+
+pub async fn request_with_timeout(
+    port: u16,
+    op: &str,
+    args: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
     let url = format!("ws://127.0.0.1:{port}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -92,9 +101,14 @@ pub async fn request(port: u16, op: &str, args: Value) -> Result<Value, String> 
         Err("stream ended before response".into())
     };
 
-    let result = tokio::time::timeout(Duration::from_secs(5), await_response)
+    let result = tokio::time::timeout(timeout, await_response)
         .await
-        .map_err(|_| "request timed out after 5s (plugin unresponsive?)".to_string())?;
+        .map_err(|_| {
+            format!(
+                "request timed out after {:.0}s (plugin unresponsive?)",
+                timeout.as_secs_f64()
+            )
+        })?;
     // Best-effort close; ignore errors.
     let _ = ws.send(Message::Close(None)).await;
     result

@@ -744,6 +744,25 @@
       "slug": "save"
     },
     {
+      "name": "transmit",
+      "title": "rosync transmit",
+      "category": "Studio control",
+      "description": "Runs an optional Studio render script, reads EditableImage/ImageLabel/ImageButton pixels from Studio, and writes local PNG files for editing or upload.",
+      "usage": "rosync transmit [--project <path>] [--port <port>] [--source <luau> | --source-file <file>] [--from <studio-path>] [--path <studio-path>...] --output <file-or-dir> [--timeout <seconds>] [--raw]",
+      "examples": [
+        "rosync transmit --project . --source-file render.luau --from Workspace/Exports --output renders",
+        "rosync transmit --project . --path StarterGui/Example --output ./example.png",
+        "rosync transmit --project . --source 'local Photobooth = require(game.ServerStorage.Photobooth.Bindings); return Photobooth.captureViewport({rect = Rect.new(0, 0, 300, 300), type = \"NoSkybox\"})' --output renders"
+      ],
+      "notes": [
+        "The plugin accepts EditableImage instances directly and can also read ImageLabel/ImageButton content through AssetService.",
+        "If --source or --source-file returns images, those are captured. If --from is supplied, Ro Sync also walks that Studio subtree after the source runs and captures any image-like instances found there.",
+        "The command writes PNG files locally. Use `rosync upload` afterwards when you want to publish the edited images to Roblox Open Cloud.",
+        "This executes Luau in Studio, so treat it like `rosync eval`: inspect render scripts first and avoid destructive code."
+      ],
+      "slug": "transmit"
+    },
+    {
       "name": "waypoint",
       "title": "rosync waypoint",
       "category": "Live writes",

@@ -4,6 +4,8 @@
 
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local AssetService = game:GetService("AssetService")
+local EncodingService = game:GetService("EncodingService")
 local ScriptEditorService: any = nil
 do
 	local ok, svc = pcall(function() return game:GetService("ScriptEditorService") end)
@@ -2446,6 +2448,197 @@ remoteHandlers.eval = function(args)
 	return enc
 end
 
+local function encodeRemoteBuffer(buf)
+	local encoded = EncodingService:Base64Encode(buf)
+	if typeof(encoded) == "buffer" then
+		return buffer.tostring(encoded)
+	end
+	return tostring(encoded)
+end
+
+local function transmitEvalEnv()
+	return {
+		game = game,
+		workspace = workspace,
+		require = require,
+		string = string,
+		table = table,
+		math = math,
+		task = task,
+		os = os,
+		print = print,
+		tostring = tostring,
+		tonumber = tonumber,
+		type = type,
+		typeof = typeof,
+		ipairs = ipairs,
+		pairs = pairs,
+		next = next,
+		select = select,
+		pcall = pcall,
+		xpcall = xpcall,
+		error = error,
+		assert = assert,
+		unpack = unpack,
+		Instance = Instance,
+		Vector2 = Vector2,
+		Vector3 = Vector3,
+		CFrame = CFrame,
+		Color3 = Color3,
+		UDim = UDim,
+		UDim2 = UDim2,
+		Rect = Rect,
+		Enum = Enum,
+		BrickColor = BrickColor,
+		NumberRange = NumberRange,
+		Content = Content,
+		buffer = buffer,
+	}
+end
+
+local function runTransmitSource(src: string): any
+	if src == "" then return nil end
+	local fn, compileErr = loadstring(src, "rosync-transmit")
+	if not fn then error("compile: " .. tostring(compileErr)) end
+	local setEnvOk, setEnvErr = pcall(function() setfenv(fn, transmitEvalEnv()) end)
+	if not setEnvOk then error("sandbox: " .. tostring(setEnvErr)) end
+	local results = table.pack(pcall(fn))
+	if not results[1] then error("runtime: " .. tostring(results[2])) end
+	local n = results.n - 1
+	if n == 0 then return nil end
+	if n == 1 then return results[2] end
+	local out = {}
+	for i = 1, n do out[i] = results[i + 1] end
+	return out
+end
+
+local function editableFromImageGui(gui: Instance): Instance
+	local okContent, content = pcall(function() return (gui :: any).ImageContent end)
+	if okContent and content ~= nil then
+		local editable
+		local ok, err = pcall(function()
+			editable = AssetService:CreateEditableImageAsync(content)
+		end)
+		if ok and editable then return editable end
+		error("CreateEditableImageAsync failed: " .. tostring(err))
+	end
+
+	local image = ""
+	pcall(function() image = tostring((gui :: any).Image or "") end)
+	if image == "" then error("image gui has no Image/ImageContent: " .. instancePathString(gui)) end
+	local editable
+	local ok, err = pcall(function()
+		editable = AssetService:CreateEditableImageAsync(Content.fromUri(image))
+	end)
+	if not ok or not editable then
+		error("CreateEditableImageAsync failed: " .. tostring(err))
+	end
+	return editable
+end
+
+local function transmitImageEntry(value: any, nameHint: string?, pathHint: string?)
+	local target = value
+	if typeof(target) ~= "Instance" then
+		return nil
+	end
+
+	local editable = target
+	if target:IsA("ImageLabel") or target:IsA("ImageButton") then
+		editable = editableFromImageGui(target)
+	end
+
+	local size
+	local okSize = pcall(function()
+		size = (editable :: any).Size
+	end)
+	if not okSize or typeof(size) ~= "Vector2" then
+		return nil
+	end
+
+	local width = math.floor(size.X)
+	local height = math.floor(size.Y)
+	if width <= 0 or height <= 0 then
+		error("invalid EditableImage size for " .. tostring(nameHint or target.Name))
+	end
+
+	local pixels
+	local okPixels, err = pcall(function()
+		pixels = (editable :: any):ReadPixelsBuffer(Vector2.zero, Vector2.new(width, height))
+	end)
+	if not okPixels or pixels == nil then
+		error("ReadPixelsBuffer failed for " .. tostring(nameHint or target.Name) .. ": " .. tostring(err))
+	end
+
+	return {
+		name = nameHint or target.Name,
+		path = pathHint or instancePathString(target),
+		class = target.ClassName,
+		width = width,
+		height = height,
+		pixelsBase64 = encodeRemoteBuffer(pixels),
+	}
+end
+
+local function appendTransmitCandidate(value: any, out: {any}, seen: {[Instance]: boolean}, nameHint: string?, pathHint: string?)
+	if value == nil then return end
+	local t = typeof(value)
+	if t == "Instance" then
+		if seen[value] then return end
+		seen[value] = true
+		local entry = transmitImageEntry(value, nameHint, pathHint)
+		if entry then table.insert(out, entry) end
+	elseif t == "table" then
+		local image = value.image or value.capture or value.editableImage or value.editable
+		if image ~= nil then
+			appendTransmitCandidate(image, out, seen, value.name or value.Name or nameHint, value.path or pathHint)
+			return
+		end
+		for key, item in pairs(value) do
+			local childName = nameHint
+			if type(key) == "string" then childName = key end
+			appendTransmitCandidate(item, out, seen, childName, pathHint)
+		end
+	end
+end
+
+local function appendTransmitPath(path: string, out: {any}, seen: {[Instance]: boolean})
+	local inst = resolveRemotePath(path)
+	if not inst then error("path not found: " .. path) end
+	appendTransmitCandidate(inst, out, seen, nil, instancePathString(inst))
+end
+
+local function appendTransmitFrom(path: string, out: {any}, seen: {[Instance]: boolean})
+	local root = resolveRemotePath(path)
+	if not root then error("from path not found: " .. path) end
+	appendTransmitCandidate(root, out, seen, nil, instancePathString(root))
+	for _, inst in ipairs(root:GetDescendants()) do
+		appendTransmitCandidate(inst, out, seen, nil, instancePathString(inst))
+	end
+end
+
+remoteHandlers.transmit = function(args)
+	local out = {}
+	local seen = {}
+
+	local source = tostring(args.source or "")
+	local result = runTransmitSource(source)
+	appendTransmitCandidate(result, out, seen, nil, nil)
+
+	local paths = args.paths
+	if type(paths) == "table" then
+		for _, path in ipairs(paths) do
+			appendTransmitPath(tostring(path), out, seen)
+		end
+	end
+
+	local fromPath = args.from
+	if fromPath ~= nil and tostring(fromPath) ~= "" then
+		appendTransmitFrom(tostring(fromPath), out, seen)
+	end
+
+	return out
+end
+
 -- ---------------------------------------------------------------------------
 -- Tier 1: construction / destruction / reparent / attributes / tags / method
 -- calls / selection. These all POST a /writelog entry on success (see
@@ -3070,6 +3263,7 @@ end
 local REMOTE_WRITE_OPS = {
 	set = true,
 	eval = true,
+	transmit = true,
 	undo = true,
 	redo = true,
 	save = true,

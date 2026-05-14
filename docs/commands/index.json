@@ -46,6 +46,7 @@
     "select",
     "eval",
     "save",
+    "transmit",
     "waypoint",
     "undo",
     "redo",

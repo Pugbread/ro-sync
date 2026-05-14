@@ -1,6 +1,6 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use futures::{SinkExt as _, StreamExt as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -128,6 +128,8 @@ pub enum Command {
     /// Execute Luau source inside Studio. Escape hatch for anything the
     /// structured ops don't cover.
     Eval(EvalArgs),
+    /// Render/read EditableImages from Studio and write them as local PNG files.
+    Transmit(TransmitArgs),
     /// Read recent Studio output/warn/error messages from the plugin's ring
     /// buffer.
     Logs(LogsArgs),
@@ -1302,6 +1304,34 @@ pub struct EvalArgs {
     pub raw: bool,
 }
 
+#[derive(ClapArgs, Debug)]
+pub struct TransmitArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Luau source to execute before collecting images.
+    #[arg(long, conflicts_with = "source_file")]
+    pub source: Option<String>,
+    /// Luau source file to execute before collecting images.
+    #[arg(long = "source-file", conflicts_with = "source")]
+    pub source_file: Option<PathBuf>,
+    /// Collect EditableImages under this Studio path after source runs.
+    #[arg(long = "from")]
+    pub from_path: Option<String>,
+    /// Collect one existing EditableImage path. May be repeated.
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
+    /// Output PNG file or directory. Direct file output is only valid for one image.
+    #[arg(long, default_value = "rosync-transmit")]
+    pub output: PathBuf,
+    /// Request timeout in seconds.
+    #[arg(long, default_value_t = 60.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 pub struct ServeArgs {
     #[arg(long)]
@@ -1473,6 +1503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Imgs(args)) => run_imgs(args).await,
         Some(Command::Find(args)) => run_find(args).await,
         Some(Command::Eval(args)) => run_eval(args).await,
+        Some(Command::Transmit(args)) => run_transmit(args).await,
         Some(Command::Logs(args)) => run_logs(args).await,
         Some(Command::Save(args)) => run_save(args).await,
         Some(Command::Undo(args)) => run_undo(args).await,
@@ -4832,6 +4863,220 @@ async fn run_eval(args: EvalArgs) -> Result<(), Box<dyn std::error::Error>> {
     ok_or_err(&resp)
 }
 
+#[derive(Debug, Deserialize)]
+struct TransmittedImage {
+    name: Option<String>,
+    path: Option<String>,
+    width: u32,
+    height: u32,
+    #[serde(rename = "pixelsBase64")]
+    pixels_base64: String,
+}
+
+async fn run_transmit(args: TransmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let source = match (&args.source, &args.source_file) {
+        (Some(source), None) => Some(source.clone()),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("transmit: read {}: {e}", path.display()))?,
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err("transmit: use --source or --source-file, not both".into())
+        }
+    };
+
+    if source.is_none() && args.from_path.is_none() && args.paths.is_empty() {
+        return Err(
+            "transmit: provide --source/--source-file, --from, or at least one --path".into(),
+        );
+    }
+    if args.timeout <= 0.0 {
+        return Err("transmit: --timeout must be greater than zero".into());
+    }
+
+    let mut req = serde_json::Map::new();
+    if let Some(source) = source {
+        req.insert("source".into(), serde_json::Value::String(source));
+    }
+    if let Some(path) = args.from_path {
+        req.insert("from".into(), serde_json::Value::String(path));
+    }
+    if !args.paths.is_empty() {
+        req.insert(
+            "paths".into(),
+            serde_json::Value::Array(
+                args.paths
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+
+    let resp = remote::request_with_timeout(
+        args.port,
+        "transmit",
+        serde_json::Value::Object(req),
+        Duration::from_secs_f64(args.timeout),
+    )
+    .await?;
+    let value = response_value_or_err(&resp, "transmit")?;
+    let images: Vec<TransmittedImage> = serde_json::from_value(value)
+        .map_err(|e| format!("transmit: plugin returned invalid image list: {e}"))?;
+    if images.is_empty() {
+        return Err("transmit: plugin returned no images".into());
+    }
+
+    let written = write_transmitted_images(&images, &args.output)?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "files": written,
+            }))?
+        );
+    } else {
+        for file in &written {
+            println!("wrote {}", file.display());
+        }
+    }
+    Ok(())
+}
+
+fn write_transmitted_images(
+    images: &[TransmittedImage],
+    output: &std::path::Path,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let output_is_file = images.len() == 1
+        && output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("png"))
+            .unwrap_or(false);
+
+    if output_is_file {
+        if let Some(parent) = output.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("transmit: create {}: {e}", parent.display()))?;
+            }
+        }
+    } else {
+        std::fs::create_dir_all(output)
+            .map_err(|e| format!("transmit: create {}: {e}", output.display()))?;
+    }
+
+    let mut used_names: HashMap<String, usize> = HashMap::new();
+    let mut written = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        if image.width == 0 || image.height == 0 {
+            return Err(format!(
+                "transmit: image {} has invalid size {}x{}",
+                image.name.as_deref().unwrap_or("<unnamed>"),
+                image.width,
+                image.height
+            )
+            .into());
+        }
+
+        let path = if output_is_file {
+            output.to_path_buf()
+        } else {
+            let fallback = image
+                .path
+                .as_deref()
+                .and_then(|path| path.rsplit('/').next())
+                .unwrap_or("image");
+            let name = image.name.as_deref().unwrap_or(fallback);
+            let stem = unique_transmit_stem(sanitize_transmit_stem(name), &mut used_names, index);
+            output.join(format!("{stem}.png"))
+        };
+        write_png_rgba(image, &path)?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
+fn write_png_rgba(
+    image: &TransmittedImage,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine as _;
+
+    let rgba = base64::engine::general_purpose::STANDARD
+        .decode(&image.pixels_base64)
+        .map_err(|e| {
+            format!(
+                "transmit: decode {}: {e}",
+                image.name.as_deref().unwrap_or("<unnamed>")
+            )
+        })?;
+    let expected = image.width as usize * image.height as usize * 4;
+    if rgba.len() != expected {
+        return Err(format!(
+            "transmit: {} pixel buffer is {} bytes, expected {} for {}x{} RGBA",
+            image.name.as_deref().unwrap_or("<unnamed>"),
+            rgba.len(),
+            expected,
+            image.width,
+            image.height
+        )
+        .into());
+    }
+
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("transmit: create {}: {e}", path.display()))?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, image.width, image.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("transmit: png header {}: {e}", path.display()))?;
+    writer
+        .write_image_data(&rgba)
+        .map_err(|e| format!("transmit: png write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn sanitize_transmit_stem(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if ch.is_whitespace() || ch == '.' || ch == '/' || ch == '\\' {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').trim_matches('.').to_string();
+    if trimmed.is_empty() || trimmed.starts_with('.') {
+        "image".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn unique_transmit_stem(
+    stem: String,
+    used_names: &mut HashMap<String, usize>,
+    index: usize,
+) -> String {
+    let base = if stem.is_empty() {
+        format!("image-{}", index + 1)
+    } else {
+        stem
+    };
+    let count = used_names.entry(base.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        base
+    } else {
+        format!("{base}-{}", *count)
+    }
+}
+
 /// Parse `30s` / `5m` / `2h` / `500ms` → seconds as f64. Bare digits are
 /// treated as seconds for convenience.
 fn parse_duration_seconds(s: &str) -> Result<f64, String> {
@@ -5839,9 +6084,8 @@ fn command_output_cost(name: &str) -> &'static str {
         | "logs" | "conflicts" | "resolve" | "lint" | "upload" | "monetization" | "set" | "new"
         | "rm" | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo"
         | "refresh" => "medium",
-        "diff" | "changes" | "snapshot" | "get" | "eval" | "call" | "tail" | "watch" => {
-            "high-or-streaming"
-        }
+        "diff" | "changes" | "snapshot" | "get" | "eval" | "transmit" | "call" | "tail"
+        | "watch" => "high-or-streaming",
         _ => "unknown",
     }
 }
@@ -5852,7 +6096,7 @@ fn command_safety_class(name: &str) -> &'static str {
             "mutates-studio"
         }
         "resolve" => "mutates-disk-or-studio",
-        "eval" | "call" => "risky-live-execution",
+        "eval" | "call" | "transmit" => "risky-live-execution",
         "select" | "open" => "mutates-studio-selection",
         "upload" | "monetization" => "open-cloud-mutating",
         "refresh" | "snapshot" => "writes-local-files",
@@ -5882,7 +6126,7 @@ fn command_prefer_before(name: &str) -> Vec<&'static str> {
         "snapshot" => vec!["tree --depth 3", "changes"],
         "set" | "new" | "rm" | "mv" => vec!["plan"],
         "resolve" => vec!["conflicts", "changes", "plan resolve"],
-        "attr" | "tag" | "call" | "eval" | "select" | "save" => {
+        "attr" | "tag" | "call" | "eval" | "transmit" | "select" | "save" => {
             vec!["status --raw", "waypoint for multi-step edits"]
         }
         "upload" => vec!["enumerate exact files", "use --manifest for bulk uploads"],
@@ -7271,6 +7515,43 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
         assert_eq!(args.auth, ImgAuth::Bearer);
         assert_eq!(args.api_key_env, "ROBLOX_OAUTH_TOKEN");
         assert_eq!(args.asset_type, None);
+    }
+
+    #[test]
+    fn transmit_args_parse_source_file_from_and_output() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "transmit",
+            "--project",
+            ".",
+            "--source-file",
+            "render.luau",
+            "--from",
+            "Workspace/Exports",
+            "--output",
+            "renders",
+            "--timeout",
+            "90",
+        ])
+        .unwrap();
+        let Some(Command::Transmit(args)) = cli.command else {
+            panic!("expected transmit command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.source_file.unwrap(), PathBuf::from("render.luau"));
+        assert_eq!(args.from_path.unwrap(), "Workspace/Exports");
+        assert_eq!(args.output, PathBuf::from("renders"));
+        assert_eq!(args.timeout, 90.0);
+    }
+
+    #[test]
+    fn transmit_sanitizes_and_deduplicates_file_names() {
+        let mut used = HashMap::new();
+        let first = unique_transmit_stem(sanitize_transmit_stem("../Cool Ball.png"), &mut used, 0);
+        let second = unique_transmit_stem(sanitize_transmit_stem("../Cool Ball.png"), &mut used, 1);
+        assert_eq!(first, "Cool_Ball_png");
+        assert_eq!(second, "Cool_Ball_png-2");
+        assert_eq!(sanitize_transmit_stem("..."), "image");
     }
 
     #[test]
