@@ -757,6 +757,7 @@
       "notes": [
         "The plugin accepts EditableImage objects directly and can also read ImageLabel/ImageButton content through AssetService.",
         "Photobooth captures may return MeshParts with object-backed TextureContent. Ro Sync reads Content.Object directly when it is already an EditableImage, otherwise it falls back to CreateEditableImageAsync for TextureContent or TextureID.",
+        "--source and --source-file run through a temporary ModuleScript under CoreGui, matching the command-line style environment expected by Photobooth bindings instead of a custom loadstring sandbox.",
         "Large batches are prepared once, then downloaded one image per request so full 768x768 render sets do not have to fit in one WebSocket response.",
         "If --source or --source-file returns images, those are captured. If --from is supplied, Ro Sync also walks that Studio subtree after the source runs and captures any image-like instances found there.",
         "The command writes PNG files locally. Use `rosync upload` afterwards when you want to publish the edited images to Roblox Open Cloud.",

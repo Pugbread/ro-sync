@@ -35,7 +35,7 @@ local SOURCE_WRITE_CONCURRENCY = 16
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "1.0.1"
+local PLUGIN_VERSION_STRING = "1.0.2"
 local PLUGIN_PROTOCOL_VERSION = 1
 
 --------------------------------------------------------------------------------
@@ -2456,53 +2456,44 @@ local function encodeRemoteBuffer(buf)
 	return tostring(encoded)
 end
 
-local function transmitEvalEnv()
-	return {
-		game = game,
-		workspace = workspace,
-		require = require,
-		string = string,
-		table = table,
-		math = math,
-		task = task,
-		os = os,
-		print = print,
-		tostring = tostring,
-		tonumber = tonumber,
-		type = type,
-		typeof = typeof,
-		ipairs = ipairs,
-		pairs = pairs,
-		next = next,
-		select = select,
-		pcall = pcall,
-		xpcall = xpcall,
-		error = error,
-		assert = assert,
-		unpack = unpack,
-		Instance = Instance,
-		Vector2 = Vector2,
-		Vector3 = Vector3,
-		CFrame = CFrame,
-		Color3 = Color3,
-		UDim = UDim,
-		UDim2 = UDim2,
-		Rect = Rect,
-		Enum = Enum,
-		BrickColor = BrickColor,
-		NumberRange = NumberRange,
-		Content = Content,
-		buffer = buffer,
-	}
-end
-
 local function runTransmitSource(src: string): any
 	if src == "" then return nil end
-	local fn, compileErr = loadstring(src, "rosync-transmit")
-	if not fn then error("compile: " .. tostring(compileErr)) end
-	local setEnvOk, setEnvErr = pcall(function() setfenv(fn, transmitEvalEnv()) end)
-	if not setEnvOk then error("sandbox: " .. tostring(setEnvErr)) end
-	local results = table.pack(pcall(fn))
+
+	-- Photobooth render scripts are usually written for Studio's command bar.
+	-- Run them through a real LuaSourceContainer instead of a custom sandbox so
+	-- bindings see the same script/require environment.
+	local moduleScript = Instance.new("ModuleScript")
+	moduleScript.Name = "__RoSyncTransmitSource"
+	moduleScript.Archivable = false
+
+	local wrapperSource = "return function(script, require)\n" .. src .. "\nend"
+	local writeOk, writeErr = pcall(function()
+		if ScriptEditorService then
+			ScriptEditorService:UpdateSourceAsync(moduleScript, function()
+				return wrapperSource
+			end)
+		else
+			moduleScript.Source = wrapperSource
+		end
+	end)
+	if not writeOk then
+		moduleScript:Destroy()
+		error("source write: " .. tostring(writeErr))
+	end
+
+	moduleScript.Parent = game:GetService("CoreGui")
+	local requireOk, callbackOrErr = pcall(require, moduleScript)
+	if not requireOk then
+		moduleScript:Destroy()
+		error("compile: " .. tostring(callbackOrErr))
+	end
+	if typeof(callbackOrErr) ~= "function" then
+		moduleScript:Destroy()
+		error("compile: transmit source did not compile to a function")
+	end
+
+	local results = table.pack(pcall(callbackOrErr, moduleScript, require))
+	moduleScript:Destroy()
 	if not results[1] then error("runtime: " .. tostring(results[2])) end
 	local n = results.n - 1
 	if n == 0 then return nil end
