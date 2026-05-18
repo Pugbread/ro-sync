@@ -794,23 +794,41 @@ struct ResolveBody {
     choice: Option<String>,
 }
 
+fn parse_resolution(raw: &str) -> Result<Resolution, String> {
+    match raw {
+        "keep-local" | "keep-disk" | "keep_disk" | "keep_fs" | "fs" | "local" | "disk" => {
+            Ok(Resolution::KeepLocal)
+        }
+        "keep-studio" | "keep_studio" | "studio" => Ok(Resolution::KeepStudio),
+        other => Err(format!("unknown resolution: {other}")),
+    }
+}
+
+fn resolve_conflict_target(project: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        project.join(path)
+    }
+}
+
 async fn resolve(
     State(state): State<AppState>,
     Json(body): Json<ResolveBody>,
 ) -> impl IntoResponse {
     let raw = body.resolution.or(body.choice).unwrap_or_default();
-    let resolution = match raw.as_str() {
-        "keep-local" | "keep_fs" | "fs" | "local" => Resolution::KeepLocal,
-        "keep-studio" | "keep_studio" | "studio" => Resolution::KeepStudio,
-        other => {
+    let resolution = match parse_resolution(&raw) {
+        Ok(resolution) => resolution,
+        Err(error) => {
             return Json(json!({
                 "ok": false,
-                "error": format!("unknown resolution: {other}"),
+                "error": error,
             }));
         }
     };
 
-    let target = PathBuf::from(&body.path);
+    let target = resolve_conflict_target(&state.canonical_project, &body.path);
     let Some(decision) = state.conflict.resolve(&target, resolution) else {
         return Json(json!({
             "ok": false,
@@ -867,6 +885,12 @@ enum ApplyOutcome {
     Applied(usize),
     Skipped,
     Conflict(PathBuf),
+}
+
+struct ChildAssignment<'a> {
+    node: &'a Value,
+    fragment: String,
+    fallback_by_name: bool,
 }
 
 fn op_kind(op: &Value) -> &str {
@@ -937,8 +961,13 @@ fn apply_service_node(root: &Path, node: &Value, ctx: &PushCtx<'_>) -> Result<us
         .cloned()
         .unwrap_or_default();
     let wanted = wanted_child_names_for_prune(&children);
-    for child in &children {
-        match apply_set(root, &[name.to_string()], child, ctx)? {
+    for child in child_fragment_assignments(&children) {
+        match apply_set_in_dir(
+            &svc_dir,
+            child.node,
+            ctx,
+            Some((&child.fragment, child.fallback_by_name)),
+        )? {
             ApplyOutcome::Applied(k) => n += k,
             _ => {}
         }
@@ -954,6 +983,16 @@ fn apply_set(
     parent_segs: &[String],
     node: &Value,
     ctx: &PushCtx<'_>,
+) -> Result<ApplyOutcome, String> {
+    let parent_dir = resolve_segments_to_dir(root, parent_segs)?;
+    apply_set_in_dir(&parent_dir, node, ctx, None)
+}
+
+fn apply_set_in_dir(
+    parent_dir: &Path,
+    node: &Value,
+    ctx: &PushCtx<'_>,
+    preferred_fragment: Option<(&str, bool)>,
 ) -> Result<ApplyOutcome, String> {
     if node
         .get("avoidSync")
@@ -984,13 +1023,23 @@ fn apply_set(
     if class == "Folder" && !has_children {
         return Ok(ApplyOutcome::Skipped);
     }
-    let parent_dir = resolve_segments_to_dir(root, parent_segs)?;
     std::fs::create_dir_all(&parent_dir)
         .map_err(|e| format!("mkdir {}: {e}", parent_dir.display()))?;
 
     // If a node with this name already exists on disk, reuse its path; otherwise
     // compute a fresh fragment.
-    let mut existing = find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?;
+    let mut existing = match preferred_fragment {
+        Some((fragment, fallback_by_name)) => {
+            if parent_dir.join(fragment).exists() {
+                Some(fragment.to_string())
+            } else if fallback_by_name {
+                find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?
+            } else {
+                None
+            }
+        }
+        None => find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?,
+    };
     if let Some(fragment) = existing.as_deref() {
         let existing_path = parent_dir.join(fragment);
         if !existing_fragment_compatible(&existing_path, class, has_children) {
@@ -1013,6 +1062,10 @@ fn apply_set(
                 is_dir,
             }
         }
+        None if let Some((fragment, _)) = preferred_fragment => crate::fs_map::PathFragment {
+            fragment: fragment.to_string(),
+            is_dir: class == "Folder" || has_children,
+        },
         None => instance_to_path(
             &InstanceDescriptor {
                 class,
@@ -1062,10 +1115,13 @@ fn apply_set(
                 SourceWriteOutcome::Skipped => {}
                 SourceWriteOutcome::Conflict(path) => return Ok(ApplyOutcome::Conflict(path)),
             }
-            let mut child_segs: Vec<String> = parent_segs.to_vec();
-            child_segs.push(name.to_string());
-            for child in &children {
-                if let ApplyOutcome::Applied(n) = apply_set(root, &child_segs, child, ctx)? {
+            for child in child_fragment_assignments(&children) {
+                if let ApplyOutcome::Applied(n) = apply_set_in_dir(
+                    &target,
+                    child.node,
+                    ctx,
+                    Some((&child.fragment, child.fallback_by_name)),
+                )? {
                     applied += n;
                 }
             }
@@ -1078,10 +1134,13 @@ fn apply_set(
             std::fs::create_dir_all(&target)
                 .map_err(|e| format!("mkdir {}: {e}", target.display()))?;
             ctx.mark_quiet(&target);
-            let mut child_segs: Vec<String> = parent_segs.to_vec();
-            child_segs.push(name.to_string());
-            for child in &children {
-                if let ApplyOutcome::Applied(n) = apply_set(root, &child_segs, child, ctx)? {
+            for child in child_fragment_assignments(&children) {
+                if let ApplyOutcome::Applied(n) = apply_set_in_dir(
+                    &target,
+                    child.node,
+                    ctx,
+                    Some((&child.fragment, child.fallback_by_name)),
+                )? {
                     applied += n;
                 }
             }
@@ -1092,6 +1151,86 @@ fn apply_set(
         }
     }
     Ok(ApplyOutcome::Applied(applied))
+}
+
+fn child_fragment_assignments(children: &[Value]) -> Vec<ChildAssignment<'_>> {
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for child in children {
+        if !node_should_materialize(child) {
+            continue;
+        }
+        if let Some(name) = child.get("name").and_then(|v| v.as_str()) {
+            *name_counts.entry(name.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut relevant = Vec::new();
+    for child in children {
+        if !node_should_materialize(child) {
+            continue;
+        }
+        let Some(name) = child.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(class) = child.get("class").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let has_children = child
+            .get("children")
+            .and_then(|v| v.as_array())
+            .is_some_and(|children| !children.is_empty());
+        relevant.push((
+            diff::snapshot_sibling_sort_key(child, class),
+            child,
+            name,
+            class,
+            has_children,
+            name_counts.get(name).copied().unwrap_or(0) == 1,
+        ));
+    }
+    relevant.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut taken = Vec::new();
+    let mut out = Vec::new();
+    for (_sort_key, node, name, class, has_children, fallback_by_name) in relevant {
+        let fragment = instance_to_path(
+            &InstanceDescriptor {
+                class,
+                name,
+                has_children,
+            },
+            &taken,
+        );
+        taken.push(fragment.fragment.clone());
+        out.push(ChildAssignment {
+            node,
+            fragment: fragment.fragment,
+            fallback_by_name,
+        });
+    }
+    out
+}
+
+fn node_should_materialize(node: &Value) -> bool {
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let class = node.get("class").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_scoped_class(class) {
+        return false;
+    }
+
+    let has_children = node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .map(|children| !children.is_empty())
+        .unwrap_or(false);
+    class != "Folder" || has_children
 }
 
 fn wanted_child_names_for_prune(children: &[Value]) -> Vec<String> {
@@ -1181,10 +1320,48 @@ fn prune_dir_to_names(
         if wanted_names.iter().any(|wanted| wanted == &inst.name) {
             continue;
         }
+        if !disk_path_is_sync_owned(&path) {
+            continue;
+        }
         remove_path_for_replace(&path, ctx)?;
         removed += 1;
     }
     Ok(removed)
+}
+
+fn disk_path_is_sync_owned(path: &Path) -> bool {
+    let Ok(Some(inst)) = path_to_instance_meta(path) else {
+        return false;
+    };
+    if inst.script_class.is_some() {
+        return true;
+    }
+    if inst.class == "Folder" && inst.is_dir {
+        return folder_contains_sync_owned_path(path);
+    }
+    false
+}
+
+fn folder_contains_sync_owned_path(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if file_name == META_FILE || file_name == ".DS_Store" {
+            continue;
+        }
+        if is_init_file(&file_name) {
+            return true;
+        }
+        if disk_path_is_sync_owned(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 fn remove_path_for_replace(path: &Path, ctx: &PushCtx<'_>) -> Result<(), String> {
@@ -1261,6 +1438,9 @@ fn apply_delete(root: &Path, segs: &[String], ctx: &PushCtx<'_>) -> Result<usize
         Some(p) => p,
         None => return Ok(0),
     };
+    if target.is_dir() && !disk_path_is_sync_owned(&target) {
+        return Ok(0);
+    }
     if target.is_dir() {
         std::fs::remove_dir_all(&target).map_err(|e| format!("rmdir {}: {e}", target.display()))?;
     } else if target.is_file() {
@@ -2007,6 +2187,35 @@ mod tests {
         Mutex::new(HashMap::new())
     }
 
+    #[test]
+    fn resolve_accepts_plan_disk_alias() {
+        assert!(matches!(
+            parse_resolution("disk"),
+            Ok(Resolution::KeepLocal)
+        ));
+        assert!(matches!(
+            parse_resolution("keep-disk"),
+            Ok(Resolution::KeepLocal)
+        ));
+        assert!(matches!(
+            parse_resolution("studio"),
+            Ok(Resolution::KeepStudio)
+        ));
+    }
+
+    #[test]
+    fn resolve_conflict_target_accepts_project_relative_file_paths() {
+        let project = PathBuf::from("/project");
+        assert_eq!(
+            resolve_conflict_target(&project, "ServerScriptService/Foo.luau"),
+            PathBuf::from("/project/ServerScriptService/Foo.luau")
+        );
+        assert_eq!(
+            resolve_conflict_target(&project, "/project/ServerScriptService/Foo.luau"),
+            PathBuf::from("/project/ServerScriptService/Foo.luau")
+        );
+    }
+
     // Out-of-scope classes are silently skipped: `Part` is not in the four-class
     // whitelist, so `apply_set` returns `Skipped` instead of materializing
     // anything on disk. Property sync is ripped out — anything beyond
@@ -2378,12 +2587,66 @@ mod tests {
         let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
 
         assert!(applied >= 1);
-        assert!(!d.path().join("ReplicatedStorage").join("Assets").exists());
+        assert!(
+            d.path().join("ReplicatedStorage").join("Assets").exists(),
+            "folder-only Studio-adjacent disk trees are outside the sync surface"
+        );
         assert!(!d
             .path()
             .join("ReplicatedStorage")
             .join("ClientOnly.server.luau")
             .exists());
+    }
+
+    #[test]
+    fn bootstrap_strict_prunes_disk_only_folder_with_script_descendant() {
+        let d = TempDir::new("bootstrap-strict-script-folder-prune");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = strict_force_harness(&engine, &quiet);
+
+        let owned_tree = d
+            .path()
+            .join("ReplicatedStorage")
+            .join("Assets")
+            .join("EventVFX");
+        std::fs::create_dir_all(&owned_tree).unwrap();
+        std::fs::write(
+            owned_tree.join("Emitter.client.luau"),
+            "print('remove me')\n",
+        )
+        .unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": []
+        });
+
+        let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
+
+        assert!(applied >= 1);
+        assert!(
+            !d.path().join("ReplicatedStorage").join("Assets").exists(),
+            "folders with script descendants remain sync-owned and pruneable"
+        );
+    }
+
+    #[test]
+    fn studio_delete_ignores_plain_disk_folder_without_script_sources() {
+        let d = TempDir::new("delete-plain-folder");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+
+        let folder = d.path().join("Workspace").join("StudioOnly").join("Nested");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let applied =
+            apply_delete(d.path(), &["Workspace".into(), "StudioOnly".into()], &ctx).unwrap();
+
+        assert_eq!(applied, 0);
+        assert!(d.path().join("Workspace").join("StudioOnly").exists());
     }
 
     #[test]
@@ -2499,6 +2762,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bootstrap_assigns_duplicate_siblings_by_stable_subtree() {
+        let d = TempDir::new("bootstrap-duplicate-order");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = strict_force_harness(&engine, &quiet);
+
+        let sell_npc = d
+            .path()
+            .join("Workspace")
+            .join("SellNPC")
+            .join("HumanoidRootPart");
+        std::fs::create_dir_all(&sell_npc).unwrap();
+        std::fs::write(sell_npc.join("DialogueDemo.client.luau"), "old dialogue\n").unwrap();
+        let sell_npc_duplicate = d.path().join("Workspace").join("SellNPC [1]");
+        std::fs::create_dir_all(&sell_npc_duplicate).unwrap();
+        std::fs::write(
+            sell_npc_duplicate.join("Animate.client.luau"),
+            "old animate\n",
+        )
+        .unwrap();
+        let stable_duplicate_target = d
+            .path()
+            .join("Workspace")
+            .join("SellNPC [1]")
+            .join("HumanoidRootPart");
+
+        let service = serde_json::json!({
+            "name": "Workspace",
+            "class": "Workspace",
+            "children": [
+                { "name": "SellNPC", "class": "Folder", "properties": {}, "children": [
+                    { "name": "HumanoidRootPart", "class": "Folder", "properties": {}, "children": [
+                        { "name": "DialogueDemo", "class": "LocalScript", "properties": { "Source": "dialogue\n" }, "children": [] }
+                    ] }
+                ] },
+                { "name": "SellNPC", "class": "Folder", "properties": {}, "children": [
+                    { "name": "Animate", "class": "LocalScript", "properties": { "Source": "animate\n" }, "children": [] }
+                ] }
+            ]
+        });
+
+        apply_service_node(d.path(), &service, &ctx).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("Workspace/SellNPC/Animate.client.luau"))
+                .unwrap(),
+            "animate\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stable_duplicate_target.join("DialogueDemo.client.luau"))
+                .unwrap(),
+            "dialogue\n"
+        );
+        assert!(!d
+            .path()
+            .join("Workspace/SellNPC/HumanoidRootPart/DialogueDemo.client.luau")
+            .exists());
+        assert!(!d
+            .path()
+            .join("Workspace/SellNPC [1]/Animate.client.luau")
+            .exists());
+    }
+
     // POST /tree writes body to `.tree.json.tmp` then replaces `tree.json`.
     // Verifies round-trip bytes and that the watcher ignores both paths so the
     // write never bounces back as an op.
@@ -2569,6 +2896,64 @@ mod tests {
                 }]
             }]
         })];
+
+        assert!(initial_snapshots_match(d.path(), &studio).unwrap());
+    }
+
+    #[test]
+    fn initial_snapshot_compare_accepts_reordered_duplicate_siblings() {
+        let d = TempDir::new("initial-duplicate-order");
+        let packages = d.path().join("ReplicatedStorage").join("Packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(packages.join("Net.luau"), "return 'Net'\n").unwrap();
+        std::fs::write(packages.join("net.lua"), "return 'net'\n").unwrap();
+
+        let sell_npc = d.path().join("Workspace").join("SellNPC");
+        std::fs::create_dir_all(&sell_npc).unwrap();
+        std::fs::write(sell_npc.join("Animate.client.luau"), "animate\n").unwrap();
+        let sell_npc_duplicate = d
+            .path()
+            .join("Workspace")
+            .join("SellNPC [1]")
+            .join("HumanoidRootPart");
+        std::fs::create_dir_all(&sell_npc_duplicate).unwrap();
+        std::fs::write(
+            sell_npc_duplicate.join("DialogueDemo.client.luau"),
+            "dialogue\n",
+        )
+        .unwrap();
+
+        let studio = vec![
+            json!({
+                "class": "ReplicatedStorage",
+                "name": "ReplicatedStorage",
+                "properties": {},
+                "children": [{
+                    "class": "Folder",
+                    "name": "Packages",
+                    "properties": {},
+                    "children": [
+                        { "class": "ModuleScript", "name": "net", "properties": { "Source": "return 'net'\n" }, "children": [] },
+                        { "class": "ModuleScript", "name": "Net", "properties": { "Source": "return 'Net'\n" }, "children": [] }
+                    ]
+                }]
+            }),
+            json!({
+                "class": "Workspace",
+                "name": "Workspace",
+                "properties": {},
+                "children": [
+                    { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                        { "class": "Folder", "name": "HumanoidRootPart", "properties": {}, "children": [
+                            { "class": "LocalScript", "name": "DialogueDemo", "properties": { "Source": "dialogue\n" }, "children": [] }
+                        ] }
+                    ] },
+                    { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                        { "class": "LocalScript", "name": "Animate", "properties": { "Source": "animate\n" }, "children": [] }
+                    ] }
+                ]
+            }),
+        ];
 
         assert!(initial_snapshots_match(d.path(), &studio).unwrap());
     }

@@ -140,14 +140,19 @@ impl ConflictEngine {
     /// change has been successfully applied on the peer.
     pub fn record_sync(&self, path: &Path, content_hash: Hash, fs_mtime: u64) {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut b = self.baselines.lock().unwrap();
-        b.insert(
-            key,
-            Baseline {
-                fs_mtime,
-                last_plugin_push_hash: content_hash,
-            },
-        );
+        {
+            let mut b = self.baselines.lock().unwrap();
+            b.insert(
+                key.clone(),
+                Baseline {
+                    fs_mtime,
+                    last_plugin_push_hash: content_hash,
+                },
+            );
+        }
+        let mut c = self.conflicts.lock().unwrap();
+        let conflict_key = resolve_key(&*c, &key);
+        c.remove(&conflict_key);
     }
 
     /// An FS-side change was observed. Returns what the caller should do.
@@ -368,6 +373,17 @@ mod tests {
         // user manually makes FS match studio
         let d = e.on_fs_change(&p("/x/a.luau"), b"studio-edit", 300);
         assert_eq!(d, FsDecision::NoChange);
+        assert!(!e.has_conflict(&p("/x/a.luau")));
+    }
+
+    #[test]
+    fn record_sync_clears_stale_parked_conflict() {
+        let e = ConflictEngine::new();
+        e.record_sync(&p("/x/a.luau"), hash(b"hello"), 100);
+        e.on_studio_push(&p("/x/a.luau"), b"studio-edit", Some((b"fs-edit", 200)));
+        assert!(e.has_conflict(&p("/x/a.luau")));
+
+        e.record_sync(&p("/x/a.luau"), hash(b"fs-edit"), 300);
         assert!(!e.has_conflict(&p("/x/a.luau")));
     }
 

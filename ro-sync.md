@@ -31,6 +31,13 @@ rosync diff --project .
 rosync path --project . Workspace/Camera
 ```
 
+For agents, the live Studio explorer is the source of truth. Before reshaping
+scripts or folders, use `rosync tree`, `rosync ls`, `rosync meta`,
+`rosync get`, and `rosync source` against the live DataModel instead of
+inferring from disk alone. Disk only mirrors Ro Sync's script/folder projection;
+Studio-only explorer folders and non-script instances may intentionally have no
+matching files.
+
 For asset uploads, use Ro Sync, not external asset tools:
 
 ```
@@ -73,6 +80,14 @@ Roblox class is Studio-authoritative: the plugin emits a read-only `tree.json`
 skeleton at the project root so tooling can see the rest of the DataModel, but
 the daemon never writes those instances to disk and never pushes property
 changes to Studio.
+
+Script source has one extra Studio caveat: `script.Source` is not a reliable
+truth source while Drafts or an open Script Editor buffer is involved. Studio
+does not always push draft/editor text into the `Source` property until the
+script is committed. Ro Sync uses `ScriptEditorService:GetEditorSource()` /
+`UpdateSourceAsync()` and ScriptDocument change events so editor text can
+round-trip, but agents should still prefer `rosync source` or live
+ScriptEditor-backed reads over raw `script.Source` assumptions.
 
 ## 1b. Playtesting is a separate environment
 
@@ -217,6 +232,11 @@ subcommands speak to the plugin over WebSocket and inspect or mutate live
 instances. They work across the entire DataModel — not just the four
 filesystem-synced classes. Every call that mutates state is appended to
 `writes.log` at the project root for audit.
+
+Treat these live explorer commands as authoritative when deciding what exists in
+Studio. The filesystem view is intentionally narrower and can omit empty
+Studio-only folders, Models, Parts, UI objects, Remotes, and other
+Studio-owned instances.
 
 Every subcommand accepts `--project <path>` (defaults aren't inferred). All
 instance paths use `/`-separated Studio names rooted at `DataModel` — e.g.
@@ -368,10 +388,14 @@ Do not paste or request the full command registry by default. It is large and
 usually worse for agent reasoning. Use this flow instead:
 
 1. Run `rosync context --project .` once at task start.
-2. Run `rosync commands --compact` only when choosing between command families.
-3. Run `rosync commands <name>` for the exact command you are about to use.
-4. Prefer cheap offline commands before live Studio reads.
-5. Never run mutating commands from an LLM workflow without a read-only
+2. For anything about Explorer shape or instance truth, use live reads:
+   `rosync tree`, `rosync ls`, `rosync meta`, `rosync get`, or
+   `rosync source` before touching files.
+3. Run `rosync commands --compact` only when choosing between command families.
+4. Run `rosync commands <name>` for the exact command you are about to use.
+5. Prefer cheap offline commands for path lookup, but do not let disk-only
+   inference override live Studio reads.
+6. Never run mutating commands from an LLM workflow without a read-only
    `rosync plan` when plan coverage exists.
 
 Cheap-first discovery:
@@ -388,11 +412,25 @@ rosync services --project . --raw
 Targeted reads:
 
 ```
+rosync tree --project . --path ReplicatedStorage/Client --depth 4
+rosync ls --project . --path ReplicatedStorage/Client
+rosync meta --project . ReplicatedStorage/Client/App
 rosync get --project . --path Workspace/Part --prop Anchored
 rosync props --project . --path Workspace/Part
 rosync source --project . --path ReplicatedStorage/Client/App --disk
 rosync source --project . --path ReplicatedStorage/Client/App
 ```
+
+`rosync source` without `--disk` asks the live plugin for Studio/editor text and
+uses ScriptEditorService for script source. Use it to inspect Studio divergence;
+use `--disk` to inspect the local file that lint and Git see.
+
+For post-edit verification, do not treat unrelated global `rosync changes`
+output as proof that your touched file failed to sync. Ro Sync projects can
+have pre-existing Studio-only scripts, duplicate-name instances, or ignored
+tooling under other paths. Verify the exact script(s) you touched with
+`rosync source --disk`, live `rosync source`, and the narrowest relevant
+`rosync lint --path`; mention unrelated global drift only as background.
 
 Higher-token reads; use only when the task needs them:
 
@@ -416,7 +454,7 @@ Preferred workflow snippets:
 
 - Inspect one object: `meta` -> `get --prop` or `props` -> `source` only for scripts.
 - Find source: `where` or `query` -> `source --disk`; use live `source` only when checking Studio divergence.
-- Compare disk vs Studio: `changes`; avoid `diff --raw` unless machine parsing is needed.
+- Verify touched scripts: `source --disk` + live `source` for each touched path; use global `changes` only to discover broader drift.
 - Resolve conflict: `conflicts` -> `changes` -> `plan resolve` -> explicit `resolve`.
 - Write Studio: `plan set|new|rm|mv` -> user confirmation -> mutating command, preferably with a waypoint for batches.
 - Upload/Open Cloud: enumerate files or `monetization discover/list` first; avoid recursive/bulk writes until the target set is clear.

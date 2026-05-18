@@ -35,7 +35,7 @@ local SOURCE_WRITE_CONCURRENCY = 16
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "1.0.6"
+local PLUGIN_VERSION_STRING = "1.0.10"
 local PLUGIN_PROTOCOL_VERSION = 1
 
 --------------------------------------------------------------------------------
@@ -728,6 +728,35 @@ local function splitStudioPath(path: string): {string}
 	return out
 end
 
+local function parseDisambiguatedSegment(seg: string): (string?, number?)
+	local base, ordinal = string.match(seg, "^(.-) %[([0-9]+)%]$")
+	if type(base) ~= "string" or base == "" then
+		return nil, nil
+	end
+	local n = tonumber(ordinal)
+	if not n then
+		return nil, nil
+	end
+	return base, n
+end
+
+local function findDisambiguatedChild(parent: Instance, seg: string): Instance?
+	local base, ordinal = parseDisambiguatedSegment(seg)
+	if not base or not ordinal then
+		return nil
+	end
+	local seen = 0
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == base then
+			if seen == ordinal then
+				return child
+			end
+			seen += 1
+		end
+	end
+	return nil
+end
+
 local function pathStartsWith(path: {string}, prefix: {string}?): boolean
 	if not prefix or #prefix == 0 or #path < #prefix then
 		return false
@@ -757,6 +786,9 @@ local function resolvePath(path)
 			end
 		else
 			nxt = cur:FindFirstChild(seg)
+		end
+		if not nxt then
+			nxt = findDisambiguatedChild(cur, seg)
 		end
 		if not nxt then return nil end
 		cur = nxt
@@ -946,6 +978,22 @@ local function canSafelyDestroy(inst: Instance, allowDescendants: boolean?): (bo
 	return true, ""
 end
 
+local function shouldStrictPruneChild(child: Instance, wanted: { [string]: boolean }): boolean
+	if wanted[child.Name] then
+		return false
+	end
+	if not ALLOWED_CLASSES[child.ClassName] then
+		return false
+	end
+	if child:IsA("LuaSourceContainer") then
+		return true
+	end
+	if child.ClassName == "Folder" then
+		return hasSyncableDescendant(child)
+	end
+	return false
+end
+
 local function applyNode(parent, node, opts)
 	if isAvoidSyncBlocked(parent) then
 		log("AvoidSync: skipping disk apply under " .. pathOf(parent))
@@ -1010,11 +1058,11 @@ local function applyNode(parent, node, opts)
 	end
 	if opts and opts.strict then
 		for _, child in ipairs(inst:GetChildren()) do
-			-- Strict pruning only removes ALLOWED-class children. Non-ALLOWED
-			-- classes (Parts, Models, Lights, etc.) are Studio-authoritative
-			-- and never appear in disk payloads — skipping them here prevents
-			-- a disk-driven apply from wiping Studio-only state.
-			if ALLOWED_CLASSES[child.ClassName] and not wanted[child.Name] then
+			-- Strict pruning only removes script sources, plus Folder containers
+			-- that still lead to script sources. Bare Studio folders are
+			-- explorer-only and must not be destroyed just because disk lacks
+			-- a matching directory.
+			if shouldStrictPruneChild(child, wanted) then
 				local safe, reason = canSafelyDestroy(child, opts and opts.forcePrune == true)
 				if safe then
 					child:Destroy()
@@ -1234,7 +1282,7 @@ local function applySnapshot(snap)
 					end
 					if strict then
 						for _, existing in ipairs(svc:GetChildren()) do
-							if ALLOWED_CLASSES[existing.ClassName] and not wanted[existing.Name] then
+							if shouldStrictPruneChild(existing, wanted) then
 								local safe, reason = canSafelyDestroy(existing, forcePrune)
 								if safe then
 									existing:Destroy()
@@ -1418,6 +1466,9 @@ end
 
 local pendingOps = {}
 local pushPending = false
+local pendingEditorSourceByScript: {[Instance]: {source: string, serial: number}} = {}
+local EDITOR_SOURCE_DEBOUNCE = 0.35
+local markTreeDirty
 
 local function flushPush()
 	if #pendingOps == 0 then return end
@@ -1467,6 +1518,67 @@ local function queueOp(op)
 	end
 end
 
+local function queueScriptUpdateOp(inst: Instance, source: string)
+	markTreeDirty()
+	queueOp({
+		op = "update",
+		path = pathFromRoot(inst),
+		properties = { Source = source },
+	})
+end
+
+local function scriptFromDocument(document): Instance?
+	local okCommandBar, isCommandBar = pcall(function()
+		return document:IsCommandBar()
+	end)
+	if okCommandBar and isCommandBar then
+		return nil
+	end
+	local ok, scriptInst = pcall(function()
+		return document:GetScript()
+	end)
+	if ok and typeof(scriptInst) == "Instance" and scriptInst:IsA("LuaSourceContainer") then
+		return scriptInst
+	end
+	return nil
+end
+
+local function sourceFromDocument(document, scriptInst: Instance): string?
+	local okText, text = pcall(function()
+		return document:GetText()
+	end)
+	if okText and type(text) == "string" then
+		return text
+	end
+	return readScriptSource(scriptInst)
+end
+
+local function queueEditorSourceChanged(scriptInst: Instance, source: string)
+	local pending = pendingEditorSourceByScript[scriptInst]
+	if pending and pending.source == source then
+		return
+	end
+	local serial = pending and (pending.serial + 1) or 1
+	pendingEditorSourceByScript[scriptInst] = {
+		source = source,
+		serial = serial,
+	}
+	task.delay(EDITOR_SOURCE_DEBOUNCE, function()
+		local latest = pendingEditorSourceByScript[scriptInst]
+		if not latest or latest.serial ~= serial then
+			return
+		end
+		pendingEditorSourceByScript[scriptInst] = nil
+		if isEchoing() then return end
+		if scriptInst.Parent == nil then return end
+		if not isUnderWatched(scriptInst) then return end
+		if isGeneratedDiskRoot(scriptInst) then return end
+		if isAvoidSyncBlocked(scriptInst) then return end
+		if not scriptInst:IsA("LuaSourceContainer") then return end
+		queueScriptUpdateOp(scriptInst, latest.source)
+	end)
+end
+
 --------------------------------------------------------------------------------
 -- Tree skeleton push (Studio → daemon tree.json)
 --------------------------------------------------------------------------------
@@ -1504,7 +1616,7 @@ local function pushTreeSkeleton()
 	end
 end
 
-local function markTreeDirty()
+markTreeDirty = function()
 	treeDirty = true
 	if treePushPending then return end
 	treePushPending = true
@@ -1666,12 +1778,7 @@ onChanged = function(inst, prop)
 		return
 	end
 	if prop == "Source" and inst:IsA("LuaSourceContainer") then
-		markTreeDirty()
-		queueOp({
-			op = "update",
-			path = pathFromRoot(inst),
-			properties = { Source = readScriptSource(inst) },
-		})
+		queueScriptUpdateOp(inst, readScriptSource(inst))
 		return
 	end
 	-- Every other property is Studio-authoritative. No op, no tree push —
@@ -1751,6 +1858,7 @@ local function disconnectHooks()
 		pcall(function() c:Disconnect() end)
 	end
 	serviceConnections = {}
+	pendingEditorSourceByScript = {}
 	for inst, _ in pairs(connections) do
 		disconnectInstance(inst)
 	end
@@ -1791,6 +1899,19 @@ local function installHooks()
 		else
 			log("skip service: " .. name)
 		end
+	end
+	if ScriptEditorService then
+		table.insert(serviceConnections, ScriptEditorService.TextDocumentDidChange:Connect(function(document, _changes)
+			if isEchoing() then return end
+			local scriptInst = scriptFromDocument(document)
+			if not scriptInst then return end
+			if not isUnderWatched(scriptInst) then return end
+			if isGeneratedDiskRoot(scriptInst) then return end
+			if isAvoidSyncBlocked(scriptInst) then return end
+			local source = sourceFromDocument(document, scriptInst)
+			if type(source) ~= "string" then return end
+			queueEditorSourceChanged(scriptInst, source)
+		end))
 	end
 end
 
@@ -2273,7 +2394,12 @@ end
 local function inspectInstance(inst)
 	local props = {}
 	for _, name in ipairs(buildInspectPropsList(inst)) do
-		local ok, raw = pcall(function() return inst[name] end)
+		local ok, raw = pcall(function()
+			if name == "Source" and inst:IsA("LuaSourceContainer") then
+				return readScriptSource(inst)
+			end
+			return inst[name]
+		end)
 		if ok and raw ~= nil then
 			local eok, encoded = pcall(encodeRemoteValue, raw)
 			if eok then props[name] = encoded end
@@ -2312,6 +2438,9 @@ remoteHandlers.get = function(args)
 	if not inst then error("path not found: " .. tostring(args.path)) end
 	local prop = tostring(args.prop or "")
 	if prop == "" then return inspectInstance(inst) end
+	if prop == "Source" and inst:IsA("LuaSourceContainer") then
+		return encodeRemoteValue(readScriptSource(inst))
+	end
 	return encodeRemoteValue(inst[prop])
 end
 

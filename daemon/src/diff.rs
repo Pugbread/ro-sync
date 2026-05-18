@@ -1,4 +1,6 @@
-use crate::fs_map::normalize_line_endings;
+use crate::fs_map::{
+    classify_script_file, instance_to_path, normalize_line_endings, InstanceDescriptor,
+};
 use crate::snapshot::SYNCED_SERVICES;
 use serde::Serialize;
 use serde_json::Value;
@@ -6,6 +8,13 @@ use std::collections::BTreeMap;
 
 const SCRIPT_CLASSES: &[&str] = &["Script", "LocalScript", "ModuleScript"];
 const SYNC_CLASSES: &[&str] = &["Folder", "Script", "LocalScript", "ModuleScript"];
+const SUPPRESS_CLASSES: &[&str] = &["Camera", "Terrain", "PlayerScripts", "PackageLink"];
+
+#[derive(Clone, Copy)]
+enum TreeFlavor {
+    Snapshot,
+    Studio,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,14 +79,37 @@ impl DiffReport {
 pub fn collect_local_nodes(services: &[Value]) -> BTreeMap<String, DiffNode> {
     let mut out = BTreeMap::new();
     for service in services {
-        collect_snapshot_node(service, "", true, &mut out);
+        let Some(name) = service.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(children) = service.get("children").and_then(|v| v.as_array()) {
+            collect_snapshot_children(children, name, &mut out);
+        }
     }
     out
 }
 
 pub fn collect_studio_tree_nodes(root: &Value) -> BTreeMap<String, DiffNode> {
     let mut out = BTreeMap::new();
-    collect_studio_node(root, "", true, &mut out);
+    let is_data_model_root = root
+        .get("class")
+        .and_then(|v| v.as_str())
+        .is_some_and(|class| class == "DataModel");
+    if is_data_model_root {
+        if let Some(children) = root.get("children").and_then(|v| v.as_array()) {
+            for service in children {
+                if !is_synced_service_node(service) {
+                    continue;
+                }
+                let Some(name) = service.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                collect_studio_children(service, name, &mut out);
+            }
+        }
+    } else {
+        collect_studio_node(root, "", &mut out);
+    }
     out
 }
 
@@ -93,6 +125,10 @@ pub fn set_node_source(nodes: &mut BTreeMap<String, DiffNode>, path: &str, sourc
     if let Some(node) = nodes.get_mut(path) {
         node.source = Some(source);
     }
+}
+
+pub(crate) fn snapshot_sibling_sort_key(node: &Value, class: &str) -> String {
+    sibling_sort_key(node, class, TreeFlavor::Snapshot)
 }
 
 pub fn has_truncated_tree(node: &Value) -> bool {
@@ -153,19 +189,66 @@ pub fn compare(
     }
 }
 
-fn collect_snapshot_node(
-    node: &Value,
+fn collect_snapshot_children(
+    children: &[Value],
     parent: &str,
-    is_service: bool,
     out: &mut BTreeMap<String, DiffNode>,
 ) {
+    let mut taken = Vec::new();
+    let mut relevant = Vec::new();
+    for child in children {
+        let Some(name) = child.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(class) = child.get("class").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if child
+            .get("avoidSync")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if !is_sync_class(class) {
+            continue;
+        }
+
+        relevant.push((
+            sibling_sort_key(child, class, TreeFlavor::Snapshot),
+            child,
+            name,
+            class,
+        ));
+    }
+    relevant.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (_sort_key, child, name, class) in relevant {
+        let has_children = child
+            .get("children")
+            .and_then(|v| v.as_array())
+            .is_some_and(|children| !children.is_empty());
+        let fragment = instance_to_path(
+            &InstanceDescriptor {
+                class,
+                name,
+                has_children,
+            },
+            &taken,
+        );
+        taken.push(fragment.fragment.clone());
+        let path = join_path(parent, &diff_segment_for_fragment(&fragment.fragment));
+        collect_snapshot_node(child, &path, out);
+    }
+}
+
+fn collect_snapshot_node(node: &Value, path: &str, out: &mut BTreeMap<String, DiffNode>) {
     let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
         return;
     };
     let Some(class) = node.get("class").and_then(|v| v.as_str()) else {
         return;
     };
-    let path = join_path(parent, name);
     if node
         .get("avoidSync")
         .and_then(|v| v.as_bool())
@@ -173,11 +256,11 @@ fn collect_snapshot_node(
     {
         return;
     }
-    if !is_service && is_sync_class(class) {
+    if is_sync_class(class) {
         out.insert(
-            path.clone(),
+            path.to_string(),
             DiffNode {
-                path: path.clone(),
+                path: path.to_string(),
                 class: class.to_string(),
                 kind: kind_for_class(class),
                 source: source_from_node(node),
@@ -185,29 +268,119 @@ fn collect_snapshot_node(
         );
     }
     if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-        for child in children {
-            collect_snapshot_node(child, &path, false, out);
-        }
+        collect_snapshot_children(children, path, out);
     }
+    let _ = name;
 }
 
-fn collect_studio_node(
-    node: &Value,
-    parent: &str,
-    is_service: bool,
+fn collect_studio_children(
+    parent_node: &Value,
+    parent_path: &str,
     out: &mut BTreeMap<String, DiffNode>,
 ) -> bool {
+    let mut taken = Vec::new();
+    let mut has_syncable_child = false;
+    let Some(children) = parent_node.get("children").and_then(|v| v.as_array()) else {
+        return false;
+    };
+
+    let mut relevant = Vec::new();
+    for child in children {
+        if !studio_node_is_diff_relevant(child) {
+            continue;
+        }
+        let Some(name) = child.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(class) = child.get("class").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mapped_class = mapped_studio_class(child, class);
+        relevant.push((
+            sibling_sort_key(child, mapped_class, TreeFlavor::Studio),
+            child,
+            name,
+            mapped_class.to_string(),
+        ));
+    }
+    relevant.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (_sort_key, child, name, mapped_class) in relevant {
+        let has_children = child
+            .get("children")
+            .and_then(|v| v.as_array())
+            .is_some_and(|children| !children.is_empty());
+        let fragment = instance_to_path(
+            &InstanceDescriptor {
+                class: &mapped_class,
+                name,
+                has_children,
+            },
+            &taken,
+        );
+        taken.push(fragment.fragment.clone());
+        let path = join_path(parent_path, &diff_segment_for_fragment(&fragment.fragment));
+        if collect_studio_node(child, &path, out) {
+            has_syncable_child = true;
+        }
+    }
+
+    has_syncable_child
+}
+
+fn sibling_sort_key(node: &Value, mapped_class: &str, flavor: TreeFlavor) -> String {
+    let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let lower_name = name.to_ascii_lowercase();
+    let signature = sync_relevant_signature(node, mapped_class, flavor);
+    format!("{lower_name}\u{0}{name}\u{0}{mapped_class}\u{0}{signature}")
+}
+
+fn sync_relevant_signature(node: &Value, mapped_class: &str, flavor: TreeFlavor) -> String {
+    let mut parts = Vec::new();
+    parts.push(mapped_class.to_string());
+
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        let mut child_keys = Vec::new();
+        for child in children {
+            if child
+                .get("avoidSync")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(class) = child.get("class").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let mapped_child_class = match flavor {
+                TreeFlavor::Snapshot => {
+                    if !is_sync_class(class) {
+                        continue;
+                    }
+                    class
+                }
+                TreeFlavor::Studio => {
+                    if !studio_node_is_diff_relevant(child) {
+                        continue;
+                    }
+                    mapped_studio_class(child, class)
+                }
+            };
+            child_keys.push(sibling_sort_key(child, mapped_child_class, flavor));
+        }
+        child_keys.sort();
+        parts.extend(child_keys);
+    }
+
+    parts.join("\u{0}")
+}
+
+fn collect_studio_node(node: &Value, path: &str, out: &mut BTreeMap<String, DiffNode>) -> bool {
     let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
         return false;
     };
     let Some(class) = node.get("class").and_then(|v| v.as_str()) else {
         return false;
-    };
-    let is_data_model_root = is_service && parent.is_empty() && class == "DataModel";
-    let path = if is_data_model_root {
-        String::new()
-    } else {
-        join_path(parent, name)
     };
     if node
         .get("avoidSync")
@@ -216,32 +389,77 @@ fn collect_studio_node(
     {
         return false;
     }
-    let mut has_syncable_child = false;
-    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-        for child in children {
-            if is_data_model_root && !is_synced_service_node(child) {
-                continue;
-            }
-            if collect_studio_node(child, &path, is_data_model_root, out) {
-                has_syncable_child = true;
-            }
-        }
-    }
+    let has_syncable_child = collect_studio_children(node, path, out);
 
-    let allowed = is_sync_class(class);
-    if !is_service && (allowed || has_syncable_child) {
-        let mapped_class = if allowed { class } else { "Folder" };
+    let is_script = SCRIPT_CLASSES.contains(&class);
+    let is_sync_relevant_folder = class == "Folder" && has_syncable_child;
+    let is_passthrough_container = !is_sync_class(class) && has_syncable_child;
+    if is_script || is_sync_relevant_folder || is_passthrough_container {
+        let mapped_class = if is_script || is_sync_relevant_folder {
+            class
+        } else {
+            "Folder"
+        };
         out.insert(
-            path.clone(),
+            path.to_string(),
             DiffNode {
-                path,
+                path: path.to_string(),
                 class: mapped_class.to_string(),
                 kind: kind_for_class(mapped_class),
                 source: None,
             },
         );
     }
-    allowed || has_syncable_child
+    let _ = name;
+    is_script || is_sync_relevant_folder || is_passthrough_container
+}
+
+fn studio_node_is_diff_relevant(node: &Value) -> bool {
+    if node
+        .get("avoidSync")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(class) = node.get("class").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if SUPPRESS_CLASSES.contains(&class) {
+        return false;
+    }
+    if SCRIPT_CLASSES.contains(&class) {
+        return true;
+    }
+    let has_syncable_child = node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .map(|children| children.iter().any(studio_node_is_diff_relevant))
+        .unwrap_or(false);
+    (class == "Folder" || !is_sync_class(class)) && has_syncable_child
+}
+
+fn mapped_studio_class<'a>(node: &'a Value, class: &'a str) -> &'a str {
+    if SCRIPT_CLASSES.contains(&class) || class == "Folder" {
+        return class;
+    }
+    if node
+        .get("children")
+        .and_then(|v| v.as_array())
+        .is_some_and(|children| children.iter().any(studio_node_is_diff_relevant))
+    {
+        "Folder"
+    } else {
+        class
+    }
+}
+
+fn diff_segment_for_fragment(fragment: &str) -> String {
+    if let Some((_class, stem)) = classify_script_file(fragment) {
+        stem
+    } else {
+        fragment.to_string()
+    }
 }
 
 fn item_from_node(node: &DiffNode) -> DiffItem {
@@ -325,11 +543,244 @@ mod tests {
         let report = compare(&local, &studio);
         assert_eq!(report.summary.added, 1);
         assert_eq!(report.added[0].path, "ReplicatedStorage/LocalOnly");
-        assert_eq!(report.summary.removed, 1);
-        assert_eq!(report.removed[0].path, "ReplicatedStorage/StudioOnly");
+        assert_eq!(report.summary.removed, 0);
         assert_eq!(report.summary.changed, 1);
         assert_eq!(report.changed[0].path, "ReplicatedStorage/Config");
         assert!(report.changed[0].source_changed);
+    }
+
+    #[test]
+    fn studio_tree_ignores_folder_without_script_descendants() {
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [
+                { "class": "ReplicatedStorage", "name": "ReplicatedStorage", "children": [
+                    { "class": "Folder", "name": "Assets", "children": [
+                        { "class": "Folder", "name": "Models", "children": [] }
+                    ] }
+                ] }
+            ]
+        });
+
+        let studio = collect_studio_tree_nodes(&studio_tree);
+        assert!(!studio.contains_key("ReplicatedStorage/Assets"));
+        assert!(!studio.contains_key("ReplicatedStorage/Assets/Models"));
+    }
+
+    #[test]
+    fn studio_tree_keeps_folder_ancestors_of_scripts() {
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [
+                { "class": "ReplicatedStorage", "name": "ReplicatedStorage", "children": [
+                    { "class": "Folder", "name": "Shared", "children": [
+                        { "class": "ModuleScript", "name": "Config", "children": [] }
+                    ] }
+                ] }
+            ]
+        });
+
+        let studio = collect_studio_tree_nodes(&studio_tree);
+        assert_eq!(studio["ReplicatedStorage/Shared"].class, "Folder");
+        assert_eq!(
+            studio["ReplicatedStorage/Shared/Config"].class,
+            "ModuleScript"
+        );
+    }
+
+    #[test]
+    fn studio_tree_suppresses_camera_subtrees_even_with_scripts() {
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [
+                { "class": "ServerStorage", "name": "ServerStorage", "children": [
+                    { "class": "Camera", "name": "Photobooth", "children": [
+                        { "class": "ModuleScript", "name": "Bindings", "children": [] }
+                    ] }
+                ] }
+            ]
+        });
+
+        let studio = collect_studio_tree_nodes(&studio_tree);
+        assert!(!studio.contains_key("ServerStorage/Photobooth"));
+        assert!(!studio.contains_key("ServerStorage/Photobooth/Bindings"));
+    }
+
+    #[test]
+    fn case_only_siblings_disambiguate_independent_of_snapshot_order() {
+        let local_services = vec![json!({
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "properties": {},
+            "children": [{
+                "class": "Folder",
+                "name": "Packages",
+                "properties": {},
+                "children": [
+                    { "class": "ModuleScript", "name": "Net", "properties": { "Source": "return 'Net'\n" }, "children": [] },
+                    { "class": "ModuleScript", "name": "net", "properties": { "Source": "return 'net'\n" }, "children": [] }
+                ]
+            }]
+        })];
+        let studio_services = vec![json!({
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "properties": {},
+            "children": [{
+                "class": "Folder",
+                "name": "Packages",
+                "properties": {},
+                "children": [
+                    { "class": "ModuleScript", "name": "net", "properties": { "Source": "return 'net'\n" }, "children": [] },
+                    { "class": "ModuleScript", "name": "Net", "properties": { "Source": "return 'Net'\n" }, "children": [] }
+                ]
+            }]
+        })];
+
+        let local = collect_local_nodes(&local_services);
+        let studio = collect_local_nodes(&studio_services);
+
+        assert!(local.contains_key("ReplicatedStorage/Packages/Net"));
+        assert!(local.contains_key("ReplicatedStorage/Packages/net [1]"));
+        assert!(studio.contains_key("ReplicatedStorage/Packages/Net"));
+        assert!(studio.contains_key("ReplicatedStorage/Packages/net [1]"));
+        assert!(compare(&local, &studio).is_clean());
+    }
+
+    #[test]
+    fn duplicate_snapshot_siblings_sort_by_sync_relevant_subtree() {
+        let local_services = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "LocalScript", "name": "Animate", "properties": { "Source": "animate" }, "children": [] }
+                ] },
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "Folder", "name": "HumanoidRootPart", "properties": {}, "children": [
+                        { "class": "LocalScript", "name": "DialogueDemo", "properties": { "Source": "dialogue" }, "children": [] }
+                    ] }
+                ] }
+            ]
+        })];
+        let studio_services = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "Folder", "name": "HumanoidRootPart", "properties": {}, "children": [
+                        { "class": "LocalScript", "name": "DialogueDemo", "properties": { "Source": "dialogue" }, "children": [] }
+                    ] }
+                ] },
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "LocalScript", "name": "Animate", "properties": { "Source": "animate" }, "children": [] }
+                ] }
+            ]
+        })];
+
+        let local = collect_local_nodes(&local_services);
+        let studio = collect_local_nodes(&studio_services);
+
+        assert!(local.contains_key("Workspace/SellNPC/Animate"));
+        assert!(local.contains_key("Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"));
+        assert!(studio.contains_key("Workspace/SellNPC/Animate"));
+        assert!(studio.contains_key("Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"));
+        assert!(compare(&local, &studio).is_clean());
+    }
+
+    #[test]
+    fn duplicate_studio_names_use_disk_disambiguation() {
+        let local_services = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "LocalScript", "name": "Animate", "properties": { "Source": "simple" }, "children": [] }
+                ] },
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "LocalScript", "name": "Animate", "properties": { "Source": "r15" }, "children": [] }
+                ] }
+            ]
+        })];
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [
+                { "class": "Workspace", "name": "Workspace", "children": [
+                    { "class": "Model", "name": "SellNPC", "children": [
+                        { "class": "LocalScript", "name": "Animate", "children": [] }
+                    ] },
+                    { "class": "Model", "name": "SellNPC", "children": [
+                        { "class": "LocalScript", "name": "Animate", "children": [] }
+                    ] }
+                ] }
+            ]
+        });
+
+        let local = collect_local_nodes(&local_services);
+        let mut studio = collect_studio_tree_nodes(&studio_tree);
+        set_node_source(&mut studio, "Workspace/SellNPC/Animate", "simple".into());
+        set_node_source(&mut studio, "Workspace/SellNPC [1]/Animate", "r15".into());
+
+        assert!(local.contains_key("Workspace/SellNPC/Animate"));
+        assert!(local.contains_key("Workspace/SellNPC [1]/Animate"));
+        assert!(studio.contains_key("Workspace/SellNPC/Animate"));
+        assert!(studio.contains_key("Workspace/SellNPC [1]/Animate"));
+        assert!(compare(&local, &studio).is_clean());
+    }
+
+    #[test]
+    fn duplicate_studio_names_with_distinct_subtrees_ignore_studio_order() {
+        let local_services = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "LocalScript", "name": "Animate", "properties": { "Source": "animate" }, "children": [] }
+                ] },
+                { "class": "Folder", "name": "SellNPC", "properties": {}, "children": [
+                    { "class": "Folder", "name": "HumanoidRootPart", "properties": {}, "children": [
+                        { "class": "LocalScript", "name": "DialogueDemo", "properties": { "Source": "dialogue" }, "children": [] }
+                    ] }
+                ] }
+            ]
+        })];
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [
+                { "class": "Workspace", "name": "Workspace", "children": [
+                    { "class": "Model", "name": "SellNPC", "children": [
+                        { "class": "Part", "name": "HumanoidRootPart", "children": [
+                            { "class": "LocalScript", "name": "DialogueDemo", "children": [] }
+                        ] }
+                    ] },
+                    { "class": "Model", "name": "SellNPC", "children": [
+                        { "class": "LocalScript", "name": "Animate", "children": [] }
+                    ] }
+                ] }
+            ]
+        });
+
+        let local = collect_local_nodes(&local_services);
+        let mut studio = collect_studio_tree_nodes(&studio_tree);
+        set_node_source(&mut studio, "Workspace/SellNPC/Animate", "animate".into());
+        set_node_source(
+            &mut studio,
+            "Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo",
+            "dialogue".into(),
+        );
+
+        assert!(studio.contains_key("Workspace/SellNPC/Animate"));
+        assert!(studio.contains_key("Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"));
+        assert!(compare(&local, &studio).is_clean());
     }
 
     #[test]
