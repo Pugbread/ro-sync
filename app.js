@@ -310,7 +310,10 @@ async function launchAndWait(project, port) {
 
 async function ensureDaemon() {
   const project = activeProjectPath();
-  const preferred = app.state.daemonPort || DEFAULT_PORT;
+  const preferred =
+    app.state.daemonProject === project && app.state.daemonPort
+      ? app.state.daemonPort
+      : DEFAULT_PORT;
 
   if (!project) {
     app.daemonOk = false;

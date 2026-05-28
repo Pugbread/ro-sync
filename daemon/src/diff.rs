@@ -26,6 +26,7 @@ pub enum DiffKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffNode {
     pub path: String,
+    pub source_path: String,
     pub class: String,
     pub kind: DiffKind,
     pub source: Option<String>,
@@ -104,20 +105,20 @@ pub fn collect_studio_tree_nodes(root: &Value) -> BTreeMap<String, DiffNode> {
                 let Some(name) = service.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                collect_studio_children(service, name, &mut out);
+                collect_studio_children(service, name, name, &mut out);
             }
         }
     } else {
-        collect_studio_node(root, "", &mut out);
+        collect_studio_node(root, "", "", &mut out);
     }
     out
 }
 
-pub fn studio_script_paths(nodes: &BTreeMap<String, DiffNode>) -> Vec<String> {
+pub fn studio_script_paths(nodes: &BTreeMap<String, DiffNode>) -> Vec<(String, String)> {
     nodes
         .values()
         .filter(|node| node.kind == DiffKind::Script)
-        .map(|node| node.path.clone())
+        .map(|node| (node.path.clone(), node.source_path.clone()))
         .collect()
 }
 
@@ -261,6 +262,7 @@ fn collect_snapshot_node(node: &Value, path: &str, out: &mut BTreeMap<String, Di
             path.to_string(),
             DiffNode {
                 path: path.to_string(),
+                source_path: path.to_string(),
                 class: class.to_string(),
                 kind: kind_for_class(class),
                 source: source_from_node(node),
@@ -276,6 +278,7 @@ fn collect_snapshot_node(node: &Value, path: &str, out: &mut BTreeMap<String, Di
 fn collect_studio_children(
     parent_node: &Value,
     parent_path: &str,
+    parent_source_path: &str,
     out: &mut BTreeMap<String, DiffNode>,
 ) -> bool {
     let mut taken = Vec::new();
@@ -320,7 +323,13 @@ fn collect_studio_children(
         );
         taken.push(fragment.fragment.clone());
         let path = join_path(parent_path, &diff_segment_for_fragment(&fragment.fragment));
-        if collect_studio_node(child, &path, out) {
+        let source_segment = if studio_has_exact_name_duplicates(children, name) {
+            diff_segment_for_fragment(&fragment.fragment)
+        } else {
+            name.to_string()
+        };
+        let source_path = join_path(parent_source_path, &source_segment);
+        if collect_studio_node(child, &path, &source_path, out) {
             has_syncable_child = true;
         }
     }
@@ -375,7 +384,12 @@ fn sync_relevant_signature(node: &Value, mapped_class: &str, flavor: TreeFlavor)
     parts.join("\u{0}")
 }
 
-fn collect_studio_node(node: &Value, path: &str, out: &mut BTreeMap<String, DiffNode>) -> bool {
+fn collect_studio_node(
+    node: &Value,
+    path: &str,
+    source_path: &str,
+    out: &mut BTreeMap<String, DiffNode>,
+) -> bool {
     let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
         return false;
     };
@@ -389,7 +403,7 @@ fn collect_studio_node(node: &Value, path: &str, out: &mut BTreeMap<String, Diff
     {
         return false;
     }
-    let has_syncable_child = collect_studio_children(node, path, out);
+    let has_syncable_child = collect_studio_children(node, path, source_path, out);
 
     let is_script = SCRIPT_CLASSES.contains(&class);
     let is_sync_relevant_folder = class == "Folder" && has_syncable_child;
@@ -404,6 +418,7 @@ fn collect_studio_node(node: &Value, path: &str, out: &mut BTreeMap<String, Diff
             path.to_string(),
             DiffNode {
                 path: path.to_string(),
+                source_path: source_path.to_string(),
                 class: mapped_class.to_string(),
                 kind: kind_for_class(mapped_class),
                 source: None,
@@ -412,6 +427,15 @@ fn collect_studio_node(node: &Value, path: &str, out: &mut BTreeMap<String, Diff
     }
     let _ = name;
     is_script || is_sync_relevant_folder || is_passthrough_container
+}
+
+fn studio_has_exact_name_duplicates(children: &[Value], name: &str) -> bool {
+    children
+        .iter()
+        .filter(|child| child.get("name").and_then(|v| v.as_str()) == Some(name))
+        .take(2)
+        .count()
+        > 1
 }
 
 fn studio_node_is_diff_relevant(node: &Value) -> bool {
@@ -651,6 +675,35 @@ mod tests {
     }
 
     #[test]
+    fn studio_tree_case_only_collision_keeps_real_source_path() {
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [{
+                "class": "ReplicatedStorage",
+                "name": "ReplicatedStorage",
+                "children": [{
+                    "class": "Folder",
+                    "name": "Packages",
+                    "children": [
+                        { "class": "ModuleScript", "name": "net", "children": [] },
+                        { "class": "ModuleScript", "name": "Net", "children": [] }
+                    ]
+                }]
+            }]
+        });
+
+        let studio = collect_studio_tree_nodes(&studio_tree);
+
+        assert!(studio.contains_key("ReplicatedStorage/Packages/Net"));
+        assert!(studio.contains_key("ReplicatedStorage/Packages/net [1]"));
+        assert_eq!(
+            studio["ReplicatedStorage/Packages/net [1]"].source_path,
+            "ReplicatedStorage/Packages/net"
+        );
+    }
+
+    #[test]
     fn duplicate_snapshot_siblings_sort_by_sync_relevant_subtree() {
         let local_services = vec![json!({
             "class": "Workspace",
@@ -690,6 +743,10 @@ mod tests {
         assert!(local.contains_key("Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"));
         assert!(studio.contains_key("Workspace/SellNPC/Animate"));
         assert!(studio.contains_key("Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"));
+        assert_eq!(
+            studio["Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"].source_path,
+            "Workspace/SellNPC [1]/HumanoidRootPart/DialogueDemo"
+        );
         assert!(compare(&local, &studio).is_clean());
     }
 
@@ -790,6 +847,7 @@ mod tests {
             "ServerScriptService/Main".into(),
             DiffNode {
                 path: "ServerScriptService/Main".into(),
+                source_path: "ServerScriptService/Main".into(),
                 class: "Script".into(),
                 kind: DiffKind::Script,
                 source: Some("print(1)\r\n".into()),
@@ -800,6 +858,7 @@ mod tests {
             "ServerScriptService/Main".into(),
             DiffNode {
                 path: "ServerScriptService/Main".into(),
+                source_path: "ServerScriptService/Main".into(),
                 class: "Script".into(),
                 kind: DiffKind::Script,
                 source: Some("print(1)\n".into()),

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "terminal-64": {
+      "args": [
+        "/Applications/Terminal 64.app/Contents/Resources/mcp/t64-server.mjs"
+      ],
+      "command": "/opt/homebrew/bin/node",
+      "env": {
+        "T64_MCP_OUTPUT_FRAMING": "newline"
+      }
+    }
+  }
+}

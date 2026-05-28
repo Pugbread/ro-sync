@@ -4402,14 +4402,14 @@ async fn run_diff(args: DiffArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut studio = diff::collect_studio_tree_nodes(&live_tree);
-    for path in diff::studio_script_paths(&studio) {
+    for (path, source_path) in diff::studio_script_paths(&studio) {
         let resp = remote::request(
             args.port,
             "get",
-            serde_json::json!({ "path": path, "prop": "Source" }),
+            serde_json::json!({ "path": source_path, "prop": "Source" }),
         )
         .await?;
-        let source_value = response_value_or_err(&resp, &format!("diff get {path}.Source"))?;
+        let source_value = response_value_or_err(&resp, &format!("diff get {source_path}.Source"))?;
         let source = source_value.as_str().unwrap_or("").to_string();
         diff::set_node_source(&mut studio, &path, source);
     }

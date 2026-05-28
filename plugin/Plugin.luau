@@ -740,7 +740,90 @@ local function parseDisambiguatedSegment(seg: string): (string?, number?)
 	return base, n
 end
 
-local function findDisambiguatedChild(parent: Instance, seg: string): Instance?
+local PathHelpers = {}
+
+function PathHelpers.pathSegmentTaken(taken: {[string]: true}, candidate: string): boolean
+	return taken[string.lower(candidate)] == true
+end
+
+function PathHelpers.generatedPathSegmentForChild(child: Instance, taken: {[string]: true}): string
+	local base = child.Name
+	if not PathHelpers.pathSegmentTaken(taken, base) then
+		taken[string.lower(base)] = true
+		return base
+	end
+	for n = 1, 9999 do
+		local candidate = string.format("%s [%d]", base, n)
+		if not PathHelpers.pathSegmentTaken(taken, candidate) then
+			taken[string.lower(candidate)] = true
+			return candidate
+		end
+	end
+	local fallback = string.format("%s__%d", base, #taken)
+	taken[string.lower(fallback)] = true
+	return fallback
+end
+
+function PathHelpers.mappedSyncClass(inst: Instance): string
+	if inst:IsA("LuaSourceContainer") or inst.ClassName == "Folder" then
+		return inst.ClassName
+	end
+	return "Folder"
+end
+
+function PathHelpers.syncRelevantSignature(inst: Instance, mappedClass: string): string
+	local parts = { mappedClass }
+	local childKeys = {}
+	for _, child in ipairs(inst:GetChildren()) do
+		if not SUPPRESS_CLASSES[child.ClassName]
+			and not isAvoidSyncBlocked(child)
+			and isSyncable(child) then
+			table.insert(childKeys, PathHelpers.syncPathSiblingSortKey(child))
+		end
+	end
+	table.sort(childKeys)
+	for _, key in ipairs(childKeys) do
+		table.insert(parts, key)
+	end
+	return table.concat(parts, "\0")
+end
+
+function PathHelpers.syncPathSiblingSortKey(inst: Instance): string
+	local mappedClass = PathHelpers.mappedSyncClass(inst)
+	return table.concat({
+		string.lower(inst.Name),
+		inst.Name,
+		mappedClass,
+		PathHelpers.syncRelevantSignature(inst, mappedClass),
+	}, "\0")
+end
+
+function PathHelpers.findGeneratedPathChild(parent: Instance, seg: string): Instance?
+	local children = {}
+	for _, child in ipairs(parent:GetChildren()) do
+		if not SUPPRESS_CLASSES[child.ClassName]
+			and not isAvoidSyncBlocked(child)
+			and isSyncable(child) then
+			table.insert(children, {
+				key = PathHelpers.syncPathSiblingSortKey(child),
+				child = child,
+			})
+		end
+	end
+	table.sort(children, function(a, b)
+		return a.key < b.key
+	end)
+	local taken = {}
+	for _, entry in ipairs(children) do
+		local child = entry.child
+		if PathHelpers.generatedPathSegmentForChild(child, taken) == seg then
+			return child
+		end
+	end
+	return nil
+end
+
+function PathHelpers.findRawDisambiguatedChild(parent: Instance, seg: string): Instance?
 	local base, ordinal = parseDisambiguatedSegment(seg)
 	if not base or not ordinal then
 		return nil
@@ -755,6 +838,10 @@ local function findDisambiguatedChild(parent: Instance, seg: string): Instance?
 		end
 	end
 	return nil
+end
+
+function PathHelpers.findDisambiguatedChild(parent: Instance, seg: string): Instance?
+	return PathHelpers.findGeneratedPathChild(parent, seg) or PathHelpers.findRawDisambiguatedChild(parent, seg)
 end
 
 local function pathStartsWith(path: {string}, prefix: {string}?): boolean
@@ -788,7 +875,7 @@ local function resolvePath(path)
 			nxt = cur:FindFirstChild(seg)
 		end
 		if not nxt then
-			nxt = findDisambiguatedChild(cur, seg)
+			nxt = PathHelpers.findDisambiguatedChild(cur, seg)
 		end
 		if not nxt then return nil end
 		cur = nxt
@@ -4126,6 +4213,9 @@ startConnect = function()
 					if gameId ~= "0" and tostring(hello.gameId) ~= gameId then
 						log(string.format("warning: manual URL reports gameId=%s but Studio is %s",
 							tostring(hello.gameId), gameId))
+						setPill("wrong_game")
+						busy = false
+						return
 					end
 				end
 			end
