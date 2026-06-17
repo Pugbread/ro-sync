@@ -494,7 +494,7 @@ local function safeGet(inst, prop)
 end
 
 -- The four Roblox classes that round-trip to/from disk. Every other class is
--- Studio-authoritative via the read-only tree.json skeleton — we never
+-- Studio-authoritative via the daemon's live tree cache — we never
 -- Instance.new them, never apply property ops to them, never push their
 -- changes to disk.
 local ALLOWED_CLASSES = {
@@ -532,7 +532,7 @@ end
 
 -- Pass-through rule: any non-ALLOWED instance (Part, Model, Tool, ValueBase,
 -- etc.) is materialized on disk as a plain directory whenever it has at least
--- one ALLOWED descendant. The real class stays in the read-only tree.json; on
+-- one ALLOWED descendant. The real class stays in the live tree cache; on
 -- disk the pathway is just `Name/`. This lets users place a script anywhere
 -- inside Studio and still have it round-trip to a file.
 local isSyncable
@@ -587,7 +587,7 @@ end
 
 -- Serialize a subtree for /push and /snapshot. Non-ALLOWED classes are
 -- emitted as pass-through Folders if (and only if) they contain an ALLOWED
--- descendant — their real class stays Studio-authoritative (see tree.json).
+-- descendant — their real class stays Studio-authoritative in the live tree.
 -- Callers should pre-check `isSyncable(inst)` before recursing; this function
 -- does not re-check because the top-level `inst` is always syncable by the
 -- time a caller has decided to emit an op for it.
@@ -669,7 +669,7 @@ serializeSnapshotInstance = function(inst)
 end
 
 -- Skeleton walker: records EVERY class's shape (class + name + children) with
--- no property values. The daemon dumps this verbatim to tree.json so external
+-- no property values. The daemon keeps this as its live tree cache so external
 -- tools (and the widget) know the full Studio tree, but the daemon never
 -- attempts to round-trip non-ALLOWED classes.
 local function skeletonNode(inst)
@@ -1667,7 +1667,7 @@ local function queueEditorSourceChanged(scriptInst: Instance, source: string)
 end
 
 --------------------------------------------------------------------------------
--- Tree skeleton push (Studio → daemon tree.json)
+-- Tree skeleton push (Studio -> daemon live tree cache)
 --------------------------------------------------------------------------------
 -- Payload can be hundreds of KB on a moderately-sized place (every Instance
 -- under every watched service), so we use HTTP POST instead of piling it into
@@ -1779,7 +1779,7 @@ onDescendantAdded = function(inst)
 	--   (b) non-ALLOWED classes that already have ALLOWED descendants (e.g. a
 	--       Part being reparented into Workspace with a Script already inside
 	--       it — we need the pass-through directory to materialize at once).
-	-- A bare non-ALLOWED with no syncable descendants is tree.json-only.
+	-- A bare non-ALLOWED with no syncable descendants is live-tree-only.
 	if not isSyncable(inst) then return end
 	-- When a script is added directly inside an existing pass-through Part,
 	-- this fires with `inst = Script` whose parent is the Part. The Part's
@@ -1838,10 +1838,10 @@ onChanged = function(inst, prop)
 	-- surrounding instances; emitting here would double-report moves.
 	if prop == "Parent" then return end
 	if prop == "Name" then
-		-- Renames affect every tree.json consumer, not just the synced files.
+		-- Renames affect every live-tree consumer, not just the synced files.
 		markTreeDirty()
 		-- Non-syncable instances don't exist on disk, so there's no file to
-		-- rename — the tree.json push above is all the daemon needs.
+		-- rename — the live-tree push above is all the daemon needs.
 		if not isSyncable(inst) then
 			lastKnownName[inst] = inst.Name
 			return
@@ -1869,7 +1869,7 @@ onChanged = function(inst, prop)
 		return
 	end
 	-- Every other property is Studio-authoritative. No op, no tree push —
-	-- tree.json shape depends on class+name+children, none of which change
+	-- live-tree shape depends on class+name+children, none of which change
 	-- on a plain property edit.
 end
 
@@ -2011,7 +2011,7 @@ end
 -- will actually be materialized on disk:
 -- ALLOWED classes plus pass-through containers (non-ALLOWED instances that
 -- have an ALLOWED descendant). Parts / Models with no scripts underneath are
--- Studio-authoritative (tree.json only) and don't count.
+-- Studio-authoritative (live-tree only) and don't count.
 local function countSyncableSubtree(inst)
 	if SUPPRESS_CLASSES[inst.ClassName] then
 		return 0, 0, false
@@ -3849,7 +3849,7 @@ local function startHooksAndWs()
 	setBanner(nil)
 	log("connected — watching " .. #WATCHED_SERVICES .. " services")
 	task.spawn(function() wsLoop(gen) end)
-	-- Seed tree.json with the current Studio skeleton. Spawned so the HTTP
+	-- Seed the daemon's live tree cache with the current Studio skeleton. Spawned so the HTTP
 	-- POST doesn't block the hook-installation path. Subsequent updates are
 	-- debounced through markTreeDirty from onDescendantAdded/Removing/Changed.
 	treeDirty = true

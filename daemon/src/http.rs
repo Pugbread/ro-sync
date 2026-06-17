@@ -430,7 +430,11 @@ fn initial_snapshot_comparison(
     if !ignored.is_empty() {
         local.retain(|path, _| !diff_path_is_avoid_synced(path, &ignored));
     }
-    let studio = diff::collect_local_nodes(studio_services);
+    let studio = diff::collect_studio_tree_nodes(&json!({
+        "class": "DataModel",
+        "name": "game",
+        "children": studio_services,
+    }));
     let report = diff::compare(&local, &studio);
     Ok(InitialComparison {
         summary: InitialComparisonSummary {
@@ -2892,6 +2896,42 @@ mod tests {
         })];
 
         assert!(initial_snapshots_match(d.path(), &studio).unwrap());
+    }
+
+    #[test]
+    fn initial_snapshot_compare_uses_studio_tree_mapping() {
+        let d = TempDir::new("initial-studio-tree-mapping");
+        let model = d.path().join("Workspace").join("Rig");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("Animate.client.luau"), "animate\n").unwrap();
+
+        let studio = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "children": [
+                {
+                    "class": "Model",
+                    "name": "Rig",
+                    "children": [{
+                        "class": "LocalScript",
+                        "name": "Animate",
+                        "properties": { "Source": "animate\r\n" },
+                        "children": []
+                    }]
+                },
+                {
+                    "class": "Folder",
+                    "name": "StudioOnlyEmpty",
+                    "children": []
+                }
+            ]
+        })];
+
+        let report = initial_snapshot_comparison(d.path(), &studio).unwrap();
+        assert!(
+            report.is_clean(),
+            "initial compare should match Studio pass-through containers and ignore empty folders: {report:?}"
+        );
     }
 
     #[test]
