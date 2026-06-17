@@ -10,7 +10,7 @@
     "rosync upload ./clip.rbxm --project . --asset-type animation"
   ],
   "notes": [
-    "Reads credentials from `ROBLOX_API_KEY`, a custom `--api-key-env`, or the widget Secrets store.",
+    "Reads credentials from `ROBLOX_API_KEY` or the environment variable named by `--api-key-env`; widget Secrets are only a fallback.",
     "Directories recurse by default, skip unsupported files, and continue after per-file failures.",
     "Use `--auth bearer` for OAuth tokens instead of API keys."
   ]

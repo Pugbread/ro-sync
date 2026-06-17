@@ -3,9 +3,10 @@
   "title": "rosync conflicts",
   "category": "Conflict resolution",
   "description": "Lists parked source conflicts waiting for a Keep Disk or Keep Studio decision.",
-  "usage": "rosync conflicts [--port <port>] [--raw]",
+  "usage": "rosync conflicts [--project <path>] [--port <port>] [--raw]",
   "examples": [
     "rosync conflicts",
+    "rosync conflicts --project .",
     "rosync conflicts --raw"
   ],
   "notes": [

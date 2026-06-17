@@ -40,18 +40,21 @@ widget daemon binary directly:
 From the project root, start with:
 
 ```
-rosync refresh --project .
-rosync status --project .
-rosync diff --project .
+rosync context --project .
+rosync status --project . --raw
 rosync path --project . Workspace/Camera
 ```
 
-For agents, the live Studio explorer is the source of truth. Before reshaping
-scripts or folders, use `rosync tree`, `rosync ls`, `rosync meta`,
-`rosync get`, and `rosync source` against the live DataModel instead of
-inferring from disk alone. Disk only mirrors Ro Sync's script/folder projection;
-Studio-only explorer folders and non-script instances may intentionally have no
-matching files.
+Do not run `diff`, `changes`, `conflicts`, or live `source` as a startup ritual.
+Use them only when the task specifically needs that information.
+
+For agents, the live Studio explorer is the source of truth for Explorer shape.
+Use `rosync tree`, `rosync ls`, `rosync meta`, or `rosync get --prop` when you
+need to inspect Studio-owned objects. For code you are about to edit, read the
+local synced file directly; use live `rosync source` only when checking a
+suspected Studio/editor divergence. Disk only mirrors Ro Sync's script/folder
+projection; Studio-only explorer folders and non-script instances may
+intentionally have no matching files.
 
 For asset uploads, use Ro Sync, not external asset tools:
 
@@ -61,8 +64,8 @@ rosync upload ./audio.mp3 ./models --project . --manifest uploaded-assets.json
 rosync upload ./clip.rbxm --project . --asset-type animation
 ```
 
-`rosync upload` reads the Roblox Open Cloud credential from the Ro Sync widget
-Secrets store (or `ROBLOX_API_KEY`) and uses the project `groupId` as
+`rosync upload` reads the Roblox Open Cloud credential from `ROBLOX_API_KEY`
+or the env var passed with `--api-key-env`, and uses the project `groupId` as
 `group:<id>` when `--creator` is omitted. It supports Roblox Open Cloud asset
 types including image, decal, audio, model, mesh, animation, and video. Use
 `--asset-type` for decals and ambiguous `.rbxm`/`.rbxmx` files.
@@ -91,9 +94,9 @@ Two-way sync covers ONLY these four Roblox classes:
 - `ModuleScript`
 
 Edits to the matching files/directories flow into Studio and back. Every other
-Roblox class is Studio-authoritative: the plugin emits a read-only `tree.json`
-skeleton at the project root so tooling can see the rest of the DataModel, but
-the daemon never writes those instances to disk and never pushes property
+Roblox class is Studio-authoritative: inspect it with live CLI reads such as
+`rosync tree`, `rosync ls`, `rosync meta`, `rosync get`, or `rosync props`.
+The daemon never writes those instances to disk and never pushes property
 changes to Studio.
 
 Script source has one extra Studio caveat: `script.Source` is not a reliable
@@ -101,15 +104,18 @@ truth source while Drafts or an open Script Editor buffer is involved. Studio
 does not always push draft/editor text into the `Source` property until the
 script is committed. Ro Sync uses `ScriptEditorService:GetEditorSource()` /
 `UpdateSourceAsync()` and ScriptDocument change events so editor text can
-round-trip, but agents should still prefer `rosync source` or live
-ScriptEditor-backed reads over raw `script.Source` assumptions.
+round-trip. For normal code work, read the local synced file directly; use live
+`rosync source` only as a loose diagnostic when you suspect Studio/editor text
+has diverged from disk.
 
 ## 1b. Playtesting is a separate environment
 
-Roblox Studio playtesting clones the current edit environment. Script edits made
-while playtesting run inside that cloned playtest environment and DO NOT mirror
-back into the current edit DataModel. Ro Sync is connected to the current edit
-DataModel and this directory, not the temporary playtest clone.
+Roblox Studio playtesting creates a completely separate DataModel clone. The
+Play/Solo/Run world and the edit-mode Studio workspace do not transfer instance
+or script changes between each other. Script edits made while playtesting run
+inside that temporary playtest DataModel and DO NOT mirror back into the edit
+DataModel. Ro Sync is connected to the edit DataModel and this directory, not
+the playtest clone.
 
 If you change code while a playtest is running, make the durable edit in this
 directory or in the non-playtest Studio edit view. Do not assume a script change
@@ -148,15 +154,16 @@ Additional sync rules:
 - File and directory renames/moves sync as Roblox instance renames/reparents
   when they stay under a synced service.
 - Set a boolean Studio attribute `AvoidSync = true` on a folder/instance to
-  exclude that subtree from filesystem sync. The subtree is still visible in
-  `tree.json` as an `avoidSync` boundary, but child scripts under it are ignored.
+  exclude that subtree from filesystem sync. Use live `rosync tree` or
+  `rosync meta` to inspect AvoidSync boundaries.
 
 Names containing characters POSIX paths can't express (`/`, control characters,
 leading `.`) are percent-encoded.
 
 **Out of scope:** `.meta.json` files, attribute/tag serialization, non-`Folder`
 non-script Roblox classes (e.g. `Part`, `TextLabel`, `RemoteEvent`, `Sound`).
-None of these round-trip through the filesystem — inspect them via `tree.json`.
+None of these round-trip through the filesystem — inspect them through live
+CLI reads from Studio.
 
 ## 3. Top-level services
 
@@ -174,16 +181,13 @@ service the plugin keeps in sync:
 
 ## 4. Generated files (do not edit)
 
-- `tree.json` — read-only DataModel skeleton (class + name + children). The
-  plugin regenerates it from Studio on every sync. Use it to discover instances
-  that don't live on disk.
 - `ro-sync.md` — this file. Ro Sync refreshes its generated tool reference.
 
-## 5. Querying the tree
+## 5. Querying the live tree
 
-The `rosync query` subcommand reads `tree.json` directly (no daemon HTTP) and
-matches a `/`-separated selector against the DataModel. Use `*` for a single
-segment (any name) and `**` for zero or more segments.
+The `rosync query` subcommand asks the running daemon/plugin for the live
+Studio tree and matches a `/`-separated selector against the DataModel. Use
+`*` for a single segment (any name) and `**` for zero or more segments.
 
 ```
 rosync query --project . 'Workspace/**/Camera'
@@ -193,11 +197,11 @@ rosync path --project . Workspace/Camera
 rosync path --project . --from fs ReplicatedStorage/Config.luau
 ```
 
-Non-script, non-folder instances are visible only via `tree.json` — query it
-when you need to know the shape of the rest of the DataModel.
+Non-script, non-folder instances are visible through live `rosync tree`,
+`rosync ls`, `rosync query`, `rosync find`, `rosync meta`, and `rosync get`.
 Use `rosync path` when you need to jump between Studio instance paths and the
 syncable files on disk. It refuses Studio-authoritative classes and paths not
-present in the latest `tree.json`.
+present in the live Studio tree.
 
 ## 5b. Linting Luau
 
@@ -221,8 +225,8 @@ rosync lint --project . --luau-lsp /path/to/luau-lsp
 
 `rosync upload` uploads assets through Roblox Open Cloud Assets. It does not
 require the daemon or Studio to be connected. The API key is read from
-`ROBLOX_API_KEY`, or from the Ro Sync widget Settings > Secrets value when the
-env var is not set. If `--creator` is omitted, Ro Sync uses the project
+`ROBLOX_API_KEY` or the env var passed with `--api-key-env`. If `--creator` is
+omitted, Ro Sync uses the project
 `groupId` from `ro-sync.json` or the active widget project.
 
 ```
@@ -402,16 +406,28 @@ rosync find-attr --project . --name Color --value \
 Do not paste or request the full command registry by default. It is large and
 usually worse for agent reasoning. Use this flow instead:
 
-1. Run `rosync context --project .` once at task start.
-2. For anything about Explorer shape or instance truth, use live reads:
-   `rosync tree`, `rosync ls`, `rosync meta`, `rosync get`, or
-   `rosync source` before touching files.
-3. Run `rosync commands --compact` only when choosing between command families.
-4. Run `rosync commands <name>` for the exact command you are about to use.
-5. Prefer cheap offline commands for path lookup, but do not let disk-only
+1. Run `rosync context --project .` once only when you need Ro Sync project
+   context that is not already in AGENTS.md.
+2. Prefer local file reads and cheap offline commands for normal code work.
+3. For Explorer shape or Studio-owned objects, use focused live reads:
+   `rosync tree`, `rosync ls`, `rosync meta`, or `rosync get --prop`.
+4. Use `rosync commands --compact` only when choosing between command families.
+5. Run `rosync commands <name>` for exact flags only for the command you are
+   about to use.
+6. Prefer cheap offline commands for path lookup, but do not let disk-only
    inference override live Studio reads.
-6. Never run mutating commands from an LLM workflow without a read-only
+7. Never run mutating commands from an LLM workflow without a read-only
    `rosync plan` when plan coverage exists.
+
+Special-case commands:
+
+- `rosync source` is a loose diagnostic for suspected Studio/editor divergence.
+  For ordinary code inspection and verification, read the local file directly
+  and lint it instead.
+- `rosync conflicts` is for resolving an observed conflict. Do not poll it as a
+  general health check, and do not block normal edits on it.
+- `rosync changes` / `diff` can be noisy on large or already-drifty projects.
+  Prefer targeted linting after focused code edits.
 
 Cheap-first discovery:
 
@@ -432,20 +448,21 @@ rosync ls --project . --path ReplicatedStorage/Client
 rosync meta --project . ReplicatedStorage/Client/App
 rosync get --project . --path Workspace/Part --prop Anchored
 rosync props --project . --path Workspace/Part
-rosync source --project . --path ReplicatedStorage/Client/App --disk
-rosync source --project . --path ReplicatedStorage/Client/App
 ```
 
 `rosync source` without `--disk` asks the live plugin for Studio/editor text and
-uses ScriptEditorService for script source. Use it to inspect Studio divergence;
-use `--disk` to inspect the local file that lint and Git see.
+uses ScriptEditorService for script source. Treat it as an optional divergence
+debug tool, not a default verification step. Prefer direct local file reads for
+the file that lint and Git see.
 
 For post-edit verification, do not treat unrelated global `rosync changes`
 output as proof that your touched file failed to sync. Ro Sync projects can
 have pre-existing Studio-only scripts, duplicate-name instances, or ignored
-tooling under other paths. Verify the exact script(s) you touched with
-`rosync source --disk`, live `rosync source`, and the narrowest relevant
-`rosync lint --path`; mention unrelated global drift only as background.
+tooling under other paths. For normal script edits, the preferred verification
+is the narrowest relevant `rosync lint --project . --path <path>` plus local
+file inspection. Use live `rosync source`, `rosync conflicts`, `rosync changes`,
+or `diff` only when the task specifically points at divergence, a reported
+conflict, or sync drift.
 
 Higher-token reads; use only when the task needs them:
 
@@ -467,10 +484,10 @@ machine-readable registry.
 
 Preferred workflow snippets:
 
-- Inspect one object: `meta` -> `get --prop` or `props` -> `source` only for scripts.
-- Find source: `where` or `query` -> `source --disk`; use live `source` only when checking Studio divergence.
-- Verify touched scripts: `source --disk` + live `source` for each touched path; use global `changes` only to discover broader drift.
-- Resolve conflict: `conflicts` -> `changes` -> `plan resolve` -> explicit `resolve`.
+- Inspect one object: `meta` -> `get --prop` or `props`; use local files for script source.
+- Find code: `rg`/local file reads first; use `where`/`query` when mapping Studio names.
+- Verify touched scripts: local read + focused `rosync lint --path`.
+- Resolve conflict: only after a conflict is reported, use `conflicts` -> `plan resolve` -> explicit `resolve`.
 - Write Studio: `plan set|new|rm|mv` -> user confirmation -> mutating command, preferably with a waypoint for batches.
 - Upload/Open Cloud: enumerate files or `monetization discover/list` first; avoid recursive/bulk writes until the target set is clear.
 

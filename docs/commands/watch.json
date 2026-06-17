@@ -3,9 +3,10 @@
   "title": "rosync watch",
   "category": "Live diagnostics",
   "description": "Streams raw daemon WebSocket frames for debugging sync traffic.",
-  "usage": "rosync watch [--port <port>] [--compact]",
+  "usage": "rosync watch [--project <path>] [--port <port>] [--compact]",
   "examples": [
     "rosync watch",
+    "rosync watch --project .",
     "rosync watch --compact"
   ],
   "notes": [

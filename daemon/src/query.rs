@@ -1,4 +1,4 @@
-//! `rosync query` — read-only DataModel selector evaluator over `tree.json`.
+//! `rosync query` — read-only DataModel selector evaluator over a live tree.
 //!
 //! Selector grammar (`/`-separated):
 //!   * literal segment — exact name match
@@ -20,7 +20,7 @@ pub struct Match {
 }
 
 /// Match `selector` against `tree`. `tree` may be either an array of service
-/// nodes (the shape the Studio plugin writes to `tree.json`) or an object with
+/// nodes (the shape returned by the Studio plugin) or an object with
 /// a `children` field (a `DataModel`-rooted node).
 pub fn query(tree: &Value, selector: &str) -> Vec<Match> {
     let pattern: Vec<&str> = if selector.is_empty() {

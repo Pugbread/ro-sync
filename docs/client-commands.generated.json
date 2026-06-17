@@ -3,10 +3,10 @@
   "source": "docs/commands/*.json",
   "categories": [
     "Command registry",
-    "Offline inspection",
-    "Open Cloud",
     "Live inspection",
     "Path tools",
+    "Offline inspection",
+    "Open Cloud",
     "Studio control",
     "Conflict resolution",
     "Live diagnostics",
@@ -49,7 +49,7 @@
       ],
       "notes": [
         "Does not mutate disk or Studio.",
-        "Includes project config, synced services, tree summary, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.",
+        "Includes project config, synced services, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.",
         "Includes LLM command-use policy so agents know to use `rosync commands --compact` and `rosync commands <name>` instead of dumping the full registry.",
         "Use `--full-commands` only when the caller needs the complete embedded command registry in the same response."
       ],
@@ -77,32 +77,32 @@
     {
       "name": "query",
       "title": "rosync query",
-      "category": "Offline inspection",
-      "description": "Matches a selector against the project `tree.json` skeleton without needing the daemon or Studio.",
-      "usage": "rosync query --project <path> <selector> [--format json|paths|classes]",
+      "category": "Live inspection",
+      "description": "Matches a selector against the live Studio tree through the daemon/plugin bridge.",
+      "usage": "rosync query [--project <path>] [--port <port>] <selector> [--format json|paths|classes]",
       "examples": [
         "rosync query --project . 'Workspace/**/Camera'",
         "rosync query --project . '**/RemoteEvent' --format paths"
       ],
       "notes": [
         "`*` matches one path segment and `**` matches zero or more segments.",
-        "Use this first when you only need to discover what exists in the latest Studio tree."
+        "Use this when you need to discover what exists in the current Studio tree."
       ],
       "slug": "query"
     },
     {
       "name": "path",
       "title": "rosync path",
-      "category": "Offline inspection",
-      "description": "Translates between Studio instance paths and syncable filesystem paths using `tree.json`.",
-      "usage": "rosync path --project <path> [--from auto|studio|fs] <target> [--raw]",
+      "category": "Path tools",
+      "description": "Translates between Studio instance paths and syncable filesystem paths using the live Studio tree.",
+      "usage": "rosync path --project <path> [--port <port>] [--from auto|studio|fs] <target> [--raw]",
       "examples": [
         "rosync path --project . Workspace/Camera",
         "rosync path --project . --from fs ReplicatedStorage/Config.luau"
       ],
       "notes": [
         "Studio-authoritative classes are reported clearly instead of pretending they map to files.",
-        "Generated files such as `tree.json` and `ro-sync.md` are not syncable Studio instances."
+        "Generated files such as `ro-sync.md` are not syncable Studio instances."
       ],
       "slug": "path"
     },
@@ -138,7 +138,7 @@
         "rosync upload ./clip.rbxm --project . --asset-type animation"
       ],
       "notes": [
-        "Reads credentials from `ROBLOX_API_KEY`, a custom `--api-key-env`, or the widget Secrets store.",
+        "Reads credentials from `ROBLOX_API_KEY` or the environment variable named by `--api-key-env`; widget Secrets are only a fallback.",
         "Directories recurse by default, skip unsupported files, and continue after per-file failures.",
         "Use `--auth bearer` for OAuth tokens instead of API keys."
       ],
@@ -159,7 +159,7 @@
       ],
       "notes": [
         "Uses multipart/form-data and Roblox Open Cloud API keys.",
-        "Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, project env files, then the Ro Sync widget Secrets store.",
+        "Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, and project env files; widget Secrets are only a fallback.",
         "Universe discovery checks --universe-id, ROBLOX_UNIVERSE_ID, UNIVERSE_ID, GAMEID, GAME_ID, project env files, then ro-sync.json gameId.",
         "discover reports likely monetization config files but does not guess project-specific code writes when schema is ambiguous.",
         "images matches files to assets by normalized filename, such as coins-small.png to Coins Small."
@@ -279,13 +279,13 @@
       "title": "rosync meta",
       "category": "Path tools",
       "description": "Shows the Studio path, class, filesystem path, and existence status for a syncable path.",
-      "usage": "rosync meta [--project <path>] [--from auto|studio|fs] [--raw] <target>",
+      "usage": "rosync meta [--project <path>] [--port <port>] [--from auto|studio|fs] [--raw] <target>",
       "examples": [
         "rosync meta --project . ReplicatedStorage/Client/UIController",
         "rosync meta --project . --from fs ReplicatedStorage/Client/UIController.client.luau"
       ],
       "notes": [
-        "Requires `tree.json`, so connect Studio once before using it on new projects."
+        "Uses the live Studio tree; start `rosync serve --project .` and connect the Studio plugin first."
       ],
       "slug": "meta"
     },
@@ -354,9 +354,10 @@
       "title": "rosync conflicts",
       "category": "Conflict resolution",
       "description": "Lists parked source conflicts waiting for a Keep Disk or Keep Studio decision.",
-      "usage": "rosync conflicts [--port <port>] [--raw]",
+      "usage": "rosync conflicts [--project <path>] [--port <port>] [--raw]",
       "examples": [
         "rosync conflicts",
+        "rosync conflicts --project .",
         "rosync conflicts --raw"
       ],
       "notes": [
@@ -369,15 +370,34 @@
       "title": "rosync resolve",
       "category": "Conflict resolution",
       "description": "Resolves one parked conflict by keeping either disk or Studio content.",
-      "usage": "rosync resolve --path <filesystem-path> (--disk | --studio) [--port <port>] [--raw]",
+      "usage": "rosync resolve --path <filesystem-path> (--disk | --studio) [--project <path>] [--port <port>] [--raw]",
       "examples": [
         "rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --studio",
+        "rosync resolve --project . --path ReplicatedStorage/Client/UIController.client.luau --studio",
         "rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --disk"
       ],
       "notes": [
         "`--studio` writes Studio bytes to disk; `--disk` pushes disk bytes back to Studio."
       ],
       "slug": "resolve"
+    },
+    {
+      "name": "decision",
+      "title": "rosync decision",
+      "category": "Conflict resolution",
+      "description": "Shows or answers the pending initial sync decision without opening the widget UI.",
+      "usage": "rosync decision [--project <path>] [--port <port>] [--choice-id <id>] [--disk|--studio|--cancel] [--raw]",
+      "examples": [
+        "rosync decision --project .",
+        "rosync decision --project . --studio",
+        "rosync decision --project . --disk"
+      ],
+      "notes": [
+        "Without a choice flag, prints the current pending initial sync decision.",
+        "When exactly one decision is pending, `--choice-id` can be omitted.",
+        "`--disk` keeps local files and pushes them to Studio; `--studio` keeps Studio and pulls it to disk; `--cancel` aborts the initial sync."
+      ],
+      "slug": "decision"
     },
     {
       "name": "tail",
@@ -399,9 +419,10 @@
       "title": "rosync watch",
       "category": "Live diagnostics",
       "description": "Streams raw daemon WebSocket frames for debugging sync traffic.",
-      "usage": "rosync watch [--port <port>] [--compact]",
+      "usage": "rosync watch [--project <path>] [--port <port>] [--compact]",
       "examples": [
         "rosync watch",
+        "rosync watch --project .",
         "rosync watch --compact"
       ],
       "notes": [
@@ -413,7 +434,7 @@
       "name": "repair",
       "title": "rosync repair",
       "category": "Maintenance",
-      "description": "Rebuilds generated Ro Sync metadata.",
+      "description": "Checks live tree access and rebuilds generated Ro Sync metadata.",
       "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]",
       "examples": [
         "rosync repair tree --project .",
@@ -421,7 +442,7 @@
         "rosync repair sourcemap --project . --output .luau-sourcemap.json"
       ],
       "notes": [
-        "`repair tree` refreshes `tree.json` from live Studio.",
+        "`repair tree` validates that the live Studio tree can be read; use `rosync tree` or `rosync query` to inspect it.",
         "`repair sourcemap` rebuilds luau-lsp sourcemap JSON from synced service folders."
       ],
       "slug": "repair"
@@ -519,7 +540,7 @@
       "name": "status",
       "title": "rosync status",
       "category": "Live diagnostics",
-      "description": "Summarizes daemon reachability, plugin handshake, project config, `tree.json`, sourcemap, and write-log health.",
+      "description": "Summarizes daemon reachability, plugin handshake, project config, sourcemap, and write-log health.",
       "usage": "rosync status [--project <path>] [--port <port>] [--raw]",
       "examples": [
         "rosync status --project .",
@@ -811,15 +832,15 @@
       "name": "serve",
       "title": "rosync serve",
       "category": "Daemon",
-      "description": "Runs the local HTTP/WebSocket daemon that bridges the widget, Studio plugin, filesystem watcher, and CLI.",
+      "description": "Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem watcher, and CLI.",
       "usage": "rosync serve --project <path> [--port <port>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]",
       "examples": [
         "rosync serve --project . --port 7878",
         "rosync serve --project . --port 7878 --game-id 1234567890"
       ],
       "notes": [
-        "The widget normally launches this for the active project.",
-        "Use it manually when debugging daemon/plugin connectivity outside the widget."
+        "This is the normal CLI-only entrypoint; the widget can also launch it for an active project.",
+        "Run it manually when using Ro Sync without opening the widget interface."
       ],
       "slug": "serve"
     }

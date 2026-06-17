@@ -11,8 +11,8 @@ Studio session.
 
 - Syncs `Folder`, `Script`, `LocalScript`, and `ModuleScript` instances between Roblox Studio and disk.
 - Represents non-script containers that hold scripts as pass-through folders so script paths round-trip cleanly.
-- Keeps non-file-backed Roblox instances Studio-authoritative and exposes their shape through `tree.json`.
-- Runs a local Rust daemon that bridges the Terminal 64 widget, Roblox Studio plugin, filesystem watcher, and CLI.
+- Keeps non-file-backed Roblox instances Studio-authoritative and exposes their shape through live CLI reads.
+- Runs a local Rust daemon that bridges the Roblox Studio plugin, filesystem watcher, CLI, and optional Terminal 64 widget.
 - Provides a sidebar widget UI with searchable projects, serving controls, per-project status, recent activity, and one-click Terminal 64 session spawning.
 - Provides a Docs tab generated from the same command catalogue used by `rosync commands`.
 - Installs a Rojo-built Roblox Studio plugin package, `plugin/Plugin.rbxm`, from the widget settings page.
@@ -22,8 +22,8 @@ Studio session.
 
 The `rosync` CLI can work in two modes:
 
-- Offline project inspection through files such as `tree.json`.
-- Live Studio control through the daemon and plugin WebSocket bridge.
+- Live Studio inspection/control through the daemon and plugin WebSocket bridge.
+- Offline project maintenance for tasks such as generated agent docs, linting, sourcemaps, and Open Cloud uploads.
 
 The command catalogue is sourced from one JSON file per command under
 `docs/commands/`. Run the builder after editing command docs:
@@ -48,7 +48,8 @@ rosync path --project . Workspace/Camera
 rosync upload ./icon.png --project .
 ```
 
-Open the widget Docs tab for the full searchable command reference.
+Use `rosync commands <name>` for exact command JSON, or open the widget Docs tab
+for the same searchable command reference.
 
 ## Agent Context
 
@@ -210,13 +211,12 @@ cd "$env:USERPROFILE\.terminal64\widgets\ro-sync\daemon"
 
 6. Click **Connect**.
 
-## Store Secrets
+## Credentials
 
-Open the widget Settings tab and use the **Secrets** section to save the
-Roblox OAuth / Open Cloud key used by upload/API workflows. Secrets are stored
-in Terminal 64 widget state instead of `ro-sync.json`, so project files and
-generated agent context do not receive credentials. The key field is designed
-to grow into additional named secrets later.
+For command-line use, set `ROBLOX_API_KEY` or pass `--api-key-env` with the
+name of an environment variable that holds a Roblox OAuth / Open Cloud key.
+The widget Settings **Secrets** section remains as a fallback for users who
+prefer storing credentials in Terminal 64 state instead of shell env files.
 
 Manual plugin install paths:
 
@@ -239,9 +239,9 @@ The Rojo project lives in `plugin-src/` and bundles React Lua / ReactRoblox
 through Wally. The React UI is in `plugin-src/src/App.luau`; the sync and daemon
 protocol code remains in `plugin/Plugin.luau`.
 
-## Run Ro Sync Manually
+## Run Ro Sync From The CLI
 
-The widget usually launches the daemon for you. Manual launch:
+Start the daemon directly:
 
 ```sh
 rosync serve --project /path/to/project --port 7878
@@ -255,6 +255,14 @@ rosync serve --project /path/to/project --port 7878 --game-id 1234567890
 
 Then open Roblox Studio, load the matching place, open the Ro Sync plugin, and
 click **Connect**.
+
+Initial sync choices can be handled without the widget:
+
+```sh
+rosync decision --project .
+rosync decision --project . --studio
+rosync decision --project . --disk
+```
 
 ## Platform Support
 

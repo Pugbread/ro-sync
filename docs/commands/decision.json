@@ -1,0 +1,17 @@
+{
+  "name": "decision",
+  "title": "rosync decision",
+  "category": "Conflict resolution",
+  "description": "Shows or answers the pending initial sync decision without opening the widget UI.",
+  "usage": "rosync decision [--project <path>] [--port <port>] [--choice-id <id>] [--disk|--studio|--cancel] [--raw]",
+  "examples": [
+    "rosync decision --project .",
+    "rosync decision --project . --studio",
+    "rosync decision --project . --disk"
+  ],
+  "notes": [
+    "Without a choice flag, prints the current pending initial sync decision.",
+    "When exactly one decision is pending, `--choice-id` can be omitted.",
+    "`--disk` keeps local files and pushes them to Studio; `--studio` keeps Studio and pulls it to disk; `--cancel` aborts the initial sync."
+  ]
+}

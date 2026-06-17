@@ -494,6 +494,7 @@ mod tests {
         let (watch_tx, _) = broadcast::channel::<Op>(64);
         let (events_tx, _) = broadcast::channel::<String>(64);
         let (request_tx, _) = broadcast::channel::<RequestEnvelope>(64);
+        let (shutdown_tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
 
         let state = AppState {
             project: Arc::new(project),
@@ -513,6 +514,10 @@ mod tests {
             request_tx,
             pending_routes: Arc::new(Mutex::new(HashMap::new())),
             active_plugin: Arc::new(Mutex::new(None)),
+            widget_owned: false,
+            widget_owner_token: Arc::new(None),
+            widget_last_seen: Arc::new(Mutex::new(None)),
+            shutdown_tx,
         };
 
         let app = crate::http::router(state.clone());

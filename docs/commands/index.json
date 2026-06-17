@@ -22,6 +22,7 @@
     "open",
     "conflicts",
     "resolve",
+    "decision",
     "tail",
     "watch",
     "repair",

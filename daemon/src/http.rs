@@ -13,11 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -32,7 +30,7 @@ use crate::fs_map::{
 };
 
 /// Roblox classes the daemon will materialize on disk. Everything else is
-/// Studio-authoritative and shows up only via the plugin-emitted tree.json.
+/// Studio-authoritative and must be inspected through the live plugin bridge.
 const SCOPED_CLASSES: &[&str] = &["Folder", "Script", "LocalScript", "ModuleScript"];
 
 fn is_scoped_class(class: &str) -> bool {
@@ -41,9 +39,7 @@ fn is_scoped_class(class: &str) -> bool {
 
 #[derive(Clone)]
 struct AvoidSyncCache {
-    tree_path: PathBuf,
-    modified: Option<SystemTime>,
-    len: u64,
+    root: PathBuf,
     paths: Vec<Vec<String>>,
 }
 
@@ -73,9 +69,14 @@ pub fn router(state: AppState) -> Router {
         .route("/resolve", get(resolve_list).post(resolve))
         .route("/initial-compare", post(initial_compare))
         .route("/initial-decision", get(initial_decision))
-        .route("/initial-choice", post(initial_choice))
+        .route(
+            "/initial-choice",
+            get(initial_choice_status).post(initial_choice),
+        )
         .route("/tree", post(tree_post))
         .route("/writelog", post(writelog))
+        .route("/widget-heartbeat", post(widget_heartbeat))
+        .route("/widget-close", post(widget_close))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
         .layer(cors)
@@ -83,9 +84,9 @@ pub fn router(state: AppState) -> Router {
 
 // ---------------------------------------------------------------------------
 // POST /tree — plugin-emitted read-only Studio tree skeleton.
-// Body is written to `<project>/.tree.json.tmp` then atomically renamed to
-// `tree.json`. The watcher blacklists both names, so these writes never bounce
-// back as ops.
+// The daemon keeps only the AvoidSync boundaries it needs for watcher
+// filtering. The full live Explorer shape stays Studio-authoritative and is
+// read through `rosync tree` / `rosync ls` rather than a project cache file.
 // ---------------------------------------------------------------------------
 
 /// Append one JSONL line to `~/.terminal64/widgets/ro-sync/writes.log`.
@@ -166,41 +167,75 @@ fn rosync_home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+#[derive(Default, Deserialize)]
+struct WidgetControlBody {
+    token: Option<String>,
+    reason: Option<String>,
+}
+
+fn parse_widget_control_body(body: &Bytes) -> WidgetControlBody {
+    if body.is_empty() {
+        return WidgetControlBody::default();
+    }
+    serde_json::from_slice(body).unwrap_or_default()
+}
+
+fn authorize_widget_control(state: &AppState, token: Option<&str>) -> Result<(), &'static str> {
+    if !state.widget_owned {
+        return Err("daemon is not widget-owned");
+    }
+    let Some(expected) = state.widget_owner_token.as_ref().as_deref() else {
+        return Err("missing daemon owner token");
+    };
+    if token != Some(expected) {
+        return Err("invalid daemon owner token");
+    }
+    Ok(())
+}
+
+async fn widget_heartbeat(State(state): State<AppState>, body: Bytes) -> Json<Value> {
+    let body = parse_widget_control_body(&body);
+    if let Err(error) = authorize_widget_control(&state, body.token.as_deref()) {
+        return Json(json!({ "ok": false, "error": error }));
+    }
+    *state.widget_last_seen.lock().unwrap() = Some(Instant::now());
+    Json(json!({ "ok": true }))
+}
+
+async fn widget_close(State(state): State<AppState>, body: Bytes) -> Json<Value> {
+    let body = parse_widget_control_body(&body);
+    if let Err(error) = authorize_widget_control(&state, body.token.as_deref()) {
+        return Json(json!({ "ok": false, "error": error }));
+    }
+    let reason = body
+        .reason
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| "widget closed".to_string());
+    let _ = state.shutdown_tx.send(Some(reason.clone()));
+    Json(json!({ "ok": true, "reason": reason }))
+}
+
 async fn tree_post(State(state): State<AppState>, body: Bytes) -> Json<Value> {
     let root = state.canonical_project.as_path();
     let bytes = body.len();
-    if let Err(e) = write_tree_json_replace(root, &body) {
-        return Json(json!({ "ok": false, "error": format!("write tree: {e}") }));
-    }
-    Json(json!({ "ok": true, "bytes": bytes }))
+    let tree = match serde_json::from_slice::<Value>(&body) {
+        Ok(tree) => tree,
+        Err(e) => return Json(json!({ "ok": false, "error": format!("parse tree: {e}") })),
+    };
+    let mut paths = Vec::new();
+    collect_avoid_sync_paths(&tree, &[], &mut paths);
+    set_avoid_sync_paths(root, paths.clone());
+    Json(json!({ "ok": true, "bytes": bytes, "avoidSyncPaths": paths.len() }))
 }
 
-fn write_tree_json_replace(root: &Path, body: &[u8]) -> io::Result<()> {
-    let tmp = root.join(".tree.json.tmp");
-    let final_path = root.join("tree.json");
-
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        file.write_all(body)?;
-        file.sync_all()?;
-        drop(file);
-
-        #[cfg(windows)]
-        if final_path.exists() {
-            std::fs::remove_file(&final_path)?;
-        }
-
-        std::fs::rename(&tmp, &final_path)
-    })();
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+fn set_avoid_sync_paths(root: &Path, paths: Vec<Vec<String>>) {
+    let cache = AVOID_SYNC_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(AvoidSyncCache {
+            root: root.to_path_buf(),
+            paths,
+        });
     }
-    result
 }
 
 #[derive(Serialize)]
@@ -218,6 +253,8 @@ struct Hello {
     wally_enabled: bool,
     #[serde(rename = "wallyFolder")]
     wally_folder: Option<String>,
+    #[serde(rename = "widgetOwned")]
+    widget_owned: bool,
 }
 
 async fn hello(State(state): State<AppState>) -> Json<Hello> {
@@ -230,6 +267,7 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         place_ids: state.place_ids.read().unwrap().clone(),
         wally_enabled: *state.wally_enabled.read().unwrap(),
         wally_folder: state.wally_folder.read().unwrap().clone(),
+        widget_owned: state.widget_owned,
     })
 }
 
@@ -474,6 +512,25 @@ async fn initial_decision(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn initial_choice_status(State(state): State<AppState>) -> Json<Value> {
+    let pending = state.pending_initial.lock().unwrap();
+    let Some(pending) = pending.as_ref() else {
+        return Json(json!({ "pending": false }));
+    };
+    let choice = pending.choice.map(|choice| match choice {
+        Choice::Disk => "disk",
+        Choice::Studio => "studio",
+        Choice::Cancel => "cancel",
+    });
+    Json(json!({
+        "pending": true,
+        "choiceId": pending.choice_id,
+        "diskStats": pending.disk_stats,
+        "studioStats": pending.studio_stats,
+        "choice": choice,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1856,7 +1913,7 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
 
             // Regular file or directory: classify and emit `set` with a node.
             // Scripts carry their Source; non-scripts emit an empty properties
-            // map (property sync is Studio-authoritative via tree.json).
+            // map (property sync is Studio-authoritative via live Studio reads).
             let inst = path_to_instance_meta(&op.path).ok().flatten()?;
             if inst.class == "Folder" && is_empty_plain_folder(&op.path).unwrap_or(false) {
                 return None;
@@ -1994,42 +2051,15 @@ fn path_is_avoid_synced(root: &Path, instance_path: &[String]) -> bool {
 }
 
 fn avoid_sync_paths(root: &Path) -> Vec<Vec<String>> {
-    let tree_path = root.join(snapshot::TREE_JSON);
-    let meta = std::fs::metadata(&tree_path).ok();
-    let modified = meta.as_ref().and_then(|m| m.modified().ok());
-    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let cache = AVOID_SYNC_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
         if let Some(cached) = guard.as_ref() {
-            if cached.tree_path == tree_path && cached.modified == modified && cached.len == len {
+            if cached.root == root {
                 return cached.paths.clone();
             }
         }
     }
-
-    let paths = if meta.is_some() {
-        std::fs::read_to_string(&tree_path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .map(|tree| {
-                let mut out = Vec::new();
-                collect_avoid_sync_paths(&tree, &[], &mut out);
-                out
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some(AvoidSyncCache {
-            tree_path,
-            modified,
-            len,
-            paths: paths.clone(),
-        });
-    }
-    paths
+    Vec::new()
 }
 
 fn collect_avoid_sync_paths(node: &Value, parent: &[String], out: &mut Vec<Vec<String>>) {
@@ -2219,7 +2249,7 @@ mod tests {
     // Out-of-scope classes are silently skipped: `Part` is not in the four-class
     // whitelist, so `apply_set` returns `Skipped` instead of materializing
     // anything on disk. Property sync is ripped out — anything beyond
-    // Folder/Script/LocalScript/ModuleScript is Studio-authoritative via tree.json.
+    // Folder/Script/LocalScript/ModuleScript is Studio-authoritative via live Studio reads.
     #[test]
     fn apply_set_skips_out_of_scope_class() {
         let d = TempDir::new("scope");
@@ -2469,31 +2499,10 @@ mod tests {
         std::fs::create_dir_all(&ignored).unwrap();
         let script = ignored.join("Worker.server.luau");
         std::fs::write(&script, "print('nope')\n").unwrap();
-        std::fs::write(
-            d.path().join(snapshot::TREE_JSON),
-            serde_json::json!([
-                {
-                    "class": "Workspace",
-                    "name": "Workspace",
-                    "children": [
-                        {
-                            "class": "Folder",
-                            "name": "Ignored",
-                            "avoidSync": true,
-                            "children": [
-                                {
-                                    "class": "Script",
-                                    "name": "Worker",
-                                    "children": []
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ])
-            .to_string(),
-        )
-        .unwrap();
+        set_avoid_sync_paths(
+            d.path(),
+            vec![vec!["Workspace".to_string(), "Ignored".to_string()]],
+        );
         let op = Op {
             kind: OpKind::Update,
             path: script,
@@ -2826,44 +2835,29 @@ mod tests {
             .exists());
     }
 
-    // POST /tree writes body to `.tree.json.tmp` then replaces `tree.json`.
-    // Verifies round-trip bytes and that the watcher ignores both paths so the
-    // write never bounces back as an op.
-    #[tokio::test]
-    async fn tree_post_round_trip() {
-        use crate::watch::{is_blacklisted, is_root_reserved};
-
+    #[test]
+    fn tree_post_state_keeps_avoid_sync_without_tree_json() {
         let d = TempDir::new("tree-post");
         let root = d.path();
         let skeleton = serde_json::json!({
             "name": "Workspace",
             "class": "Workspace",
             "children": [
+                { "name": "Ignored", "class": "Folder", "avoidSync": true, "children": [] },
                 { "name": "Camera", "class": "Camera", "children": [] }
             ]
         });
-        let bytes = serde_json::to_vec(&skeleton).unwrap();
+        let mut paths = Vec::new();
+        collect_avoid_sync_paths(&skeleton, &[], &mut paths);
+        set_avoid_sync_paths(root, paths);
 
-        let final_path = root.join("tree.json");
-        std::fs::write(&final_path, br#"{"old":true}"#).unwrap();
-        write_tree_json_replace(root, &bytes).unwrap();
-
-        assert!(final_path.exists(), "tree.json should exist after rename");
-        let tmp = root.join(".tree.json.tmp");
-        assert!(!tmp.exists(), ".tree.json.tmp should be gone after rename");
-
-        let reloaded: Value = serde_json::from_slice(&std::fs::read(&final_path).unwrap()).unwrap();
-        assert_eq!(reloaded, skeleton);
-
-        // The watcher blacklist should ignore both filenames — proving that a
-        // POST /tree round-trip never fires a watcher op.
+        assert!(path_is_avoid_synced(
+            root,
+            &["Workspace".to_string(), "Ignored".to_string()]
+        ));
         assert!(
-            is_root_reserved(&final_path, root),
-            "tree.json at project root should be reserved"
-        );
-        assert!(
-            is_blacklisted(&tmp) || is_root_reserved(&tmp, root),
-            ".tree.json.tmp should be filtered out of watcher ops"
+            !root.join("tree.json").exists(),
+            "live tree posts should not create tree.json"
         );
     }
 

@@ -47,10 +47,13 @@ impl ResolvedPath {
     }
 }
 
-pub fn resolve(project: &Path, input: &str, from: PathInputKind) -> Result<ResolvedPath, String> {
+pub fn resolve_with_tree(
+    project: &Path,
+    tree: &Value,
+    input: &str,
+    from: PathInputKind,
+) -> Result<ResolvedPath, String> {
     let project = absolute_lexical(project)?;
-    let tree = load_tree(&project)?;
-
     match from {
         PathInputKind::Studio => studio_to_fs(&project, &tree, input, PathInputKind::Studio),
         PathInputKind::Fs => fs_to_studio(&project, &tree, input, PathInputKind::Fs),
@@ -62,21 +65,6 @@ pub fn resolve(project: &Path, input: &str, from: PathInputKind) -> Result<Resol
             }
         }
     }
-}
-
-fn load_tree(project: &Path) -> Result<Value, String> {
-    let tree_path = project.join(TREE_JSON);
-    let text = match std::fs::read_to_string(&tree_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "path: no tree.json at {}. Connect Studio via the Ro Sync plugin to generate it.",
-                tree_path.display()
-            ));
-        }
-        Err(e) => return Err(format!("path: read {}: {e}", tree_path.display())),
-    };
-    serde_json::from_str(&text).map_err(|e| format!("path: parse {}: {e}", tree_path.display()))
 }
 
 fn looks_like_studio_path(tree: &Value, input: &str) -> bool {
@@ -204,7 +192,7 @@ fn fs_to_studio(
     let matches = find_tree_paths(tree, &studio_path);
     if matches.is_empty() {
         return Err(format!(
-            "path: filesystem path {} maps to likely Studio path {}, but that path is not present in tree.json",
+            "path: filesystem path {} maps to likely Studio path {}, but that path is not present in the live Studio tree",
             fs_path.display(),
             studio_path.join("/")
         ));
@@ -425,11 +413,11 @@ fn one_tree_match<'a>(
 ) -> Result<Vec<&'a Value>, String> {
     match matches.len() {
         0 => Err(format!(
-            "path: no Studio instance {display} found in tree.json"
+            "path: no Studio instance {display} found in the live Studio tree"
         )),
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(format!(
-            "path: Studio path {display} is ambiguous in tree.json ({n} matches)"
+            "path: Studio path {display} is ambiguous in the live Studio tree ({n} matches)"
         )),
     }
 }
@@ -557,8 +545,8 @@ mod tests {
         }
     }
 
-    fn write_tree(project: &Path) {
-        let tree = json!([
+    fn test_tree() -> Value {
+        json!([
             {
                 "class": "Workspace",
                 "name": "Workspace",
@@ -579,18 +567,16 @@ mod tests {
                     ]}
                 ]
             }
-        ]);
-        fs::write(
-            project.join(TREE_JSON),
-            serde_json::to_string(&tree).unwrap(),
-        )
-        .unwrap();
+        ])
+    }
+
+    fn resolve(project: &Path, input: &str, from: PathInputKind) -> Result<ResolvedPath, String> {
+        resolve_with_tree(project, &test_tree(), input, from)
     }
 
     #[test]
     fn studio_path_resolves_to_existing_script_file() {
         let d = TempDir::new("studio-file");
-        write_tree(d.path());
         let rs = d.path().join("ReplicatedStorage");
         fs::create_dir_all(&rs).unwrap();
         fs::write(rs.join("Config.luau"), "return {}").unwrap();
@@ -605,7 +591,6 @@ mod tests {
     #[test]
     fn studio_path_predicts_script_with_children_directory() {
         let d = TempDir::new("studio-dir");
-        write_tree(d.path());
 
         let resolved = resolve(d.path(), "ReplicatedStorage/Net", PathInputKind::Studio).unwrap();
         assert_eq!(resolved.class, "ModuleScript");
@@ -619,7 +604,6 @@ mod tests {
     #[test]
     fn filesystem_script_file_resolves_to_studio_path() {
         let d = TempDir::new("fs-file");
-        write_tree(d.path());
         let rs = d.path().join("ReplicatedStorage");
         fs::create_dir_all(&rs).unwrap();
         fs::write(rs.join("Config.luau"), "return {}").unwrap();
@@ -633,7 +617,6 @@ mod tests {
     #[test]
     fn init_file_resolves_to_parent_script_instance() {
         let d = TempDir::new("init-file");
-        write_tree(d.path());
         let net = d.path().join("ReplicatedStorage").join("Net");
         fs::create_dir_all(&net).unwrap();
         fs::write(net.join("init (Net).luau"), "return {}").unwrap();
@@ -650,7 +633,6 @@ mod tests {
     #[test]
     fn non_syncable_studio_path_is_rejected() {
         let d = TempDir::new("part");
-        write_tree(d.path());
 
         let err = resolve(d.path(), "Workspace/Baseplate", PathInputKind::Studio).unwrap_err();
         assert!(err.contains("Studio-authoritative"), "{err}");
@@ -659,7 +641,6 @@ mod tests {
     #[test]
     fn unresolved_filesystem_path_reports_likely_studio_path() {
         let d = TempDir::new("missing");
-        write_tree(d.path());
 
         let err = resolve(
             d.path(),
@@ -668,6 +649,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("maps to likely Studio path ReplicatedStorage/Missing"));
-        assert!(err.contains("not present in tree.json"));
+        assert!(err.contains("not present in the live Studio tree"));
     }
 }

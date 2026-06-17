@@ -13,7 +13,7 @@
   ],
   "notes": [
     "Uses multipart/form-data and Roblox Open Cloud API keys.",
-    "Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, project env files, then the Ro Sync widget Secrets store.",
+    "Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, and project env files; widget Secrets are only a fallback.",
     "Universe discovery checks --universe-id, ROBLOX_UNIVERSE_ID, UNIVERSE_ID, GAMEID, GAME_ID, project env files, then ro-sync.json gameId.",
     "discover reports likely monetization config files but does not guess project-specific code writes when schema is ambiguous.",
     "images matches files to assets by normalized filename, such as coins-small.png to Coins Small."

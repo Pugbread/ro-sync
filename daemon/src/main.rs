@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch as tokio_watch};
 
 mod conflict;
 mod diff;
@@ -30,6 +30,8 @@ use watch::{Op, OpKind, Watch};
 use ws::{PendingRoutes, RequestEnvelope};
 
 const COMMANDS_BUNDLE_JSON: &str = include_str!("../../docs/client-commands.generated.json");
+const DEFAULT_DAEMON_PORT: u16 = 7878;
+const DAEMON_PORT_SCAN_MAX: u16 = 7890;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,7 +48,7 @@ pub struct Cli {
     #[arg(long)]
     pub project: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
 
     /// Roblox GameId (Int64 — stored as string to avoid JSON precision loss).
@@ -72,7 +74,7 @@ pub enum Command {
     Context(ContextArgs),
     /// Build a read-only JSON plan for a mutating command.
     Plan(PlanArgs),
-    /// Match a selector against the plugin-emitted `tree.json` skeleton.
+    /// Match a selector against the live Studio tree.
     Query(QueryArgs),
     /// Translate between Studio instance paths and syncable filesystem paths.
     Path(PathArgs),
@@ -107,6 +109,9 @@ pub enum Command {
     Conflicts(ConflictsArgs),
     /// Resolve a parked conflict with either the disk or Studio version.
     Resolve(ResolveArgs),
+    /// Inspect or answer the pending initial sync decision.
+    #[command(alias = "decide")]
+    Decision(DecisionArgs),
     /// Alias for `logs --tail`.
     Tail(TailArgs),
     /// Stream raw daemon WebSocket frames.
@@ -356,6 +361,9 @@ pub struct ServicesArgs {
 
 #[derive(ClapArgs, Debug)]
 pub struct ConflictsArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
     #[arg(long)]
@@ -364,6 +372,9 @@ pub struct ConflictsArgs {
 
 #[derive(ClapArgs, Debug)]
 pub struct ResolveArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
     #[arg(long)]
@@ -396,6 +407,9 @@ pub struct TailArgs {
 
 #[derive(ClapArgs, Debug)]
 pub struct WatchArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
     #[arg(long, default_value_t = 7878)]
     pub port: u16,
     /// Print compact one-line summaries instead of JSON frames.
@@ -411,7 +425,7 @@ pub struct RepairArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RepairCommand {
-    /// Refresh `tree.json` from the live Studio tree.
+    /// Validate that the live Studio tree can be read.
     Tree(RepairTreeArgs),
     /// Regenerate luau-lsp sourcemap JSON.
     Sourcemap(RepairSourcemapArgs),
@@ -1348,13 +1362,24 @@ pub struct ServeArgs {
 
     #[arg(long = "place-id")]
     pub place_id: Vec<String>,
+
+    /// Mark this daemon as owned by the Terminal 64 widget lifecycle.
+    #[arg(long = "widget-owned", hide = true)]
+    pub widget_owned: bool,
+
+    /// Token required for widget lifecycle heartbeat and close requests.
+    #[arg(long = "owner-token", hide = true)]
+    pub owner_token: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
 pub struct QueryArgs {
-    /// Project directory containing `tree.json`.
+    /// Project directory. Used for daemon port discovery.
     #[arg(long)]
-    pub project: PathBuf,
+    pub project: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
 
     /// Selector. `/`-separated; `*` matches one segment, `**` matches zero or more.
     pub selector: String,
@@ -1366,9 +1391,12 @@ pub struct QueryArgs {
 
 #[derive(ClapArgs, Debug)]
 pub struct PathArgs {
-    /// Project directory containing `tree.json`.
+    /// Project directory. Used for filesystem mapping and daemon port discovery.
     #[arg(long)]
     pub project: PathBuf,
+
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
 
     /// Interpret input as `studio`, `fs`, or try `auto`.
     #[arg(long, value_enum, default_value_t = path_resolver::PathInputKind::Auto)]
@@ -1378,6 +1406,30 @@ pub struct PathArgs {
     pub target: String,
 
     /// Print JSON instead of the resolved path.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct DecisionArgs {
+    /// Project directory. Defaults to current working directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = 7878)]
+    pub port: u16,
+    /// Pending choice id. If omitted, the single current pending choice is used.
+    #[arg(long = "choice-id")]
+    pub choice_id: Option<String>,
+    /// Keep disk/local files and push them to Studio.
+    #[arg(long, conflicts_with_all = ["studio", "cancel"])]
+    pub disk: bool,
+    /// Keep Studio and pull it to disk.
+    #[arg(long, conflicts_with_all = ["disk", "cancel"])]
+    pub studio: bool,
+    /// Cancel the initial sync.
+    #[arg(long, conflicts_with_all = ["disk", "studio"])]
+    pub cancel: bool,
+    /// Print JSON instead of human-readable output.
     #[arg(long)]
     pub raw: bool,
 }
@@ -1463,21 +1515,223 @@ pub struct AppState {
     /// clients are allowed to come and go, but only one plugin may own the live
     /// Studio bridge at a time.
     pub active_plugin: Arc<Mutex<Option<u64>>>,
+    /// Whether this daemon was launched by the Terminal 64 widget and should
+    /// exit with that widget instead of lingering as a background service.
+    pub widget_owned: bool,
+    /// Shared secret for widget lifecycle endpoints.
+    pub widget_owner_token: Arc<Option<String>>,
+    /// Last heartbeat received from the owning widget.
+    pub widget_last_seen: Arc<Mutex<Option<Instant>>>,
+    /// Graceful shutdown trigger used by local lifecycle endpoints.
+    pub shutdown_tx: tokio_watch::Sender<Option<String>>,
 }
 
 /// Duration of the per-path quiet window after a `/push` write.
 pub const PUSH_QUIET_MS: u64 = 1500;
+const WIDGET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const WIDGET_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Context(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "context")?
+        }
+        Command::Query(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "query")?
+        }
+        Command::Path(args) => resolve_port_field(&mut args.port, Some(&args.project), "path")?,
+        Command::Get(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "get")?,
+        Command::Set(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "set")?,
+        Command::Ls(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "ls")?,
+        Command::Tree(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "tree")?,
+        Command::Snapshot(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "snapshot")?
+        }
+        Command::Diff(args) | Command::Changes(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "diff")?
+        }
+        Command::Open(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "open")?,
+        Command::Where(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "where")?
+        }
+        Command::Props(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "props")?
+        }
+        Command::Source(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "source")?
+        }
+        Command::Meta(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "meta")?,
+        Command::Services(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "services")?
+        }
+        Command::Conflicts(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "conflicts")?
+        }
+        Command::Resolve(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "resolve")?
+        }
+        Command::Decision(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "decision")?
+        }
+        Command::Tail(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "tail")?,
+        Command::Watch(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "watch")?
+        }
+        Command::Repair(args) => {
+            if let RepairCommand::Tree(tree_args) = &mut args.command {
+                resolve_port_field(
+                    &mut tree_args.port,
+                    tree_args.project.as_deref(),
+                    "repair tree",
+                )?;
+            }
+        }
+        Command::Find(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "find")?,
+        Command::Eval(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "eval")?,
+        Command::Transmit(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "transmit")?
+        }
+        Command::Logs(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "logs")?,
+        Command::Save(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "save")?,
+        Command::Undo(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "undo")?,
+        Command::Redo(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "redo")?,
+        Command::Waypoint(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "waypoint")?
+        }
+        Command::Ping(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "ping")?,
+        Command::Version(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "version")?
+        }
+        Command::Status(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "status")?
+        }
+        Command::Doctor(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "doctor")?
+        }
+        Command::New(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "new")?,
+        Command::Rm(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "rm")?,
+        Command::Mv(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "mv")?,
+        Command::Attr(args) => match &mut args.command {
+            AttrCommand::Set(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "attr set")?
+            }
+            AttrCommand::Rm(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "attr rm")?
+            }
+            AttrCommand::Ls(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "attr ls")?
+            }
+        },
+        Command::Tag(args) => match &mut args.command {
+            TagCommand::Add(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "tag add")?
+            }
+            TagCommand::Rm(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "tag rm")?
+            }
+        },
+        Command::Call(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "call")?,
+        Command::Select(args) => match &mut args.command {
+            SelectCommand::Get(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "select get")?
+            }
+            SelectCommand::Set(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "select set")?
+            }
+        },
+        Command::Classinfo(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "classinfo")?
+        }
+        Command::Enums(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "enums")?
+        }
+        Command::Enum(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "enum")?,
+        Command::FindAttr(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "find-attr")?
+        }
+        Command::Commands(_)
+        | Command::Plan(_)
+        | Command::Serve(_)
+        | Command::Upload(_)
+        | Command::Monetization(_)
+        | Command::Img(_)
+        | Command::Imgs(_)
+        | Command::Refresh(_)
+        | Command::Lint(_) => {}
+    }
+
+    Ok(())
+}
+
+fn resolve_port_field(
+    port: &mut u16,
+    project: Option<&std::path::Path>,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project = project_or_cwd(project, context)?;
+    if let Some(resolved) = discover_project_daemon_port(&project, *port) {
+        *port = resolved;
+    }
+    Ok(())
+}
+
+fn discover_project_daemon_port(project: &std::path::Path, requested_port: u16) -> Option<u16> {
+    let canonical_project = canonicalize_project_path(project);
+
+    if fetch_daemon_hello(requested_port)
+        .ok()
+        .as_ref()
+        .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
+    {
+        return Some(requested_port);
+    }
+
+    for port in DEFAULT_DAEMON_PORT..=DAEMON_PORT_SCAN_MAX {
+        if port == requested_port {
+            continue;
+        }
+
+        if fetch_daemon_hello(port)
+            .ok()
+            .as_ref()
+            .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
+        {
+            return Some(port);
+        }
+    }
+
+    None
+}
+
+fn daemon_hello_matches_project(
+    hello: &serde_json::Value,
+    canonical_project: &std::path::Path,
+) -> bool {
+    let Some(daemon_project) = hello.get("project").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    canonicalize_project_path(std::path::Path::new(daemon_project)) == canonical_project
+}
+
+fn canonicalize_project_path(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let mut command = cli.command;
 
-    match cli.command {
+    if let Some(command) = command.as_mut() {
+        resolve_command_port(command)?;
+    }
+
+    match command {
         Some(Command::Commands(args)) => run_commands(args),
         Some(Command::Context(args)) => run_context(args),
         Some(Command::Plan(args)) => run_plan(args),
-        Some(Command::Query(args)) => run_query(args),
-        Some(Command::Path(args)) => run_path(args),
+        Some(Command::Query(args)) => run_query(args).await,
+        Some(Command::Path(args)) => run_path(args).await,
         Some(Command::Serve(args)) => run_serve(args).await,
         Some(Command::Get(args)) => run_get(args).await,
         Some(Command::Set(args)) => run_set(args).await,
@@ -1494,6 +1748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Services(args)) => run_services(args).await,
         Some(Command::Conflicts(args)) => run_conflicts(args).await,
         Some(Command::Resolve(args)) => run_resolve(args).await,
+        Some(Command::Decision(args)) => run_decision(args).await,
         Some(Command::Tail(args)) => run_tail(args).await,
         Some(Command::Watch(args)) => run_watch(args).await,
         Some(Command::Repair(args)) => run_repair(args).await,
@@ -1538,6 +1793,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 game_id: cli.game_id,
                 group_id: cli.group_id,
                 place_id: cli.place_id,
+                widget_owned: false,
+                owner_token: None,
             })
             .await
         }
@@ -1595,6 +1852,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let conflict_engine = Arc::new(ConflictEngine::new());
     let push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let (request_tx, _) = broadcast::channel::<RequestEnvelope>(256);
+    let (shutdown_tx, shutdown_rx) = tokio_watch::channel::<Option<String>>(None);
 
     let state = AppState {
         project: Arc::new(args.project.clone()),
@@ -1614,6 +1872,10 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         request_tx,
         pending_routes: Arc::new(Mutex::new(HashMap::new())),
         active_plugin: Arc::new(Mutex::new(None)),
+        widget_owned: args.widget_owned,
+        widget_owner_token: Arc::new(args.owner_token.clone()),
+        widget_last_seen: Arc::new(Mutex::new(args.widget_owned.then(Instant::now))),
+        shutdown_tx,
     };
 
     spawn_watch_bridge(
@@ -1624,6 +1886,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         push_quiet.clone(),
     );
     spawn_config_hot_reload(state.clone());
+    if args.widget_owned {
+        spawn_widget_owner_watchdog(state.clone());
+    }
 
     let addr = format!("127.0.0.1:{}", args.port);
     eprintln!(
@@ -1635,21 +1900,53 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(serve_shutdown_signal(tx.clone()))
+        .with_graceful_shutdown(serve_shutdown_signal(tx.clone(), shutdown_rx))
         .await?;
     Ok(())
 }
 
-async fn serve_shutdown_signal(events: broadcast::Sender<String>) {
-    wait_for_shutdown_signal().await;
+async fn serve_shutdown_signal(
+    events: broadcast::Sender<String>,
+    mut shutdown_rx: tokio_watch::Receiver<Option<String>>,
+) {
+    let reason = tokio::select! {
+        _ = wait_for_shutdown_signal() => "daemon shutting down".to_string(),
+        changed = shutdown_rx.changed() => {
+            match changed {
+                Ok(()) => shutdown_rx
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| "daemon shutting down".to_string()),
+                Err(_) => "daemon shutting down".to_string(),
+            }
+        },
+    };
     let _ = events.send(
         serde_json::json!({
             "type": "shutdown",
-            "reason": "daemon shutting down",
+            "reason": reason,
         })
         .to_string(),
     );
     tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+fn spawn_widget_owner_watchdog(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(WIDGET_HEARTBEAT_CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            let last_seen = *state.widget_last_seen.lock().unwrap();
+            if let Some(last_seen) = last_seen {
+                if last_seen.elapsed() > WIDGET_HEARTBEAT_TIMEOUT {
+                    let _ = state
+                        .shutdown_tx
+                        .send(Some("widget heartbeat lost".to_string()));
+                    break;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(unix)]
@@ -1674,21 +1971,8 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let tree_path = args.project.join(snapshot::TREE_JSON);
-    let text = match std::fs::read_to_string(&tree_path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "no tree.json at {}. Connect Studio via the Ro Sync plugin to generate it.",
-                tree_path.display()
-            )
-            .into());
-        }
-        Err(e) => return Err(format!("read {}: {e}", tree_path.display()).into()),
-    };
-    let tree: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", tree_path.display()))?;
+async fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = live_tree(args.port, "query").await?;
 
     let matches = query::query(&tree, &args.selector);
 
@@ -1724,8 +2008,9 @@ fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_path(args: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let resolved = path_resolver::resolve(&args.project, &args.target, args.from)?;
+async fn run_path(args: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved =
+        resolve_live_path(args.port, &args.project, &args.target, args.from, "path").await?;
     if args.raw {
         println!(
             "{}",
@@ -1744,6 +2029,33 @@ fn run_path(args: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", resolved.studio_path_string());
     }
     Ok(())
+}
+
+async fn live_tree(
+    port: u16,
+    context: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let resp = remote::request(
+        port,
+        "tree",
+        serde_json::json!({ "path": "", "depth": u32::MAX }),
+    )
+    .await
+    .map_err(|e| format!("{context}: live tree request failed: {e}"))?;
+    let tree = response_value_or_err(&resp, &format!("{context} tree"))?;
+    Ok(tree)
+}
+
+async fn resolve_live_path(
+    port: u16,
+    project: &std::path::Path,
+    target: &str,
+    from: path_resolver::PathInputKind,
+    context: &str,
+) -> Result<path_resolver::ResolvedPath, Box<dyn std::error::Error>> {
+    let tree = live_tree(port, context).await?;
+    path_resolver::resolve_with_tree(project, &tree, target, from)
+        .map_err(|e| format!("{context}: {e}").into())
 }
 
 fn run_commands(args: CommandsArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1831,9 +2143,9 @@ fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
         "llmPolicy": {
             "startup": "Use `rosync context --project .` once, then `rosync commands --compact` only when choosing command families.",
             "lookup": "Use `rosync commands <name>` for exact flags. Avoid plain `rosync commands` unless a full registry dump is explicitly needed.",
-            "cheapFirst": ["query", "path", "meta", "services", "status --raw"],
-            "targetedReads": ["get --prop", "props", "source --disk", "source"],
-            "expensiveReads": ["changes", "diff --raw", "snapshot", "get without --prop", "logs --tail", "watch"],
+            "cheapFirst": ["tree", "ls", "query", "path", "meta", "services", "status --raw"],
+            "targetedReads": ["get --prop", "props", "read local files directly", "lint touched paths"],
+            "expensiveReads": ["changes", "diff --raw", "snapshot", "get without --prop", "source live only on suspected divergence", "logs --tail", "watch", "conflicts only when resolving a reported conflict"],
             "mutationRule": "Use `rosync plan` before supported writes and explicit preflight/list commands before upload or monetization writes."
         },
     });
@@ -1857,7 +2169,6 @@ fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         "sync": {
             "services": context_services(&project),
-            "tree": context_tree_summary(&project),
             "files": context_project_files(&project),
             "conflicts": conflicts,
         },
@@ -2565,7 +2876,7 @@ fn resolve_monetization_api_key(
     }
 
     Err(format!(
-        "monetization: missing Roblox Open Cloud API key. Set one of {}, add it to an env file, or save it in Ro Sync Settings > Secrets.",
+        "monetization: missing Roblox Open Cloud API key. Set one of {} or add it to a project env file.",
         env_names.join(", ")
     )
     .into())
@@ -3764,7 +4075,7 @@ fn resolve_img_api_key(env_name: &str) -> Result<String, Box<dyn std::error::Err
     }
 
     Err(format!(
-        "upload: missing Roblox Open Cloud credential. Set {env_name}, or save it in the Ro Sync widget Settings > Secrets."
+        "upload: missing Roblox Open Cloud credential. Set {env_name} or pass --api-key-env with a populated environment variable."
     )
     .into())
 }
@@ -4453,8 +4764,14 @@ async fn run_open(args: OpenArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_where(args: WhereArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = serde_json::Map::new();
     if let Some(project) = args.project.as_deref() {
-        if let Ok(resolved) =
-            path_resolver::resolve(project, &args.target, path_resolver::PathInputKind::Auto)
+        if let Ok(resolved) = resolve_live_path(
+            args.port,
+            project,
+            &args.target,
+            path_resolver::PathInputKind::Auto,
+            "where",
+        )
+        .await
         {
             out.insert(
                 "path".into(),
@@ -4543,9 +4860,14 @@ async fn run_props(args: PropsArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_source(args: SourceArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.disk {
         let project = project_or_cwd(args.project.as_deref(), "source")?;
-        let resolved =
-            path_resolver::resolve(&project, &args.path, path_resolver::PathInputKind::Auto)
-                .map_err(|e| format!("source: {e}"))?;
+        let resolved = resolve_live_path(
+            args.port,
+            &project,
+            &args.path,
+            path_resolver::PathInputKind::Auto,
+            "source",
+        )
+        .await?;
         let source_path = disk_source_path(&resolved.fs_path)
             .ok_or_else(|| format!("source: no source file at {}", resolved.fs_path.display()))?;
         let source = std::fs::read_to_string(&source_path)
@@ -4592,8 +4914,7 @@ async fn run_source(args: SourceArgs) -> Result<(), Box<dyn std::error::Error>> 
 
 async fn run_meta(args: MetaArgs) -> Result<(), Box<dyn std::error::Error>> {
     let project = project_or_cwd(args.project.as_deref(), "meta")?;
-    let resolved = path_resolver::resolve(&project, &args.target, args.from)
-        .map_err(|e| format!("meta: {e}"))?;
+    let resolved = resolve_live_path(args.port, &project, &args.target, args.from, "meta").await?;
     let value = serde_json::json!({
         "studioPath": resolved.studio_path_string(),
         "class": resolved.class,
@@ -4723,6 +5044,102 @@ async fn run_resolve(args: ResolveArgs) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+async fn run_decision(args: DecisionArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let status =
+        http_get_json(args.port, "/initial-choice").map_err(|e| format!("decision: {e}"))?;
+    let pending = status
+        .get("pending")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let choice = match (args.disk, args.studio, args.cancel) {
+        (true, false, false) => Some("disk"),
+        (false, true, false) => Some("studio"),
+        (false, false, true) => Some("cancel"),
+        (false, false, false) => None,
+        _ => return Err("decision: pass at most one of --disk, --studio, or --cancel".into()),
+    };
+
+    let Some(choice) = choice else {
+        if args.raw {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        } else if pending {
+            print_pending_decision(&status);
+        } else {
+            println!("no pending initial sync decision");
+        }
+        return Ok(());
+    };
+
+    if !pending {
+        return Err("decision: no pending initial sync decision".into());
+    }
+    let choice_id = args
+        .choice_id
+        .or_else(|| {
+            status
+                .get("choiceId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .ok_or("decision: pending choice has no choiceId")?;
+    let value = http_post_json(
+        args.port,
+        "/initial-choice",
+        &serde_json::json!({ "choiceId": choice_id, "choice": choice }),
+    )
+    .await
+    .map_err(|e| format!("decision: {e}"))?;
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if value
+        .get("ok")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        println!("ok: initial sync decision set to {choice}");
+    } else {
+        let err = value
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("request failed");
+        return Err(err.to_string().into());
+    }
+    Ok(())
+}
+
+fn print_pending_decision(value: &serde_json::Value) {
+    let choice_id = value
+        .get("choiceId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    println!("pending initial sync decision: {choice_id}");
+    if let Some(disk) = value.get("diskStats") {
+        println!(
+            "  disk:   {} script(s), {} instance(s)",
+            disk.get("scriptCount")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            disk.get("instanceCount")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        );
+    }
+    if let Some(studio) = value.get("studioStats") {
+        println!(
+            "  studio: {} script(s), {} instance(s)",
+            studio
+                .get("scriptCount")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            studio
+                .get("instanceCount")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0)
+        );
+    }
+    println!("  choose: rosync decision --disk | --studio | --cancel");
+}
+
 async fn run_tail(args: TailArgs) -> Result<(), Box<dyn std::error::Error>> {
     run_logs(LogsArgs {
         project: args.project,
@@ -4774,7 +5191,6 @@ async fn run_repair(args: RepairArgs) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn run_repair_tree(args: RepairTreeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let project = project_or_cwd(args.project.as_deref(), "repair tree")?;
     let resp = remote::request(
         args.port,
         "tree",
@@ -4789,22 +5205,20 @@ async fn run_repair_tree(args: RepairTreeArgs) -> Result<(), Box<dyn std::error:
         )
         .into());
     }
-    let output = project.join(snapshot::TREE_JSON);
-    std::fs::write(
-        &output,
-        format!("{}\n", serde_json::to_string_pretty(&tree)?),
-    )
-    .map_err(|e| format!("repair tree: write {}: {e}", output.display()))?;
     if args.raw {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
-                "output": output,
+                "source": "live",
+                "nodes": count_tree_nodes(&tree),
             }))?
         );
     } else {
-        println!("ok: wrote {}", output.display());
+        println!(
+            "ok: live Studio tree readable ({} node(s))",
+            count_tree_nodes(&tree)
+        );
     }
     Ok(())
 }
@@ -5561,7 +5975,6 @@ async fn run_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         check_daemon_hello(args.port),
         check_plugin_version(args.port).await,
         check_project_config(&project),
-        check_tree_json(&project),
         check_sourcemap(&project),
         check_writes_log_path(),
     ];
@@ -5612,7 +6025,6 @@ async fn run_doctor(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> 
     let project_ok = project.is_dir();
     checks.push(check_project_path(&project));
     checks.push(check_project_config(&project));
-    checks.push(check_tree_json(&project));
     checks.push(check_sourcemap(&project));
     checks.push(check_daemon_hello(args.port));
     checks.push(check_luau_lsp());
@@ -5793,7 +6205,6 @@ fn status_json_key(name: &str) -> &str {
     match name {
         "project" => "project_path",
         "ro-sync.json" => "project_config",
-        "tree.json" => "tree",
         "writes.log" => "writes_log",
         other => other,
     }
@@ -5822,7 +6233,7 @@ fn status_check_json(check: &DoctorCheck) -> serde_json::Value {
                 serde_json::json!(check.status == DoctorStatus::Ok),
             );
         }
-        "tree.json" | "sourcemap" => {
+        "sourcemap" => {
             obj.insert("freshness".into(), serde_json::json!(check.detail));
         }
         "writes.log" => {
@@ -5873,27 +6284,6 @@ fn check_project_config(project: &std::path::Path) -> DoctorCheck {
         Ok(None) => doctor_check("ro-sync.json", DoctorStatus::Warn, "missing"),
         Err(e) => doctor_check("ro-sync.json", DoctorStatus::Fail, format!("invalid: {e}")),
     }
-}
-
-fn check_tree_json(project: &std::path::Path) -> DoctorCheck {
-    let path = project.join(snapshot::TREE_JSON);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return doctor_check("tree.json", DoctorStatus::Warn, "missing");
-        }
-        Err(e) => return doctor_check("tree.json", DoctorStatus::Fail, format!("read: {e}")),
-    };
-    if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
-        return doctor_check("tree.json", DoctorStatus::Fail, format!("parse: {e}"));
-    }
-    let age = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(format_duration_short)
-        .unwrap_or_else(|| "unknown age".into());
-    doctor_check("tree.json", DoctorStatus::Ok, format!("valid ({age} old)"))
 }
 
 fn check_sourcemap(project: &std::path::Path) -> DoctorCheck {
@@ -6063,19 +6453,6 @@ async fn http_post_json(
     Ok(value)
 }
 
-fn format_duration_short(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
-
 fn project_or_cwd(
     project: Option<&std::path::Path>,
     context: &str,
@@ -6174,10 +6551,12 @@ fn command_output_cost(name: &str) -> &'static str {
         "commands" => "high-full-or-low-single",
         "context" | "plan" | "query" | "path" | "meta" | "services" | "where" | "open"
         | "classinfo" | "enums" | "enum" | "ping" | "version" => "low",
-        "status" | "doctor" | "ls" | "tree" | "props" | "source" | "find" | "find-attr"
-        | "logs" | "conflicts" | "resolve" | "lint" | "upload" | "monetization" | "set" | "new"
-        | "rm" | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo"
-        | "refresh" => "medium",
+        "status" | "doctor" | "ls" | "tree" | "props" | "find" | "find-attr" | "logs"
+        | "resolve" | "decision" | "lint" | "upload" | "monetization" | "set" | "new" | "rm"
+        | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo" | "refresh" => {
+            "medium"
+        }
+        "source" | "conflicts" => "medium-special-case",
         "diff" | "changes" | "snapshot" | "get" | "eval" | "transmit" | "call" | "tail"
         | "watch" => "high-or-streaming",
         _ => "unknown",
@@ -6189,7 +6568,7 @@ fn command_safety_class(name: &str) -> &'static str {
         "set" | "new" | "rm" | "mv" | "attr" | "tag" | "save" | "waypoint" | "undo" | "redo" => {
             "mutates-studio"
         }
-        "resolve" => "mutates-disk-or-studio",
+        "resolve" | "decision" => "mutates-disk-or-studio",
         "eval" | "call" | "transmit" => "risky-live-execution",
         "select" | "open" => "mutates-studio-selection",
         "upload" | "monetization" => "open-cloud-mutating",
@@ -6201,7 +6580,10 @@ fn command_safety_class(name: &str) -> &'static str {
 
 fn command_requirements(name: &str) -> Vec<&'static str> {
     match name {
-        "query" | "path" | "meta" | "services" | "source" | "lint" => vec!["project"],
+        "query" | "path" | "meta" | "services" | "source" | "decision" => {
+            vec!["project", "daemon", "studio-plugin"]
+        }
+        "lint" => vec!["project"],
         "upload" | "monetization" => vec!["project", "roblox-open-cloud-credential"],
         "commands" | "context" | "plan" | "snapshot" | "diff" | "changes" | "status" | "doctor"
         | "refresh" => vec!["project"],
@@ -6213,13 +6595,15 @@ fn command_prefer_before(name: &str) -> Vec<&'static str> {
     match name {
         "get" | "props" => vec!["meta", "get --prop when possible"],
         "source" => vec![
-            "meta",
-            "source --disk before live source when checking local code",
+            "local file read first",
+            "lint touched paths for verification",
+            "live source only for Studio/editor divergence",
         ],
-        "diff" | "changes" => vec!["status --raw", "services --raw"],
+        "diff" | "changes" => vec!["lint touched paths first", "status --raw", "services --raw"],
         "snapshot" => vec!["tree --depth 3", "changes"],
         "set" | "new" | "rm" | "mv" => vec!["plan"],
-        "resolve" => vec!["conflicts", "changes", "plan resolve"],
+        "resolve" => vec!["conflicts only when resolving", "plan resolve"],
+        "decision" => vec!["decision without flags to inspect pending choice first"],
         "attr" | "tag" | "call" | "eval" | "transmit" | "select" | "save" => {
             vec!["status --raw", "waypoint for multi-step edits"]
         }
@@ -6248,42 +6632,6 @@ fn context_services(project: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn context_tree_summary(project: &std::path::Path) -> serde_json::Value {
-    let path = project.join(snapshot::TREE_JSON);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return serde_json::json!({ "ok": false, "missing": true, "path": path.display().to_string() });
-        }
-        Err(e) => {
-            return serde_json::json!({ "ok": false, "error": e.to_string(), "path": path.display().to_string() });
-        }
-    };
-    let tree: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(tree) => tree,
-        Err(e) => {
-            return serde_json::json!({ "ok": false, "error": format!("parse: {e}"), "path": path.display().to_string() });
-        }
-    };
-    let services = tree
-        .get("children")
-        .and_then(|value| value.as_array())
-        .map(|children| {
-            children
-                .iter()
-                .filter_map(|child| child.get("name").and_then(|value| value.as_str()))
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    serde_json::json!({
-        "ok": true,
-        "path": path.display().to_string(),
-        "nodes": count_tree_nodes(&tree),
-        "services": services,
-    })
-}
-
 fn count_tree_nodes(node: &serde_json::Value) -> usize {
     1 + node
         .get("children")
@@ -6295,7 +6643,6 @@ fn count_tree_nodes(node: &serde_json::Value) -> usize {
 fn context_project_files(project: &std::path::Path) -> serde_json::Value {
     serde_json::json!({
         "projectConfig": file_summary(&project.join(project_config::CONFIG_FILE)),
-        "treeJson": file_summary(&project.join(snapshot::TREE_JSON)),
         "sourcemapJson": file_summary(&project.join("sourcemap.json")),
         "roSyncMd": file_summary(&project.join("ro-sync.md")),
         "agentsMd": file_summary(&project.join("AGENTS.md")),
@@ -7375,6 +7722,78 @@ mod tier2_tests {
     }
 
     #[test]
+    fn serve_args_parse_widget_owner_flags() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "serve",
+            "--project",
+            ".",
+            "--widget-owned",
+            "--owner-token",
+            "secret",
+        ])
+        .unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.project, PathBuf::from("."));
+        assert!(args.widget_owned);
+        assert_eq!(args.owner_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn conflicts_resolve_and_watch_accept_project() {
+        let cli = Cli::try_parse_from(["rosync", "conflicts", "--project", ".", "--raw"]).unwrap();
+        let Some(Command::Conflicts(args)) = cli.command else {
+            panic!("expected conflicts command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert!(args.raw);
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "resolve",
+            "--project",
+            ".",
+            "--path",
+            "ReplicatedStorage/Foo.luau",
+            "--disk",
+        ])
+        .unwrap();
+        let Some(Command::Resolve(args)) = cli.command else {
+            panic!("expected resolve command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert_eq!(args.path, "ReplicatedStorage/Foo.luau");
+        assert!(args.disk);
+
+        let cli = Cli::try_parse_from(["rosync", "watch", "--project", ".", "--compact"]).unwrap();
+        let Some(Command::Watch(args)) = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+        assert!(args.compact);
+    }
+
+    #[test]
+    fn daemon_hello_project_match_uses_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("Project");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let hello = serde_json::json!({
+            "project": nested.display().to_string(),
+        });
+        let canonical = std::fs::canonicalize(&nested).unwrap();
+        assert!(daemon_hello_matches_project(&hello, &canonical));
+
+        let other = dir.path().join("Other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_canonical = std::fs::canonicalize(other).unwrap();
+        assert!(!daemon_hello_matches_project(&hello, &other_canonical));
+    }
+
+    #[test]
     fn refresh_args_parse_project_and_raw() {
         let cli = Cli::try_parse_from(["rosync", "refresh", "--project", ".", "--raw"]).unwrap();
         let Some(Command::Refresh(args)) = cli.command else {
@@ -7574,7 +7993,6 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
     fn status_json_uses_stable_keys_and_flags() {
         assert_eq!(status_json_key("project"), "project_path");
         assert_eq!(status_json_key("ro-sync.json"), "project_config");
-        assert_eq!(status_json_key("tree.json"), "tree");
         assert_eq!(status_json_key("writes.log"), "writes_log");
 
         let plugin = doctor_check("plugin", DoctorStatus::Ok, "v1, Studio test");

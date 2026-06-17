@@ -31,7 +31,6 @@ rosync commands upload --compact
 - The output is embedded from `docs/client-commands.generated.json`, which is rebuilt from `docs/commands/*.json`.
 
 ---
-
 ### `rosync context`
 
 Prints a compact LLM-oriented project context snapshot as JSON.
@@ -55,12 +54,11 @@ rosync context --project . --port 7878
 **Notes**
 
 - Does not mutate disk or Studio.
-- Includes project config, synced services, tree summary, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.
+- Includes project config, synced services, key generated files, daemon status, daemon project mismatch warnings, conflict count, and command registry pointers.
 - Includes LLM command-use policy so agents know to use `rosync commands --compact` and `rosync commands <name>` instead of dumping the full registry.
 - Use `--full-commands` only when the caller needs the complete embedded command registry in the same response.
 
 ---
-
 ### `rosync plan`
 
 Builds a read-only JSON plan for a mutating command without executing it.
@@ -93,17 +91,16 @@ rosync plan resolve --path ReplicatedStorage/Client/UIController.client.luau --s
 - Use this before running risky write commands from an LLM workflow.
 
 ---
-
 ### `rosync query`
 
-Matches a selector against the project `tree.json` skeleton without needing the daemon or Studio.
+Matches a selector against the live Studio tree through the daemon/plugin bridge.
 
-**Category:** Offline inspection
+**Category:** Live inspection
 
 **Usage**
 
 ```sh
-rosync query --project <path> <selector> [--format json|paths|classes]
+rosync query [--project <path>] [--port <port>] <selector> [--format json|paths|classes]
 ```
 
 **Examples**
@@ -116,20 +113,19 @@ rosync query --project . '**/RemoteEvent' --format paths
 **Notes**
 
 - `*` matches one path segment and `**` matches zero or more segments.
-- Use this first when you only need to discover what exists in the latest Studio tree.
+- Use this when you need to discover what exists in the current Studio tree.
 
 ---
-
 ### `rosync path`
 
-Translates between Studio instance paths and syncable filesystem paths using `tree.json`.
+Translates between Studio instance paths and syncable filesystem paths using the live Studio tree.
 
-**Category:** Offline inspection
+**Category:** Path tools
 
 **Usage**
 
 ```sh
-rosync path --project <path> [--from auto|studio|fs] <target> [--raw]
+rosync path --project <path> [--port <port>] [--from auto|studio|fs] <target> [--raw]
 ```
 
 **Examples**
@@ -142,10 +138,9 @@ rosync path --project . --from fs ReplicatedStorage/Config.luau
 **Notes**
 
 - Studio-authoritative classes are reported clearly instead of pretending they map to files.
-- Generated files such as `tree.json` and `ro-sync.md` are not syncable Studio instances.
+- Generated files such as `ro-sync.md` are not syncable Studio instances.
 
 ---
-
 ### `rosync lint`
 
 Runs `luau-lsp analyze` against a project or one or more paths with a Ro Sync sourcemap, Roblox definitions, and dependency-aware diagnostic filtering.
@@ -175,7 +170,6 @@ rosync lint --project . --no-sourcemap --no-vendor-ignores
 - `--scope-only` / `--owned-only` requires at least one `--path` and filters captured diagnostics down to those requested paths while preserving non-diagnostic luau-lsp log lines.
 
 ---
-
 ### `rosync upload`
 
 Uploads Roblox assets through Open Cloud from files or directories.
@@ -198,12 +192,11 @@ rosync upload ./clip.rbxm --project . --asset-type animation
 
 **Notes**
 
-- Reads credentials from `ROBLOX_API_KEY`, a custom `--api-key-env`, or the widget Secrets store.
+- Reads credentials from `ROBLOX_API_KEY` or the environment variable named by `--api-key-env`; widget Secrets are only a fallback.
 - Directories recurse by default, skip unsupported files, and continue after per-file failures.
 - Use `--auth bearer` for OAuth tokens instead of API keys.
 
 ---
-
 ### `rosync monetization`
 
 Discovers, lists, creates, edits, and uploads images for Roblox game passes and developer products through Open Cloud.
@@ -235,13 +228,12 @@ rosync monetization product images ./icons --project .
 **Notes**
 
 - Uses multipart/form-data and Roblox Open Cloud API keys.
-- Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, project env files, then the Ro Sync widget Secrets store.
+- Credential discovery checks ROBLOX_API_KEY, CLOUD_API_KEY, ROBLOX_OPEN_CLOUD_API_KEY, and project env files; widget Secrets are only a fallback.
 - Universe discovery checks --universe-id, ROBLOX_UNIVERSE_ID, UNIVERSE_ID, GAMEID, GAME_ID, project env files, then ro-sync.json gameId.
 - discover reports likely monetization config files but does not guess project-specific code writes when schema is ambiguous.
 - images matches files to assets by normalized filename, such as coins-small.png to Coins Small.
 
 ---
-
 ### `rosync get`
 
 Reads an instance view or one property from the live Studio session.
@@ -267,7 +259,6 @@ rosync get --project . --path ReplicatedStorage/Shared --raw
 - Works across the whole DataModel, not only filesystem-synced classes.
 
 ---
-
 ### `rosync ls`
 
 Lists the direct children of a live Studio instance.
@@ -293,7 +284,6 @@ rosync ls --project . --path ""
 - Use `tree` when you need recursive output.
 
 ---
-
 ### `rosync tree`
 
 Prints a class and name tree below a live Studio instance.
@@ -318,7 +308,6 @@ rosync tree --project . --path ReplicatedStorage --depth 8 --raw
 - Depth defaults to 3; use 0 for only the root instance.
 
 ---
-
 ### `rosync snapshot`
 
 Exports the live Studio tree plus inspectable properties, attributes, and tags to deterministic JSON.
@@ -344,7 +333,6 @@ rosync snapshot --project . --output snapshots/
 - Useful for backups, debugging, and comparing Studio state outside the sync surface.
 
 ---
-
 ### `rosync diff`
 
 Compares local scripts and folders against the live Studio syncable tree.
@@ -369,7 +357,6 @@ rosync diff --project . --raw
 - Reports items added locally, removed locally, and scripts whose `Source` differs.
 
 ---
-
 ### `rosync changes`
 
 Alias for `rosync diff`, intended for reviewing what a resync would change.
@@ -394,7 +381,6 @@ rosync changes --project . --raw
 - Only compares synced services, so random project files are ignored.
 
 ---
-
 ### `rosync services`
 
 Lists Ro Sync service roots and whether each exists on disk and in live Studio.
@@ -419,7 +405,6 @@ rosync services --project . --raw
 - Uses the fixed synced service allowlist rather than scanning arbitrary top-level folders.
 
 ---
-
 ### `rosync meta`
 
 Shows the Studio path, class, filesystem path, and existence status for a syncable path.
@@ -429,7 +414,7 @@ Shows the Studio path, class, filesystem path, and existence status for a syncab
 **Usage**
 
 ```sh
-rosync meta [--project <path>] [--from auto|studio|fs] [--raw] <target>
+rosync meta [--project <path>] [--port <port>] [--from auto|studio|fs] [--raw] <target>
 ```
 
 **Examples**
@@ -441,10 +426,9 @@ rosync meta --project . --from fs ReplicatedStorage/Client/UIController.client.l
 
 **Notes**
 
-- Requires `tree.json`, so connect Studio once before using it on new projects.
+- Uses the live Studio tree; start `rosync serve --project .` and connect the Studio plugin first.
 
 ---
-
 ### `rosync props`
 
 Prints inspectable live Studio properties for one instance.
@@ -469,7 +453,6 @@ rosync props --path ReplicatedStorage/Client/UIController --raw
 - This is a focused view over `rosync get --path <path>`.
 
 ---
-
 ### `rosync source`
 
 Prints script source from live Studio or from the synced disk file.
@@ -494,7 +477,6 @@ rosync source --project . --path ReplicatedStorage/Client/UIController --disk
 - Without `--disk`, reads the live Studio `Source` property through the plugin.
 
 ---
-
 ### `rosync where`
 
 Finds live Studio instances by name substring and, when possible, resolves a target path to disk.
@@ -519,7 +501,6 @@ rosync where Controller --under ReplicatedStorage/Client
 - Combines a live name search with local path translation when `--project` is supplied.
 
 ---
-
 ### `rosync open`
 
 Selects one or more Studio instances by path.
@@ -544,7 +525,6 @@ rosync open Workspace/Baseplate ReplicatedStorage/Client
 - This is a shorthand over `rosync select set --paths '[...]'`.
 
 ---
-
 ### `rosync conflicts`
 
 Lists parked source conflicts waiting for a Keep Disk or Keep Studio decision.
@@ -554,13 +534,14 @@ Lists parked source conflicts waiting for a Keep Disk or Keep Studio decision.
 **Usage**
 
 ```sh
-rosync conflicts [--port <port>] [--raw]
+rosync conflicts [--project <path>] [--port <port>] [--raw]
 ```
 
 **Examples**
 
 ```sh
 rosync conflicts
+rosync conflicts --project .
 rosync conflicts --raw
 ```
 
@@ -569,7 +550,6 @@ rosync conflicts --raw
 - Only source conflicts parked by the daemon conflict engine are shown.
 
 ---
-
 ### `rosync resolve`
 
 Resolves one parked conflict by keeping either disk or Studio content.
@@ -579,13 +559,14 @@ Resolves one parked conflict by keeping either disk or Studio content.
 **Usage**
 
 ```sh
-rosync resolve --path <filesystem-path> (--disk | --studio) [--port <port>] [--raw]
+rosync resolve --path <filesystem-path> (--disk | --studio) [--project <path>] [--port <port>] [--raw]
 ```
 
 **Examples**
 
 ```sh
 rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --studio
+rosync resolve --project . --path ReplicatedStorage/Client/UIController.client.luau --studio
 rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --disk
 ```
 
@@ -594,7 +575,33 @@ rosync resolve --path ReplicatedStorage/Client/UIController.client.luau --disk
 - `--studio` writes Studio bytes to disk; `--disk` pushes disk bytes back to Studio.
 
 ---
+### `rosync decision`
 
+Shows or answers the pending initial sync decision without opening the widget UI.
+
+**Category:** Conflict resolution
+
+**Usage**
+
+```sh
+rosync decision [--project <path>] [--port <port>] [--choice-id <id>] [--disk|--studio|--cancel] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync decision --project .
+rosync decision --project . --studio
+rosync decision --project . --disk
+```
+
+**Notes**
+
+- Without a choice flag, prints the current pending initial sync decision.
+- When exactly one decision is pending, `--choice-id` can be omitted.
+- `--disk` keeps local files and pushes them to Studio; `--studio` keeps Studio and pulls it to disk; `--cancel` aborts the initial sync.
+
+---
 ### `rosync tail`
 
 Streams Studio output, warning, and error messages until interrupted.
@@ -619,7 +626,6 @@ rosync tail --level warn --since 5m
 - Equivalent to `rosync logs --tail`.
 
 ---
-
 ### `rosync watch`
 
 Streams raw daemon WebSocket frames for debugging sync traffic.
@@ -629,13 +635,14 @@ Streams raw daemon WebSocket frames for debugging sync traffic.
 **Usage**
 
 ```sh
-rosync watch [--port <port>] [--compact]
+rosync watch [--project <path>] [--port <port>] [--compact]
 ```
 
 **Examples**
 
 ```sh
 rosync watch
+rosync watch --project .
 rosync watch --compact
 ```
 
@@ -644,10 +651,9 @@ rosync watch --compact
 - Use this for debugging daemon/plugin traffic; `rosync tail` is better for Studio output.
 
 ---
-
 ### `rosync repair`
 
-Rebuilds generated Ro Sync metadata.
+Checks live tree access and rebuilds generated Ro Sync metadata.
 
 **Category:** Maintenance
 
@@ -668,11 +674,10 @@ rosync repair sourcemap --project . --output .luau-sourcemap.json
 
 **Notes**
 
-- `repair tree` refreshes `tree.json` from live Studio.
+- `repair tree` validates that the live Studio tree can be read; use `rosync tree` or `rosync query` to inspect it.
 - `repair sourcemap` rebuilds luau-lsp sourcemap JSON from synced service folders.
 
 ---
-
 ### `rosync find`
 
 Finds live Studio instances by class name and/or name substring.
@@ -697,7 +702,6 @@ rosync find --project . --class Part --under Workspace/Map
 - Omit `--under` to search the whole DataModel.
 
 ---
-
 ### `rosync find-attr`
 
 Finds live Studio instances that have a named attribute, optionally matching a value.
@@ -722,7 +726,6 @@ rosync find-attr --project . --name Color --value '{"__type":"Color3","r":1,"g":
 - `--value` uses the same JSON literal and tagged-value codec as `rosync set --value`.
 
 ---
-
 ### `rosync classinfo`
 
 Lists properties and methods for a Roblox class using Studio reflection when available.
@@ -747,7 +750,6 @@ rosync classinfo --project . --class TextLabel --raw
 - Falls back to a baked table for common classes when reflection is unavailable.
 
 ---
-
 ### `rosync enums`
 
 Lists every Enum type name exposed by the connected Studio session.
@@ -771,7 +773,6 @@ rosync enums --project .
 - Use `rosync enum --name <EnumName>` to inspect one enum's items.
 
 ---
-
 ### `rosync enum`
 
 Lists the items for one Roblox Enum type.
@@ -796,7 +797,6 @@ rosync enum --project . --name KeyCode --raw
 - Outputs item names and underlying integer values.
 
 ---
-
 ### `rosync logs`
 
 Reads recent Studio output, warning, and error messages from the plugin log buffer.
@@ -821,10 +821,9 @@ rosync logs --project . --tail
 - `--tail` streams until interrupted.
 
 ---
-
 ### `rosync status`
 
-Summarizes daemon reachability, plugin handshake, project config, `tree.json`, sourcemap, and write-log health.
+Summarizes daemon reachability, plugin handshake, project config, sourcemap, and write-log health.
 
 **Category:** Live diagnostics
 
@@ -846,7 +845,6 @@ rosync status --project . --raw
 - Useful as the first live check before making further CLI calls.
 
 ---
-
 ### `rosync doctor`
 
 Runs a broader health check over project files, daemon, plugin, linter, and sourcemap setup.
@@ -871,7 +869,6 @@ rosync doctor --project . --raw
 - Use after `status` when setup or connectivity looks suspicious.
 
 ---
-
 ### `rosync ping`
 
 Round-trips a lightweight request to the Studio plugin and reports latency.
@@ -895,7 +892,6 @@ rosync ping --project .
 - A fast way to confirm the plugin WebSocket path is alive.
 
 ---
-
 ### `rosync version`
 
 Prints the daemon build version and, when reachable, the plugin version.
@@ -919,7 +915,6 @@ rosync version --project .
 - Useful when checking for mismatched widget, daemon, or plugin installs.
 
 ---
-
 ### `rosync refresh`
 
 Refreshes generated Ro Sync agent docs without starting the daemon.
@@ -945,7 +940,6 @@ rosync refresh --project . --raw
 - When Wally is enabled or a `wally.toml` is present, the regenerated `AGENTS.md` block embeds the resolved Wally settings and package config.
 
 ---
-
 ### `rosync set`
 
 Sets one property or applies a batch of property writes in the live Studio session.
@@ -972,7 +966,6 @@ rosync set --project . --batch writes.json --waypoint "refactor camera"
 - `--waypoint` brackets the write so one Studio undo can reverse the batch.
 
 ---
-
 ### `rosync new`
 
 Creates a new live Studio instance under a parent path.
@@ -998,7 +991,6 @@ rosync new --project . --path ReplicatedStorage --class RemoteEvent --name Damag
 - The created instance is written to `writes.log`.
 
 ---
-
 ### `rosync rm`
 
 Destroys a live Studio instance.
@@ -1022,7 +1014,6 @@ rosync rm --project . --path Workspace/Box
 - Calls `:Destroy()` through the plugin and records the write in `writes.log`.
 
 ---
-
 ### `rosync mv`
 
 Reparents a live Studio instance to a destination parent path.
@@ -1048,7 +1039,6 @@ rosync mv --project . --from Workspace/Box --to ServerStorage --force
 - Use this instead of `rosync set --prop Parent`.
 
 ---
-
 ### `rosync attr`
 
 Lists, sets, or removes attributes on a live Studio instance.
@@ -1075,7 +1065,6 @@ rosync attr ls --project . --path Workspace/Box
 - `--value` uses the same JSON literal and tagged-value codec as `rosync set --value`.
 
 ---
-
 ### `rosync tag`
 
 Adds or removes CollectionService tags on a live Studio instance.
@@ -1100,7 +1089,6 @@ rosync tag rm --project . --path Workspace/Box --tag Enemy
 - Successful tag mutations are written to `writes.log`.
 
 ---
-
 ### `rosync call`
 
 Invokes a method on a live Studio instance and prints the returned value.
@@ -1125,7 +1113,6 @@ rosync call --project . --path Workspace/Folder --method FindFirstChild --args '
 - Treat methods with side effects as writes; successful calls are audited.
 
 ---
-
 ### `rosync select`
 
 Reads or replaces the current Studio Selection.
@@ -1150,7 +1137,6 @@ rosync select set --project . --paths '["Workspace/Box","Workspace/SpawnLocation
 - `select get` is read-only; `select set` is a Studio state change.
 
 ---
-
 ### `rosync eval`
 
 Executes Luau source inside Studio through the plugin sandbox.
@@ -1175,7 +1161,6 @@ rosync eval --project . --source 'return #game.Workspace:GetChildren()'
 - This is the broadest escape hatch; ask before using it for mutations.
 
 ---
-
 ### `rosync save`
 
 Asks Studio to save the current place.
@@ -1199,7 +1184,6 @@ rosync save --project .
 - The CLI returns after Studio accepts the save request; the actual save is asynchronous.
 
 ---
-
 ### `rosync transmit`
 
 Runs an optional Studio render script, reads EditableImage/ImageLabel/ImageButton/MeshPart texture pixels from Studio, and writes local PNG files for editing or upload.
@@ -1231,7 +1215,6 @@ rosync transmit --project . --source 'local Photobooth = require(game.ServerStor
 - This executes Luau in Studio, so treat it like `rosync eval`: inspect render scripts first and avoid destructive code.
 
 ---
-
 ### `rosync waypoint`
 
 Creates a named Studio change-history waypoint.
@@ -1255,7 +1238,6 @@ rosync waypoint --project . --name "before refactor"
 - Use waypoints before and after multi-step edits so Studio undo has a clear boundary.
 
 ---
-
 ### `rosync undo`
 
 Requests Studio to undo one change-history entry.
@@ -1279,7 +1261,6 @@ rosync undo --project .
 - Pairs naturally with `--waypoint` on `rosync set` for reversible batches.
 
 ---
-
 ### `rosync redo`
 
 Requests Studio to redo the last undone change-history entry.
@@ -1303,10 +1284,9 @@ rosync redo --project .
 - Requires the same live Studio/plugin connection as `undo`.
 
 ---
-
 ### `rosync serve`
 
-Runs the local HTTP/WebSocket daemon that bridges the widget, Studio plugin, filesystem watcher, and CLI.
+Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem watcher, and CLI.
 
 **Category:** Daemon
 
@@ -1325,7 +1305,7 @@ rosync serve --project . --port 7878 --game-id 1234567890
 
 **Notes**
 
-- The widget normally launches this for the active project.
-- Use it manually when debugging daemon/plugin connectivity outside the widget.
+- This is the normal CLI-only entrypoint; the widget can also launch it for an active project.
+- Run it manually when using Ro Sync without opening the widget interface.
 
 ---
