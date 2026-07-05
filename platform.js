@@ -247,24 +247,21 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
   // POSIX: double-quote binaryPath so $HOME expands; single-quote each arg so
   // spaces and metachars are preserved. Pre-flight: if the binary doesn't
   // exist, short-circuit with an ERROR sentinel the widget parses.
+  //
+  // Print `$!` from the launch shell instead of using pgrep. The old pgrep
+  // approach matched by `--port`, which could report a stale daemon from a
+  // different project as the process we just launched.
   const quotedArgs = args.map(posixQuote).join(" ");
-  // Match `--port N` with a non-digit (or end) after N so `--port 787` can't
-  // accidentally resolve to a PID on `--port 7878`.
-  const grepPat = `${BINARY_NAME}.*--port ${port}([^0-9]|$)`;
   return (
     `if [ ! -x "${binaryPath}" ] ; then ` +
     `  echo "---" ; ` +
     `  echo "ERROR: binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ${binaryPath}" ; ` +
     `  exit 0 ; ` +
     `fi ; ` +
-    `( nohup "${binaryPath}" ${quotedArgs} ` +
-    `</dev/null >${posixQuote(logPath)} 2>&1 & ) ; ` +
-    `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ; do ` +
-    `  PID=$(pgrep -f ${posixQuote(grepPat)} | tail -1) ; ` +
-    `  if [ -n "$PID" ] ; then echo "---" ; echo "$PID" ; exit 0 ; fi ; ` +
-    `  sleep 0.2 ; ` +
-    `done ; ` +
-    `echo "---" ; echo ""`
+    `nohup "${binaryPath}" ${quotedArgs} ` +
+    `</dev/null >${posixQuote(logPath)} 2>&1 & ` +
+    `PID=$! ; ` +
+    `echo "---" ; echo "$PID"`
   );
 }
 

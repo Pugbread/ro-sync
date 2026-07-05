@@ -56,7 +56,7 @@ export function mountSettings(root, api) {
       <h3>Secrets</h3>
       <p style="color:var(--muted)">Stored in Terminal 64 widget state, not in <code>ro-sync.json</code>. Use this for upload/API credentials.</p>
       <div class="secret-grid">
-        <label>Roblox OAuth / Open Cloud key
+        <label>Roblox Open Cloud API key
           <div class="secret-input-row">
             <input id="secret-roblox-key" type="password" placeholder="Paste key or token" spellcheck="false" autocomplete="off" />
             <button id="secret-toggle" type="button">Show</button>
@@ -284,11 +284,18 @@ export function mountSettings(root, api) {
   $buildRun.addEventListener("click", runBuild);
 
   let secrets = {};
+  let secretInputDirty = false;
+  $secretSave.disabled = true;
+  $secretClear.disabled = true;
 
   async function hydrateSecrets() {
     secrets = await loadSecrets(api);
-    $secretRobloxKey.value = secrets.robloxCloudApiKey || "";
+    if (!secretInputDirty) {
+      $secretRobloxKey.value = secrets.robloxCloudApiKey || "";
+    }
     $secretMsg.textContent = secrets.robloxCloudApiKey ? "Roblox key saved." : "No Roblox key saved.";
+    $secretSave.disabled = false;
+    $secretClear.disabled = false;
   }
 
   async function persistSecrets() {
@@ -301,6 +308,7 @@ export function mountSettings(root, api) {
         robloxCloudApiKeyUpdatedAt: value ? Date.now() : null,
       };
       await saveSecrets(api, secrets);
+      secretInputDirty = false;
       $secretMsg.textContent = value ? "Roblox key saved." : "Roblox key cleared.";
       api.toast(value ? "Secrets saved" : "Secret cleared");
     } catch (e) {
@@ -320,6 +328,9 @@ export function mountSettings(root, api) {
     const showing = $secretRobloxKey.type === "text";
     $secretRobloxKey.type = showing ? "password" : "text";
     $secretToggle.textContent = showing ? "Show" : "Hide";
+  });
+  $secretRobloxKey.addEventListener("input", () => {
+    secretInputDirty = true;
   });
   $secretSave.addEventListener("click", persistSecrets);
   $secretClear.addEventListener("click", clearRobloxKey);

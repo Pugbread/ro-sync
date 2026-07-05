@@ -23,7 +23,7 @@ import {
 //   {
 //     projects: [{ id, name, path, addedAt, gameId, groupId, placeIds }],
 //     activeProjectId,
-//     daemonPid, daemonPort, daemonProject,
+//     daemonPid, daemonPort, daemonProject, daemonOwnerToken,
 //     lastView,
 //   }
 const DEFAULT_STATE = {
@@ -32,6 +32,7 @@ const DEFAULT_STATE = {
   daemonPid: null,
   daemonPort: null,
   daemonProject: null,
+  daemonOwnerToken: null,
   lastView: "projects",
 };
 
@@ -75,6 +76,11 @@ export function setState(patch) {
 
 const DEFAULT_PORT = 7878;
 const PORT_SCAN_MAX = 7890;   // inclusive — scan 7878..7890 before giving up
+const DAEMON_HEARTBEAT_INTERVAL_MS = 5000;
+
+let daemonHeartbeatTimer = null;
+let widgetCloseSent = false;
+let lastHeartbeatFailureNoticeAt = 0;
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
 // Persisted via t64:get-state/set-state under key "sessions". Shape:
@@ -123,7 +129,12 @@ async function pruneDeadSessions() {
 
 async function upsertSession(entry) {
   const list = await loadSessions();
-  const next = list.filter((s) => s && s.port !== entry.port && s.pid !== entry.pid);
+  const next = list.filter((s) => {
+    if (!s) return false;
+    if (s.port === entry.port) return false;
+    if (entry.pid && s.pid === entry.pid) return false;
+    return true;
+  });
   next.push(entry);
   await saveSessions(next);
 }
@@ -137,6 +148,44 @@ async function removeSession(match) {
     return true;
   });
   if (next.length !== list.length) await saveSessions(next);
+}
+
+async function stopTrackedSession(session) {
+  if (!session) return;
+  try {
+    if (session.pid && await pidAlive(session.pid)) {
+      await t64("t64:exec", { command: killPidCmd(session.pid) });
+    } else if (session.port) {
+      await t64("t64:exec", { command: killDaemonOnPortCmd(session.port) });
+    }
+  } catch (e) {
+    console.warn("stopTrackedSession failed", session, e);
+  }
+  await removeSession({ pid: session.pid, port: session.port });
+}
+
+async function stopDuplicateTrackedSessions(keepProject, keepPort) {
+  const keepPortN = parseInt(keepPort, 10);
+  const sessions = await pruneDeadSessions();
+  for (const session of sessions) {
+    const sessionPort = parseInt(session && session.port, 10);
+    if (Number.isFinite(keepPortN) && sessionPort === keepPortN) continue;
+
+    // The widget serves one project at a time. Kill only daemons this widget
+    // launched/tracked; manually launched daemons are not in this registry.
+    if (session && session.project) {
+      await stopTrackedSession(session);
+    }
+  }
+
+  const remaining = await loadSessions();
+  const activeOnly = remaining.filter((session) => {
+    const sessionPort = parseInt(session && session.port, 10);
+    return session && session.project === keepProject && sessionPort === keepPortN;
+  });
+  if (activeOnly.length !== remaining.length) {
+    await saveSessions(activeOnly);
+  }
 }
 
 async function probePort(port) {
@@ -162,6 +211,121 @@ async function getPortOwner(port) {
   }
 }
 
+function parsePortOwnerPid(owner) {
+  const match = String(owner || "").match(/\((\d+)\)\s*$/);
+  if (!match) return null;
+  const pid = parseInt(match[1], 10);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+async function getPortOwnerPid(port) {
+  return parsePortOwnerPid(await getPortOwner(port));
+}
+
+function makeOwnerToken() {
+  const bytes = new Uint8Array(24);
+  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function ensureOwnerToken() {
+  if (app.state.daemonOwnerToken) return app.state.daemonOwnerToken;
+  const token = makeOwnerToken();
+  setState({ daemonOwnerToken: token });
+  return token;
+}
+
+async function daemonLifecycleRequest(base, path, reason) {
+  const token = app.state.daemonOwnerToken;
+  if (!base || !token) return { sent: false, ok: false, error: "missing daemon owner token" };
+  const url = `${base.replace(/\/+$/, "")}${path}`;
+  const body = JSON.stringify({ token, reason });
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      keepalive: true,
+    });
+    const json = await res.json().catch(() => null);
+    return {
+      sent: true,
+      ok: !!(res.ok && json && json.ok !== false),
+      status: res.status,
+      error: json && json.error,
+    };
+  } catch (e) {
+    return { sent: false, ok: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
+function daemonLifecyclePost(path, reason, preferBeacon = false) {
+  const base = app.daemonBase;
+  const token = app.state.daemonOwnerToken;
+  if (!base || !token) return false;
+  const url = `${base.replace(/\/+$/, "")}${path}`;
+  const body = JSON.stringify({ token, reason });
+  if (preferBeacon && navigator.sendBeacon) {
+    try {
+      const blob = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon(url, blob)) return true;
+    } catch {}
+  }
+  fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+    keepalive: true,
+  }).catch(() => {});
+  return true;
+}
+
+async function verifyDaemonOwnership(base) {
+  const result = await daemonLifecycleRequest(base, "/widget-heartbeat", "widget heartbeat");
+  if (!result.ok) {
+    console.warn("daemon heartbeat rejected", result);
+  }
+  return result.ok;
+}
+
+function stopDaemonHeartbeat() {
+  if (daemonHeartbeatTimer) {
+    clearInterval(daemonHeartbeatTimer);
+    daemonHeartbeatTimer = null;
+  }
+}
+
+function sendDaemonHeartbeat() {
+  const base = app.daemonBase;
+  if (!base || !app.state.daemonOwnerToken) return;
+  daemonLifecycleRequest(base, "/widget-heartbeat", "widget heartbeat").then((result) => {
+    if (result.ok) return;
+    const now = Date.now();
+    if (now - lastHeartbeatFailureNoticeAt > 30_000) {
+      lastHeartbeatFailureNoticeAt = now;
+      console.warn("daemon heartbeat failed", result);
+    }
+  });
+}
+
+function startDaemonHeartbeat() {
+  stopDaemonHeartbeat();
+  if (!app.daemonBase || !app.state.daemonOwnerToken) return;
+  sendDaemonHeartbeat();
+  daemonHeartbeatTimer = setInterval(sendDaemonHeartbeat, DAEMON_HEARTBEAT_INTERVAL_MS);
+}
+
+function notifyWidgetClosing() {
+  if (widgetCloseSent) return;
+  widgetCloseSent = true;
+  stopDaemonHeartbeat();
+  daemonLifecyclePost("/widget-close", "widget closed", true);
+}
+
 function activeProject() {
   const s = app.state;
   return (s.projects || []).find((x) => x.id === s.activeProjectId) || null;
@@ -179,8 +343,11 @@ async function launchDaemon(projectPath, port) {
 
   // Raw (unquoted) args — launchDaemonCmd applies platform-native quoting.
   const args = [
+    "serve",
     "--project", projectPath,
     "--port",    String(port),
+    "--widget-owned",
+    "--owner-token", ensureOwnerToken(),
   ];
   if (proj && proj.gameId) {
     args.push("--game-id", String(proj.gameId));
@@ -255,6 +422,25 @@ async function scanFallbackPorts(project, preferred) {
     const occ = await probePort(p);
     if (occ && !isOwnDaemon(occ.info, project)) continue;
     if (occ && isOwnDaemon(occ.info, project)) {
+      if (!isWidgetOwnedDaemon(occ.info) || !app.state.daemonOwnerToken) {
+        await killStaleDaemonAt(p);
+        const relaunched = await launchAndWait(project, p);
+        if (relaunched) {
+          toast(`Port ${preferred} busy — started daemon on :${p}`);
+          return relaunched;
+        }
+        continue;
+      }
+      if (!(await verifyDaemonOwnership(`http://127.0.0.1:${occ.port}`))) {
+        setState({ daemonOwnerToken: null });
+        await killStaleDaemonAt(p);
+        const relaunched = await launchAndWait(project, p);
+        if (relaunched) {
+          toast(`Port ${preferred} busy — started daemon on :${p}`);
+          return relaunched;
+        }
+        continue;
+      }
       toast(`Port ${preferred} busy — started daemon on :${p}`);
       return occ;
     }
@@ -298,6 +484,10 @@ function isOwnDaemon(info, project) {
   return false;
 }
 
+function isWidgetOwnedDaemon(info) {
+  return !!(info && typeof info === "object" && info.widgetOwned === true);
+}
+
 async function launchAndWait(project, port) {
   await launchDaemon(project, port);
   for (let i = 0; i < 20; i++) {
@@ -308,7 +498,17 @@ async function launchAndWait(project, port) {
   return null;
 }
 
+let ensureDaemonPromise = null;
+
 async function ensureDaemon() {
+  if (ensureDaemonPromise) return ensureDaemonPromise;
+  ensureDaemonPromise = ensureDaemonInner().finally(() => {
+    ensureDaemonPromise = null;
+  });
+  return ensureDaemonPromise;
+}
+
+async function ensureDaemonInner() {
   const project = activeProjectPath();
   const preferred =
     app.state.daemonProject === project && app.state.daemonPort
@@ -330,7 +530,19 @@ async function ensureDaemon() {
   if (hit) {
     const ours = isOwnDaemon(hit.info, project);
     const pointedAtOurProject = hit.info && hit.info.project === project;
-    if (ours) {
+    if (ours && (!isWidgetOwnedDaemon(hit.info) || !app.state.daemonOwnerToken)) {
+      // Older widget builds launched daemons without lifecycle ownership. Reap
+      // and relaunch so closing Terminal 64 no longer leaves this process
+      // alive. Do the same if state lost the token required to control it.
+      await killStaleDaemonAt(preferred);
+      hit = await launchAndWait(project, preferred);
+    } else if (ours && !(await verifyDaemonOwnership(`http://127.0.0.1:${hit.port}`))) {
+      // A widget-owned daemon can outlive the widget state token that launched it.
+      // Reusing it would make every heartbeat fail until the daemon self-stops.
+      setState({ daemonOwnerToken: null });
+      await killStaleDaemonAt(preferred);
+      hit = await launchAndWait(project, preferred);
+    } else if (ours) {
       // Already have a daemon for our project — great, use it.
     } else if (pointedAtOurProject) {
       // Daemon IS serving our current project path, but gameId/groupId/placeIds don't
@@ -359,11 +571,21 @@ async function ensureDaemon() {
   }
 
   if (hit) {
+    const ownerPid = await getPortOwnerPid(hit.port);
+    const daemonPid = ownerPid || app.state.daemonPid || null;
     app.daemonBase = `http://127.0.0.1:${hit.port}`;
     app.daemonOk = true;
     setDaemonDot("ok", `:${hit.port}`);
     if (app.state.daemonPort !== hit.port) setState({ daemonPort: hit.port });
+    if (daemonPid && app.state.daemonPid !== daemonPid) setState({ daemonPid });
     if (app.state.daemonProject !== project) setState({ daemonProject: project });
+    await upsertSession({
+      port: hit.port,
+      pid: daemonPid,
+      project,
+      startedAt: Date.now(),
+    });
+    await stopDuplicateTrackedSessions(project, hit.port);
     emit("daemon:up", { base: app.daemonBase, info: hit.info, project });
   } else {
     app.daemonOk = false;
@@ -388,7 +610,7 @@ async function killDaemon() {
     console.warn("kill failed", e);
   }
   await removeSession({ pid, port });
-  setState({ daemonPid: null, daemonProject: null });
+  setState({ daemonPid: null, daemonProject: null, daemonOwnerToken: null });
   app.daemonOk = false;
   app.daemonBase = null;
   setDaemonDot("idle", "daemon stopped");
@@ -408,7 +630,7 @@ async function killStaleDaemonAt(port) {
   }
   if (app.state.daemonPort === portN) {
     await removeSession({ port: portN });
-    setState({ daemonPid: null, daemonProject: null });
+    setState({ daemonPid: null, daemonProject: null, daemonOwnerToken: null });
   }
   app.daemonOk = false;
   app.daemonBase = null;
@@ -523,9 +745,17 @@ for (const t of $tabs) {
   t.addEventListener("click", () => navigate(t.dataset.route));
 }
 
+window.addEventListener("pagehide", (event) => {
+  if (event && event.persisted) return;
+  notifyWidgetClosing();
+});
+window.addEventListener("beforeunload", notifyWidgetClosing);
+
 // Re-render active view on daemon state changes (cheap).
 on("daemon:up", () => emit("view:refresh", app.currentView));
 on("daemon:down", () => emit("view:refresh", app.currentView));
+on("daemon:up", startDaemonHeartbeat);
+on("daemon:down", stopDaemonHeartbeat);
 
 // When the active project changes, (re)launch the daemon against it.
 let lastActiveProject = null;
@@ -571,7 +801,11 @@ function applyTheme(theme) {
 onT64("t64:init", (payload) => {
   if (payload && payload.theme) applyTheme(payload.theme);
   if (payload && payload.state) {
-    app.state = { ...DEFAULT_STATE, ...payload.state };
+    app.state = {
+      ...DEFAULT_STATE,
+      ...payload.state,
+      daemonOwnerToken: payload.state.daemonOwnerToken || app.state.daemonOwnerToken || null,
+    };
     emit("state", app.state);
   }
 });

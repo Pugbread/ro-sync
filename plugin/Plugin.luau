@@ -1556,8 +1556,24 @@ local pushPending = false
 local pendingEditorSourceByScript: {[Instance]: {source: string, serial: number}} = {}
 local EDITOR_SOURCE_DEBOUNCE = 0.35
 local markTreeDirty
+local flushPush
 
-local function flushPush()
+local function prependPendingOps(ops)
+	for i = #ops, 1, -1 do
+		table.insert(pendingOps, 1, ops[i])
+	end
+end
+
+local function schedulePushRetry(delaySeconds: number?)
+	if pushPending then return end
+	pushPending = true
+	task.delay(delaySeconds or 0.25, function()
+		pushPending = false
+		flushPush()
+	end)
+end
+
+flushPush = function()
 	if #pendingOps == 0 then return end
 	local client = ws
 	if not client then
@@ -1569,13 +1585,7 @@ local function flushPush()
 			pendingOps = {}
 			return
 		end
-		if not pushPending then
-			pushPending = true
-			task.delay(0.25, function()
-				pushPending = false
-				flushPush()
-			end)
-		end
+		schedulePushRetry(0.25)
 		return
 	end
 	local ops = pendingOps
@@ -1589,7 +1599,13 @@ local function flushPush()
 	end
 	local sendOk, sendErr = pcall(function() client:Send(enc) end)
 	if not sendOk then
-		log(string.format("push err: %s (%d op(s) dropped)", tostring(sendErr), #ops))
+		prependPendingOps(ops)
+		log(string.format("push err: %s (%d op(s) requeued)", tostring(sendErr), #ops))
+		if ws == client then
+			ws = nil
+		end
+		pcall(function() client:Close() end)
+		schedulePushRetry(0.5)
 	end
 end
 
@@ -2677,7 +2693,7 @@ local function runTransmitSource(src: string): any
 
 	local function collectResults(results: {any})
 		if not results[1] then error("runtime: " .. tostring(results[2])) end
-		local n = results.n - 1
+		local n = (results :: any).n - 1
 		if n == 0 then return nil end
 		if n == 1 then return results[2] end
 		local out = {}
@@ -3691,6 +3707,8 @@ local function handleRemoteRequest(client, msg)
 	end
 end
 
+local applyWallyConfig
+
 local function wsLoop(gen)
 	local clientId = tostring(game.GameId)
 	while connected and gen == wsGeneration do
@@ -3767,6 +3785,9 @@ local function wsLoop(gen)
 					-- initial-sync path uses HTTP /initial-decision polling, so
 					-- these are informational here.
 					log("ws event: " .. kind)
+				elseif kind == "plugin" then
+					-- Daemon status fan-out for widget clients; Studio already
+					-- knows whether this socket is connected.
 				else
 					log("ws: unknown msg type " .. tostring(kind))
 				end
@@ -4081,8 +4102,6 @@ local function trimTrailingSlash(s)
 	return (s:gsub("/+$", ""))
 end
 
-local applyWallyConfig
-
 local function probePort(port, gameId)
 	-- Returns (matched: bool, url: string?, hello: table?)
 	local url = string.format("http://127.0.0.1:%d", port)
@@ -4107,8 +4126,9 @@ end
 applyWallyConfig = function(wallyEnabled, wallyFolder)
 	wallyRootSegments = nil
 	if wallyEnabled == true and type(wallyFolder) == "string" and wallyFolder ~= "" then
-		wallyRootSegments = splitStudioPath(wallyFolder)
-		log("wally generated root: " .. table.concat(wallyRootSegments, "/"))
+		local segments = splitStudioPath(wallyFolder)
+		wallyRootSegments = segments
+		log("wally generated root: " .. table.concat(segments, "/"))
 	end
 end
 

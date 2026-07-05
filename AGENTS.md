@@ -64,11 +64,13 @@ rosync upload ./audio.mp3 ./models --project . --manifest uploaded-assets.json
 rosync upload ./clip.rbxm --project . --asset-type animation
 ```
 
-`rosync upload` reads the Roblox Open Cloud credential from `ROBLOX_API_KEY`
-or the env var passed with `--api-key-env`, and uses the project `groupId` as
-`group:<id>` when `--creator` is omitted. It supports Roblox Open Cloud asset
-types including image, decal, audio, model, mesh, animation, and video. Use
-`--asset-type` for decals and ambiguous `.rbxm`/`.rbxmx` files.
+`rosync upload` reads the Roblox Open Cloud credential from the key saved in
+Ro Sync Settings first. `--api-key-env` is an explicit override; if omitted,
+the CLI falls back to `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and
+`ROBLOX_OPEN_CLOUD_API_KEY`. It uses the project `groupId` as `group:<id>` when
+`--creator` is omitted. It supports Roblox Open Cloud asset types including
+image, decal, audio, model, mesh, animation, and video. Use `--asset-type` for
+decals and ambiguous `.rbxm`/`.rbxmx` files.
 
 ## 0b. Refreshing agent docs
 
@@ -224,10 +226,10 @@ rosync lint --project . --luau-lsp /path/to/luau-lsp
 ## 5c. Asset uploads
 
 `rosync upload` uploads assets through Roblox Open Cloud Assets. It does not
-require the daemon or Studio to be connected. The API key is read from
-`ROBLOX_API_KEY` or the env var passed with `--api-key-env`. If `--creator` is
-omitted, Ro Sync uses the project
-`groupId` from `ro-sync.json` or the active widget project.
+require the daemon or Studio to be connected. The API key is read from Ro Sync
+Settings first; `--api-key-env` is only an explicit override. If `--creator` is
+omitted, Ro Sync uses the project `groupId` from `ro-sync.json` or the active
+widget project.
 
 ```
 rosync upload ./icon.png --creator user:123456
@@ -416,8 +418,10 @@ usually worse for agent reasoning. Use this flow instead:
    about to use.
 6. Prefer cheap offline commands for path lookup, but do not let disk-only
    inference override live Studio reads.
-7. Never run mutating commands from an LLM workflow without a read-only
-   `rosync plan` when plan coverage exists.
+7. Before mutating Studio from an LLM workflow, inspect the exact live target
+   with focused read-only commands and confirm explicit user intent. Use
+   `rosync plan` only when a dry-run explanation is useful; do not treat it as
+   a mandatory ritual.
 
 Special-case commands:
 
@@ -487,8 +491,8 @@ Preferred workflow snippets:
 - Inspect one object: `meta` -> `get --prop` or `props`; use local files for script source.
 - Find code: `rg`/local file reads first; use `where`/`query` when mapping Studio names.
 - Verify touched scripts: local read + focused `rosync lint --path`.
-- Resolve conflict: only after a conflict is reported, use `conflicts` -> `plan resolve` -> explicit `resolve`.
-- Write Studio: `plan set|new|rm|mv` -> user confirmation -> mutating command, preferably with a waypoint for batches.
+- Resolve conflict: only after a conflict is reported, inspect `conflicts` -> explicit `resolve`.
+- Write Studio: inspect target with `meta`/`get`/`tree` -> user confirmation -> mutating command, preferably with a waypoint for batches.
 - Upload/Open Cloud: enumerate files or `monetization discover/list` first; avoid recursive/bulk writes until the target set is clear.
 
 Two write-path flags every agent should know:

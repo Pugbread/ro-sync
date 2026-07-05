@@ -171,9 +171,17 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // closed", which the mpsc flags automatically once the receiver is dropped.
     let mut routes = state.pending_routes.lock().unwrap();
     routes.retain(|_, sink| !sink.is_closed());
-    let mut active = state.active_plugin.lock().unwrap();
-    if *active == Some(conn_id) {
-        *active = None;
+    let disconnected_plugin = {
+        let mut active = state.active_plugin.lock().unwrap();
+        if *active == Some(conn_id) {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    };
+    if disconnected_plugin {
+        publish_plugin_state(&state, false);
     }
 }
 
@@ -194,13 +202,14 @@ async fn recv_loop(
                 _ if rejecting => {}
                 Ok(ClientMsg::Hello { client_id, role }) => {
                     if is_plugin_client(role.as_deref(), client_id.as_deref()) {
-                        let already_active = {
+                        let (already_active, became_active) = {
                             let mut active = state.active_plugin.lock().unwrap();
                             match *active {
-                                Some(existing) if existing != conn_id => true,
+                                Some(existing) if existing != conn_id => (true, false),
+                                Some(_) => (false, false),
                                 _ => {
                                     *active = Some(conn_id);
-                                    false
+                                    (false, true)
                                 }
                             }
                         };
@@ -215,6 +224,9 @@ async fn recv_loop(
                             let _ = out_tx.send(Message::Close(None));
                             rejecting = true;
                             continue;
+                        }
+                        if became_active {
+                            publish_plugin_state(&state, true);
                         }
                     }
                 }
@@ -368,7 +380,12 @@ async fn send_loop(
                         // send). The watch_tx branch above already emitted a
                         // plugin-shape op for the same event, so drop the dup.
                         if has_type(&s, "op") { continue; }
+                        let is_shutdown = has_type(&s, "shutdown");
                         if sender.send(Message::Text(s)).await.is_err() { break; }
+                        if is_shutdown {
+                            let _ = sender.send(Message::Close(None)).await;
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let _ = send_ws_msg(&mut sender, &ServerMsg::Lagged).await;
@@ -399,13 +416,22 @@ fn is_plugin_client(role: Option<&str>, client_id: Option<&str>) -> bool {
     match role {
         Some("plugin") | Some("studio-plugin") | Some("roblox-plugin") => return true,
         Some("cli") | Some("watch") | Some("agent") => return false,
-        Some(_) | None => {}
+        Some(_) => return false,
+        None => {}
     }
 
-    !matches!(
-        client_id.unwrap_or(""),
-        "rosync-cli" | "rosync-watch" | "cli" | "watch"
-    )
+    let client_id = client_id.unwrap_or("").trim();
+    !client_id.is_empty() && client_id.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn publish_plugin_state(state: &AppState, connected: bool) {
+    let _ = state.events.send(
+        serde_json::json!({
+            "type": "plugin",
+            "connected": connected,
+        })
+        .to_string(),
+    );
 }
 
 async fn send_ws_msg(
@@ -574,7 +600,7 @@ mod tests {
         let (mut plugin, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         plugin
             .send(tungstenite::Message::Text(
-                r#"{"type":"hello","clientId":"plugin"}"#.into(),
+                r#"{"type":"hello","clientId":"plugin","role":"plugin"}"#.into(),
             ))
             .await
             .unwrap();
@@ -708,7 +734,7 @@ mod tests {
         let (mut plugin, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         plugin
             .send(tungstenite::Message::Text(
-                r#"{"type":"hello","clientId":"plugin"}"#.into(),
+                r#"{"type":"hello","clientId":"plugin","role":"plugin"}"#.into(),
             ))
             .await
             .unwrap();

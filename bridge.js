@@ -18,10 +18,12 @@ function nextId() {
   return "r" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+let setStateQueue = Promise.resolve();
+
 // `payload.timeoutMs` — optional override for the default 30s timeout, for
 // long-running ops like `cargo build`. The timeoutMs key is NOT forwarded to
 // the host; it only controls our local pending-promise expiry.
-export function t64(type, payload = {}) {
+function postT64(type, payload = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId();
     const { timeoutMs = 30000, ...forwarded } = payload || {};
@@ -40,6 +42,18 @@ export function t64(type, payload = {}) {
       reject(err);
     }
   });
+}
+
+export function t64(type, payload = {}) {
+  if (type !== "t64:set-state") return postT64(type, payload);
+
+  // Terminal 64 persists widget keys into one state file. Serializing writes
+  // from this iframe prevents rapid `state` saves from racing separate
+  // `secrets` saves and making top-level keys appear/disappear.
+  const run = () => postT64(type, payload);
+  const result = setStateQueue.then(run, run);
+  setStateQueue = result.catch(() => {});
+  return result;
 }
 
 export function onT64(type, fn) {

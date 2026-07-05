@@ -421,7 +421,11 @@ fn collect_studio_node(
                 source_path: source_path.to_string(),
                 class: mapped_class.to_string(),
                 kind: kind_for_class(mapped_class),
-                source: if is_script { source_from_node(node) } else { None },
+                source: if is_script {
+                    source_from_node(node)
+                } else {
+                    None
+                },
             },
         );
     }

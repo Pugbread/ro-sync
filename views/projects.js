@@ -146,6 +146,8 @@ export function mountProjects(root, api) {
   let activityParsedOpsInWindow = 0;
   let skippedActivityOps = 0;
   let skippedActivityTimer = 0;
+  let activityErrorCount = 0;
+  let lastActivityErrorAt = 0;
   let disposed = false;
   const activityFrames = [];
 
@@ -925,8 +927,12 @@ export function mountProjects(root, api) {
     try {
       activityWs = daemonWS(base, "/ws", {
         skipRaw: shouldSkipRawActivityFrame,
+        open: () => {
+          activityErrorCount = 0;
+          lastActivityErrorAt = 0;
+        },
         error: () => {
-          pushActivityFrame({ type: "error", message: "activity stream error" });
+          pushActivityStreamError();
         },
         close: () => {},
         message: (data) => {
@@ -941,12 +947,35 @@ export function mountProjects(root, api) {
             });
             return;
           }
+          if (t === "shutdown") {
+            pushActivityFrame({
+              type: "shutdown",
+              message: data.reason ? `daemon shutdown: ${data.reason}` : "daemon shutdown",
+            });
+            closeActivityStream();
+            return;
+          }
           pushActivityFrame(data);
         },
       });
     } catch (e) {
       pushActivityFrame({ type: "error", message: `activity stream failed: ${e.message}` });
     }
+  }
+
+  function pushActivityStreamError() {
+    const now = Date.now();
+    activityErrorCount++;
+    if (lastActivityErrorAt && now - lastActivityErrorAt < 30_000) return;
+    const count = activityErrorCount;
+    activityErrorCount = 0;
+    lastActivityErrorAt = now;
+    pushActivityFrame({
+      type: "error",
+      message: count > 1
+        ? `activity stream error (${count} reconnect attempts)`
+        : "activity stream error",
+    });
   }
 
   function shouldSkipRawActivityFrame(raw) {

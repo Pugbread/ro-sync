@@ -602,9 +602,10 @@ pub struct UploadArgs {
     /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
     #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
     pub auth: ImgAuth,
-    /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
-    #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
-    pub api_key_env: String,
+    /// Optional env var override for the Roblox Open Cloud API key or OAuth token.
+    /// When omitted, Ro Sync uses the saved Settings key first.
+    #[arg(long = "api-key-env")]
+    pub api_key_env: Option<String>,
     /// Return after Roblox accepts the operation instead of polling for the asset id.
     #[arg(long = "no-wait")]
     pub no_wait: bool,
@@ -651,9 +652,10 @@ pub struct ImgArgs {
     /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
     #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
     pub auth: ImgAuth,
-    /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
-    #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
-    pub api_key_env: String,
+    /// Optional env var override for the Roblox Open Cloud API key or OAuth token.
+    /// When omitted, Ro Sync uses the saved Settings key first.
+    #[arg(long = "api-key-env")]
+    pub api_key_env: Option<String>,
     /// Return after Roblox accepts each operation instead of polling for asset ids.
     #[arg(long = "no-wait")]
     pub no_wait: bool,
@@ -689,9 +691,10 @@ pub struct ImgsArgs {
     /// Credential type: API key uses `x-api-key`; bearer uses OAuth access tokens.
     #[arg(long, value_enum, default_value_t = ImgAuth::ApiKey)]
     pub auth: ImgAuth,
-    /// Environment variable that holds the Roblox Open Cloud API key or OAuth token.
-    #[arg(long = "api-key-env", default_value = "ROBLOX_API_KEY")]
-    pub api_key_env: String,
+    /// Optional env var override for the Roblox Open Cloud API key or OAuth token.
+    /// When omitted, Ro Sync uses the saved Settings key first.
+    #[arg(long = "api-key-env")]
+    pub api_key_env: Option<String>,
     /// Return after Roblox accepts each operation instead of polling for asset ids.
     #[arg(long = "no-wait")]
     pub no_wait: bool,
@@ -799,6 +802,8 @@ pub struct MonetizationCommonArgs {
     pub project: Option<PathBuf>,
     #[arg(long = "universe-id")]
     pub universe_id: Option<String>,
+    /// Optional env var override for the Roblox Open Cloud API key.
+    /// When omitted, Ro Sync uses the saved Settings key first.
     #[arg(long = "api-key-env")]
     pub api_key_env: Option<String>,
     #[arg(long)]
@@ -1528,7 +1533,7 @@ pub struct AppState {
 
 /// Duration of the per-path quiet window after a `/push` write.
 pub const PUSH_QUIET_MS: u64 = 1500;
-const WIDGET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const WIDGET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WIDGET_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error::Error>> {
@@ -1939,6 +1944,10 @@ fn spawn_widget_owner_watchdog(state: AppState) {
             let last_seen = *state.widget_last_seen.lock().unwrap();
             if let Some(last_seen) = last_seen {
                 if last_seen.elapsed() > WIDGET_HEARTBEAT_TIMEOUT {
+                    let plugin_connected = state.active_plugin.lock().unwrap().is_some();
+                    if plugin_connected {
+                        continue;
+                    }
                     let _ = state
                         .shutdown_tx
                         .send(Some("widget heartbeat lost".to_string()));
@@ -2146,7 +2155,7 @@ fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
             "cheapFirst": ["tree", "ls", "query", "path", "meta", "services", "status --raw"],
             "targetedReads": ["get --prop", "props", "read local files directly", "lint touched paths"],
             "expensiveReads": ["changes", "diff --raw", "snapshot", "get without --prop", "source live only on suspected divergence", "logs --tail", "watch", "conflicts only when resolving a reported conflict"],
-            "mutationRule": "Use `rosync plan` before supported writes and explicit preflight/list commands before upload or monetization writes."
+            "mutationRule": "Before mutating Studio, inspect the target with focused live reads, use waypoints for multi-step edits, and only run the mutating command after explicit user intent. Use `rosync plan` only when a dry-run explanation is useful."
         },
     });
     if args.full_commands {
@@ -2175,7 +2184,7 @@ fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
         "commands": commands,
         "nextActions": [
             "Use `rosync commands <name>` for exact command usage JSON.",
-            "Use `rosync plan <operation>` before mutating Studio or disk from an LLM workflow.",
+            "Before mutating Studio, inspect the exact target with focused live reads; use `rosync plan` only when a dry-run explanation is useful.",
             "Use `rosync status --raw` or `rosync doctor --raw` when a health check is needed.",
             "Use `rosync changes --raw` before choosing Keep Disk or Keep Studio."
         ],
@@ -2693,7 +2702,7 @@ async fn run_upload_inner(args: UploadArgs) -> Result<(), Box<dyn std::error::Er
             .ok_or("upload: missing creator. Pass --creator user:<id> or group:<id>, set ROBLOX_CREATOR, or set a project Group ID.")?;
         let creator = img_upload::parse_creator(&creator_text)
             .map_err(|e| format!("upload: invalid creator {creator_text:?}: {e}"))?;
-        let api_key = resolve_img_api_key(&args.api_key_env)?;
+        let api_key = resolve_img_api_key(args.api_key_env.as_deref())?;
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
         let mut tasks = futures::stream::FuturesUnordered::new();
@@ -2852,7 +2861,31 @@ fn resolve_monetization_api_key(
         }
     }
 
+    if let Some(env_name) = preferred_env {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    } else if let Some(value) = find_widget_secret("robloxCloudApiKey") {
+        return Ok(value);
+    }
+
+    let env_values = read_project_env_values(project);
+    if let Some(env_name) = preferred_env {
+        if let Some((_, value)) = env_values
+            .iter()
+            .find(|(key, value)| key == env_name && !value.trim().is_empty())
+        {
+            return Ok(value.trim().to_string());
+        }
+    }
+
     for env_name in &env_names {
+        if Some(env_name.as_str()) == preferred_env {
+            continue;
+        }
         if let Ok(value) = std::env::var(env_name) {
             let value = value.trim().to_string();
             if !value.is_empty() {
@@ -2861,8 +2894,10 @@ fn resolve_monetization_api_key(
         }
     }
 
-    let env_values = read_project_env_values(project);
     for env_name in &env_names {
+        if Some(env_name.as_str()) == preferred_env {
+            continue;
+        }
         if let Some((_, value)) = env_values
             .iter()
             .find(|(key, value)| key == env_name && !value.trim().is_empty())
@@ -2876,7 +2911,7 @@ fn resolve_monetization_api_key(
     }
 
     Err(format!(
-        "monetization: missing Roblox Open Cloud API key. Set one of {} or add it to a project env file.",
+        "monetization: missing Roblox Open Cloud API key. Save one in Ro Sync Settings, set one of {}, or add it to a project env file.",
         env_names.join(", ")
     )
     .into())
@@ -4062,20 +4097,53 @@ fn find_bundled_luau_definitions() -> Option<PathBuf> {
     find_in_tool_bases(&rel)
 }
 
-fn resolve_img_api_key(env_name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if let Ok(value) = std::env::var(env_name) {
-        let value = value.trim().to_string();
-        if !value.is_empty() {
+fn resolve_img_api_key(preferred_env: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(env_name) = preferred_env {
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    } else if let Some(value) = find_widget_secret("robloxCloudApiKey") {
+        return Ok(value);
+    }
+
+    let mut env_names = Vec::new();
+    if let Some(env_name) = preferred_env {
+        env_names.push(env_name.to_string());
+    }
+    for env_name in [
+        "ROBLOX_API_KEY",
+        "CLOUD_API_KEY",
+        "ROBLOX_OPEN_CLOUD_API_KEY",
+    ] {
+        if !env_names.iter().any(|existing| existing == env_name) {
+            env_names.push(env_name.to_string());
+        }
+    }
+
+    for env_name in &env_names {
+        if Some(env_name.as_str()) == preferred_env {
+            continue;
+        }
+        if let Ok(value) = std::env::var(env_name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    if preferred_env.is_some() {
+        if let Some(value) = find_widget_secret("robloxCloudApiKey") {
             return Ok(value);
         }
     }
 
-    if let Some(value) = find_widget_secret("robloxCloudApiKey") {
-        return Ok(value);
-    }
-
     Err(format!(
-        "upload: missing Roblox Open Cloud credential. Set {env_name} or pass --api-key-env with a populated environment variable."
+        "upload: missing Roblox Open Cloud credential. Save one in Ro Sync Settings, set one of {}, or pass --api-key-env with a populated environment variable.",
+        env_names.join(", ")
     )
     .into())
 }
@@ -4176,6 +4244,21 @@ fn secret_from_widget_state(value: &serde_json::Value, key: &str) -> Option<Stri
 
 fn widget_state_file_candidates() -> Vec<PathBuf> {
     let mut bases = Vec::new();
+    let mut files = Vec::new();
+
+    if let Ok(path) = std::env::var("ROSYNC_WIDGET_STATE") {
+        push_unique_path(&mut files, PathBuf::from(path));
+    }
+    if let Some(home) = dirs::home_dir() {
+        push_unique_path(
+            &mut files,
+            home.join(".terminal64")
+                .join("widgets")
+                .join("ro-sync")
+                .join("state.json"),
+        );
+    }
+
     if let Ok(cwd) = std::env::current_dir() {
         push_ancestors(&mut bases, cwd);
     }
@@ -4199,14 +4282,16 @@ fn widget_state_file_candidates() -> Vec<PathBuf> {
         }
     }
 
-    let mut files = Vec::new();
     for base in bases {
-        let candidate = base.join("state.json");
-        if !files.contains(&candidate) {
-            files.push(candidate);
-        }
+        push_unique_path(&mut files, base.join("state.json"));
     }
     files
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
 }
 
 fn push_exe_ancestors(paths: &mut Vec<PathBuf>, exe: &std::path::Path) {
@@ -6601,8 +6686,13 @@ fn command_prefer_before(name: &str) -> Vec<&'static str> {
         ],
         "diff" | "changes" => vec!["lint touched paths first", "status --raw", "services --raw"],
         "snapshot" => vec!["tree --depth 3", "changes"],
-        "set" | "new" | "rm" | "mv" => vec!["plan"],
-        "resolve" => vec!["conflicts only when resolving", "plan resolve"],
+        "set" | "new" | "rm" | "mv" => {
+            vec!["meta/get target first", "waypoint for multi-step edits"]
+        }
+        "resolve" => vec![
+            "conflicts only when resolving",
+            "inspect pending conflict first",
+        ],
         "decision" => vec!["decision without flags to inspect pending choice first"],
         "attr" | "tag" | "call" | "eval" | "transmit" | "select" | "save" => {
             vec!["status --raw", "waypoint for multi-step edits"]
@@ -8025,7 +8115,7 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
         assert_eq!(args.inputs, vec![PathBuf::from("icon.png")]);
         assert_eq!(args.project.unwrap(), PathBuf::from("."));
         assert_eq!(args.auth, ImgAuth::Bearer);
-        assert_eq!(args.api_key_env, "ROBLOX_OAUTH_TOKEN");
+        assert_eq!(args.api_key_env.as_deref(), Some("ROBLOX_OAUTH_TOKEN"));
         assert_eq!(args.asset_type, None);
     }
 
@@ -8086,7 +8176,7 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
         assert_eq!(args.path, PathBuf::from("icon.png"));
         assert_eq!(args.project.unwrap(), PathBuf::from("."));
         assert_eq!(args.auth, ImgAuth::Bearer);
-        assert_eq!(args.api_key_env, "ROBLOX_OAUTH_TOKEN");
+        assert_eq!(args.api_key_env.as_deref(), Some("ROBLOX_OAUTH_TOKEN"));
     }
 
     #[test]

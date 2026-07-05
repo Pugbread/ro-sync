@@ -211,6 +211,14 @@ async fn widget_close(State(state): State<AppState>, body: Bytes) -> Json<Value>
         .reason
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or_else(|| "widget closed".to_string());
+    if state.active_plugin.lock().unwrap().is_some() {
+        return Json(json!({
+            "ok": true,
+            "reason": reason,
+            "keptAlive": true,
+            "pluginConnected": true,
+        }));
+    }
     let _ = state.shutdown_tx.send(Some(reason.clone()));
     Json(json!({ "ok": true, "reason": reason }))
 }
@@ -255,9 +263,12 @@ struct Hello {
     wally_folder: Option<String>,
     #[serde(rename = "widgetOwned")]
     widget_owned: bool,
+    #[serde(rename = "pluginConnected")]
+    plugin_connected: bool,
 }
 
 async fn hello(State(state): State<AppState>) -> Json<Hello> {
+    let plugin_connected = state.active_plugin.lock().unwrap().is_some();
     Json(Hello {
         name: state.project_name.read().unwrap().clone(),
         version: env!("CARGO_PKG_VERSION"),
@@ -268,6 +279,7 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         wally_enabled: *state.wally_enabled.read().unwrap(),
         wally_folder: state.wally_folder.read().unwrap().clone(),
         widget_owned: state.widget_owned,
+        plugin_connected,
     })
 }
 
@@ -642,11 +654,13 @@ async fn snapshot(
         }
     };
     let bootstrap = services.is_empty();
+    let plugin_connected = state.active_plugin.lock().unwrap().is_some();
     Json(json!({
         "services": services,
         "bootstrap": bootstrap,
         "strict": params.strict,
         "forcePrune": params.force_prune,
+        "pluginConnected": plugin_connected,
     }))
 }
 
@@ -1825,14 +1839,15 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
 
     match op.kind {
         OpKind::Delete => {
-            let target_segs = segs_to_instance_path(&segs)?;
+            let target_lookup_segs = segs_to_lookup_path(&segs)?;
+            let target_name_segs = segs_to_instance_path(&segs)?;
             if deleted_path_is_shadowed_ignored_folder(root, &segs, &op.path) {
                 return None;
             }
-            if path_is_avoid_synced(root, &target_segs) {
+            if path_is_avoid_synced(root, &target_name_segs) {
                 return None;
             }
-            Some(json!({ "op": "delete", "path": target_segs }))
+            Some(json!({ "op": "delete", "path": target_lookup_segs }))
         }
         OpKind::Rename => {
             if is_empty_plain_folder(&op.path).unwrap_or(false) {
@@ -1851,21 +1866,23 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
             if !is_synced_service_segment(&from_segs_fs[0]) {
                 return None;
             }
-            let from_inst = segs_to_instance_path(&from_segs_fs)?;
-            let to_inst = segs_to_instance_path(&segs)?;
-            if path_is_avoid_synced(root, &from_inst) || path_is_avoid_synced(root, &to_inst) {
+            let from_lookup = segs_to_lookup_path(&from_segs_fs)?;
+            let to_naming = segs_to_naming_path(&segs)?;
+            let from_name = segs_to_instance_path(&from_segs_fs)?;
+            let to_name = segs_to_instance_path(&segs)?;
+            if path_is_avoid_synced(root, &from_name) || path_is_avoid_synced(root, &to_name) {
                 return None;
             }
             let from_script = script_identity_from_segments(root, &from_segs_fs, from_path);
             let to_script = script_identity_from_segments(root, &segs, &op.path);
-            if let (Some((from_path, from_class)), Some((to_path, to_class))) =
+            if let (Some((from_lookup_path, _, from_class)), Some((_, to_naming_path, to_class))) =
                 (from_script, to_script)
             {
                 if from_class != to_class {
                     return Some(json!({
                         "op": "class_change",
-                        "path": from_path,
-                        "to": to_path,
+                        "path": from_lookup_path,
+                        "to": to_naming_path,
                         "class": to_class,
                         "properties": { "Source": source_for_path(&op.path, op.content.as_deref()) },
                     }));
@@ -1876,8 +1893,8 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
             //   (b) cross-parent move  → reparent + maybe rename.
             Some(json!({
                 "op": "rename",
-                "from": from_inst,
-                "to": to_inst,
+                "from": from_lookup,
+                "to": to_naming,
             }))
         }
         OpKind::Add | OpKind::Update => {
@@ -1893,16 +1910,18 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                 }) = Some(&parent_inst).filter(|i| i.is_script_with_children)
                 {
                     let parent_segs_fs: Vec<String> = segs[..segs.len() - 1].to_vec();
-                    let inst_segs = segs_to_instance_path(&parent_segs_fs)?;
-                    if path_is_avoid_synced(root, &inst_segs) {
+                    let inst_lookup_segs = segs_to_lookup_path(&parent_segs_fs)?;
+                    let inst_naming_segs = segs_to_naming_path(&parent_segs_fs)?;
+                    let inst_name_segs = segs_to_instance_path(&parent_segs_fs)?;
+                    if path_is_avoid_synced(root, &inst_name_segs) {
                         return None;
                     }
                     let content = op.content.as_deref().unwrap_or(b"");
                     let source = String::from_utf8_lossy(content).to_string();
                     return Some(json!({
                         "op": "class_change",
-                        "path": inst_segs,
-                        "to": inst_segs,
+                        "path": inst_lookup_segs,
+                        "to": inst_naming_segs,
                         "class": parent_inst.class,
                         "properties": { "Source": source },
                     }));
@@ -1923,10 +1942,11 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                 return None;
             }
             let parent_segs_fs: Vec<String> = segs[..segs.len() - 1].to_vec();
-            let parent_inst_segs = segs_to_instance_path(&parent_segs_fs).unwrap_or_default();
-            let inst_segs = segs_to_instance_path(&segs)?;
-            if path_is_avoid_synced(root, &parent_inst_segs)
-                || path_is_avoid_synced(root, &inst_segs)
+            let parent_lookup_segs = segs_to_lookup_path(&parent_segs_fs).unwrap_or_default();
+            let parent_name_segs = segs_to_instance_path(&parent_segs_fs).unwrap_or_default();
+            let inst_name_segs = segs_to_instance_path(&segs)?;
+            if path_is_avoid_synced(root, &parent_name_segs)
+                || path_is_avoid_synced(root, &inst_name_segs)
             {
                 return None;
             }
@@ -1940,7 +1960,7 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
             }
             Some(json!({
                 "op": "set",
-                "path": parent_inst_segs,
+                "path": parent_lookup_segs,
                 "node": {
                     "class": inst.class,
                     "name": inst.name,
@@ -1956,30 +1976,42 @@ fn script_identity_from_segments(
     root: &Path,
     segs: &[String],
     fs_path: &Path,
-) -> Option<(Vec<String>, String)> {
+) -> Option<(Vec<String>, Vec<String>, String)> {
     let fname = segs.last()?;
     if let Some((script_class, _)) = parse_init_file(fname) {
         let parent_segs = &segs[..segs.len().saturating_sub(1)];
-        let instance_path = if let Some(parent) = fs_path.parent() {
+        let mut naming_path = if let Some(parent) = fs_path.parent() {
             path_to_instance_meta(parent)
                 .ok()
                 .flatten()
                 .and_then(|inst| {
-                    let mut out = segs_to_instance_path(parent_segs)?;
+                    let mut out = segs_to_naming_path(parent_segs)?;
                     let last = out.last_mut()?;
                     *last = inst.name;
                     Some(out)
                 })
-                .or_else(|| segs_to_instance_path(parent_segs))
+                .or_else(|| segs_to_naming_path(parent_segs))
         } else {
-            segs_to_instance_path(parent_segs)
+            segs_to_naming_path(parent_segs)
         }?;
-        return Some((instance_path, script_class.class_name().to_string()));
+        if let Some(parent) = fs_path.parent() {
+            if let Ok(Some(inst)) = path_to_instance_meta(parent) {
+                if let Some(last) = naming_path.last_mut() {
+                    *last = inst.name;
+                }
+            }
+        }
+        return Some((
+            segs_to_lookup_path(parent_segs)?,
+            naming_path,
+            script_class.class_name().to_string(),
+        ));
     }
 
     if let Some((script_class, _)) = classify_script_file(fname) {
         return Some((
-            segs_to_instance_path(segs)?,
+            segs_to_lookup_path(segs)?,
+            segs_to_naming_path(segs)?,
             script_class.class_name().to_string(),
         ));
     }
@@ -1991,7 +2023,11 @@ fn script_identity_from_segments(
         .collect();
     let inst = path_to_instance_meta(fs_path).ok().flatten()?;
     if inst.script_class.is_some() {
-        return Some((segs_to_instance_path(&rel_segs)?, inst.class));
+        return Some((
+            segs_to_lookup_path(&rel_segs)?,
+            segs_to_naming_path(&rel_segs)?,
+            inst.class,
+        ));
     }
     None
 }
@@ -2137,6 +2173,57 @@ fn segs_to_instance_path(segs: &[String]) -> Option<Vec<String>> {
         out.push(crate::fs_map::decode_name(&name));
     }
     Some(out)
+}
+
+/// Convert filesystem segments to plugin lookup segments. Unlike
+/// `segs_to_instance_path`, this preserves generated duplicate suffixes such as
+/// `Foo [1]` so the Studio plugin can resolve the exact sibling.
+fn segs_to_lookup_path(segs: &[String]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(segs.len());
+    for (i, s) in segs.iter().enumerate() {
+        if i == 0 {
+            out.push(fs_segment_instance_name(s));
+        } else {
+            out.push(fs_segment_lookup_name(s));
+        }
+    }
+    Some(out)
+}
+
+/// Convert filesystem segments to a path whose parents are lookup-safe but
+/// whose final segment is the actual Roblox instance name. This is used for
+/// rename/class-change destinations, where the parent may need disambiguation
+/// but the final segment becomes `Instance.Name`.
+fn segs_to_naming_path(segs: &[String]) -> Option<Vec<String>> {
+    let mut out = segs_to_lookup_path(segs)?;
+    if let (Some(last), Some(source_last)) = (out.last_mut(), segs.last()) {
+        *last = fs_segment_instance_name(source_last);
+    }
+    Some(out)
+}
+
+fn fs_segment_lookup_name(segment: &str) -> String {
+    if let Some((_, stem)) = classify_script_file(segment) {
+        crate::fs_map::decode_name(&stem)
+    } else {
+        crate::fs_map::decode_name(segment)
+    }
+}
+
+fn fs_segment_instance_name(segment: &str) -> String {
+    if let Some((_, stem)) = classify_script_file(segment) {
+        let name = match parse_disambiguated(&stem) {
+            Some((n, _)) => n,
+            None => stem,
+        };
+        crate::fs_map::decode_name(&name)
+    } else {
+        let name = match parse_disambiguated(segment) {
+            Some((n, _)) => n,
+            None => segment.to_string(),
+        };
+        crate::fs_map::decode_name(&name)
+    }
 }
 
 fn fs_mtime(path: &Path) -> u64 {
@@ -2481,6 +2568,110 @@ mod tests {
         };
 
         assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
+    }
+
+    #[test]
+    fn fs_delete_preserves_duplicate_lookup_segment() {
+        let d = TempDir::new("fs-delete-duplicate-lookup");
+        let root = d.path().join("Workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let duplicate = root.join("Controller [1].luau");
+
+        let op = Op {
+            kind: OpKind::Delete,
+            path: duplicate,
+            from: None,
+            content: None,
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).unwrap();
+        assert_eq!(plugin_op["op"], "delete");
+        assert_eq!(
+            plugin_op["path"],
+            serde_json::json!(["Workspace", "Controller [1]"])
+        );
+    }
+
+    #[test]
+    fn fs_set_under_duplicate_parent_uses_lookup_parent() {
+        let d = TempDir::new("fs-set-duplicate-parent");
+        let duplicate_parent = d.path().join("Workspace").join("Rig [1]");
+        std::fs::create_dir_all(&duplicate_parent).unwrap();
+        let child = duplicate_parent.join("Animate.client.luau");
+        std::fs::write(&child, "print('animate')\n").unwrap();
+
+        let op = Op {
+            kind: OpKind::Update,
+            path: child,
+            from: None,
+            content: Some(b"print('animate')\n".to_vec()),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).unwrap();
+        assert_eq!(plugin_op["op"], "set");
+        assert_eq!(
+            plugin_op["path"],
+            serde_json::json!(["Workspace", "Rig [1]"])
+        );
+        assert_eq!(plugin_op["node"]["name"], "Animate");
+        assert_eq!(plugin_op["node"]["class"], "LocalScript");
+    }
+
+    #[test]
+    fn fs_rename_uses_duplicate_lookup_source_and_actual_destination_name() {
+        let d = TempDir::new("fs-rename-duplicate-lookup");
+        let root = d.path().join("Workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let from = root.join("Controller [1].luau");
+        let to = root.join("ControllerRenamed.luau");
+        std::fs::write(&to, "return {}\n").unwrap();
+
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: Some(b"return {}\n".to_vec()),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).unwrap();
+        assert_eq!(plugin_op["op"], "rename");
+        assert_eq!(
+            plugin_op["from"],
+            serde_json::json!(["Workspace", "Controller [1]"])
+        );
+        assert_eq!(
+            plugin_op["to"],
+            serde_json::json!(["Workspace", "ControllerRenamed"])
+        );
+    }
+
+    #[test]
+    fn fs_class_change_uses_duplicate_lookup_but_actual_destination_name() {
+        let d = TempDir::new("fs-class-change-duplicate-lookup");
+        let root = d.path().join("Workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let from = root.join("Controller [1].luau");
+        let to = root.join("Controller [1].client.luau");
+        std::fs::write(&to, "print('client')\n").unwrap();
+
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: Some(b"print('client')\n".to_vec()),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).unwrap();
+        assert_eq!(plugin_op["op"], "class_change");
+        assert_eq!(
+            plugin_op["path"],
+            serde_json::json!(["Workspace", "Controller [1]"])
+        );
+        assert_eq!(
+            plugin_op["to"],
+            serde_json::json!(["Workspace", "Controller"])
+        );
+        assert_eq!(plugin_op["class"], "LocalScript");
     }
 
     #[test]
