@@ -433,6 +433,9 @@ pub struct CapturePhotoArgs {
     /// Frame the original target in place instead of a script-free isolated clone.
     #[arg(long)]
     pub include_world: bool,
+    /// Preserve the camera-framed canvas instead of tightly cropping an isolated transparent --focus capture.
+    #[arg(long, requires = "focus")]
+    pub no_tight_crop: bool,
     /// Choose whether in-game UI is excluded, overlaid on the scene, or captured alone with transparency.
     #[arg(long, value_enum)]
     pub ui: Option<CapturePhotoUiMode>,
@@ -473,6 +476,9 @@ pub struct CaptureSceneArgs {
     pub size: String,
     #[arg(long, value_enum, default_value_t = CaptureResampleMode::Default)]
     pub resample: CaptureResampleMode,
+    /// Preserve the camera-framed canvas instead of tightly cropping the isolated subject.
+    #[arg(long)]
+    pub no_tight_crop: bool,
     #[arg(long, default_value = "rosync-scene.png")]
     pub output: PathBuf,
     #[arg(long, default_value_t = 120.0)]
@@ -8855,7 +8861,11 @@ async fn run_capture_scene(args: CaptureSceneArgs) -> Result<(), Box<dyn std::er
     if args.resample != CaptureResampleMode::Default {
         return Err("capture scene: --resample pixelated is not supported by the Photo engine; use `capture photo` and resize the PNG after capture".into());
     }
-    run_capture_photo(CapturePhotoArgs {
+    run_capture_photo(capture_scene_photo_args(args)).await
+}
+
+fn capture_scene_photo_args(args: CaptureSceneArgs) -> CapturePhotoArgs {
+    CapturePhotoArgs {
         project: args.project,
         port: args.port,
         focus: Some(args.focus),
@@ -8869,6 +8879,7 @@ async fn run_capture_scene(args: CaptureSceneArgs) -> Result<(), Box<dyn std::er
         background: CapturePhotoBackground::Transparent,
         alpha_bleed: true,
         include_world: false,
+        no_tight_crop: args.no_tight_crop,
         ui: None,
         ui_target: None,
         include_ui: false,
@@ -8876,8 +8887,7 @@ async fn run_capture_scene(args: CaptureSceneArgs) -> Result<(), Box<dyn std::er
         output: args.output,
         timeout: args.timeout,
         raw: args.raw,
-    })
-    .await
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -8902,6 +8912,8 @@ struct PhotoPrepared {
     field_of_view: Option<f64>,
     #[serde(default)]
     isolated: Option<bool>,
+    #[serde(default, rename = "tightCrop")]
+    tight_crop: Option<bool>,
     #[serde(default, rename = "fullSize")]
     full_size: Option<serde_json::Value>,
     #[serde(default)]
@@ -9020,6 +9032,10 @@ fn build_capture_photo_request(
     );
     request.insert("alphaBleed".into(), serde_json::json!(args.alpha_bleed));
     request.insert(
+        "tightCrop".into(),
+        serde_json::json!(capture_photo_uses_tight_crop(args)),
+    );
+    request.insert(
         "uiMode".into(),
         serde_json::Value::String(ui_mode.as_wire_str().to_string()),
     );
@@ -9079,6 +9095,13 @@ fn build_capture_photo_request(
         );
     }
     request
+}
+
+fn capture_photo_uses_tight_crop(args: &CapturePhotoArgs) -> bool {
+    args.focus.is_some()
+        && !args.include_world
+        && !args.no_tight_crop
+        && args.background == CapturePhotoBackground::Transparent
 }
 
 fn validate_photo_dimensions(width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -9201,6 +9224,9 @@ async fn run_capture_photo(args: CapturePhotoArgs) -> Result<(), Box<dyn std::er
     if args.delay >= args.timeout {
         return Err("capture photo: --delay must be shorter than --timeout".into());
     }
+    if args.no_tight_crop && args.focus.is_none() {
+        return Err("capture photo: --no-tight-crop requires --focus".into());
+    }
     if let Some(ui_target) = &args.ui_target {
         if ui_target.trim().is_empty() {
             return Err(
@@ -9302,6 +9328,7 @@ async fn run_capture_photo(args: CapturePhotoArgs) -> Result<(), Box<dyn std::er
         .as_deref()
         .map(parse_capture_camera_cframe)
         .transpose()?;
+    let tight_crop = capture_photo_uses_tight_crop(&args);
 
     let request =
         build_capture_photo_request(&args, ui_mode, region, size, direction, camera_cframe);
@@ -9310,7 +9337,11 @@ async fn run_capture_photo(args: CapturePhotoArgs) -> Result<(), Box<dyn std::er
     let mut photo_remote =
         capture_remote_session_connect_until(args.port, work_deadline, "capture photo connect")
             .await?;
-    if ui_mode == CapturePhotoUiMode::Only || camera_cframe.is_some() || args.ui_target.is_some() {
+    if ui_mode == CapturePhotoUiMode::Only
+        || camera_cframe.is_some()
+        || args.ui_target.is_some()
+        || tight_crop
+    {
         let capability_response = capture_remote_session_request_until(
             &mut photo_remote,
             "capabilities",
@@ -9345,6 +9376,12 @@ async fn run_capture_photo(args: CapturePhotoArgs) -> Result<(), Box<dyn std::er
         if ui_mode == CapturePhotoUiMode::Only && !supported("photoUiOnly") {
             return Err(
                 "capture photo: the connected Studio plugin does not support --ui only; reinstall the current Ro Sync plugin and reload Studio"
+                    .into(),
+            );
+        }
+        if tight_crop && !supported("photoInstanceTightCrop") {
+            return Err(
+                "capture photo: the connected Studio plugin does not support automatic instance tight-cropping; reinstall the current Ro Sync plugin and reload Studio, or pass --no-tight-crop"
                     .into(),
             );
         }
@@ -9501,6 +9538,7 @@ async fn run_capture_photo(args: CapturePhotoArgs) -> Result<(), Box<dyn std::er
                     "uiTargetClass": prepared.ui_target_class,
                     "fieldOfView": prepared.field_of_view,
                     "isolated": prepared.isolated,
+                    "tightCrop": prepared.tight_crop,
                     "fullSize": prepared.full_size,
                     "region": prepared.region,
                     "regionSource": prepared.region_source,
@@ -15446,6 +15484,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
         assert_eq!(args.background, CapturePhotoBackground::Transparent);
         assert!(!args.alpha_bleed);
         assert!(!args.include_world);
+        assert!(!args.no_tight_crop);
         assert!(args.ui.is_none());
         assert!(args.ui_target.is_none());
         assert!(!args.include_ui);
@@ -15480,6 +15519,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             "uiTarget": "StarterGui/Hud/Panel",
             "uiTargetClass": "Frame",
             "fieldOfView": 45,
+            "tightCrop": false,
             "regionSource": "ui-target"
         }))
         .unwrap();
@@ -15496,7 +15536,57 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
         assert_eq!(prepared.ui_target.as_deref(), Some("StarterGui/Hud/Panel"));
         assert_eq!(prepared.ui_target_class.as_deref(), Some("Frame"));
         assert_eq!(prepared.field_of_view, Some(45.0));
+        assert_eq!(prepared.tight_crop, Some(false));
         assert_eq!(prepared.region_source.as_deref(), Some("ui-target"));
+    }
+
+    #[test]
+    fn capture_photo_tight_crop_defaults_to_isolated_transparent_focus_only() {
+        let mut args = capture_photo_args_for_validation();
+        assert!(!capture_photo_uses_tight_crop(&args));
+
+        args.focus = Some("Workspace/Car".into());
+        assert!(capture_photo_uses_tight_crop(&args));
+        let request = build_capture_photo_request(
+            &args,
+            CapturePhotoUiMode::None,
+            None,
+            Some([1024, 1024]),
+            None,
+            None,
+        );
+        assert_eq!(request.get("tightCrop"), Some(&serde_json::json!(true)));
+
+        args.no_tight_crop = true;
+        assert!(!capture_photo_uses_tight_crop(&args));
+        args.no_tight_crop = false;
+        args.include_world = true;
+        assert!(!capture_photo_uses_tight_crop(&args));
+        args.include_world = false;
+        args.background = CapturePhotoBackground::Scene;
+        assert!(!capture_photo_uses_tight_crop(&args));
+
+        let request = build_capture_photo_request(
+            &args,
+            CapturePhotoUiMode::None,
+            None,
+            Some([1024, 1024]),
+            None,
+            None,
+        );
+        assert_eq!(request.get("tightCrop"), Some(&serde_json::json!(false)));
+
+        let prepared: PhotoPrepared = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-tight",
+            "width": 1024,
+            "height": 1024,
+            "byteLength": 4_194_304,
+            "tightCrop": true,
+            "regionSource": "subject-alpha"
+        }))
+        .unwrap();
+        assert_eq!(prepared.tight_crop, Some(true));
+        assert_eq!(prepared.region_source.as_deref(), Some("subject-alpha"));
     }
 
     fn capture_photo_args_for_validation() -> CapturePhotoArgs {
@@ -15514,6 +15604,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             background: CapturePhotoBackground::Transparent,
             alpha_bleed: false,
             include_world: false,
+            no_tight_crop: false,
             ui: None,
             ui_target: None,
             include_ui: false,
@@ -15541,6 +15632,41 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
     }
 
     #[tokio::test]
+    async fn capture_photo_no_tight_crop_requires_focus_before_network_io() {
+        assert!(Cli::try_parse_from(["rosync", "capture", "photo", "--no-tight-crop",]).is_err());
+
+        let mut args = capture_photo_args_for_validation();
+        args.no_tight_crop = true;
+        let error = run_capture_photo(args).await.unwrap_err().to_string();
+        assert!(error.contains("--no-tight-crop requires --focus"));
+        assert!(!error.contains("connect"));
+    }
+
+    #[test]
+    fn capture_scene_forwards_tight_crop_default_and_opt_out() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rosync", "capture", "scene", "--focus", "Workspace/Car"];
+            argv.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Some(Command::Capture(args)) = cli.command else {
+                panic!("expected capture command");
+            };
+            let CaptureCommand::Scene(args) = args.command else {
+                panic!("expected capture scene command");
+            };
+            args
+        };
+
+        let photo = capture_scene_photo_args(parse(&[]));
+        assert!(!photo.no_tight_crop);
+        assert!(capture_photo_uses_tight_crop(&photo));
+
+        let photo = capture_scene_photo_args(parse(&["--no-tight-crop"]));
+        assert!(photo.no_tight_crop);
+        assert!(!capture_photo_uses_tight_crop(&photo));
+    }
+
+    #[tokio::test]
     async fn capture_scene_rejects_pixelated_resampling_before_network_io() {
         let error = run_capture_scene(CaptureSceneArgs {
             project: None,
@@ -15550,6 +15676,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             padding: 1.25,
             size: "64x64".into(),
             resample: CaptureResampleMode::Pixelated,
+            no_tight_crop: false,
             output: PathBuf::from("unused.png"),
             timeout: 30.0,
             raw: true,
@@ -15606,6 +15733,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             "scene",
             "--alpha-bleed",
             "--include-world",
+            "--no-tight-crop",
             "--include-ui",
             "--delay",
             "0.25",
@@ -15636,6 +15764,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
         assert_eq!(args.background, CapturePhotoBackground::Scene);
         assert!(args.alpha_bleed);
         assert!(args.include_world);
+        assert!(args.no_tight_crop);
         assert!(args.ui.is_none());
         assert!(args.ui_target.is_none());
         assert!(args.include_ui);

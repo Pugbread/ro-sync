@@ -17,7 +17,13 @@ binding or source folder from the open place. It returns bounded
 `{ buffer, size }` RGBA records, keeping screenshot `EditableImage` objects
 private and destroying them as soon as their pixels have been read. Its UI
 mode can exclude ScreenGuis, preserve them over the scene, or extract the
-edit-mode ScreenGui layer alone as transparent RGBA.
+edit-mode ScreenGui layer alone as transparent RGBA. Isolated transparent
+instance captures tight-crop the rendered subject alpha by default and
+aspect-contain it in any exact requested output size, including exact-CFrame
+views. Callers can disable that behavior to retain the full camera-framed
+render; `capture photo` scene-background and include-world captures remain
+framed, while the isolated transparent `capture scene` alias inherits the
+default crop.
 
 ## Build
 

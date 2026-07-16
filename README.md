@@ -94,6 +94,9 @@ rosync capture photo --project . \
   --padding 1.25 --fov 32 --background transparent --alpha-bleed \
   --delay 0.1 --output ./captures/boss.png --timeout 120 --raw
 rosync capture photo --project . \
+  --focus Workspace/Map/Boss --view isometric --size 1024x1024 \
+  --no-tight-crop --output ./captures/boss-framed.png --raw
+rosync capture photo --project . \
   --focus Workspace/Map/Boss \
   --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --fov 40 \
   --size 1600x900 --background transparent \
@@ -110,14 +113,24 @@ rosync capture photo --project . \
 ```
 
 Photo `--focus` is optional. With a focus, Ro Sync normally makes a script-free
-temporary clone, isolates it from the world, frames it with `--view` or an
-arbitrary `--direction x,y,z`, and produces the exact `--size WIDTHxHEIGHT`.
+temporary clone, isolates it from the world, and frames it with `--view` or an
+arbitrary `--direction x,y,z`. Isolated transparent focus captures tight-crop
+the rendered subject's alpha bounds by default. An exact `--size WIDTHxHEIGHT`
+is preserved by aspect-containing the cropped subject in a transparent canvas;
+raw metadata reports its `region`, `fullSize`, and `regionSource` as
+`subject-alpha`, with `tightCrop: true`. Pass `--no-tight-crop` to keep the
+full camera-framed render.
 `--padding` and `--fov` tune framing. `--include-world` instead frames the
-original target in place. For an authored angle, `--camera-cframe` accepts the
-12 finite values returned by `CFrame:GetComponents()` and preserves that exact
-subject-relative camera position, orientation, and roll for isolated clones;
-with `--include-world`, the same CFrame is used directly in world space. It is
-compatible with `--fov`, and replaces `--view`, `--direction`, and `--padding`.
+original target in place. `capture photo --background scene` and
+`--include-world` captures remain camera-framed rather than alpha-cropped;
+the isolated, transparent `capture scene` compatibility alias inherits the
+default tight crop and accepts the same opt-out. For an authored angle,
+`--camera-cframe` accepts the 12 finite values returned by
+`CFrame:GetComponents()` and preserves that exact subject-relative camera
+position, orientation, and roll for isolated clones; the default tight crop
+still applies. With `--include-world`, the same CFrame is used directly in
+world space. It is compatible with `--fov`, and replaces `--view`,
+`--direction`, and `--padding`.
 
 `--ui overlay` keeps in-game ScreenGui layers over the scene, while `--ui only`
 extracts the edit-mode ScreenGui layer as a transparent RGBA PNG with no 3D

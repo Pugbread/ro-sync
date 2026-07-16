@@ -6175,6 +6175,7 @@ do
 		end
 		local capture
 		local isolated = false
+		local instanceTightCrop = false
 		local fieldOfViewMetadata = nil
 		if focusPath ~= "" then
 			local target = resolveRemotePath(focusPath)
@@ -6198,10 +6199,12 @@ do
 			end
 			fieldOfViewMetadata = fieldOfView
 			isolated = args.isolate ~= false
+			instanceTightCrop = isolated and background == "transparent" and args.tightCrop ~= false
 			capture = Photo.renderInstance(target, {
 				view = tostring(args.view or "isometric"),
 				direction = photoDirection(args.direction),
 				padding = padding,
+				tightCrop = instanceTightCrop,
 				size = outputSize,
 				fieldOfView = fieldOfView,
 				cameraCFrame = cameraCFrame,
@@ -6268,6 +6271,8 @@ do
 				regionSource = "explicit"
 			elseif uiTarget ~= nil then
 				regionSource = "target-alpha"
+			elseif focusPath ~= "" and instanceTightCrop then
+				regionSource = "subject-alpha"
 			elseif focusPath ~= "" then
 				regionSource = "framed"
 			else
@@ -6292,6 +6297,7 @@ do
 			background = background,
 			uiMode = uiMode,
 			isolated = isolated,
+			tightCrop = instanceTightCrop,
 			region = region,
 			fullSize = fullSize,
 			regionSource = regionSource,
@@ -6600,6 +6606,7 @@ do
 				photoUiOnly = photoAvailable,
 				photoCameraCFrame = photoAvailable,
 				photoUiTarget = photoAvailable,
+				photoInstanceTightCrop = photoAvailable,
 				artifactChunks = true,
 				pluginConnection = pluginConnection,
 				studioTest = studioTest,
@@ -6639,6 +6646,7 @@ do
 			photoUiOnlyAvailable = photoAvailable,
 			photoCameraCFrameAvailable = photoAvailable,
 			photoUiTargetAvailable = photoAvailable,
+			photoInstanceTightCropAvailable = photoAvailable,
 			photoAuthorizationRequired = false,
 			permissionPromptRequired = service ~= nil
 				and not canCaptureScreenshot(service)

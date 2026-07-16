@@ -19,6 +19,7 @@ local DEFAULT_TIMEOUT = 30
 local DEFAULT_DELAY = 0.08
 local DEFAULT_SIZE = Vector2.new(1024, 1024)
 local ALPHA_NOISE_FLOOR = 0.04
+local CALIBRATED_ALPHA_NOISE_FLOOR = 1 / 510
 local UI_ALPHA_NOISE_FLOOR = 1 / 510
 
 export type Image = {
@@ -49,6 +50,7 @@ export type RenderInstanceOptions = {
 	direction: Vector3?,
 	cameraCFrame: CFrame?,
 	padding: number?,
+	tightCrop: boolean?,
 	size: Vector2?,
 	fieldOfView: number?,
 	background: "transparent" | "scene"?,
@@ -501,6 +503,10 @@ local function recoverAlpha(dark: RawImage, light: RawImage, exactBackdropEndpoi
 			buffer.writeu8(output, offset, math.floor(math.clamp(recoveredR, 0, 255) + 0.5))
 			buffer.writeu8(output, offset + 1, math.floor(math.clamp(recoveredG, 0, 255) + 0.5))
 			buffer.writeu8(output, offset + 2, math.floor(math.clamp(recoveredB, 0, 255) + 0.5))
+		else
+			buffer.writeu8(output, offset, 0)
+			buffer.writeu8(output, offset + 1, 0)
+			buffer.writeu8(output, offset + 2, 0)
 		end
 		buffer.writeu8(output, offset + 3, alpha)
 	end
@@ -508,7 +514,132 @@ local function recoverAlpha(dark: RawImage, light: RawImage, exactBackdropEndpoi
 	return { size = dark.size, pixels = output }
 end
 
-local function alphaBounds(image: RawImage, deadline: number): Rect
+local function recoverAlphaCalibrated(
+	dark: RawImage,
+	light: RawImage,
+	backdropDark: RawImage,
+	backdropLight: RawImage
+): RawImage
+	if dark.size ~= light.size or dark.size ~= backdropDark.size or dark.size ~= backdropLight.size then
+		error("calibrated background passes returned different dimensions", 2)
+	end
+
+	local width = dark.size.X
+	local height = dark.size.Y
+	local byteLength = width * height * 4
+	local output = dark.pixels
+	for offset = 0, byteLength - 4, 4 do
+		local darkR = buffer.readu8(dark.pixels, offset)
+		local darkG = buffer.readu8(dark.pixels, offset + 1)
+		local darkB = buffer.readu8(dark.pixels, offset + 2)
+		local backdropDarkR = buffer.readu8(backdropDark.pixels, offset)
+		local backdropDarkG = buffer.readu8(backdropDark.pixels, offset + 1)
+		local backdropDarkB = buffer.readu8(backdropDark.pixels, offset + 2)
+		local backdropSpanR = math.max(0, buffer.readu8(backdropLight.pixels, offset) - backdropDarkR)
+		local backdropSpanG = math.max(0, buffer.readu8(backdropLight.pixels, offset + 1) - backdropDarkG)
+		local backdropSpanB = math.max(0, buffer.readu8(backdropLight.pixels, offset + 2) - backdropDarkB)
+		local deltaR = math.max(0, buffer.readu8(light.pixels, offset) - darkR)
+		local deltaG = math.max(0, buffer.readu8(light.pixels, offset + 1) - darkG)
+		local deltaB = math.max(0, buffer.readu8(light.pixels, offset + 2) - darkB)
+
+		local backgroundShare = 0
+		local validChannels = 0
+		local emptyBackdrop = true
+		if backdropSpanR >= 4 then
+			backgroundShare += math.clamp(deltaR / backdropSpanR, 0, 1)
+			validChannels += 1
+			emptyBackdrop = emptyBackdrop and deltaR >= backdropSpanR - 1
+		end
+		if backdropSpanG >= 4 then
+			backgroundShare += math.clamp(deltaG / backdropSpanG, 0, 1)
+			validChannels += 1
+			emptyBackdrop = emptyBackdrop and deltaG >= backdropSpanG - 1
+		end
+		if backdropSpanB >= 4 then
+			backgroundShare += math.clamp(deltaB / backdropSpanB, 0, 1)
+			validChannels += 1
+			emptyBackdrop = emptyBackdrop and deltaB >= backdropSpanB - 1
+		end
+
+		if validChannels == 0 then
+			buffer.writeu8(output, offset, 0)
+			buffer.writeu8(output, offset + 1, 0)
+			buffer.writeu8(output, offset + 2, 0)
+			buffer.writeu8(output, offset + 3, 0)
+			continue
+		end
+
+		local coverage = if emptyBackdrop then 0 else math.clamp(1 - backgroundShare / validChannels, 0, 1)
+		if coverage <= CALIBRATED_ALPHA_NOISE_FLOOR then
+			coverage = 0
+		end
+		local alpha = math.floor(coverage * 255 + 0.5)
+		if alpha > 0 then
+			local encodedCoverage = alpha / 255
+			local recoveredR = (darkR - backdropDarkR * (1 - encodedCoverage)) / encodedCoverage
+			local recoveredG = (darkG - backdropDarkG * (1 - encodedCoverage)) / encodedCoverage
+			local recoveredB = (darkB - backdropDarkB * (1 - encodedCoverage)) / encodedCoverage
+			buffer.writeu8(output, offset, math.floor(math.clamp(recoveredR, 0, 255) + 0.5))
+			buffer.writeu8(output, offset + 1, math.floor(math.clamp(recoveredG, 0, 255) + 0.5))
+			buffer.writeu8(output, offset + 2, math.floor(math.clamp(recoveredB, 0, 255) + 0.5))
+		else
+			buffer.writeu8(output, offset, 0)
+			buffer.writeu8(output, offset + 1, 0)
+			buffer.writeu8(output, offset + 2, 0)
+		end
+		buffer.writeu8(output, offset + 3, alpha)
+	end
+
+	return dark
+end
+
+local function hasBackdropContrast(dark: RawImage, light: RawImage): boolean
+	if dark.size ~= light.size then
+		return false
+	end
+	local spans = { 0, 0, 0 }
+	local byteLength = dark.size.X * dark.size.Y * 4
+	for offset = 0, byteLength - 4, 4 do
+		for channel = 0, 2 do
+			local span = math.max(
+				0,
+				buffer.readu8(light.pixels, offset + channel) - buffer.readu8(dark.pixels, offset + channel)
+			)
+			spans[channel + 1] = math.max(spans[channel + 1], span)
+		end
+		if spans[1] >= 4 and spans[2] >= 4 and spans[3] >= 4 then
+			return true
+		end
+	end
+	return false
+end
+
+local function hasAnyBackdropContrast(dark: RawImage, light: RawImage): boolean
+	if dark.size ~= light.size then
+		return false
+	end
+	local byteLength = dark.size.X * dark.size.Y * 4
+	for offset = 0, byteLength - 4, 4 do
+		for channel = 0, 2 do
+			local difference = buffer.readu8(light.pixels, offset + channel)
+				- buffer.readu8(dark.pixels, offset + channel)
+			if math.abs(difference) >= 4 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function forceOpaque(image: RawImage): RawImage
+	local byteLength = image.size.X * image.size.Y * 4
+	for offset = 3, byteLength - 1, 4 do
+		buffer.writeu8(image.pixels, offset, 255)
+	end
+	return image
+end
+
+local function alphaBounds(image: RawImage, deadline: number, label: string): Rect
 	local width = image.size.X
 	local height = image.size.Y
 	local minimumX = width
@@ -518,7 +649,7 @@ local function alphaBounds(image: RawImage, deadline: number): Rect
 
 	for y = 0, height - 1 do
 		if y % 64 == 0 then
-			assertTime(deadline, "UI target bounds")
+			assertTime(deadline, label .. " bounds")
 		end
 		for x = 0, width - 1 do
 			if buffer.readu8(image.pixels, (y * width + x) * 4 + 3) > 0 then
@@ -531,7 +662,7 @@ local function alphaBounds(image: RawImage, deadline: number): Rect
 	end
 
 	if maximumX < minimumX or maximumY < minimumY then
-		error("UI target rendered no visible pixels", 2)
+		error(label .. " rendered no visible pixels", 2)
 	end
 	return Rect.new(minimumX, minimumY, maximumX + 1, maximumY + 1)
 end
@@ -1010,13 +1141,53 @@ local function captureViewInternal(options: CaptureViewOptions, register: Cleanu
 		local dark = takeScreenshot(deadline, delaySeconds)
 		backdropColor.BackgroundColor3 = Color3.new(1, 1, 1)
 		local light = takeScreenshot(deadline, math.min(delaySeconds, 0.1))
-		raw = recoverAlpha(dark, light, uiMode == "only")
+		if uiMode == "only" then
+			raw = recoverAlpha(dark, light, true)
+		else
+			local recovered, result = pcall(recoverAlpha, dark, light)
+			if recovered then
+				raw = result :: RawImage
+			else
+				local recoveryError = tostring(result)
+				if
+					not string.find(
+						recoveryError,
+						"background passes do not contain enough contrast to recover alpha",
+						1,
+						true
+					)
+				then
+					error(result, 0)
+				end
+				if hasAnyBackdropContrast(dark, light) then
+					error(result, 0)
+				end
+				local backdropSurface = backdropColor.Parent
+				if backdropSurface == nil or not backdropSurface:IsA("SurfaceGui") then
+					error(result, 0)
+				end
+
+				-- An entirely opaque world can legitimately hide every pixel of the
+				-- physical backdrop. Prove that the backdrop path itself still works
+				-- before treating the original pass as an all-opaque image.
+				backdropSurface.AlwaysOnTop = true
+				backdropColor.BackgroundColor3 = Color3.new(0, 0, 0)
+				local probeDark = takeScreenshot(deadline, delaySeconds)
+				backdropColor.BackgroundColor3 = Color3.new(1, 1, 1)
+				local probeLight = takeScreenshot(deadline, math.min(delaySeconds, 0.1))
+				backdropSurface.AlwaysOnTop = false
+				if not hasBackdropContrast(probeDark, probeLight) then
+					error(result, 0)
+				end
+				raw = forceOpaque(dark)
+			end
+		end
 	end
 
 	local selectedRegion = options.region
 	local regionSource = if selectedRegion ~= nil then "explicit" else "full"
 	if selectedRegion == nil and uiTargetLayer ~= nil then
-		selectedRegion = alphaBounds(raw, deadline)
+		selectedRegion = alphaBounds(raw, deadline, "UI target")
 		regionSource = "target-alpha"
 	end
 	local region, outputSize = chooseOutput(raw.size, selectedRegion, options.size)
@@ -1301,6 +1472,7 @@ local function renderIsolated(subject: Instance, options: RenderInstanceOptions,
 	end
 	camera.Focus = boundsCFrame
 
+	local tightCrop = background == "transparent" and options.tightCrop ~= false
 	local raw: RawImage
 	if background == "transparent" then
 		local backdropColor = createBackdrop(camera, register)
@@ -1308,13 +1480,41 @@ local function renderIsolated(subject: Instance, options: RenderInstanceOptions,
 		local dark = takeScreenshot(deadline, delaySeconds)
 		backdropColor.BackgroundColor3 = Color3.new(1, 1, 1)
 		local light = takeScreenshot(deadline, math.min(delaySeconds, 0.1))
-		raw = recoverAlpha(dark, light)
+		if tightCrop and uiMode == "none" then
+			-- The world renderer can remap a distant backdrop unevenly through
+			-- atmosphere and exposure. Capture the same backdrop without the
+			-- temporary subject so alpha is calibrated per pixel. This preserves
+			-- genuinely translucent geometry while removing renderer residue that
+			-- would otherwise expand subject-alpha bounds to the viewport edges.
+			clone.Parent = nil
+			backdropColor.BackgroundColor3 = Color3.new(0, 0, 0)
+			local backdropDark = takeScreenshot(deadline, delaySeconds)
+			backdropColor.BackgroundColor3 = Color3.new(1, 1, 1)
+			local backdropLight = takeScreenshot(deadline, math.min(delaySeconds, 0.1))
+			if hasBackdropContrast(backdropDark, backdropLight) then
+				raw = recoverAlphaCalibrated(dark, light, backdropDark, backdropLight)
+			else
+				raw = recoverAlpha(dark, light)
+			end
+		else
+			raw = recoverAlpha(dark, light)
+		end
 	else
 		raw = takeScreenshot(deadline, delaySeconds)
 	end
 
-	local crop = centerCrop(raw.size, outputAspect)
-	local output = resample(raw, crop, outputSize)
+	local crop: Rect
+	local destination: Rect? = nil
+	local regionSource: string
+	if tightCrop then
+		crop = alphaBounds(raw, deadline, "Photo subject")
+		destination = containedDestination(Vector2.new(crop.Width, crop.Height), outputSize)
+		regionSource = "subject-alpha"
+	else
+		crop = centerCrop(raw.size, outputAspect)
+		regionSource = "framed"
+	end
+	local output = resample(raw, crop, outputSize, destination)
 	if background == "transparent" and options.alphaBleed == true then
 		bleedTransparentRGB(output, outputSize)
 	end
@@ -1324,7 +1524,7 @@ local function renderIsolated(subject: Instance, options: RenderInstanceOptions,
 		buffer = output,
 		region = crop,
 		fullSize = raw.size,
-		regionSource = "framed",
+		regionSource = regionSource,
 	}
 end
 

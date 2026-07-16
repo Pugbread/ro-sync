@@ -441,6 +441,9 @@ rosync capture photo --project . --focus Workspace/Map/Boss \
   --view isometric --size 1024x1024 --padding 1.25 --fov 32 \
   --background transparent --alpha-bleed --output ./captures/boss.png --raw
 rosync capture photo --project . --focus Workspace/Map/Boss \
+  --view isometric --size 1024x1024 --no-tight-crop \
+  --output ./captures/boss-framed.png --raw
+rosync capture photo --project . --focus Workspace/Map/Boss \
   --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --fov 40 \
   --size 1600x900 --output ./captures/boss-exact-camera.png --raw
 rosync capture photo --project . --region 120,80,1280,720 \
@@ -455,11 +458,19 @@ rosync capture scene --project . --focus Workspace/Map/Boss \
 
 Photo `--focus` is optional. With it, Ro Sync normally makes a script-free
 isolated clone and frames it with `--view` or `--direction x,y,z`; use
-`--include-world` to frame the original in place. `--size WIDTHxHEIGHT` is
-exact; `--padding` and `--fov` tune framing. `--camera-cframe` takes the 12
-`CFrame:GetComponents()` values for an exact subject-relative camera pose (or
-an exact world pose with `--include-world`) and works with `--fov`. Without a
-focus, `--region` is
+`--include-world` to frame the original in place. Isolated transparent focus
+captures tight-crop the rendered subject alpha by default. `--size WIDTHxHEIGHT`
+remains exact and aspect-contains the crop in a transparent canvas; raw
+metadata reports `tightCrop: true`, `region`, `fullSize`, and
+`regionSource: "subject-alpha"`. Pass `--no-tight-crop` to retain the full
+camera-framed render. `capture photo --background scene` and include-world
+captures remain framed instead of
+alpha-cropped; the isolated transparent `capture scene` alias inherits the
+default crop and accepts the same opt-out. `--padding` and `--fov` tune framing.
+`--camera-cframe` takes the 12
+`CFrame:GetComponents()` values for an exact subject-relative camera pose and
+still uses the default tight crop (or supplies an exact world pose with
+`--include-world`) and works with `--fov`. Without a focus, `--region` is
 `x,y,width,height` in native viewport pixels. Combine `--region` with `--size`
 to crop an arbitrary viewport or UI rectangle and resample it to exact output
 dimensions. `--background` is `transparent` or `scene`; `--alpha-bleed`

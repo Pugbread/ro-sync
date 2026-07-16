@@ -111,7 +111,8 @@ Its value identifies `pluginVersion` (`2.0.0`), `protocolVersion` (`2`), the
 Studio/host DataModel and place/game IDs, limits, current screenshot permission,
 and feature flags. `features.photo`, `features.photoTransparent`,
 `features.photoUiOnly`, `features.photoCameraCFrame`,
-`features.photoUiTarget`, and the `photoAxis`, `photoPixels`, and
+`features.photoUiTarget`, `features.photoInstanceTightCrop`, and the `photoAxis`,
+`photoPixels`, and
 `photoChunkBytes` limits describe the locally packaged Photo engine
 independently of `features.capture` and Studio screenshot permission. Agents
 should check this document before using an optional Studio API instead of
@@ -133,7 +134,8 @@ Permission-gated screen capture uses the following correlated operations:
 
 - `capture_status` reports API availability, current permission, packaged
   `photoAvailable` / `photoUiOnlyAvailable` /
-  `photoCameraCFrameAvailable` / `photoUiTargetAvailable` state,
+  `photoCameraCFrameAvailable` / `photoUiTargetAvailable` /
+  `photoInstanceTightCropAvailable` state,
   `photoAuthorizationRequired` (`false`), and the cached `providerUnsupported`
   / `providerError` result without prompting.
 - `capture_authorize` explicitly calls Studio's permission request and may
@@ -183,9 +185,9 @@ screenshot artifact lease:
 
 - `photo_prepare` accepts optional `focus`, `nativeRect`, `outputSize`, `view`,
   `direction`, tagged `cameraCFrame`, `padding`, `fieldOfView`, `background`,
-  `alphaBleed`, `isolate`, `uiMode`, `uiTarget`, legacy `hideUI`, `delay`, and
-  `timeoutSeconds`. `cameraCFrame` contains the 12 finite components returned by
-  `CFrame:GetComponents()` and supplies an exact camera pose in place of
+  `alphaBleed`, `isolate`, `tightCrop`, `uiMode`, `uiTarget`, legacy `hideUI`,
+  `delay`, and `timeoutSeconds`. `cameraCFrame` contains the 12 finite
+  components returned by `CFrame:GetComponents()` and supplies an exact camera pose in place of
   automatic view/direction/padding framing. `uiTarget` is a Studio path to a
   `ScreenGui` or `GuiObject`, captures only that subtree, and requires
   `uiMode: "only"`. `nativeRect` is a
@@ -195,10 +197,20 @@ screenshot artifact lease:
   cannot accompany `focus`, and returns the edit-mode ScreenGui layer without
   the 3D world or Studio chrome. For targeted UI without `nativeRect`, the
   engine returns a tight rendered-alpha crop; an explicit rectangle overrides
-  the automatic target bounds.
+  the automatic target bounds. For an isolated focus with a transparent
+  background, `tightCrop` defaults to `true` and crops the rendered subject's
+  alpha bounds. `outputSize` aspect-contains that crop in the exact transparent
+  canvas, including when `cameraCFrame` supplies the view. Set `tightCrop` to
+  `false` (CLI `--no-tight-crop`) to retain the full camera-framed render.
+  `capture photo` requests with a scene background and non-isolated/include-world
+  captures remain framed and are not subject-alpha cropped. The isolated,
+  transparent `capture scene` compatibility alias inherits the tight-crop
+  default and the same opt-out.
 - A successful prepare returns `sessionId`, `width`, `height`, `byteLength`,
-  `background`, `uiMode`, `isolated`, optional `region` / `fullSize`, and target
-  or exact-camera metadata when used. Pixel data is
+  `background`, `uiMode`, `isolated`, `tightCrop`, optional `region` /
+  `fullSize`, and target or exact-camera metadata when used. A focused
+  automatic crop reports `tightCrop: true` and
+  `regionSource: "subject-alpha"`. Pixel data is
   tightly packed RGBA8, so `byteLength` must equal `width * height * 4`.
 - `photo_read` accepts `sessionId`, the exact next `offset`, and optional
   `maxBytes`. It returns `offset`, `nextOffset`, `eof`, and `bytesBase64`.
