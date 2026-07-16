@@ -7,7 +7,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 const SCRIPT_CLASSES: &[&str] = &["Script", "LocalScript", "ModuleScript"];
-const SYNC_CLASSES: &[&str] = &["Folder", "Script", "LocalScript", "ModuleScript"];
 const SUPPRESS_CLASSES: &[&str] = &["Camera", "Terrain", "PlayerScripts", "PackageLink"];
 
 #[derive(Clone, Copy)]
@@ -520,7 +519,7 @@ fn join_path(parent: &str, name: &str) -> String {
 }
 
 fn is_sync_class(class: &str) -> bool {
-    SYNC_CLASSES.contains(&class)
+    crate::sync_scope::contains(class)
 }
 
 fn is_synced_service_node(node: &Value) -> bool {
@@ -625,7 +624,7 @@ mod tests {
             "name": "game",
             "children": [
                 { "class": "ServerStorage", "name": "ServerStorage", "children": [
-                    { "class": "Camera", "name": "Photobooth", "children": [
+                    { "class": "Camera", "name": "PreviewCamera", "children": [
                         { "class": "ModuleScript", "name": "Bindings", "children": [] }
                     ] }
                 ] }
@@ -633,8 +632,8 @@ mod tests {
         });
 
         let studio = collect_studio_tree_nodes(&studio_tree);
-        assert!(!studio.contains_key("ServerStorage/Photobooth"));
-        assert!(!studio.contains_key("ServerStorage/Photobooth/Bindings"));
+        assert!(!studio.contains_key("ServerStorage/PreviewCamera"));
+        assert!(!studio.contains_key("ServerStorage/PreviewCamera/Bindings"));
     }
 
     #[test]

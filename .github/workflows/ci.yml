@@ -9,6 +9,153 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust quality tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon -> target
+
+      - name: Check Rust formatting
+        working-directory: daemon
+        run: cargo fmt --check
+
+      - name: Check Rust lints
+        working-directory: daemon
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Check Luau formatting
+        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Photo.luau plugin-src/src/App.luau
+
+      - name: Install pinned Luau compiler
+        run: |
+          set -euo pipefail
+          compiler="$RUNNER_TEMP/luau-compile"
+          node scripts/install-luau-compiler.mjs --verify-manifest
+          node scripts/install-luau-compiler.mjs \
+            --target linux-x86_64 \
+            --dest "$compiler"
+          test -x "$compiler"
+          echo "LUAU_COMPILE=$compiler" >> "$GITHUB_ENV"
+
+      - name: Install pinned luau-lsp
+        env:
+          LUAU_LSP_VERSION: "1.68.1"
+          LUAU_LSP_UBUNTU_SHA256: "ddb5fe8fd503bbcb76ee439fbd6522efbfe9f0098be5a233401e493c579fc4a9"
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/luau-lsp.zip"
+          install_dir="$RUNNER_TEMP/luau-lsp"
+          curl --fail --location --retry 3 \
+            "https://github.com/JohnnyMorganz/luau-lsp/releases/download/$LUAU_LSP_VERSION/luau-lsp-linux-x86_64.zip" \
+            --output "$archive"
+          echo "$LUAU_LSP_UBUNTU_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$install_dir"
+          unzip -q "$archive" -d "$install_dir"
+          analyzer="$(find "$install_dir" -type f -name luau-lsp -print -quit)"
+          test -n "$analyzer"
+          chmod +x "$analyzer"
+          echo "ROSYNC_LUAU_LSP=$analyzer" >> "$GITHUB_ENV"
+
+      - name: Compile Studio plugin Luau bytecode
+        run: |
+          node scripts/check-luau-bytecode.mjs plugin/Plugin.luau
+          node scripts/check-luau-bytecode.mjs plugin/Photo.luau
+          node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
+
+      - name: Check strict DataModel lint parity
+        working-directory: daemon
+        shell: bash
+        run: |
+          set +e
+          output="$(cargo run --quiet --locked -- lint \
+            --project tests/fixtures/lint-parity \
+            --path ReplicatedStorage/StrictDataModelError.luau \
+            --data-model filesystem \
+            --raw)"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          jq -e '
+            .ok == false and
+            .dataModel.strict == true and
+            .diagnosticCount >= 1 and
+            any(.diagnostics[]; .category == "TypeError")
+          ' <<<"$output"
+
+          set +e
+          output="$(cargo run --quiet --locked -- lint \
+            --project tests/fixtures/lint-parity \
+            --path StarterPlayer/PlayerModule/ExplicitVendorTarget.luau \
+            --data-model filesystem \
+            --raw)"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          jq -e '
+            .diagnosticCount >= 1 and
+            any(.diagnostics[];
+              .path == "StarterPlayer/PlayerModule/ExplicitVendorTarget.luau" and
+              .category == "TypeError")
+          ' <<<"$output"
+
+          set +e
+          output="$(cargo run --quiet --locked -- lint \
+            --project tests/fixtures/lint-parity \
+            --path ReplicatedStorage/RegisterLimit.luau \
+            --data-model filesystem \
+            --compile required \
+            --raw)"
+          status=$?
+          set -e
+          test "$status" -ne 0
+          jq -e '
+            .analyzerDiagnosticCount == 0 and
+            .compiler.optimizationsChecked == [0, 1, 2] and
+            .compilerDiagnosticCount >= 1 and
+            any(.diagnostics[];
+              .stage == "compiler" and
+              .category == "CompileError" and
+              (.message | contains("exceeded limit 200")))
+          ' <<<"$output"
+
+          cargo run --quiet --locked -- lint \
+            --project tests/fixtures/lint-parity \
+            --path ReplicatedStorage/Valid.luau \
+            --data-model filesystem \
+            --raw | jq -e '.ok == true and .diagnosticCount == 0'
+
+      - name: Check widget JavaScript syntax
+        run: |
+          node --check app.js
+          node --check bridge.js
+          node --check platform.js
+          node --check scripts/install-luau-compiler.mjs
+          for file in views/*.js; do node --check "$file"; done
+
+      - name: Install plugin build tools
+        run: |
+          cargo install --locked --version 0.3.2 wally
+          cargo install --locked --version 7.5.1 rojo
+
+      - name: Check generated Studio plugin
+        run: |
+          node plugin/build-plugin.mjs
+          git diff --exit-code -- plugin/Plugin.rbxm
+
+      - name: Check generated command docs
+        run: |
+          node scripts/build-command-docs.mjs
+          git diff --exit-code -- docs/client-commands.generated.json docs/client-commands.md
+
   test:
     strategy:
       fail-fast: false

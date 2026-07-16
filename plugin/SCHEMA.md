@@ -1,161 +1,270 @@
-# Ro Sync value schema
+# Ro Sync wire schema
 
-Shared single source of truth for the type-tagged JSON shapes that flow over
-`/push`, `/poll`, and the WebSocket channel. The **plugin** encodes
-(`encodeValue` / `decodeValue` in `plugin/Plugin.luau`) and the **daemon**
-must decode (and re-encode for reverse direction) with exactly the same shape.
+This document describes the current daemon ↔ Studio plugin protocol. The
+implementation lives in `plugin/Plugin.luau` and `daemon/src/http.rs` /
+`daemon/src/ws.rs`.
 
-> `.meta.json` is **not** a supported artifact in Ro Sync. Property/attribute
-> persistence is intentionally out of scope — only scripts and folder-ish
-> container shapes round-trip to disk. The encodings below are used for
-> in-memory / wire traffic (e.g. `tree.json` skeleton values, `set`/`update`
-> op payloads), not for on-disk meta files.
+Ro Sync only mirrors `Folder`, `Script`, `LocalScript`, and `ModuleScript` to
+disk. `.meta.json` files and arbitrary Roblox properties are not part of the
+filesystem format.
 
-## General rules
+## WebSocket handshake
 
-- **Primitives pass through unwrapped.** `boolean`, finite `number`,
-  `string` → emitted as JSON bool / number / string.
-- **Non-finite numbers** (`NaN`, `±Inf`) are dropped by the plugin (JSON has
-  no representation). Daemon should treat missing keys as default.
-- **Everything else** is a JSON object with a `"__type"` discriminator field.
-  Unknown `__type` values are passed through unchanged on the plugin side
-  (forward-compat). The daemon SHOULD reject unknowns loudly instead.
-- **`nil` / absent values are never emitted.** A missing key in the JSON
-  object means "default" (the value equals what `Instance.new(ClassName)`
-  would produce for that property).
-- **Property names are PascalCase** exactly as Roblox exposes them
-  (`BackgroundColor3`, not `backgroundColor3`). Attribute names are free-form
-  but constrained by Roblox's own rules (see validator in `Plugin.luau`).
-
-## Encoded type catalogue
-
-### Geometry / math
-
-| Roblox type      | JSON shape                                                                    |
-|------------------|-------------------------------------------------------------------------------|
-| `Vector2`        | `{"__type":"Vector2","x":N,"y":N}`                                            |
-| `Vector3`        | `{"__type":"Vector3","x":N,"y":N,"z":N}`                                      |
-| `Vector2int16`   | `{"__type":"Vector2int16","x":N,"y":N}`                                       |
-| `Vector3int16`   | `{"__type":"Vector3int16","x":N,"y":N,"z":N}`                                 |
-| `CFrame`         | `{"__type":"CFrame","components":[x,y,z,r00,r01,r02,r10,r11,r12,r20,r21,r22]}` |
-| `UDim`           | `{"__type":"UDim","s":N,"o":N}` (scale, offset)                               |
-| `UDim2`          | `{"__type":"UDim2","xs":N,"xo":N,"ys":N,"yo":N}`                              |
-| `Rect`           | `{"__type":"Rect","minx":N,"miny":N,"maxx":N,"maxy":N}`                       |
-| `NumberRange`    | `{"__type":"NumberRange","min":N,"max":N}`                                    |
-| `Ray`            | `{"__type":"Ray","origin":[x,y,z],"direction":[x,y,z]}`                       |
-
-CFrame component order is Roblox's `CFrame:GetComponents()` — position first,
-then the rotation matrix in row-major order.
-
-### Colour
-
-| Roblox type    | JSON shape                                                    |
-|----------------|---------------------------------------------------------------|
-| `Color3`       | `{"__type":"Color3","r":N,"g":N,"b":N}` (all floats 0..1)     |
-| `BrickColor`   | `{"__type":"BrickColor","number":N}` (BrickColor palette idx) |
-
-### Sequences
-
-| Roblox type       | JSON shape                                                                              |
-|-------------------|-----------------------------------------------------------------------------------------|
-| `NumberSequence`  | `{"__type":"NumberSequence","keypoints":[{"t":N,"value":N,"envelope":N}, ...]}`         |
-| `ColorSequence`   | `{"__type":"ColorSequence","keypoints":[{"t":N,"r":N,"g":N,"b":N}, ...]}`               |
-
-Keypoint `t` is in `[0, 1]`; sequences need at least 2 keypoints with the
-first at `t=0` and last at `t=1` (Roblox constraint — daemon should not
-re-order, just pass through).
-
-### Enums
-
-| Roblox type  | JSON shape                                                 |
-|--------------|------------------------------------------------------------|
-| `EnumItem`   | `{"__type":"Enum","enum":"Material","name":"Plastic"}`     |
-
-`enum` is the Enum category short name (without `Enum.` prefix). `name` is
-the member name. The decoder accepts `"__type":"EnumItem"` as a legacy alias.
-
-### Typography
-
-| Roblox type  | JSON shape                                                                       |
-|--------------|----------------------------------------------------------------------------------|
-| `Font`       | `{"__type":"Font","family":"rbxasset://...","weight":"Regular","style":"Normal"}` |
-
-`family` is a content URI (usually `rbxasset://fonts/families/<Name>.json`).
-`weight` and `style` are `Enum.FontWeight` / `Enum.FontStyle` member names.
-
-### Physics
-
-| Roblox type          | JSON shape                                                                                                         |
-|----------------------|--------------------------------------------------------------------------------------------------------------------|
-| `PhysicalProperties` | `{"__type":"PhysicalProperties","density":N,"friction":N,"elasticity":N,"frictionWeight":N,"elasticityWeight":N}`  |
-
-When a BasePart's `CustomPhysicalProperties` is unset (material defaults),
-the property is absent from the JSON entirely rather than encoded as `null`.
-
-### Sets
-
-| Roblox type  | JSON shape                                              |
-|--------------|---------------------------------------------------------|
-| `Axes`       | `{"__type":"Axes","axes":["X","Y"]}`                    |
-| `Faces`      | `{"__type":"Faces","faces":["Top","Bottom","Front"]}`   |
-
-### Instance references
+The Studio plugin first reads `/hello`, retains the process-local
+`pluginCapability` without logging or persisting it, then opens `/ws` and
+announces both the protocol version and capability:
 
 ```json
-{"__type":"Instance","path":["Workspace","Baseplate"]}
+{"type":"hello","clientId":"123456789","role":"plugin","protocol":2,"pluginCapability":"<64 hex characters>"}
 ```
 
-Path is the full sequence from the DataModel root (first segment is a
-service name: `Workspace`, `ReplicatedStorage`, `ServerScriptService`, ...).
-An empty path or one that fails to resolve decodes to `nil`.
+The daemon rejects a missing/incompatible protocol or capability with a
+`shutdown` frame. Every socket sends exactly one hello using protocol 2;
+`plugin`, command-capable CLI/agent, and read-only widget/watch roles receive
+only the traffic appropriate to that role. The daemon replaces caller request
+IDs with private correlation IDs before routing them to Studio.
+Origin-bearing browser HTTP/WebSocket requests must also carry the owning
+widget's capability as `?widgetToken=...`; native loopback Studio/CLI clients
+do not send an Origin header.
+Protocol 2 corresponds to Studio plugin 2.0.0 and adds structured errors,
+capability discovery, artifact-backed capture, playtest runtime routing, and
+workflow transaction/precondition operations.
 
-Used for `ObjectValue.Value`, `PrimaryPart`, `Attachment0` / `Attachment1`
-on `Beam` / `Trail`, `SoundGroup`, etc.
+## Filesystem sync operations
 
-## Properties covered by the walker
+Plugin → daemon operations are sent in a WebSocket `push` frame. Daemon →
+plugin operations are sent one at a time in an `op` frame:
 
-The plugin's walker iterates a curated `CANDIDATE_PROPS` list (≈150 entries)
-and only emits values that differ from the per-class default obtained via
-`Instance.new(ClassName)`. Classes currently hit include:
+```json
+{"type":"push","ops":[{"op":"update","path":["Workspace","Main"],"properties":{"Source":"print('hi')"}}]}
+{"type":"op","op":{"op":"delete","path":["Workspace","Old"]}}
+```
 
-- Every `BasePart` subclass (`Part`, `MeshPart`, `WedgePart`,
-  `UnionOperation`, `SpawnLocation`, `Seat`, `VehicleSeat`, ...)
-- `Decal`, `Texture`, `SpecialMesh`
-- `GuiObject` subclasses (`Frame`, `TextLabel`, `TextButton`, `TextBox`,
-  `ImageLabel`, `ImageButton`, `ScrollingFrame`, `ViewportFrame`,
-  `VideoFrame`, `CanvasGroup`)
-- `UIStroke`, `UIGradient`, `UICorner`, `UIPadding`, `UIListLayout`,
-  `UIGridLayout`, `UIScale`, `UIAspectRatioConstraint`,
-  `UISizeConstraint`, `UITextSizeConstraint`
-- `PointLight`, `SpotLight`, `SurfaceLight`
-- `Fire`, `Smoke`, `Sparkles`, `ParticleEmitter`, `Trail`, `Beam`
-- `Attachment`, `Camera`
-- `Sound`, `SoundGroup`
-- `ClickDetector`, `ProximityPrompt`
-- `Tool`, `Model`, `Folder`
-- All `ValueBase` subclasses (`StringValue`, `IntValue`, `NumberValue`,
-  `BoolValue`, `CFrameValue`, `Vector3Value`, `Color3Value`,
-  `BrickColorValue`, `ObjectValue`, `RayValue`)
-- `LuaSourceContainer` (Source via `ScriptEditorService`)
+Supported sync operation payloads:
 
-Services themselves (`Workspace`, `Lighting`, ...) are NOT walked for
-properties — `Instance.new(serviceName)` errors, so the template-comparison
-machinery has no ground truth to compare against. They still round-trip
-their children and attributes.
+- `set`: `path` is the parent instance path and `node` contains `class`,
+  `name`, `properties`, and `children`.
+- `update`: `path` identifies an existing script; the only mirrored property
+  is `Source`.
+- `delete`: `path` identifies the removed instance.
+- `rename`: plugin → daemon uses `path` plus `name`; daemon → plugin uses
+  `from` plus the full destination path in `to`.
+- `move`: `from` and `to` are full instance paths in the sync pipeline.
+- `class_change`: daemon → plugin replaces a script class while preserving
+  its destination identity and `Source`.
 
-## Op schema (reminder)
+Nodes outside the four mirrored classes may appear as pass-through containers
+while carrying mirrored descendants, but their properties remain
+Studio-authoritative.
 
-The `/push` and `/poll` ops share this shape (plugin → daemon and daemon →
-plugin):
+## Remote-control request/response
 
-- `{"op":"set","path":[...parent segments],"node":{class,name,properties,children}}`
-- `{"op":"delete","path":[...segments of deleted instance]}`
-- `{"op":"update","path":[...segments],"properties":{...}}` — plain property
-  update; never carries a `name` field (renames are a separate op).
-- `{"op":"rename","path":[...OLD segments],"name":"NewName"}` — path points
-  to where the instance USED to live on disk; daemon renames that file/dir.
-- `{"op":"move","from":[...old segments],"to":[...new parent segments]}`
+CLI commands use correlated WebSocket frames:
 
-Plugin emits `rename` using a cached "last known name" table (see
-`lastKnownName` in `Plugin.luau`) because `Changed("Name")` fires after the
-assignment and `pathFromRoot` would otherwise reconstruct the new path.
+```json
+{"type":"request","request_id":42,"op":"get","args":{"path":"Workspace/Part"}}
+{"type":"response","request_id":42,"ok":true,"value":{"class":"Part"},"meta":{"op":"get","durationMs":1,"protocol":2}}
+{"type":"response","request_id":43,"ok":false,"error":{"code":"NOT_FOUND","message":"instance not found: Workspace/Missing","retryable":false,"details":{"op":"get"}},"meta":{"op":"get","durationMs":0,"protocol":2}}
+```
+
+Every response repeats the numeric `request_id`. Successful responses carry a
+`value`; failed responses carry an error object with stable `code`, readable
+`message`, `retryable`, and optional `details`. Current plugin error codes are
+`UNKNOWN_OP`, `NOT_FOUND`, `PERMISSION_REQUIRED`, `TIMEOUT`,
+`INVALID_ARGUMENT`, `CONFLICT`, and the fallback `PLUGIN_ERROR`. The daemon
+preserves the whole envelope, so `--raw` callers can branch on codes rather
+than parsing error prose.
+
+The plugin dispatch table is `remoteHandlers`. Tagged values used by commands
+such as `set`, `new`, and attribute writes are decoded by
+`decodeRemoteValue`; values returned to the CLI are encoded by
+`encodeRemoteValue`.
+
+Common tagged shapes include:
+
+| Roblox value | JSON shape |
+| --- | --- |
+| `Vector2` | `{"__type":"Vector2","x":0,"y":0}` |
+| `Vector3` | `{"__type":"Vector3","x":0,"y":0,"z":0}` |
+| `Color3` | `{"__type":"Color3","r":1,"g":1,"b":1}` |
+| `UDim` | `{"__type":"UDim","scale":0,"offset":0}` |
+| `UDim2` | `{"__type":"UDim2","x":{"scale":0,"offset":0},"y":{"scale":0,"offset":0}}` |
+| `CFrame` | `{"__type":"CFrame","components":[12 numbers]}` |
+| `BrickColor` | `{"__type":"BrickColor","name":"Medium stone grey"}` |
+| `EnumItem` | `{"__type":"EnumItem","enum":"Material","name":"Plastic","value":256}` |
+| `NumberRange` | `{"__type":"NumberRange","min":0,"max":1}` |
+| `Instance` | `{"__type":"Instance","path":"Workspace/Part","class":"Part"}` |
+
+Primitive booleans, finite numbers, and strings pass through directly. A
+decoder error is returned to the requesting CLI rather than silently
+substituting a default.
+
+## Capability discovery
+
+The read-only `capabilities` operation is the feature-negotiation entrypoint:
+
+```json
+{"type":"request","request_id":1,"op":"capabilities","args":{}}
+```
+
+Its value identifies `pluginVersion` (`2.0.0`), `protocolVersion` (`2`), the
+Studio/host DataModel and place/game IDs, limits, current screenshot permission,
+and feature flags. `features.photo`, `features.photoTransparent`,
+`features.photoUiOnly`, `features.photoCameraCFrame`,
+`features.photoUiTarget`, and the `photoAxis`, `photoPixels`, and
+`photoChunkBytes` limits describe the locally packaged Photo engine
+independently of `features.capture` and Studio screenshot permission. Agents
+should check this document before using an optional Studio API instead of
+inferring support from a version string.
+
+## Projected live query
+
+`query` matches a `/`-separated selector inside Studio (`*` for one segment,
+`**` for zero or more) and returns only requested properties, attributes, and
+tags. Matching is memoized and bounded by selector length, 128 segments, 32
+projected properties, 10,000 matches, a traversal-node budget, a wall-clock
+budget, and a 4 MiB encoded response budget. Partial results set `truncated`
+and a machine-readable `truncationReason` (`matches`, `nodes`, `time`, or
+`response-bytes`) plus visited-node/response-byte counters.
+
+## Screenshot and artifact transport
+
+Permission-gated screen capture uses the following correlated operations:
+
+- `capture_status` reports API availability, current permission, packaged
+  `photoAvailable` / `photoUiOnlyAvailable` /
+  `photoCameraCFrameAvailable` / `photoUiTargetAvailable` state,
+  `photoAuthorizationRequired` (`false`), and the cached `providerUnsupported`
+  / `providerError` result without prompting.
+- `capture_authorize` explicitly calls Studio's permission request and may
+  show a user prompt. If Studio returns its exact `Feature not supported yet`
+  stub error, the plugin caches and returns that state instead of treating an
+  ordinary missing authorization as provider failure. The macOS CLI then uses
+  this same explicit command to request native screen-capture permission.
+- `capture_prepare` accepts optional `position`, `captureSize`, `outputSize`,
+  `ui`, `resample`, and legacy scene `focus` / `view` / `padding`; it returns a
+  short-lived `sessionId`, dimensions, position, and `byteLength`. New subject
+  and viewport renders use the Photo operations below.
+- `capture_export` streams one prepared PNG to an artifact lease;
+  `capture_close` releases a session early. `capture_read` remains the bounded
+  chunk primitive.
+
+Artifact bytes use a separate localhost HTTP channel so a 4K image is not one
+huge WebSocket JSON frame:
+
+```text
+POST /artifacts/lease
+POST /artifacts/:id/chunk
+POST /artifacts/:id/finalize
+POST /artifacts/:id/abort
+POST /artifacts/:id/consume
+GET  /artifacts/:id
+```
+
+A lease contains an opaque random ID and token. Chunks are base64 at the HTTP
+edge, must append at the exact next offset, and are bounded in size and total
+bytes. The token is valid only until finalize/abort/expiry. Finalization checks
+the expected size and optional SHA-256, atomically promotes the private staging
+file, and returns absolute path, MIME, size, and digest metadata. Tokens are
+never returned by lookup or final artifact metadata.
+The CLI looks finalized metadata up by the lease ID, verifies bounded bytes,
+MIME, dimensions, PNG structure, size, and SHA-256, writes its requested
+output, then consumes the transport file. Finalized files that are not consumed
+have a TTL, LRU ordering, and a global byte budget. Pending uploads have
+separate lease-count and reserved-byte budgets; expired owned crash leftovers
+are removed on startup or cleanup, and partial/finalized entries are bounded.
+
+## Locally packaged Photo transport
+
+`rosync capture photo` and the compatibility `capture scene` alias use Ro
+Sync's child `Photo` module. This path does not require screenshot permission,
+does not load any capture dependency from the open place, and does not use the
+screenshot artifact lease:
+
+- `photo_prepare` accepts optional `focus`, `nativeRect`, `outputSize`, `view`,
+  `direction`, tagged `cameraCFrame`, `padding`, `fieldOfView`, `background`,
+  `alphaBleed`, `isolate`, `uiMode`, `uiTarget`, legacy `hideUI`, `delay`, and
+  `timeoutSeconds`. `cameraCFrame` contains the 12 finite components returned by
+  `CFrame:GetComponents()` and supplies an exact camera pose in place of
+  automatic view/direction/padding framing. `uiTarget` is a Studio path to a
+  `ScreenGui` or `GuiObject`, captures only that subtree, and requires
+  `uiMode: "only"`. `nativeRect` is a
+  viewport-native `{x,y,width,height}` rectangle and cannot accompany `focus`;
+  `outputSize` is `{x,y}`. `background` is `transparent` or `scene`. `uiMode`
+  is `none`, `overlay`, or `only`; `only` requires a transparent background,
+  cannot accompany `focus`, and returns the edit-mode ScreenGui layer without
+  the 3D world or Studio chrome. For targeted UI without `nativeRect`, the
+  engine returns a tight rendered-alpha crop; an explicit rectangle overrides
+  the automatic target bounds.
+- A successful prepare returns `sessionId`, `width`, `height`, `byteLength`,
+  `background`, `uiMode`, `isolated`, optional `region` / `fullSize`, and target
+  or exact-camera metadata when used. Pixel data is
+  tightly packed RGBA8, so `byteLength` must equal `width * height * 4`.
+- `photo_read` accepts `sessionId`, the exact next `offset`, and optional
+  `maxBytes`. It returns `offset`, `nextOffset`, `eof`, and `bytesBase64`.
+  Chunks are contiguous and bounded to 512 KiB before base64 encoding.
+- `photo_close` releases the RGBA session. Sessions expire after 120 seconds,
+  only two may remain active, and Photo preparation is serialized.
+
+Photo dimensions are limited to 4096 pixels per axis and 16,777,216 pixels
+total. The CLI revalidates dimensions, exact RGBA length, chunk offsets, and
+EOF, then encodes and validates the PNG locally. Subject capture clones without
+scripts and isolates by default; protected cleanup restores camera, in-game UI,
+and Lighting state and destroys temporary clones after both success and failure.
+
+## Playtest runtime routing
+
+Only the edit-mode plugin connects to the daemon. When Studio clones the plugin
+into a PlayServer or PlayClient DataModel, that copy starts a lightweight
+runtime agent and connects to edit mode through `PluginConnectionService`.
+Runtime messages carry their own request IDs inside the plugin-to-plugin link;
+each CLI-started generation also carries a random session token injected through
+`StudioTestService` test args. Runtime hello/request/response frames are SHA-256
+authenticated, replayed request IDs are ignored, and contexts are scoped to the
+matching playtest job. The raw session token is never included in runtime hello
+or response metadata. The edit plugin exposes runtime operations externally through:
+
+- `playtest_start`, `playtest_status`, `playtest_contexts`, `playtest_wait`,
+  and `playtest_stop` for asynchronous job lifecycle.
+- `playtest_request` with `{context, op, args, timeout}` for a named `server`
+  or `client:N` runtime.
+- `playtest_capture` for artifact-backed runtime screenshots.
+
+Supported runtime operations include `exec`, `logs`, `ui_tree`, `input`,
+`capture_prepare`, `capture_read`, and `capture_close`. Runtime hello metadata
+includes the role, host DataModel type, target/runtime IDs, place/game, and
+client player identity when available. Game-identity execution uses a temporary
+Script/LocalScript in the playtest clone; it is destroyed after completion.
+Plugin-identity execution is opt-in. Runtime changes never enter the edit-mode
+sync pipeline. Input sequences, capture dimensions/bytes/session counts, and
+runtime serialization breadth are bounded. Plugin-identity timeouts cancel the
+cooperating execution thread, but tasks deliberately spawned by user code are
+outside that cooperative cancellation boundary.
+
+## Workflow support operations
+
+The workflow schema is a CLI contract (`rosync run --file`), not a second wire
+format. The CLI validates all schema-v1 steps and references, opens one
+persistent WebSocket session, then maps each step onto ordinary protocol 2
+requests. Three operations add safe workflow semantics:
+
+- `inspect_ref` checks a live target and rejects mismatched `expectedClass` or
+  `etag` before a step executes.
+- `transaction_begin` starts a named Studio change-history recording.
+- `transaction_finish` commits or cancels that recording; cancel rolls the
+  in-progress changes back.
+
+Workflow result references are exact JSON strings such as
+`$stepId.value.properties.Name` and preserve the selected JSON type. A leading
+`$$` is an escape. Atomic groups must be contiguous and may contain only
+bounded operations with understood change-history behavior. `verify: true`
+causes supported writes to be read back before the step is reported successful.
+Assertions and waits are evaluated by the workflow executor, while capture,
+playtest, and upload steps use their dedicated transports.
+
+## Source writes
+
+Filesystem source is applied with
+`ScriptEditorService:UpdateSourceAsync()`. Failure is reported as a failed
+apply; the plugin does not fall back to assigning `.Source`, because doing so
+can overwrite an open Studio editor draft.

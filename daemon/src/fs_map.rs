@@ -10,8 +10,8 @@
 //!     with the same class mapping.
 //!   * `Foo/` (dir)          → Folder          named `Foo`
 //!   * `Foo/init (Foo).luau` → the folder IS a ModuleScript named `Foo` whose children
-//!                             are the other entries in the folder. `.lua`,
-//!                             `.server.*`, and `.client.*` variants are accepted.
+//!     are the other entries in the folder. `.lua`, `.server.*`, and
+//!     `.client.*` variants are accepted.
 //!   * `Foo/init.lua`        → Wally/Rojo-style equivalent of `Foo/init (Foo).luau`.
 //!   * Sibling name collisions are broken with numeric suffixes.
 //!   * Unsafe characters in instance names are percent-encoded.
@@ -109,11 +109,11 @@ pub fn parse_init_file(file_name: &str) -> Option<(ScriptClass, String)> {
     if inner.is_empty() {
         return None;
     }
-    let name = match parse_disambiguated(inner) {
+    let encoded_name = match parse_disambiguated(inner) {
         Some((n, _)) => n,
         None => inner.to_string(),
     };
-    Some((class, name))
+    Some((class, decode_name(&encoded_name)))
 }
 
 /// Parse a Wally/Rojo-style plain init file name.
@@ -152,15 +152,17 @@ pub fn parse_disambiguated(stem: &str) -> Option<(String, usize)> {
 // ---------------------------------------------------------------------------
 
 fn needs_escape(ch: char) -> bool {
-    // Portable-everywhere: POSIX separators, NUL, control chars, our `%`
-    // escape marker, plus characters Windows forbids in filenames (<>:"|?*).
-    // We apply this union on every platform so that a project authored on macOS
-    // and later opened on Windows (or vice-versa) doesn't produce paths that
-    // are legal on one but unwriteable on the other.
-    matches!(
-        ch,
-        '/' | '\\' | '\0' | '%' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
-    ) || (ch as u32) < 0x20
+    // Keep generated fragments ASCII-only. Literal Unicode filenames can alias
+    // under APFS/HFS+ normalization and case folding (for example `É`/`é`),
+    // while NTFS applies a different case table. Percent-encoding UTF-8 bytes
+    // gives every platform the same bytewise identity without requiring the
+    // Studio plugin to implement Unicode normalization/case folding.
+    !ch.is_ascii()
+        || matches!(
+            ch,
+            '/' | '\\' | '\0' | '%' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+        )
+        || (ch as u32) < 0x20
 }
 
 /// Case-insensitive match against the Windows reserved device-name list. These
@@ -196,9 +198,11 @@ fn is_windows_reserved_stem(stem: &str) -> bool {
     )
 }
 
-/// Percent-encode characters that can't (or shouldn't) appear in POSIX / NTFS
-/// paths. Also guards against trailing `.`/space (illegal as a Windows file
-/// name tail) and against Windows reserved device names (CON, PRN, ...).
+/// Percent-encode non-ASCII text and characters that can't (or shouldn't)
+/// appear in POSIX / NTFS paths. ASCII-only output avoids Unicode
+/// case/normalization aliases across filesystems. Also guards against trailing
+/// `.`/space (illegal as a Windows file name tail) and Windows reserved device
+/// names (CON, PRN, ...).
 pub fn encode_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let char_count = name.chars().count();
@@ -334,7 +338,7 @@ fn fragment_taken(taken: &[String], candidate: &str) -> bool {
 }
 
 fn fragments_equal(a: &str, b: &str) -> bool {
-    a == b || a.to_lowercase() == b.to_lowercase()
+    a.eq_ignore_ascii_case(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +593,14 @@ mod tests {
             parse_init_file("init (Thing).server.luau"),
             Some((ScriptClass::Script, "Thing".to_string()))
         );
+        assert_eq!(
+            parse_init_file("init (a%2Fb).luau"),
+            Some((ScriptClass::ModuleScript, "a/b".to_string()))
+        );
+        assert_eq!(
+            parse_init_file("init (%C3%89).luau"),
+            Some((ScriptClass::ModuleScript, "É".to_string()))
+        );
     }
 
     // ----- encode / decode ----------------------------------------------
@@ -615,7 +627,7 @@ mod tests {
         for s in inputs {
             let enc = encode_name(s);
             assert!(
-                !enc.contains(|c: char| matches!(c, '<' | '>' | '"' | '|' | '?' | '*')),
+                !enc.contains(['<', '>', '"', '|', '?', '*']),
                 "encoded form of {s:?} still contains a Windows-illegal char: {enc}"
             );
             assert_eq!(decode_name(&enc), s);
@@ -654,7 +666,26 @@ mod tests {
         let name = "配置/αβ.data";
         let enc = encode_name(name);
         assert!(!enc.contains('/'));
+        assert!(enc.is_ascii());
         assert_eq!(decode_name(&enc), name);
+    }
+
+    #[test]
+    fn unicode_names_have_distinct_portable_ascii_fragments() {
+        let names = ["É", "é", "e\u{301}"];
+        let encoded: Vec<String> = names.iter().map(|name| encode_name(name)).collect();
+        assert!(encoded.iter().all(|name| name.is_ascii()));
+        assert_eq!(encoded, ["%C3%89", "%C3%A9", "e%CC%81"]);
+        assert_eq!(
+            encoded
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            names.len()
+        );
+        for (encoded, original) in encoded.iter().zip(names) {
+            assert_eq!(decode_name(encoded), original);
+        }
     }
 
     #[test]
@@ -803,6 +834,12 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_matching_uses_ascii_case_rules_on_portable_fragments() {
+        assert!(fragments_equal("Config", "config"));
+        assert!(!fragments_equal(&encode_name("É"), &encode_name("é")));
+    }
+
+    #[test]
     fn instance_to_path_collision_script_with_children_numbered() {
         let taken = vec!["Net".to_string()];
         let f = instance_to_path(
@@ -881,6 +918,32 @@ mod tests {
         assert_eq!(inst.class, "ModuleScript");
         assert!(inst.is_script_with_children);
         assert_eq!(inst.script_class, Some(ScriptClass::ModuleScript));
+    }
+
+    #[test]
+    fn path_to_instance_decodes_portable_script_with_children_names() {
+        for name in ["a/b", "É", "é", "e\u{301}"] {
+            let d = TempDir::new("portable-swc");
+            let encoded = encode_name(name);
+            let p = d.path().join(&encoded);
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join(format!("init ({encoded}).luau")), b"return {}").unwrap();
+            let inst = path_to_instance_meta(&p).unwrap().unwrap();
+            assert_eq!(inst.name, name);
+            assert_eq!(inst.class, "ModuleScript");
+            assert!(inst.is_script_with_children);
+        }
+    }
+
+    #[test]
+    fn path_to_instance_still_reads_legacy_literal_unicode_init() {
+        let d = TempDir::new("legacy-unicode-swc");
+        let p = d.path().join("É");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("init (É).luau"), b"return {}").unwrap();
+        let inst = path_to_instance_meta(&p).unwrap().unwrap();
+        assert_eq!(inst.name, "É");
+        assert_eq!(inst.class, "ModuleScript");
     }
 
     #[test]

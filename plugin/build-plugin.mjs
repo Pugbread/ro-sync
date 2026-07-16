@@ -26,6 +26,10 @@ await copyFile(
   path.join(repoRoot, "plugin", "Plugin.luau"),
   path.join(pluginSrcDir, "src", "RoSync.server.luau"),
 );
+await copyFile(
+  path.join(repoRoot, "plugin", "Photo.luau"),
+  path.join(pluginSrcDir, "src", "Photo.luau"),
+);
 
 run("wally", ["install"]);
 run("rojo", ["build", "plugin.project.json", "--output", "../plugin/Plugin.rbxm"]);

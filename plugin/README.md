@@ -11,6 +11,14 @@ The Terminal 64 widget's Settings view does this copy automatically.
 `Plugin.luau` remains as the legacy/source artifact. The packaged plugin is
 built with Rojo from `plugin-src/`.
 
+`Photo.luau` is Ro Sync's dependency-free native viewport/subject capture
+module. The builder packages it as `RoSync.Photo`; it never requires a capture
+binding or source folder from the open place. It returns bounded
+`{ buffer, size }` RGBA records, keeping screenshot `EditableImage` objects
+private and destroying them as soon as their pixels have been read. Its UI
+mode can exclude ScreenGuis, preserve them over the scene, or extract the
+edit-mode ScreenGui layer alone as transparent RGBA.
+
 ## Build
 
 ```sh

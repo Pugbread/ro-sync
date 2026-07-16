@@ -1,7 +1,7 @@
 // views/projects.js — list+detail Projects view with sidebar-friendly shell,
 // per-project controls, and a throttled activity tail for the served project.
 import { daemonJson, daemonWS } from "../bridge.js";
-import { copyText, pathFromDrop } from "./runtime.js";
+import { copyText, joinProjectFile, pathFromDrop } from "./runtime.js";
 import {
   pickFolderCmd,
   openFolderEnsuredCmd,
@@ -938,7 +938,7 @@ export function mountProjects(root, api) {
         message: (data) => {
           if (!data || typeof data !== "object") return;
           const t = data.type;
-          if (t === "ping" || t === "pong" || t === "hello" || t === "lagged"
+          if (t === "ping" || t === "pong" || t === "lagged"
               || t === "push-result" || t === "error") return;
           if (t === "plugin") {
             pushActivityFrame({
@@ -1184,16 +1184,6 @@ async function writeTextFile(api, absPath, text) {
 async function readTextFile(api, absPath) {
   const res = await api.t64("t64:exec", { command: readFileCmd(absPath) });
   return (res && typeof res.stdout === "string") ? res.stdout : "";
-}
-function joinProjectFile(projectPath, relPath) {
-  const root = String(projectPath || "").replace(/[\\/]+$/, "");
-  const rel = String(relPath || "").replace(/^[\\/]+/, "").replace(/[\\/]+/g, pathSepFor(root));
-  return `${root}${pathSepFor(root)}${rel}`;
-}
-function pathSepFor(projectPath) {
-  return /^[A-Za-z]:[\\/]/.test(String(projectPath || "")) || String(projectPath || "").includes("\\")
-    ? "\\"
-    : "/";
 }
 function normalizeStudioPath(path) {
   return String(path || "")

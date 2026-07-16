@@ -154,34 +154,6 @@ export function killPidCmd(pid) {
     : `/bin/kill ${n}`;
 }
 
-// Kill any process whose command line matches the binary name + --port <port>
-// (fuzzy but adequate — nothing else should match both strings together).
-// Waits briefly so the listener socket is actually free before returning.
-export function killDaemonOnPortCmd(port) {
-  const p = parseInt(port, 10);
-  if (!Number.isFinite(p)) return `echo skip`;
-  if (IS_WINDOWS) {
-    // Match on process name + command-line regex via CIM; Stop-Process -Force.
-    // Use a negative-lookahead so `--port 787` doesn't match `--port 7878`.
-    // Sleep 600ms after the kill so the port is fully released.
-    const ps =
-      `$procs = Get-CimInstance Win32_Process -Filter "Name='${BINARY_NAME}'" | ` +
-      `Where-Object { $_.CommandLine -match '--port\\s+${p}(?!\\d)' }; ` +
-      `if ($procs) { $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }; ` +
-      `Start-Sleep -Milliseconds 600`;
-    return psEncodedCmd(ps);
-  }
-  // POSIX: same word-boundary guard — `--port 787` must not kill `--port 7878`.
-  const pat = `${BINARY_NAME}.*--port ${p}([^0-9]|$)`;
-  return (
-    `pkill -f ${posixQuote(pat)} 2>/dev/null ; ` +
-    `sleep 0.4 ; ` +
-    `pkill -9 -f ${posixQuote(pat)} 2>/dev/null ; ` +
-    `sleep 0.6 ; ` +
-    `true`
-  );
-}
-
 // Tail the last ~40 lines of a log file (best-effort; empty if missing).
 export function tailLogCmd(path) {
   if (IS_WINDOWS) {

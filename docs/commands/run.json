@@ -1,0 +1,20 @@
+{
+  "name": "run",
+  "title": "rosync run",
+  "category": "Agent Runtime",
+  "description": "Validates and executes a versioned JSON workflow over one persistent daemon session with typed references, preconditions, transactions, assertions, waits, verification, and idempotent replay.",
+  "usage": "rosync run --file <workflow.json> [--project <path>] [--port <port>] [--dry-run] [--keep-going] [--raw]",
+  "examples": [
+    "rosync run --file ./workflow.json --project . --dry-run",
+    "rosync run --file ./workflow.json --project . --raw",
+    "rosync run --file ./diagnostics.json --project . --keep-going --raw"
+  ],
+  "notes": [
+    "Schema version 1 supports get, set, new, rm, mv, attr-set, attr-rm, attr-ls, tag-add, tag-rm, assert, wait, eval, capture, call, playtest, and upload steps.",
+    "A string containing exactly `$stepId.value.path` references an earlier result while preserving its JSON type; use `$$literal` to emit a string beginning with `$`. Forward, self, unknown, and missing-path references fail validation or execution precisely.",
+    "Declare contiguous atomic transaction groups and assign steps with `transaction`. Atomic groups use Studio change-history recording and cancel automatically on failure; eval, call, wait, capture, playtest, and upload are rejected inside atomic groups.",
+    "Use workflow/step `expectedMode`, `expectedPlaceId`, `expectedClass`, and `etag` preconditions to reject stale targets. Set `verify: true` on supported writes for read-back verification.",
+    "Assertions support equals, not-equals, exists, truthy, contains, and numeric comparisons. Wait polls one path/property until its assertion passes or `timeoutMs` expires.",
+    "A successful workflow with `idempotencyKey` is recorded under `.rosync-workflows/`; rerunning the same key returns the prior result with `replayed: true`. `--dry-run` validates and prints normalized dependencies without executing."
+  ]
+}

@@ -12,9 +12,12 @@
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Per-process counter so parallel calls (e.g. batch-mode) don't collide.
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
@@ -48,70 +51,299 @@ pub async fn request_with_timeout(
     args: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| format!("connect {url}: {e}"))?;
+    let mut session = RemoteSession::connect(port).await?;
+    let result = session.request(op, args, timeout).await;
+    // Best-effort close; a short-lived command must not turn close-handshake
+    // failures into command failures after the response has arrived.
+    let _ = session.close().await;
+    result
+}
 
-    ws.send(Message::Text(
-        r#"{"type":"hello","clientId":"rosync-cli","role":"cli"}"#.into(),
-    ))
-    .await
-    .map_err(|e| format!("send hello: {e}"))?;
+type CliSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-    let request_id = next_request_id();
-    let frame = json!({
-        "type": "request",
-        "request_id": request_id,
-        "op": op,
-        "args": args,
-    });
-    ws.send(Message::Text(frame.to_string()))
-        .await
-        .map_err(|e| format!("send request: {e}"))?;
+/// One operation in a sequential request batch sent over a [`RemoteSession`].
+///
+/// Requests in a batch may use different deadlines. A transport failure stops
+/// the batch; a plugin response with `ok: false` is still a valid response and
+/// is retained in the returned vector, matching [`request`] semantics.
+#[derive(Clone, Debug)]
+pub struct RemoteRequest {
+    pub op: String,
+    pub args: Value,
+    pub timeout: Duration,
+}
 
-    let await_response = async {
-        while let Some(frame) = ws.next().await {
-            let msg = match frame {
-                Ok(m) => m,
-                Err(e) => return Err(format!("recv: {e}")),
-            };
-            let text = match msg {
-                Message::Text(t) => t,
-                Message::Close(_) => {
-                    return Err("daemon closed connection before response".into());
-                }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                    continue;
-                }
-                _ => continue,
-            };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if v.get("type").and_then(|t| t.as_str()) != Some("response") {
-                continue;
-            }
-            if v.get("request_id").and_then(|t| t.as_u64()) != Some(request_id) {
-                continue;
-            }
-            return Ok(v);
+impl RemoteRequest {
+    pub fn new(op: impl Into<String>, args: Value, timeout: Duration) -> Self {
+        Self {
+            op: op.into(),
+            args,
+            timeout,
         }
-        Err("stream ended before response".into())
-    };
+    }
+}
 
-    let result = tokio::time::timeout(timeout, await_response)
-        .await
-        .map_err(|_| {
+/// A parsed plugin-level error from a response frame.
+///
+/// Older plugins use a plain string in the `error` field. Newer plugins may
+/// return an object such as `{code,message,details,retryable}`. This type
+/// accepts both without changing the long-standing behavior where transport
+/// helpers return the full response frame, including `ok: false` responses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginError {
+    pub code: Option<String>,
+    pub message: String,
+    pub details: Option<Value>,
+    pub retryable: Option<bool>,
+    /// The original `error` JSON value for forward-compatible inspection.
+    pub raw: Value,
+}
+
+impl PluginError {
+    /// Parse the `error` field of a response. Returns `None` for a successful
+    /// response, even if it happens to contain diagnostic error metadata.
+    pub fn from_response(response: &Value) -> Option<Self> {
+        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        Some(Self::from_value(
+            response.get("error").unwrap_or(&Value::Null),
+        ))
+    }
+
+    /// Parse a legacy string or a structured plugin error value.
+    pub fn from_value(error: &Value) -> Self {
+        match error {
+            Value::String(message) => Self {
+                code: None,
+                message: message.clone(),
+                details: None,
+                retryable: None,
+                raw: error.clone(),
+            },
+            Value::Object(object) => {
+                let code = object
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let message = object
+                    .get("message")
+                    .or_else(|| object.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        code.as_deref()
+                            .map(|value| value.replace('_', " "))
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| "request failed".to_string())
+                    });
+                let details = object
+                    .get("details")
+                    .or_else(|| object.get("data"))
+                    .cloned();
+                let retryable = object.get("retryable").and_then(Value::as_bool);
+                Self {
+                    code,
+                    message,
+                    details,
+                    retryable,
+                    raw: error.clone(),
+                }
+            }
+            Value::Null => Self {
+                code: None,
+                message: "request failed".to_string(),
+                details: None,
+                retryable: None,
+                raw: Value::Null,
+            },
+            other => Self {
+                code: None,
+                message: other.to_string(),
+                details: None,
+                retryable: None,
+                raw: other.clone(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for PluginError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code.as_deref() {
+            Some(code) => write!(formatter, "{code}: {}", self.message),
+            None => formatter.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for PluginError {}
+
+/// Parse a plugin-level error from a full response frame.
+pub fn plugin_error(response: &Value) -> Option<PluginError> {
+    PluginError::from_response(response)
+}
+
+/// A reusable CLI connection to the daemon's request/response bridge.
+///
+/// Unlike [`request`], this keeps one WebSocket open for an entire workflow or
+/// artifact transfer. Calls are intentionally sequential (`&mut self`), which
+/// keeps response routing simple while still eliminating reconnect and hello
+/// overhead between steps.
+pub struct RemoteSession {
+    socket: CliSocket,
+}
+
+impl RemoteSession {
+    /// Connect to the local daemon and perform the CLI hello handshake.
+    pub async fn connect(port: u16) -> Result<Self, String> {
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .map_err(|e| format!("connect {url}: {e}"))?;
+
+        socket
+            .send(Message::Text(format!(
+                r#"{{"type":"hello","clientId":"rosync-cli","role":"cli","protocol":{}}}"#,
+                crate::ws::PLUGIN_PROTOCOL_VERSION
+            )))
+            .await
+            .map_err(|e| format!("send hello: {e}"))?;
+
+        Ok(Self { socket })
+    }
+
+    /// Send one request and wait for its matching response frame.
+    ///
+    /// Plugin-level failures (`ok: false`) are returned as response values so
+    /// existing CLI response handling keeps working. Use [`plugin_error`] when
+    /// a typed view of either the legacy or structured error is useful.
+    pub async fn request(
+        &mut self,
+        op: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let request_id = next_request_id();
+        let request = json!({
+            "type": "request",
+            "request_id": request_id,
+            "op": op,
+            "args": args,
+        });
+
+        let exchange = async {
+            self.socket
+                .send(Message::Text(request.to_string()))
+                .await
+                .map_err(|e| format!("send request: {e}"))?;
+            self.wait_for_response(request_id).await
+        };
+
+        tokio::time::timeout(timeout, exchange).await.map_err(|_| {
             format!(
                 "request timed out after {:.0}s (plugin unresponsive?)",
                 timeout.as_secs_f64()
             )
-        })?;
-    // Best-effort close; ignore errors.
-    let _ = ws.send(Message::Close(None)).await;
-    result
+        })?
+    }
+
+    /// Execute a sequence over this connection, preserving response order.
+    ///
+    /// A transport error or timeout stops the sequence. Plugin-declared
+    /// failures remain ordinary response frames, allowing workflows to inspect
+    /// structured errors or implement their own continue/abort policy.
+    pub async fn request_many<I>(&mut self, requests: I) -> Result<Vec<Value>, String>
+    where
+        I: IntoIterator<Item = RemoteRequest>,
+    {
+        let requests = requests.into_iter();
+        let (lower_bound, _) = requests.size_hint();
+        let mut responses = Vec::with_capacity(lower_bound);
+        for request in requests {
+            responses.push(
+                self.request(&request.op, request.args, request.timeout)
+                    .await?,
+            );
+        }
+        Ok(responses)
+    }
+
+    /// Gracefully close the persistent connection.
+    pub async fn close(&mut self) -> Result<(), String> {
+        self.socket
+            .send(Message::Close(None))
+            .await
+            .map_err(|e| format!("close connection: {e}"))
+    }
+
+    async fn wait_for_response(&mut self, request_id: u64) -> Result<Value, String> {
+        while let Some(frame) = self.socket.next().await {
+            let message = frame.map_err(|e| format!("recv: {e}"))?;
+            let text = match message {
+                Message::Text(text) => text,
+                Message::Close(frame) => {
+                    let reason = frame
+                        .map(|frame| frame.reason.to_string())
+                        .filter(|reason| !reason.is_empty());
+                    return Err(match reason {
+                        Some(reason) => {
+                            format!("daemon closed connection before response: {reason}")
+                        }
+                        None => "daemon closed connection before response".to_string(),
+                    });
+                }
+                Message::Ping(payload) => {
+                    self.socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|e| format!("send pong: {e}"))?;
+                    continue;
+                }
+                // Pong, Binary, and raw Frame messages cannot contain a JSON
+                // response in the current protocol and are safe to ignore.
+                _ => continue,
+            };
+
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("response")
+                    if value.get("request_id").and_then(Value::as_u64) == Some(request_id) =>
+                {
+                    return Ok(value);
+                }
+                // The daemon heartbeat is a JSON protocol frame rather than
+                // a WebSocket control-frame ping.
+                Some("ping") => {
+                    self.socket
+                        .send(Message::Text(r#"{"type":"pong"}"#.into()))
+                        .await
+                        .map_err(|e| format!("send heartbeat pong: {e}"))?;
+                }
+                Some("shutdown") => {
+                    let reason = value
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("daemon is shutting down");
+                    return Err(format!("daemon shut down before response: {reason}"));
+                }
+                Some("lagged") => {
+                    return Err("daemon connection lagged before response".to_string());
+                }
+                Some("error") => {
+                    let error = value.get("error").unwrap_or(&Value::Null);
+                    return Err(format!("daemon error: {}", PluginError::from_value(error)));
+                }
+                // Other response IDs can arrive after an earlier timeout;
+                // daemon events and requests for other peers may also share
+                // this socket. None belong to the active sequential call.
+                _ => {}
+            }
+        }
+        Err("stream ended before response".into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +424,141 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["value"]["class"], "Part");
         assert_eq!(resp["value"]["properties"]["Anchored"], true);
+    }
+
+    #[tokio::test]
+    async fn persistent_session_reuses_one_socket_for_a_sequence() {
+        let addr = start_mock_responder(|op, args| match op {
+            "get" => (true, json!({ "path": args["path"], "name": "Part" }), None),
+            "set" => (true, json!({ "applied": args["value"] }), None),
+            other => panic!("unexpected op: {other}"),
+        })
+        .await;
+
+        // The mock only accepts one TCP connection, so both successful
+        // responses prove the session reused its original WebSocket.
+        let mut session = RemoteSession::connect(addr.port()).await.unwrap();
+        let responses = session
+            .request_many(vec![
+                RemoteRequest::new(
+                    "get",
+                    json!({ "path": "Workspace/Part" }),
+                    Duration::from_secs(1),
+                ),
+                RemoteRequest::new(
+                    "set",
+                    json!({ "path": "Workspace/Part", "value": 7 }),
+                    Duration::from_secs(1),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["value"]["path"], "Workspace/Part");
+        assert_eq!(responses[1]["value"]["applied"], 7);
+        let _ = session.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_tolerates_heartbeats_and_unrelated_frames() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let request_id = loop {
+                let Some(Ok(tungstenite::Message::Text(text))) = ws.next().await else {
+                    panic!("client closed before sending a request");
+                };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value.get("type").and_then(Value::as_str) == Some("request") {
+                    break value.get("request_id").and_then(Value::as_u64).unwrap();
+                }
+            };
+
+            ws.send(tungstenite::Message::Ping(vec![1, 2, 3]))
+                .await
+                .unwrap();
+            ws.send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+                .await
+                .unwrap();
+            ws.send(tungstenite::Message::Text(
+                json!({
+                    "type": "response",
+                    "request_id": request_id.wrapping_add(1),
+                    "ok": true,
+                    "value": "stale",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.send(tungstenite::Message::Text(
+                r#"{"type":"config-changed"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(tungstenite::Message::Text(
+                json!({
+                    "type": "response",
+                    "request_id": request_id,
+                    "ok": true,
+                    "value": { "pong": true },
+                    "error": null,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let mut session = RemoteSession::connect(addr.port()).await.unwrap();
+        let response = session
+            .request("ping", json!({}), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(response["value"]["pong"], true);
+    }
+
+    #[test]
+    fn parses_legacy_and_structured_plugin_errors() {
+        let legacy = plugin_error(&json!({
+            "ok": false,
+            "error": "instance not found",
+        }))
+        .unwrap();
+        assert_eq!(legacy.code, None);
+        assert_eq!(legacy.message, "instance not found");
+        assert_eq!(legacy.to_string(), "instance not found");
+
+        let structured = plugin_error(&json!({
+            "ok": false,
+            "error": {
+                "code": "INSTANCE_NOT_FOUND",
+                "message": "No instance exists at that path",
+                "details": { "path": "Workspace/Nope" },
+                "retryable": false,
+            },
+        }))
+        .unwrap();
+        assert_eq!(structured.code.as_deref(), Some("INSTANCE_NOT_FOUND"));
+        assert_eq!(structured.message, "No instance exists at that path");
+        assert_eq!(
+            structured.details.as_ref().unwrap()["path"],
+            "Workspace/Nope"
+        );
+        assert_eq!(structured.retryable, Some(false));
+        assert_eq!(
+            structured.to_string(),
+            "INSTANCE_NOT_FOUND: No instance exists at that path"
+        );
+
+        assert!(plugin_error(&json!({
+            "ok": true,
+            "error": { "message": "diagnostic only" },
+        }))
+        .is_none());
     }
 
     #[tokio::test]

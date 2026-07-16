@@ -1,63 +1,75 @@
-# Ro Sync — manual verification (sync + widget workspace)
+# Ro Sync manual verification
 
-Covers reflection-driven `.meta.json`, `[N]` sibling disambiguation, and the
-Terminal 64 widget workspace: sidebar navigation, project detail/activity,
-duplicate-name chips, session spawning, and throttled live logs.
+Use a scratch place and project. Automated Rust tests cover the daemon paths;
+these checks exercise Roblox Studio signals and `ScriptEditorService`, which
+cannot be reproduced outside Studio.
 
 ## Prep
 
-1. Build the daemon and run tests — both must pass:
-   - macOS/Linux: `bash daemon/build.sh`, then `cargo test` in `daemon/`
-   - Windows PowerShell: `daemon\build.ps1`, then `cargo test` in `daemon\`
-2. Use the widget Settings tab to install `plugin/Plugin.rbxm`, or copy it to
-   `~/Documents/Roblox/Plugins/RoSync.rbxm`.
-3. Create a scratch project folder:
-   - macOS/Linux: `mkdir -p /tmp/rosync-v2`
-   - Windows PowerShell: `New-Item -ItemType Directory -Force "$env:TEMP\rosync-v2" | Out-Null`
-4. Open the Ro Sync widget, go to Projects from the sidebar, add project
-   `/tmp/rosync-v2` on macOS/Linux or `$env:TEMP\rosync-v2` on Windows, and
-   turn on its serving switch. Daemon dot should go green with `:7878`.
-5. Open Roblox Studio → Plugins → RoSync → **Connect**. Plugin stat in the
-   Active view should read `connected`.
-6. Run widget JS smoke checks after editing UI files:
-   `node --check app.js bridge.js views/active.js views/projects.js`.
+1. Run `cargo test --locked` and
+   `cargo clippy --locked --all-targets -- -D warnings` in `daemon/`.
+2. Run `node scripts/check-luau-bytecode.mjs` with the official
+   `luau-compile` on `PATH`, then rebuild with `node plugin/build-plugin.mjs`.
+3. Install `plugin/Plugin.rbxm` from the widget Settings tab.
+4. Start a scratch project with `rosync serve --project <path>` and connect the
+   matching Studio place.
 
-## Checklist
+## Sync checks
 
-| # | Scenario | Expected | Pass |
-|---|----------|----------|------|
-| 1 | In Studio, insert a `Part` into `Workspace`, set `Size = 5,1,5`, `Color = 1,0,0`, `Material = Neon`. Save/Connect. | `<scratch>/Workspace/Part.meta.json` exists with `className: "Part"` AND keys `Size`, `Color3uint8` (or `Color`), `Material` each shaped `{__type: "<TypeName>", value: ...}`. Default props (Anchored=false, CanCollide=true, etc.) are absent. | ☐ |
-| 2 | In Studio, rename that `Part` to `Baseplate`. | Within 500 ms (watch Active log), `Part.luau`/`Part.meta.json` are gone and `Baseplate.meta.json` appears with the same properties. Only one pair of files exists; no orphan. | ☐ |
-| 3 | In Studio, delete `Baseplate`. | Within 500 ms, `Baseplate.meta.json` is removed from disk. No error in the Active log. | ☐ |
-| 4 | Recreate a `Part` named `Baseplate`. Then on disk, edit `Baseplate.meta.json` to set `"Transparency": {"__type":"f32","value":0.8}`. Save. | Within 500 ms, Studio's `Baseplate.Transparency` becomes `0.8`. The Active log shows a line with a `meta` chip reading `…/Baseplate.meta.json • Transparency + 0.8` (or `→ 0.8` if a prior value existed). | ☐ |
-| 5 | In Studio, create two sibling parts under `Workspace` both named `Foo`. | Disk has `Workspace/Foo.luau`/`.meta.json` **and** `Workspace/Foo [1].luau`/`.meta.json`. No `(ClassName)`-style names anywhere. | ☐ |
-| 6 | Add a third sibling `Foo`. | `Workspace/Foo [2].luau`/`.meta.json` appears. Existing `Foo` and `Foo [1]` files are untouched. | ☐ |
-| 7 | Delete the middle `Foo [1]` in Studio. | `Foo [1].meta.json` is removed. `Foo` and `Foo [2]` remain (stable — no cascading rename is required; loose ordering is OK). | ☐ |
-| 8 | Back on the Projects tab, wait for status to refresh. | Project card for the scratch folder shows a warning chip `1 duplicate-name group` from the remaining `Foo` siblings. Switch views / return to confirm the chip persists until duplicates resolve. | ☐ |
-| 9 | Select the project card, then click **Edit** in the detail pane. | The detail pane opens the editable Game ID / Group ID / Place IDs fields plus Local Path, Plugin, Refresh Status, View Diff, and two-click Delete actions. | ☐ |
-| 10 | Click **Spawn Session** from the project detail header. | Terminal 64 opens a new session with cwd set to the scratch folder. If the host lacks `t64:create-session`, the widget shows `Spawn session failed` without breaking navigation. | ☐ |
-| 11 | Go to Activity and exercise a burst such as creating/deleting many Studio children. | The log remains responsive, shows op counts/last sync, and collapses saturated daemon events instead of rendering every frame. **Stop live log** pauses the stream and **Start live log** resumes it. | ☐ |
-| 12 | Grep the widget JS for stale disambiguation references: `grep -n "(ClassName)" app.js views/*.js bridge.js` | No matches. | ☐ |
+| # | Scenario | Expected |
+| --- | --- | --- |
+| 1 | Create a `ModuleScript` named `Config` in `ReplicatedStorage`. | `ReplicatedStorage/Config.luau` appears with the current editor source. |
+| 2 | Edit and save that local file. | The open Studio editor updates through `UpdateSourceAsync`; no duplicate script is created. |
+| 3 | Rename the script in Studio. | The existing file is renamed without losing its contents. |
+| 4 | Delete the script in Studio without local edits. | The corresponding local file is removed. |
+| 5 | Recreate it, make divergent local and Studio edits, then delete it in Studio. | The local file remains and `rosync conflicts` reports a Studio deletion conflict. |
+| 6 | Resolve that conflict with `rosync resolve <path> --disk`. | The script is recreated in Studio with the retained local source. |
+| 7 | Repeat and resolve with `--studio`. | The retained local file is deleted. |
+| 8 | Create a script, disconnect/restart the daemon, change both sides before reconnecting. | Initial compare or the conflict engine asks for a decision; neither side silently overwrites the other. |
+| 9 | Delete a Studio script and a Studio folder containing scripts. | Delete operations reach disk; the plugin log includes the cached pre-removal path. |
+| 10 | Open a script editor draft, make the source read-only/unwritable for `UpdateSourceAsync`, then trigger a local change. | The plugin reports the failed apply and does not assign raw `.Source` over the draft. |
 
-## UX gotchas noted while wiring the widget
+## Protocol and CLI checks
 
-* **`/snapshot` shape isn't formally documented.** `countDupeGroups()` in
-  `views/projects.js` walks either `children[]`, `services[]`, or a bare
-  array — if Agent 1/2 settle on a different tree key, update that visitor.
-  The current daemon returns `{bootstrap, services, strict}`, so the
-  duplicate-name chip stays hidden (0 groups) until the tree is populated — that's
-  fine for the empty-project state.
-* **Widget streams are intentionally lossy for display.** Control events still
-  reach the app-level prompt modals, but high-volume raw `op` frames are
-  throttled/collapsed before JSON parsing in the app relay and live logs. The
-  daemon/plugin sync path is unchanged; this only affects what the widget
-  chooses to render.
-* **SSE content is a byte-array.** The inspector decodes via
-  `String.fromCharCode(...content)`, which is fine for ASCII/UTF-8 up to a
-  few KB but will silently truncate on very long `.meta.json` content
-  (e.g. Lighting with every ColorSequence serialised). If we ever go that
-  big, switch to `TextDecoder`.
-* **`Color` vs `Color3uint8`.** Roblox exposes parts' colour as two
-  properties with the same underlying storage. Whichever one Agent 1's
-  reflection list picks is what shows up on disk — the verification cell
-  accepts either.
+| # | Scenario | Expected |
+| --- | --- | --- |
+| 11 | Connect an older plugin that omits protocol version 2. | The daemon closes it with an incompatible-protocol message asking for plugin reinstall. |
+| 12 | Run `rosync set --batch` with an entry whose `prop` is `Parent`. | The whole batch is rejected before any network write unless `--force-parent` is explicit. |
+| 13 | Create `Workspace/tools/Test.luau` locally. | It syncs normally; only a project-root `tools/` directory is watcher-ignored. |
+| 14 | Run `node scripts/build-command-docs.mjs` and inspect `git diff`. | Generated command docs remain unchanged. |
+
+## Widget smoke checks
+
+After editing widget JavaScript, run:
+
+```sh
+node --check app.js
+node --check bridge.js
+node --check views/active.js
+node --check views/projects.js
+node --check views/settings.js
+```
+
+Confirm project switching, plugin status, initial-sync decisions, conflict
+navigation, and daemon shutdown all remain responsive.
+
+## Capture and playtest checks
+
+| # | Scenario | Expected |
+| --- | --- | --- |
+| 15 | Run `rosync capabilities --project . --raw`. | Protocol 2, plugin 2.0.0, and explicit capture/playtest/runtime feature flags and limits are returned. |
+| 16 | Run `rosync capture status --project . --raw` before authorization. | Status is read-only and no permission prompt appears. |
+| 17 | Run `rosync capture authorize`, then capture a custom `x,y,width,height` region and a resized output. | One explicit Studio prompt is shown; the CLI writes a verified PNG with matching dimensions, size, and SHA-256 metadata. |
+| 18 | Before screenshot authorization, run `rosync capture photo` for a viewport region and a focused target from each named view; repeat one focused capture through the `capture scene` alias. | No permission prompt appears; exact dimensions and valid RGBA/PNG metadata are returned, the target remains fully framed, and camera, UI, Lighting, and temporary-clone state are cleaned up after every success/failure. |
+| 19 | Start Play with `--wait`, list contexts, and execute `return game.PlaceId` at game identity on `server`. | A generation-scoped `server` context appears and the typed result is returned; the temporary harness script is removed. |
+| 20 | Execute a deliberately invalid/runtime-failing script and request logs from its context. | The command returns a structured error and bounded output/log entries identify the failure without hanging the test. |
+| 21 | Inspect UI, send a short input sequence to `client:1`, and capture that client. | Resolved GUI visibility/geometry is reported, bounded input completes, and a verified PNG is written. |
+| 22 | Stop and restart the test, then address a context from the old job. | The stale generation is rejected and cannot satisfy `wait` or receive runtime requests. |
+
+## Workflow checks
+
+| # | Scenario | Expected |
+| --- | --- | --- |
+| 23 | Dry-run a workflow containing a typoed field, forward reference, dynamic `Parent` property, or unbounded operation in an atomic group. | Validation fails before a WebSocket or Studio mutation. |
+| 24 | Run an atomic workflow whose second write intentionally fails. | The whole Studio recording is canceled; the first write is rolled back and rollback status is present in raw output. |
+| 25 | Run a successful workflow twice with one `idempotencyKey`. | The second run returns the stored result with `replayed: true` and performs no side effects. Reusing that key with different workflow content is rejected. |

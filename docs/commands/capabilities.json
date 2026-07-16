@@ -1,0 +1,16 @@
+{
+  "name": "capabilities",
+  "title": "rosync capabilities",
+  "category": "Agent Runtime",
+  "description": "Negotiates the connected daemon, Studio plugin, host DataModel, and optional LLM automation features before an agent chooses a command path.",
+  "usage": "rosync capabilities [--project <path>] [--port <port>] [--raw]",
+  "examples": [
+    "rosync capabilities --project .",
+    "rosync capabilities --project . --raw"
+  ],
+  "notes": [
+    "The protocol 2 / plugin 2.0.0 document reports feature flags for screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.photo`, `features.photoTransparent`, and `features.photoUiOnly`, plus the `photoAxis`, `photoPixels`, and `photoChunkBytes` limits, are independent of Studio screenshot authorization.",
+    "Use this cheap read before relying on optional Studio APIs; Studio version and permission differences are reported instead of guessed.",
+    "`--raw` prints the complete correlated response envelope for machine use."
+  ]
+}

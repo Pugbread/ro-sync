@@ -18,14 +18,20 @@ jobs:
             target: aarch64-apple-darwin
             out: rosync-darwin-arm64
             src_bin: rosync
+            tool_target: darwin-arm64
+            compiler_bin: luau-compile
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             out: rosync-linux-x86_64
             src_bin: rosync
+            tool_target: linux-x86_64
+            compiler_bin: luau-compile
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             out: rosync-windows-x86_64.exe
             src_bin: rosync.exe
+            tool_target: windows-x86_64
+            compiler_bin: luau-compile.exe
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -46,26 +52,96 @@ jobs:
 
       - name: Test
         working-directory: daemon
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Build
         working-directory: daemon
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Install checksum-pinned Luau compiler
+        run: node scripts/install-luau-compiler.mjs --target ${{ matrix.tool_target }}
 
       - name: Stage artifact
         shell: bash
-        working-directory: daemon
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.src_bin }}" "dist/${{ matrix.out }}"
+          set -euo pipefail
+          dist="daemon/dist"
+          bundle="$dist/bundle-root"
+          archive="$dist/rosync-${{ matrix.tool_target }}-bundle.zip"
+          rm -rf "$bundle"
+          mkdir -p \
+            "$bundle/daemon" \
+            "$bundle/tools/luau/${{ matrix.tool_target }}"
+          cp \
+            "daemon/target/${{ matrix.target }}/release/${{ matrix.src_bin }}" \
+            "$dist/${{ matrix.out }}"
+          cp "$dist/${{ matrix.out }}" "$bundle/daemon/${{ matrix.out }}"
+          cp \
+            "tools/luau/${{ matrix.tool_target }}/${{ matrix.compiler_bin }}" \
+            "$bundle/tools/luau/${{ matrix.tool_target }}/"
+          cp tools/luau/README.md tools/luau/LICENSE.txt "$bundle/tools/luau/"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bundle_win="$(cygpath -w "$bundle")"
+            archive_win="$(cygpath -w "$archive")"
+            BUNDLE_DIR="$bundle_win" ARCHIVE_PATH="$archive_win" \
+              powershell -NoProfile -NonInteractive -Command \
+                'Compress-Archive -Path "$env:BUNDLE_DIR\*" -DestinationPath $env:ARCHIVE_PATH -Force'
+          else
+            archive_abs="$PWD/$archive"
+            (cd "$bundle" && zip -q -r "$archive_abs" .)
+          fi
+
+          ARCHIVE_PATH="$archive" node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const file = process.env.ARCHIVE_PATH;
+            const hash = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+            fs.writeFileSync(file + ".sha256", hash + "  " + path.basename(file) + "\n");
+          '
+          rm -rf "$bundle"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
-          path: daemon/dist/${{ matrix.out }}
+          path: |
+            daemon/dist/${{ matrix.out }}
+            daemon/dist/rosync-${{ matrix.tool_target }}-bundle.zip
+            daemon/dist/rosync-${{ matrix.tool_target }}-bundle.zip.sha256
+
+  plugin:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Luau compiler
+        run: |
+          set -euo pipefail
+          compiler="$RUNNER_TEMP/luau-compile"
+          node scripts/install-luau-compiler.mjs \
+            --target linux-x86_64 \
+            --dest "$compiler"
+          test -x "$compiler"
+          echo "LUAU_COMPILE=$compiler" >> "$GITHUB_ENV"
+      - name: Compile Studio plugin Luau bytecode
+        run: |
+          node scripts/check-luau-bytecode.mjs plugin/Plugin.luau
+          node scripts/check-luau-bytecode.mjs plugin/Photo.luau
+          node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
+      - name: Install plugin build tools
+        run: |
+          cargo install --locked --version 0.3.2 wally
+          cargo install --locked --version 7.5.1 rojo
+      - name: Build Studio plugin
+        run: node plugin/build-plugin.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoSyncPlugin.rbxm
+          path: plugin/Plugin.rbxm
 
   release:
-    needs: build
+    needs: [build, plugin]
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -73,6 +149,21 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Verify release bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          shopt -s nullglob
+          bundles=(rosync-*-bundle.zip)
+          test "${#bundles[@]}" -eq 3
+          sha256sum --check --strict -- *-bundle.zip.sha256
+          for bundle in "${bundles[@]}"; do
+            unzip -tq "$bundle"
+            unzip -Z1 "$bundle" | grep -Eq '^daemon/rosync-(darwin-arm64|linux-x86_64|windows-x86_64\.exe)$'
+            unzip -Z1 "$bundle" | grep -Eq '^tools/luau/(darwin-arm64|linux-x86_64|windows-x86_64)/luau-compile(\.exe)?$'
+            unzip -Z1 "$bundle" | grep -q '^tools/luau/LICENSE.txt$'
+          done
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*

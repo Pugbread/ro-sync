@@ -3,7 +3,10 @@
   "tree": {
     "$className": "Folder",
     "RoSync": {
-      "$path": "src/RoSync.server.luau"
+      "$path": "src/RoSync.server.luau",
+      "Photo": {
+        "$path": "src/Photo.luau"
+      }
     },
     "App": {
       "$path": "src/App.luau"

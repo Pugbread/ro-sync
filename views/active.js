@@ -313,7 +313,7 @@ export function mountActive(root, api) {
           if (!data || typeof data !== "object") return;
           const t = data.type;
           // Transport-only frames — not log-worthy.
-          if (t === "ping" || t === "pong" || t === "hello" || t === "lagged"
+          if (t === "ping" || t === "pong" || t === "lagged"
               || t === "push-result" || t === "error") return;
 
           if (t === "op") {

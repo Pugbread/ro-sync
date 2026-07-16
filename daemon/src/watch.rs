@@ -9,7 +9,6 @@
 //   Op, OpKind, Watch
 //   Watch::new(root) -> Watch
 //   Watch::subscribe() -> broadcast::Receiver<Op>
-//   Watch::sender()    -> broadcast::Sender<Op>
 //   Watch::pause_until(Instant)
 //   Watch::pause_handle() -> Arc<Mutex<Instant>>
 
@@ -31,14 +30,9 @@ const DEBOUNCE_MS: u64 = 150;
 const CHANNEL_CAP: usize = 16384;
 
 /// Substrings / name fragments we never want to propagate. Matches are
-/// case-sensitive and applied to the final path component (except generated /
-/// vendor tooling directories, which match any ancestor component).
+/// case-sensitive and applied to the final path component.
 const BLACKLISTED: &[&str] = &[
     ".DS_Store",
-    ".git",
-    ".codex",
-    ".vscode",
-    "tools",
     "~$",
     ".#",
     ".swp",
@@ -46,6 +40,20 @@ const BLACKLISTED: &[&str] = &[
     ".meta.json",
     ".tree.json.tmp",
     ".luaurc",
+];
+
+/// Project-root tooling directories. These names are valid Roblox instance
+/// names below a synced service, so only the first component relative to the
+/// project root is excluded.
+const ROOT_TOOLING_DIRS: &[&str] = &[
+    ".git",
+    ".codex",
+    ".vscode",
+    ".t64",
+    ".rosync-artifacts",
+    ".rosync-backups",
+    ".rosync-workflows",
+    "tools",
 ];
 
 /// Reserved filenames the daemon itself writes at the project root. Watching
@@ -77,7 +85,7 @@ pub enum OpKind {
     Rename,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Op {
     pub kind: OpKind,
     pub path: PathBuf,
@@ -130,10 +138,6 @@ impl Watch {
         self.tx.subscribe()
     }
 
-    pub fn sender(&self) -> broadcast::Sender<Op> {
-        self.tx.clone()
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -180,7 +184,7 @@ fn drain_loop(
                 if ev.event.paths.len() >= 2 {
                     let from = &ev.event.paths[0];
                     let to = &ev.event.paths[1];
-                    if is_blacklisted(from) || is_blacklisted(to) {
+                    if is_blacklisted(from, &root) || is_blacklisted(to, &root) {
                         continue;
                     }
                     if is_root_reserved(from, &root) || is_root_reserved(to, &root) {
@@ -196,7 +200,7 @@ fn drain_loop(
                 }
             }
             for p in &ev.event.paths {
-                if is_blacklisted(p) {
+                if is_blacklisted(p, &root) {
                     continue;
                 }
                 if is_root_reserved(p, &root) {
@@ -222,17 +226,17 @@ fn classify_rename(from: &Path, to: &Path) -> Option<Op> {
     })
 }
 
-/// Returns true if any component of the path matches a blacklisted fragment
-/// (either a fixed name like `.DS_Store` / generated tooling dirs, or a
-/// substring pattern for editor swap files).
-pub(crate) fn is_blacklisted(p: &Path) -> bool {
-    // Ancestor-wide matches: bail early if any component is a blacklisted
-    // directory or file name.
-    for comp in p.components() {
-        let Some(s) = comp.as_os_str().to_str() else {
-            continue;
-        };
-        if s == ".DS_Store" || s == ".git" || s == ".codex" || s == ".vscode" || s == "tools" {
+/// Returns true for project-root tooling directories or a blacklisted final
+/// filename. Nested folders named `tools`, `.codex`, or `.vscode` are valid
+/// Studio names and must continue syncing.
+pub(crate) fn is_blacklisted(p: &Path, root: &Path) -> bool {
+    if let Ok(relative) = p.strip_prefix(root) {
+        if relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .is_some_and(|name| ROOT_TOOLING_DIRS.contains(&name))
+        {
             return true;
         }
     }
@@ -271,7 +275,6 @@ pub(crate) fn is_root_reserved(path: &Path, root: &Path) -> bool {
 fn matches_fragment(name: &str, frag: &str) -> bool {
     match frag {
         ".DS_Store" => name == ".DS_Store",
-        ".git" | ".codex" | ".vscode" => name == frag,
         ".meta.json" | ".tree.json.tmp" => name == frag,
         ".#" => name.starts_with(".#"),
         "~$" => name.starts_with("~$"),
@@ -419,16 +422,39 @@ mod tests {
 
     #[test]
     fn blacklist_filters_ds_store_and_swap_files() {
-        assert!(is_blacklisted(Path::new("/tmp/proj/.DS_Store")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/sub/.DS_Store")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/.git/config")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/.codex/config.toml")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/.vscode/settings.json")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/.#foo.luau")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/~$temp.docx")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/x.swp")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/x.swo")));
-        assert!(is_blacklisted(Path::new("/tmp/proj/backup~")));
-        assert!(!is_blacklisted(Path::new("/tmp/proj/Main.luau")));
+        let root = Path::new("/tmp/proj");
+        assert!(is_blacklisted(&root.join(".DS_Store"), root));
+        assert!(is_blacklisted(&root.join("sub/.DS_Store"), root));
+        assert!(is_blacklisted(&root.join(".git/config"), root));
+        assert!(is_blacklisted(&root.join(".codex/config.toml"), root));
+        assert!(is_blacklisted(&root.join(".vscode/settings.json"), root));
+        assert!(is_blacklisted(
+            &root.join(".rosync-backups/123/Workspace/Main.luau"),
+            root
+        ));
+        assert!(is_blacklisted(
+            &root.join(".rosync-workflows/run.json"),
+            root
+        ));
+        assert!(is_blacklisted(&root.join(".t64/session.json"), root));
+        assert!(is_blacklisted(&root.join("tools/linter"), root));
+        assert!(is_blacklisted(&root.join(".#foo.luau"), root));
+        assert!(is_blacklisted(&root.join("~$temp.docx"), root));
+        assert!(is_blacklisted(&root.join("x.swp"), root));
+        assert!(is_blacklisted(&root.join("x.swo"), root));
+        assert!(is_blacklisted(&root.join("backup~"), root));
+        assert!(!is_blacklisted(&root.join("Main.luau"), root));
+        assert!(!is_blacklisted(
+            &root.join("Workspace/tools/Main.luau"),
+            root
+        ));
+        assert!(!is_blacklisted(
+            &root.join("Workspace/.codex/Main.luau"),
+            root
+        ));
+        assert!(!is_blacklisted(
+            &root.join("Workspace/.vscode/Main.luau"),
+            root
+        ));
     }
 }

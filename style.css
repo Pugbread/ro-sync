@@ -1828,63 +1828,6 @@ input.is-drop-target {
   text-wrap: pretty;
 }
 
-/* -------- Modal: batch-preview (threshold gate) -------- */
-.preview-card { max-width: 560px; }
-.preview-counts {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  margin: 4px 0;
-}
-.pv-count {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-}
-.pv-count .n {
-  font-family: var(--mono);
-  font-size: 18px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-.pv-count .l {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--muted);
-}
-.pv-count.pv-add { border-color: var(--ok); }
-.pv-count.pv-add .n { color: var(--ok); }
-.pv-count.pv-upd { border-color: var(--warn); }
-.pv-count.pv-upd .n { color: var(--warn); }
-.pv-count.pv-rem { border-color: var(--danger); }
-.pv-count.pv-rem .n { color: var(--danger); }
-
-.preview-list {
-  list-style: none;
-  margin: 0;
-  padding: 10px;
-  max-height: 180px;
-  overflow: auto;
-  background: #000;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  font-family: var(--mono);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5);
-}
-.preview-list .pv-line { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.preview-list .pv-line.pv-add { color: var(--ok); }
-.preview-list .pv-line.pv-upd { color: var(--warn); }
-.preview-list .pv-line.pv-rem { color: var(--danger); }
-.preview-list .pv-more { color: var(--muted); padding: 2px 0; }
-
 /* -------- Badges: warn variant -------- */
 .badge.badge-warn {
   background: var(--warn);
@@ -2042,7 +1985,6 @@ input.is-drop-target {
   }
   .initial-decision { grid-template-columns: 1fr; }
   .initial-decision .modal-actions { justify-content: flex-start; }
-  .preview-counts { grid-template-columns: repeat(3, 1fr); }
   .pp-grid { grid-template-columns: 1fr; }
   .docs-grid { grid-template-rows: minmax(104px, 32%) minmax(0, 1fr); }
   .docs-command { padding: 10px; border-radius: var(--radius); }

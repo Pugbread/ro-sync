@@ -10,8 +10,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-const SYNCED_CLASSES: &[&str] = &["Folder", "Script", "LocalScript", "ModuleScript"];
-
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathInputKind {
     /// Try Studio path first, then filesystem path.
@@ -55,13 +53,13 @@ pub fn resolve_with_tree(
 ) -> Result<ResolvedPath, String> {
     let project = absolute_lexical(project)?;
     match from {
-        PathInputKind::Studio => studio_to_fs(&project, &tree, input, PathInputKind::Studio),
-        PathInputKind::Fs => fs_to_studio(&project, &tree, input, PathInputKind::Fs),
+        PathInputKind::Studio => studio_to_fs(&project, tree, input, PathInputKind::Studio),
+        PathInputKind::Fs => fs_to_studio(&project, tree, input, PathInputKind::Fs),
         PathInputKind::Auto => {
-            if looks_like_studio_path(&tree, input) {
-                studio_to_fs(&project, &tree, input, PathInputKind::Studio)
+            if looks_like_studio_path(tree, input) {
+                studio_to_fs(&project, tree, input, PathInputKind::Studio)
             } else {
-                fs_to_studio(&project, &tree, input, PathInputKind::Fs)
+                fs_to_studio(&project, tree, input, PathInputKind::Fs)
             }
         }
     }
@@ -235,10 +233,10 @@ fn validate_syncable_studio_path(nodes: &[&Value], display: &str) -> Result<(), 
         return Ok(());
     }
     let class = node_class(nodes[nodes.len() - 1]).unwrap_or("");
-    if !SYNCED_CLASSES.contains(&class) {
+    if !crate::sync_scope::contains(class) {
         return Err(format!(
             "path: Studio path {display} is a {class}, which is Studio-authoritative and has no filesystem path. Syncable classes: {}",
-            SYNCED_CLASSES.join(", ")
+            crate::sync_scope::CLASSES.join(", ")
         ));
     }
     Ok(())
@@ -362,7 +360,7 @@ fn existing_fragments(dir: &Path) -> Result<Vec<String>, String> {
 
 fn is_syncable_child(node: &Value) -> bool {
     node_class(node)
-        .map(|class| SYNCED_CLASSES.contains(&class))
+        .map(crate::sync_scope::contains)
         .unwrap_or(false)
 }
 

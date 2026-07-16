@@ -1,18 +1,26 @@
 // app.js — view router, state store, daemon supervisor.
-import { t64, onT64, daemonJson, daemonWS, emit, on } from "./bridge.js";
+import {
+  t64,
+  onT64,
+  daemonJson,
+  daemonWS,
+  daemonURL,
+  setDaemonAuthToken,
+  emit,
+  on,
+} from "./bridge.js";
 import { mountProjects } from "./views/projects.js";
 import { mountActive } from "./views/active.js";
 import { mountConflicts } from "./views/conflicts.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
-import { mountPreviewModal } from "./views/preview.js";
 import {
   PLATFORM, IS_WINDOWS,
   BINARY_REL, WIDGET_DIR_SHELL,
   shQuote,
   pidAliveCmd, parsePidAlive,
-  killPidCmd, killDaemonOnPortCmd,
+  killPidCmd,
   tailLogCmd, portOwnerCmd,
   launchDaemonCmd, tmpLogPath,
   joinShell,
@@ -44,10 +52,22 @@ const app = {
   unmountCurrent: null,
 };
 
+let stateSaveChain = Promise.resolve();
+
 function saveState() {
-  return t64("t64:set-state", { key: "state", value: app.state }).catch((e) =>
-    console.warn("t64:set-state failed", e)
-  );
+  // setState can fire several times while a daemon is stopping, scanning
+  // fallback ports, and relaunching. Terminal 64 state writes are async, so
+  // unconstrained calls can complete out of order and resurrect an older
+  // daemonProject/daemonPort snapshot. Queue immutable snapshots in call
+  // order; a failed write is logged without breaking later saves.
+  const value = { ...app.state };
+  stateSaveChain = stateSaveChain.then(
+    () => t64("t64:set-state", { key: "state", value }),
+    () => t64("t64:set-state", { key: "state", value }),
+  ).catch((e) => {
+    console.warn("t64:set-state failed", e);
+  });
+  return stateSaveChain;
 }
 
 async function loadState() {
@@ -60,12 +80,14 @@ async function loadState() {
   } catch {
     // No stored state yet — that's fine.
   }
+  setDaemonAuthToken(app.state.daemonOwnerToken);
 }
 
 export function getState() { return app.state; }
 export function getDaemonBase() { return app.daemonOk ? app.daemonBase : null; }
 export function setState(patch) {
   app.state = { ...app.state, ...patch };
+  setDaemonAuthToken(app.state.daemonOwnerToken);
   saveState();
   emit("state", app.state);
 }
@@ -155,8 +177,6 @@ async function stopTrackedSession(session) {
   try {
     if (session.pid && await pidAlive(session.pid)) {
       await t64("t64:exec", { command: killPidCmd(session.pid) });
-    } else if (session.port) {
-      await t64("t64:exec", { command: killDaemonOnPortCmd(session.port) });
     }
   } catch (e) {
     console.warn("stopTrackedSession failed", session, e);
@@ -190,7 +210,7 @@ async function stopDuplicateTrackedSessions(keepProject, keepPort) {
 
 async function probePort(port) {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/hello`, {
+    const r = await fetch(daemonURL(`http://127.0.0.1:${port}`, "/hello"), {
       method: "GET",
       signal: AbortSignal.timeout(500),
     });
@@ -222,6 +242,24 @@ async function getPortOwnerPid(port) {
   return parsePortOwnerPid(await getPortOwner(port));
 }
 
+async function waitForPidExit(pid, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await pidAlive(pid))) return true;
+    await sleep(100);
+  }
+  return !(await pidAlive(pid));
+}
+
+async function waitForPortRelease(port, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await getPortOwner(port))) return true;
+    await sleep(100);
+  }
+  return !(await getPortOwner(port));
+}
+
 function makeOwnerToken() {
   const bytes = new Uint8Array(24);
   if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
@@ -242,7 +280,7 @@ function ensureOwnerToken() {
 async function daemonLifecycleRequest(base, path, reason) {
   const token = app.state.daemonOwnerToken;
   if (!base || !token) return { sent: false, ok: false, error: "missing daemon owner token" };
-  const url = `${base.replace(/\/+$/, "")}${path}`;
+  const url = daemonURL(base, path);
   const body = JSON.stringify({ token, reason });
   try {
     const res = await fetch(url, {
@@ -257,6 +295,7 @@ async function daemonLifecycleRequest(base, path, reason) {
       ok: !!(res.ok && json && json.ok !== false),
       status: res.status,
       error: json && json.error,
+      data: json,
     };
   } catch (e) {
     return { sent: false, ok: false, error: e && e.message ? e.message : String(e) };
@@ -267,7 +306,7 @@ function daemonLifecyclePost(path, reason, preferBeacon = false) {
   const base = app.daemonBase;
   const token = app.state.daemonOwnerToken;
   if (!base || !token) return false;
-  const url = `${base.replace(/\/+$/, "")}${path}`;
+  const url = daemonURL(base, path);
   const body = JSON.stringify({ token, reason });
   if (preferBeacon && navigator.sendBeacon) {
     try {
@@ -423,23 +462,13 @@ async function scanFallbackPorts(project, preferred) {
     if (occ && !isOwnDaemon(occ.info, project)) continue;
     if (occ && isOwnDaemon(occ.info, project)) {
       if (!isWidgetOwnedDaemon(occ.info) || !app.state.daemonOwnerToken) {
-        await killStaleDaemonAt(p);
-        const relaunched = await launchAndWait(project, p);
-        if (relaunched) {
-          toast(`Port ${preferred} busy — started daemon on :${p}`);
-          return relaunched;
-        }
-        continue;
+        toast(`Port ${preferred} busy — using existing daemon on :${p}`);
+        return occ;
       }
       if (!(await verifyDaemonOwnership(`http://127.0.0.1:${occ.port}`))) {
         setState({ daemonOwnerToken: null });
-        await killStaleDaemonAt(p);
-        const relaunched = await launchAndWait(project, p);
-        if (relaunched) {
-          toast(`Port ${preferred} busy — started daemon on :${p}`);
-          return relaunched;
-        }
-        continue;
+        toast(`Port ${preferred} busy — using existing daemon on :${p}`);
+        return occ;
       }
       toast(`Port ${preferred} busy — started daemon on :${p}`);
       return occ;
@@ -489,11 +518,19 @@ function isWidgetOwnedDaemon(info) {
 }
 
 async function launchAndWait(project, port) {
-  await launchDaemon(project, port);
+  const launchedPid = await launchDaemon(project, port);
+  if (!launchedPid) return null;
   for (let i = 0; i < 20; i++) {
     await sleep(200);
     const hit = await probePort(port);
     if (hit) return hit;
+  }
+  // A process that launched but never passed the authenticated browser probe
+  // must not leak into the fallback scan. Stop only the exact PID we just
+  // created; manually managed daemons are never touched here.
+  await stopTrackedSession({ pid: launchedPid, port, project });
+  if (app.state.daemonPid === launchedPid) {
+    setState({ daemonPid: null, daemonProject: null });
   }
   return null;
 }
@@ -531,26 +568,18 @@ async function ensureDaemonInner() {
     const ours = isOwnDaemon(hit.info, project);
     const pointedAtOurProject = hit.info && hit.info.project === project;
     if (ours && (!isWidgetOwnedDaemon(hit.info) || !app.state.daemonOwnerToken)) {
-      // Older widget builds launched daemons without lifecycle ownership. Reap
-      // and relaunch so closing Terminal 64 no longer leaves this process
-      // alive. Do the same if state lost the token required to control it.
-      await killStaleDaemonAt(preferred);
-      hit = await launchAndWait(project, preferred);
+      // A manually started daemon, or a widget daemon whose ownership token
+      // is no longer available, is external to this widget. Reuse it without
+      // claiming lifecycle ownership; never kill a process by command pattern.
     } else if (ours && !(await verifyDaemonOwnership(`http://127.0.0.1:${hit.port}`))) {
-      // A widget-owned daemon can outlive the widget state token that launched it.
-      // Reusing it would make every heartbeat fail until the daemon self-stops.
+      // Lost/invalid ownership is not permission to kill the listener.
       setState({ daemonOwnerToken: null });
-      await killStaleDaemonAt(preferred);
-      hit = await launchAndWait(project, preferred);
     } else if (ours) {
       // Already have a daemon for our project — great, use it.
     } else if (pointedAtOurProject) {
       // Daemon IS serving our current project path, but gameId/groupId/placeIds don't
-      // match. It was launched with stale CLI args (before the user set the
-      // Roblox ids, or edited them while serving in an older widget build that
-      // didn't auto-restart). Kill and relaunch with current settings.
-      await killStaleDaemonAt(preferred);
-      hit = await launchAndWait(project, preferred);
+      // match. The daemon hot-reloads ro-sync.json, so keep the existing
+      // process instead of risking a pattern-based kill of a manual daemon.
     } else if (app.state.daemonProject && app.state.daemonProject !== project) {
       // It's our own prior daemon but for a different project — stop and relaunch here.
       await killDaemon();
@@ -571,21 +600,40 @@ async function ensureDaemonInner() {
   }
 
   if (hit) {
-    const ownerPid = await getPortOwnerPid(hit.port);
-    const daemonPid = ownerPid || app.state.daemonPid || null;
     app.daemonBase = `http://127.0.0.1:${hit.port}`;
     app.daemonOk = true;
     setDaemonDot("ok", `:${hit.port}`);
     if (app.state.daemonPort !== hit.port) setState({ daemonPort: hit.port });
-    if (daemonPid && app.state.daemonPid !== daemonPid) setState({ daemonPid });
     if (app.state.daemonProject !== project) setState({ daemonProject: project });
-    await upsertSession({
-      port: hit.port,
-      pid: daemonPid,
-      project,
-      startedAt: Date.now(),
-    });
-    await stopDuplicateTrackedSessions(project, hit.port);
+
+    // A matching /hello response only proves that this is a Ro Sync daemon;
+    // it does not give the widget lifecycle ownership. Claim and persist its
+    // PID only after the widget-owned token has been authenticated. Otherwise
+    // a manually started daemon would enter our sessions registry and a later
+    // project switch/widget close could kill that external process by PID.
+    const ownsLifecycle =
+      isWidgetOwnedDaemon(hit.info) &&
+      !!app.state.daemonOwnerToken &&
+      await verifyDaemonOwnership(app.daemonBase);
+    if (ownsLifecycle) {
+      const ownerPid = await getPortOwnerPid(hit.port);
+      const daemonPid = ownerPid || app.state.daemonPid || null;
+      if (daemonPid && app.state.daemonPid !== daemonPid) setState({ daemonPid });
+      await upsertSession({
+        port: hit.port,
+        pid: daemonPid,
+        project,
+        startedAt: Date.now(),
+      });
+      await stopDuplicateTrackedSessions(project, hit.port);
+    } else {
+      // Forget any stale record for this listener. Keeping a token or PID here
+      // would make killDaemon()/heartbeat treat an external process as ours.
+      await removeSession({ port: hit.port });
+      if (app.state.daemonPid || app.state.daemonOwnerToken) {
+        setState({ daemonPid: null, daemonOwnerToken: null });
+      }
+    }
     emit("daemon:up", { base: app.daemonBase, info: hit.info, project });
   } else {
     app.daemonOk = false;
@@ -595,45 +643,61 @@ async function ensureDaemonInner() {
   }
 }
 
-async function killDaemon() {
+async function killDaemon({ preserveTarget = false } = {}) {
   const pid = app.state.daemonPid;
   const port = app.state.daemonPort;
   if (!pid) {
-    // No tracked pid (e.g. widget was reloaded). Try to kill by port so we
-    // don't leave a zombie daemon running.
-    if (port) await killStaleDaemonAt(port);
-    return;
+    // No tracked PID means the process may have been started manually. Only
+    // the authenticated lifecycle endpoint is safe to use in this case.
+    if (!app.daemonBase || !app.state.daemonOwnerToken) {
+      toast("Daemon is externally managed; it was left running.");
+      return false;
+    }
+    const result = await daemonLifecycleRequest(app.daemonBase, "/widget-close", "daemon stopped");
+    if (!result.ok) {
+      toast(`Could not stop daemon safely: ${result.error || "ownership rejected"}`);
+      return false;
+    }
+    if (result.data && result.data.keptAlive) {
+      toast("Daemon kept running because Studio is connected.");
+      return false;
+    }
+    if (port && !(await waitForPortRelease(port))) {
+      toast(`Daemon did not release port ${port}; restart was cancelled.`);
+      return false;
+    }
+    await removeSession({ port });
+    setState({
+      daemonPid: null,
+      daemonProject: preserveTarget ? app.state.daemonProject : null,
+      daemonOwnerToken: null,
+    });
+    app.daemonOk = false;
+    app.daemonBase = null;
+    setDaemonDot("idle", "daemon stopped");
+    emit("daemon:down", {});
+    return true;
   }
   try {
     await t64("t64:exec", { command: killPidCmd(pid) });
   } catch (e) {
     console.warn("kill failed", e);
   }
+  if (!(await waitForPidExit(pid))) {
+    toast(`Daemon PID ${pid} did not exit; restart was cancelled.`);
+    return false;
+  }
   await removeSession({ pid, port });
-  setState({ daemonPid: null, daemonProject: null, daemonOwnerToken: null });
+  setState({
+    daemonPid: null,
+    daemonProject: preserveTarget ? app.state.daemonProject : null,
+    daemonOwnerToken: null,
+  });
   app.daemonOk = false;
   app.daemonBase = null;
   setDaemonDot("idle", "daemon stopped");
   emit("daemon:down", {});
-}
-
-// Kill whatever rosync daemon is bound to `port`, even if we don't have its
-// PID in state (common after a widget reload or after an older build launched
-// it with different CLI args). Platform-aware — see killDaemonOnPortCmd.
-async function killStaleDaemonAt(port) {
-  const portN = parseInt(port, 10);
-  if (!Number.isFinite(portN)) return;
-  try {
-    await t64("t64:exec", { command: killDaemonOnPortCmd(portN) });
-  } catch (e) {
-    console.warn("killStaleDaemonAt failed", e);
-  }
-  if (app.state.daemonPort === portN) {
-    await removeSession({ port: portN });
-    setState({ daemonPid: null, daemonProject: null, daemonOwnerToken: null });
-  }
-  app.daemonOk = false;
-  app.daemonBase = null;
+  return true;
 }
 
 // ---------- Health loop ----------
@@ -806,6 +870,7 @@ onT64("t64:init", (payload) => {
       ...payload.state,
       daemonOwnerToken: payload.state.daemonOwnerToken || app.state.daemonOwnerToken || null,
     };
+    setDaemonAuthToken(app.state.daemonOwnerToken);
     emit("state", app.state);
   }
 });
@@ -822,7 +887,7 @@ const ENABLE_APP_REALTIME_STREAM = true;
 //       → skipped here; the plugin consumes sync ops directly
 //   {type:"<event-name>", ...}   ← daemon forwards state.events frames with
 //       their ORIGINAL top-level type ("initial-choice-needed",
-//       "initial-choice-made", "config-changed", "conflict", "batch-preview")
+//       "initial-choice-made", "config-changed", "conflict")
 //       → emit(type, frame)
 //   {type:"ping"} / {type:"pong"} / {type:"lagged"} / {type:"push-result"} /
 //   {type:"error"} → transport-only, ignored here
@@ -831,10 +896,6 @@ const RAW_OP_RE = /"type"\s*:\s*"op"/;
 
 // Op frames are intentionally skipped on the app-level stream so large file
 // bursts do not force the Terminal 64 host to JSON-parse every source payload.
-// Older builds also synthesized a "batch-preview" modal from rapid op bursts;
-// that made normal Codex/multiedit syncs look suspicious. When the daemon is
-// alive, filesystem sync is the source of truth, so only native daemon control
-// events should ask for a decision.
 function shouldSkipRawAppFrame(raw) {
   if (typeof raw !== "string" || !RAW_OP_RE.test(raw)) return false;
   return true;
@@ -860,15 +921,14 @@ function openAppStream() {
         }
         // Transport-only frames — not surfaced to views.
         if (t === "ping" || t === "pong" || t === "lagged"
-            || t === "push-result" || t === "error" || t === "hello") {
+            || t === "push-result" || t === "error") {
           return;
         }
         // Everything else is a state.events passthrough carrying its
-        // original top-level type. Fan out to the bus so modals / previews
+        // original top-level type. Fan out to the bus so app-level controls
         // can react.
         if (t === "initial-choice-needed" || t === "initial-choice-made"
-            || t === "batch-preview" || t === "config-changed"
-            || t === "conflict") {
+            || t === "config-changed" || t === "conflict") {
           emit(t, data);
           return;
         }
@@ -897,13 +957,6 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
   navigate(app.state.lastView || "projects");
   // Mount the blocking overwrite-choice modal at app-level.
   mountOverwriteModal({
-    onBus: on,
-    getDaemonBase,
-    getState,
-    toast,
-  });
-  // Mount the daemon-sourced batch-preview modal at app-level.
-  mountPreviewModal({
     onBus: on,
     getDaemonBase,
     getState,

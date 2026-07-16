@@ -30,6 +30,20 @@ export function platformLabel(platform) {
   return String(platform || "Unknown");
 }
 
+export function joinProjectFile(projectPath, relativePath) {
+  const root = String(projectPath || "").replace(/[\\/]+$/, "");
+  const separator = pathSeparatorFor(root);
+  const relative = String(relativePath || "")
+    .replace(/^[\\/]+/, "")
+    .replace(/[\\/]+/g, separator);
+  return `${root}${separator}${relative}`;
+}
+
+function pathSeparatorFor(projectPath) {
+  const path = String(projectPath || "");
+  return /^[A-Za-z]:[\\/]/.test(path) || path.includes("\\") ? "\\" : "/";
+}
+
 export function installDocumentEscape(handler) {
   const onKeydown = (event) => {
     if (event.key === "Escape") handler(event);

@@ -1,27 +1,33 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch as tokio_watch};
 
+mod artifact;
 mod conflict;
 mod diff;
 mod fs_map;
 mod http;
 mod img_upload;
 mod initial_sync;
+mod native_capture;
 mod path_resolver;
 mod project_config;
+#[cfg(test)]
 mod query;
 mod remote;
 mod snapshot;
 mod sourcemap;
+mod sync_scope;
 mod watch;
+mod workflow;
 mod ws;
 
 use conflict::{ConflictEngine, FsDecision};
@@ -32,6 +38,18 @@ use ws::{PendingRoutes, RequestEnvelope};
 const COMMANDS_BUNDLE_JSON: &str = include_str!("../../docs/client-commands.generated.json");
 const DEFAULT_DAEMON_PORT: u16 = 7878;
 const DAEMON_PORT_SCAN_MAX: u16 = 7890;
+const CAPTURE_MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+const CAPTURE_MAX_DIMENSION: u32 = 16_384;
+const CAPTURE_MAX_PIXELS: u64 = 64 * 1024 * 1024;
+const PHOTO_MAX_DIMENSION: u32 = 4096;
+const PHOTO_MAX_PIXELS: u64 = 16 * 1024 * 1024;
+const LOCAL_HTTP_MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
+const LOCAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCAL_HTTP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_CLEANUP_RESERVE: Duration = Duration::from_millis(250);
+const RECOMMENDED_LUAU_LSP_VERSION: (u64, u64, u64) = (1, 68, 1);
+const ROBLOX_DEFINITIONS_SHA256: &str =
+    "08fbcafcf6d17643886d8fe0ec297fc9bfab33d3bf8d96d88b6eefe29f6d5490";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,6 +90,14 @@ pub enum Command {
     Commands(CommandsArgs),
     /// Print an LLM-oriented project context snapshot as JSON.
     Context(ContextArgs),
+    /// Execute a validated, reference-aware JSON workflow over one persistent session.
+    Run(RunWorkflowArgs),
+    /// Report negotiated daemon, plugin, Studio, and runtime capabilities.
+    Capabilities(CapabilitiesArgs),
+    /// Capture an arbitrary Studio viewport/screen region as a PNG artifact.
+    Capture(CaptureArgs),
+    /// Start and control Studio playtests and their server/client runtime agents.
+    Playtest(PlaytestArgs),
     /// Build a read-only JSON plan for a mutating command.
     Plan(PlanArgs),
     /// Match a selector against the live Studio tree.
@@ -186,6 +212,536 @@ pub enum Command {
 }
 
 #[derive(ClapArgs, Debug)]
+pub struct CapabilitiesArgs {
+    /// Project directory. Used for daemon port discovery.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    /// Print the complete JSON capability document.
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CaptureArgs {
+    #[command(subcommand)]
+    pub command: CaptureCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CaptureCommand {
+    /// Check screenshot API availability and current permission without prompting.
+    Status(CaptureStatusArgs),
+    /// Ask Studio for screenshot permission. This may show a user prompt.
+    Authorize(CaptureAuthorizeArgs),
+    /// Capture the requested screen rectangle and write a PNG file.
+    Screen(CaptureScreenArgs),
+    /// Capture the Studio viewport through Ro Sync's locally packaged Photo engine.
+    Photo(CapturePhotoArgs),
+    /// Frame a Studio instance in the 3D camera and capture the viewport.
+    Scene(CaptureSceneArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CaptureStatusArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CaptureAuthorizeArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureUiMode {
+    All,
+    None,
+}
+
+impl CaptureUiMode {
+    fn as_plugin_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureResampleMode {
+    Default,
+    Pixelated,
+}
+
+impl CaptureResampleMode {
+    fn as_plugin_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Pixelated => "pixelated",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CaptureScreenArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    /// Capture rectangle as x,y,width,height. Omit to capture the full Studio surface.
+    #[arg(long)]
+    pub region: Option<String>,
+    /// Output dimensions as WIDTHxHEIGHT. Omit to preserve the capture size.
+    #[arg(long = "output-size")]
+    pub output_size: Option<String>,
+    /// Include all Studio UI or capture only the 3D viewport.
+    #[arg(long, value_enum, default_value_t = CaptureUiMode::All)]
+    pub ui: CaptureUiMode,
+    /// Scaling algorithm used when --output-size differs from the capture size.
+    #[arg(long, value_enum, default_value_t = CaptureResampleMode::Default)]
+    pub resample: CaptureResampleMode,
+    /// Destination PNG. Parent directories are created automatically.
+    #[arg(long, default_value = "rosync-capture.png")]
+    pub output: PathBuf,
+    /// Overall Studio capture timeout in seconds.
+    #[arg(long, default_value_t = 30.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+    #[arg(long, hide = true)]
+    pub focus: Option<String>,
+    #[arg(long, hide = true)]
+    pub view: Option<CaptureView>,
+    #[arg(long, hide = true)]
+    pub padding: Option<f64>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureView {
+    Isometric,
+    Front,
+    Back,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl CaptureView {
+    fn as_plugin_str(self) -> &'static str {
+        match self {
+            Self::Isometric => "isometric",
+            Self::Front => "front",
+            Self::Back => "back",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturePhotoBackground {
+    /// Reconstruct transparency by capturing against black and white backgrounds.
+    Transparent,
+    /// Preserve the viewport, sky, and world background exactly as rendered.
+    Scene,
+}
+
+impl CapturePhotoBackground {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Transparent => "transparent",
+            Self::Scene => "scene",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturePhotoUiMode {
+    /// Exclude in-game ScreenGui layers from the capture.
+    None,
+    /// Preserve in-game ScreenGui layers over the rendered 3D scene.
+    Overlay,
+    /// Capture only in-game ScreenGui layers as a transparent RGBA image.
+    Only,
+}
+
+impl CapturePhotoUiMode {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Overlay => "overlay",
+            Self::Only => "only",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CapturePhotoArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    /// Optional Studio instance to clone, isolate, and frame before capture.
+    #[arg(long)]
+    pub focus: Option<String>,
+    /// Native viewport-image rectangle as x,y,width,height. Coordinates start at the viewport's top-left; combine with --size to resize the crop.
+    #[arg(long)]
+    pub region: Option<String>,
+    /// Exact output dimensions as WIDTHxHEIGHT. Full UI-only captures preserve the native aspect ratio with transparent padding; explicit regions fill the canvas. With --focus, defaults to 1024x1024.
+    #[arg(long)]
+    pub size: Option<String>,
+    /// Preset camera direction used with --focus.
+    #[arg(long, value_enum, default_value_t = CaptureView::Isometric)]
+    pub view: CaptureView,
+    /// Arbitrary camera direction x,y,z; overrides --view.
+    #[arg(long, allow_hyphen_values = true)]
+    pub direction: Option<String>,
+    /// Exact camera transform as the 12 values returned by CFrame:GetComponents(). Requires --focus and replaces automatic view/direction/padding framing.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        requires = "focus",
+        conflicts_with_all = ["view", "direction", "padding"]
+    )]
+    pub camera_cframe: Option<String>,
+    /// Extra camera framing multiplier (1.0-4.0).
+    #[arg(long, default_value_t = 1.25)]
+    pub padding: f64,
+    /// Camera vertical field of view used while framing --focus (1-120 degrees).
+    #[arg(long, default_value_t = 32.0)]
+    pub fov: f64,
+    /// Preserve the rendered scene or reconstruct a transparent background.
+    #[arg(long, value_enum, default_value_t = CapturePhotoBackground::Transparent)]
+    pub background: CapturePhotoBackground,
+    /// Keep RGB color in transparent edge pixels for cleaner texture filtering.
+    #[arg(long)]
+    pub alpha_bleed: bool,
+    /// Frame the original target in place instead of a script-free isolated clone.
+    #[arg(long)]
+    pub include_world: bool,
+    /// Choose whether in-game UI is excluded, overlaid on the scene, or captured alone with transparency.
+    #[arg(long, value_enum)]
+    pub ui: Option<CapturePhotoUiMode>,
+    /// Capture one GuiObject and its descendants with transparency, hiding every unrelated UI element. Implies --ui only; --region may override its automatic bounds.
+    #[arg(long)]
+    pub ui_target: Option<String>,
+    /// Legacy alias for --ui overlay.
+    #[arg(long, conflicts_with = "ui")]
+    pub include_ui: bool,
+    /// Delay after camera/scene setup so streaming and rendering can settle.
+    #[arg(long, default_value_t = 0.05)]
+    pub delay: f64,
+    /// Destination PNG. Parent directories are created automatically.
+    #[arg(long, default_value = "rosync-photo.png")]
+    pub output: PathBuf,
+    /// Overall Photo capture timeout in seconds.
+    #[arg(long, default_value_t = 120.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CaptureSceneArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    /// Studio instance to frame, such as Workspace/Map/Boss.
+    #[arg(long)]
+    pub focus: String,
+    #[arg(long, value_enum, default_value_t = CaptureView::Isometric)]
+    pub view: CaptureView,
+    /// Extra camera framing multiplier (1.0-4.0).
+    #[arg(long, default_value_t = 1.25)]
+    pub padding: f64,
+    #[arg(long = "size", default_value = "1024x1024")]
+    pub size: String,
+    #[arg(long, value_enum, default_value_t = CaptureResampleMode::Default)]
+    pub resample: CaptureResampleMode,
+    #[arg(long, default_value = "rosync-scene.png")]
+    pub output: PathBuf,
+    #[arg(long, default_value_t = 120.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestArgs {
+    #[command(subcommand)]
+    pub command: PlaytestCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlaytestCommand {
+    /// Start Play, Run, or a local multiplayer test as an asynchronous job.
+    Start(PlaytestStartArgs),
+    /// Print a playtest job and its currently connected contexts.
+    Status(PlaytestStatusArgs),
+    /// List PlayServer and PlayClient runtime contexts.
+    Contexts(PlaytestContextsArgs),
+    /// Wait until the requested number of runtime contexts are connected.
+    Wait(PlaytestWaitArgs),
+    /// Stop the active playtest.
+    Stop(PlaytestStopArgs),
+    /// Execute Luau in a PlayServer or PlayClient context.
+    Exec(PlaytestExecArgs),
+    /// Read output from a PlayServer or PlayClient context.
+    Logs(PlaytestLogsArgs),
+    /// Inspect resolved GUI geometry/text in a PlayClient context.
+    Ui(PlaytestUiArgs),
+    /// Send a JSON action sequence through PlayClient VirtualInput.
+    Input(PlaytestInputArgs),
+    /// Capture a PlayServer/PlayClient screen through its runtime agent.
+    Capture(PlaytestCaptureArgs),
+    /// Send an advanced runtime operation directly.
+    Request(PlaytestRequestArgs),
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum PlaytestMode {
+    Play,
+    Run,
+    Multiplayer,
+}
+
+impl PlaytestMode {
+    fn as_plugin_str(self) -> &'static str {
+        match self {
+            Self::Play => "play",
+            Self::Run => "run",
+            Self::Multiplayer => "multiplayer",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestStartArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long, value_enum, default_value_t = PlaytestMode::Play)]
+    pub mode: PlaytestMode,
+    /// Number of clients for multiplayer mode (1-8).
+    #[arg(long, default_value_t = 1)]
+    pub players: u8,
+    /// Optional StudioTestService arguments as a JSON object.
+    #[arg(long = "test-args")]
+    pub test_args: Option<String>,
+    /// Wait for runtime contexts after starting (server + clients for multiplayer).
+    #[arg(long)]
+    pub wait: bool,
+    #[arg(long, default_value_t = 45.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestStatusArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long = "job-id")]
+    pub job_id: Option<String>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestContextsArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestWaitArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long, default_value_t = 1)]
+    pub minimum: u8,
+    #[arg(long, default_value_t = 45.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestStopArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long = "job-id")]
+    pub job_id: Option<String>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum RuntimeIdentity {
+    Game,
+    Plugin,
+}
+
+impl RuntimeIdentity {
+    fn as_plugin_str(self) -> &'static str {
+        match self {
+            Self::Game => "game",
+            Self::Plugin => "plugin",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestExecArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    /// Runtime context from `playtest contexts`, e.g. server or client:1.
+    #[arg(long)]
+    pub context: String,
+    #[arg(long, conflicts_with = "source_file")]
+    pub source: Option<String>,
+    #[arg(long = "source-file", conflicts_with = "source")]
+    pub source_file: Option<PathBuf>,
+    /// Game runs through a temporary Script/LocalScript; plugin runs in plugin identity.
+    #[arg(long, value_enum, default_value_t = RuntimeIdentity::Game)]
+    pub identity: RuntimeIdentity,
+    #[arg(long, default_value_t = 15.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestLogsArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long = "since-seq", default_value_t = 0)]
+    pub since_seq: u64,
+    #[arg(long, default_value_t = 200)]
+    pub limit: usize,
+    #[arg(long, default_value_t = 15.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestUiArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub root: Option<String>,
+    #[arg(long = "class")]
+    pub class_name: Option<String>,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    pub limit: usize,
+    #[arg(long, default_value_t = 15.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestInputArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub context: String,
+    /// JSON object or array of input actions.
+    #[arg(long, conflicts_with = "file")]
+    pub actions: Option<String>,
+    /// Read the action object/array from a JSON file.
+    #[arg(long, conflicts_with = "actions")]
+    pub file: Option<PathBuf>,
+    #[arg(long, default_value_t = 30.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestCaptureArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub region: Option<String>,
+    #[arg(long = "output-size")]
+    pub output_size: Option<String>,
+    #[arg(long, value_enum, default_value_t = CaptureUiMode::All)]
+    pub ui: CaptureUiMode,
+    #[arg(long, value_enum, default_value_t = CaptureResampleMode::Default)]
+    pub resample: CaptureResampleMode,
+    #[arg(long, default_value = "rosync-playtest-capture.png")]
+    pub output: PathBuf,
+    #[arg(long, default_value_t = 45.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaytestRequestArgs {
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub op: String,
+    /// Runtime operation arguments as a JSON object.
+    #[arg(long, default_value = "{}")]
+    pub args: String,
+    #[arg(long, default_value_t = 30.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
 pub struct CommandsArgs {
     /// Optional command name. If omitted, prints the full command registry.
     pub name: Option<String>,
@@ -199,11 +755,31 @@ pub struct ContextArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Include the full command registry. Omitted by default to keep context compact.
     #[arg(long = "full-commands")]
     pub full_commands: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct RunWorkflowArgs {
+    /// Workflow JSON file using schema version 1.
+    #[arg(long)]
+    pub file: PathBuf,
+    /// Project directory. Used for daemon port discovery and upload steps.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
+    /// Validate, resolve static structure, and print the normalized workflow without executing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Continue after a non-transactional failed step. References to failed steps remain available.
+    #[arg(long)]
+    pub keep_going: bool,
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -280,7 +856,7 @@ pub struct PlanResolveArgs {
 pub struct OpenArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Studio path(s) to select.
     #[arg(required = true)]
@@ -293,7 +869,7 @@ pub struct OpenArgs {
 pub struct WhereArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Name substring or path to inspect.
     pub target: String,
@@ -308,7 +884,7 @@ pub struct WhereArgs {
 pub struct PropsArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub path: String,
@@ -320,7 +896,7 @@ pub struct PropsArgs {
 pub struct SourceArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Studio path or filesystem path.
     #[arg(long)]
@@ -338,7 +914,7 @@ pub struct MetaArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Studio path or filesystem path.
     pub target: String,
@@ -353,7 +929,7 @@ pub struct ServicesArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub raw: bool,
@@ -364,7 +940,7 @@ pub struct ConflictsArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub raw: bool,
@@ -375,7 +951,7 @@ pub struct ResolveArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub path: String,
@@ -393,7 +969,7 @@ pub struct ResolveArgs {
 pub struct TailArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub since: Option<String>,
@@ -410,7 +986,7 @@ pub struct WatchArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Print compact one-line summaries instead of JSON frames.
     #[arg(long)]
@@ -436,7 +1012,7 @@ pub struct RepairTreeArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Max recursion depth for the live Studio tree request.
     #[arg(long, default_value_t = 128)]
@@ -463,7 +1039,7 @@ pub struct GetArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
     /// Daemon port.
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Instance path, `/`-separated (e.g. `Workspace/Baseplate`).
     #[arg(long)]
@@ -480,7 +1056,7 @@ pub struct GetArgs {
 pub struct SetArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Instance path (ignored when `--batch` is passed).
     #[arg(long)]
@@ -520,7 +1096,7 @@ pub struct SetArgs {
 pub struct LsArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Instance path to list children under. Use empty string or omit for the
     /// DataModel root (services).
@@ -534,7 +1110,7 @@ pub struct LsArgs {
 pub struct TreeArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long, default_value_t = String::new())]
     pub path: String,
@@ -550,7 +1126,7 @@ pub struct SnapshotArgs {
     /// Project directory used for the default output location.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Output file or existing directory. Defaults to
     /// `<project-or-cwd>/rosync-snapshot-<unix-seconds>.json`.
@@ -565,7 +1141,7 @@ pub struct DiffArgs {
     /// Project directory. Defaults to the current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Max recursion depth for the live Studio tree request.
     #[arg(long, default_value_t = 128)]
@@ -925,7 +1501,7 @@ impl MonetizationKind {
 pub struct FindArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Match instances whose `ClassName` equals this.
     #[arg(long = "class")]
@@ -945,7 +1521,7 @@ pub struct FindArgs {
 pub struct LogsArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// How far back to look (e.g. `30s`, `5m`, `1h`). Defaults to `30s`.
     #[arg(long)]
@@ -984,7 +1560,7 @@ impl LogLevel {
 pub struct SaveArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Deprecated no-op kept for old scripts.
     #[arg(long, hide = true)]
@@ -997,7 +1573,7 @@ pub struct SaveArgs {
 pub struct UndoArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long, hide = true)]
     pub yes: bool,
@@ -1009,7 +1585,7 @@ pub struct UndoArgs {
 pub struct RedoArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long, hide = true)]
     pub yes: bool,
@@ -1021,7 +1597,7 @@ pub struct RedoArgs {
 pub struct WaypointArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Label shown in Studio's change-history UI.
     #[arg(long)]
@@ -1034,7 +1610,7 @@ pub struct WaypointArgs {
 pub struct PingArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub raw: bool,
@@ -1044,7 +1620,7 @@ pub struct PingArgs {
 pub struct VersionArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub raw: bool,
@@ -1055,7 +1631,7 @@ pub struct StatusArgs {
     /// Project directory. Defaults to the current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Print JSON instead of human-readable checks.
     #[arg(long)]
@@ -1067,7 +1643,7 @@ pub struct DoctorArgs {
     /// Project directory. Defaults to the current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Print JSON instead of human-readable checks.
     #[arg(long)]
@@ -1093,7 +1669,7 @@ pub struct RefreshArgs {
 pub struct NewArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Parent instance path. The new child is created under this path.
     #[arg(long)]
@@ -1119,7 +1695,7 @@ pub struct NewArgs {
 pub struct RmArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Instance path to destroy.
     #[arg(long)]
@@ -1135,7 +1711,7 @@ pub struct RmArgs {
 pub struct MvArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Instance path to reparent.
     #[arg(long)]
@@ -1173,7 +1749,7 @@ pub enum AttrCommand {
 pub struct AttrSetArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub path: String,
@@ -1192,7 +1768,7 @@ pub struct AttrSetArgs {
 pub struct AttrRmArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub path: String,
@@ -1208,7 +1784,7 @@ pub struct AttrRmArgs {
 pub struct AttrLsArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub path: String,
@@ -1234,7 +1810,7 @@ pub enum TagCommand {
 pub struct TagMutArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub path: String,
@@ -1250,7 +1826,7 @@ pub struct TagMutArgs {
 pub struct CallArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Instance path the method is invoked on (self).
     #[arg(long)]
@@ -1286,7 +1862,7 @@ pub enum SelectCommand {
 pub struct SelectGetArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub raw: bool,
@@ -1296,7 +1872,7 @@ pub struct SelectGetArgs {
 pub struct SelectSetArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// JSON array of instance paths.
     #[arg(long)]
@@ -1311,7 +1887,7 @@ pub struct SelectSetArgs {
 pub struct EvalArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Luau source to execute. Wrap in `return ...` to get a return value.
     #[arg(long)]
@@ -1327,7 +1903,7 @@ pub struct EvalArgs {
 pub struct TransmitArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Luau source to execute before collecting images.
     #[arg(long, conflicts_with = "source_file")]
@@ -1356,7 +1932,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub project: PathBuf,
 
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
 
     #[arg(long = "game-id")]
@@ -1383,7 +1959,7 @@ pub struct QueryArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
 
     /// Selector. `/`-separated; `*` matches one segment, `**` matches zero or more.
@@ -1392,6 +1968,22 @@ pub struct QueryArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = QueryFormat::Json)]
     pub format: QueryFormat,
+
+    /// Include an inspectable property in each match. Repeat for more properties.
+    #[arg(long = "prop")]
+    pub props: Vec<String>,
+
+    /// Include attributes in each match.
+    #[arg(long)]
+    pub attributes: bool,
+
+    /// Include CollectionService tags in each match.
+    #[arg(long)]
+    pub tags: bool,
+
+    /// Maximum matches returned by Studio (1..=10000).
+    #[arg(long, default_value_t = 5000)]
+    pub limit: usize,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -1400,7 +1992,7 @@ pub struct PathArgs {
     #[arg(long)]
     pub project: PathBuf,
 
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
 
     /// Interpret input as `studio`, `fs`, or try `auto`.
@@ -1420,7 +2012,7 @@ pub struct DecisionArgs {
     /// Project directory. Defaults to current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Pending choice id. If omitted, the single current pending choice is used.
     #[arg(long = "choice-id")]
@@ -1444,12 +2036,15 @@ pub struct LintArgs {
     /// Project directory. Defaults to the current working directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
+    /// Daemon port used for live Studio DataModel discovery.
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
+    pub port: u16,
     /// File or directory to analyze. May be repeated. Relative paths are
     /// resolved from `--project` when provided, otherwise from the current
     /// working directory.
     #[arg(long = "path")]
     pub paths: Vec<PathBuf>,
-    /// Additional luau-lsp diagnostic ignore glob. May be repeated.
+    /// Additional analyzer/compiler ignore glob. May be repeated.
     #[arg(long = "ignore")]
     pub ignores: Vec<String>,
     /// Disable Ro Sync's default dependency/vendor diagnostic ignores.
@@ -1462,16 +2057,77 @@ pub struct LintArgs {
     /// Print diagnostic counts by category and file after analysis.
     #[arg(long)]
     pub summary: bool,
-    /// Path to a luau-lsp executable. If omitted, `ROSYNC_LUAU_LSP` is checked,
-    /// then `luau-lsp` is resolved from PATH.
+    /// Path to a luau-lsp executable. If omitted, `ROSYNC_LUAU_LSP`, bundled
+    /// and Aftman locations, then PATH are checked.
     #[arg(long = "luau-lsp")]
     pub luau_lsp: Option<PathBuf>,
+    /// Run the Luau bytecode compiler in addition to static analysis. `auto`
+    /// checks when luau-compile is available, `required` fails when it is not,
+    /// and `off` disables the compiler stage.
+    #[arg(long = "compile", value_enum, default_value_t = LintCompileMode::Auto)]
+    pub compile: LintCompileMode,
+    /// Path to a luau-compile executable. If omitted,
+    /// `ROSYNC_LUAU_COMPILE`, `LUAU_COMPILE`, the bundled compiler, Aftman,
+    /// and PATH are checked.
+    #[arg(long = "luau-compile")]
+    pub luau_compile: Option<PathBuf>,
     /// Do not generate/pass a Ro-Sync sourcemap to luau-lsp.
     #[arg(long = "no-sourcemap")]
     pub no_sourcemap: bool,
+    /// DataModel typing source. `auto` uses the complete live Studio tree when
+    /// connected and safely falls back to relaxed filesystem-only analysis.
+    #[arg(long = "data-model", value_enum, default_value_t = LintDataModelMode::Auto)]
+    pub data_model: LintDataModelMode,
+    /// Print machine-readable diagnostics and coverage metadata as JSON.
+    #[arg(long)]
+    pub raw: bool,
     /// Extra arguments passed to `luau-lsp analyze` after `--`.
     #[arg(last = true)]
     pub extra_args: Vec<String>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintDataModelMode {
+    /// Prefer the complete live Studio tree; fall back to relaxed disk types.
+    Auto,
+    /// Require the complete live Studio tree and strict DataModel diagnostics.
+    Studio,
+    /// Use the filesystem sourcemap with strict DataModel diagnostics. This can
+    /// report false unknown-child errors for Studio-only instances.
+    Filesystem,
+    /// Use the filesystem sourcemap with relaxed DataModel diagnostics.
+    Loose,
+}
+
+impl LintDataModelMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Studio => "studio",
+            Self::Filesystem => "filesystem",
+            Self::Loose => "loose",
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintCompileMode {
+    /// Check bytecode compilation when luau-compile is available.
+    Auto,
+    /// Require luau-compile and fail if the compiler cannot be run.
+    Required,
+    /// Disable bytecode compilation checks.
+    Off,
+}
+
+impl LintCompileMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::Off => "off",
+        }
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -1491,7 +2147,8 @@ pub struct AppState {
     pub canonical_project: Arc<PathBuf>,
     pub events: broadcast::Sender<String>,
     pub conflict: Arc<ConflictEngine>,
-    pub watch_tx: broadcast::Sender<Op>,
+    /// Short-lived, bounded binary artifacts uploaded by the Studio plugin.
+    pub artifacts: artifact::ArtifactStore,
     pub project_name: Arc<RwLock<String>>,
     pub game_id: Arc<RwLock<Option<String>>>,
     pub group_id: Arc<RwLock<Option<String>>>,
@@ -1499,10 +2156,6 @@ pub struct AppState {
     pub wally_enabled: Arc<RwLock<bool>>,
     pub wally_folder: Arc<RwLock<Option<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
-    /// Deadline after a user chooses "keep Studio" during initial sync.
-    /// Bootstrap pushes inside this window prune disk-only paths even if an
-    /// older already-loaded plugin does not send the newer strict flags.
-    pub strict_bootstrap_until: Arc<Mutex<Option<Instant>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
     /// `spawn_watch_bridge` drops watcher ops for paths whose deadline hasn't
     /// passed yet — prevents our own writes from being re-emitted as FS
@@ -1541,6 +2194,62 @@ fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error:
         Command::Context(args) => {
             resolve_port_field(&mut args.port, args.project.as_deref(), "context")?
         }
+        Command::Run(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "run")?,
+        Command::Capabilities(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "capabilities")?
+        }
+        Command::Capture(args) => match &mut args.command {
+            CaptureCommand::Status(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "capture status")?
+            }
+            CaptureCommand::Authorize(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "capture authorize")?
+            }
+            CaptureCommand::Screen(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "capture screen")?
+            }
+            CaptureCommand::Photo(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "capture photo")?
+            }
+            CaptureCommand::Scene(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "capture scene")?
+            }
+        },
+        Command::Playtest(args) => match &mut args.command {
+            PlaytestCommand::Start(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest start")?
+            }
+            PlaytestCommand::Status(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest status")?
+            }
+            PlaytestCommand::Contexts(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest contexts")?
+            }
+            PlaytestCommand::Wait(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest wait")?
+            }
+            PlaytestCommand::Stop(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest stop")?
+            }
+            PlaytestCommand::Exec(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest exec")?
+            }
+            PlaytestCommand::Logs(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest logs")?
+            }
+            PlaytestCommand::Ui(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest ui")?
+            }
+            PlaytestCommand::Input(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest input")?
+            }
+            PlaytestCommand::Capture(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest capture")?
+            }
+            PlaytestCommand::Request(args) => {
+                resolve_port_field(&mut args.port, args.project.as_deref(), "playtest request")?
+            }
+        },
         Command::Query(args) => {
             resolve_port_field(&mut args.port, args.project.as_deref(), "query")?
         }
@@ -1654,6 +2363,7 @@ fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error:
         Command::FindAttr(args) => {
             resolve_port_field(&mut args.port, args.project.as_deref(), "find-attr")?
         }
+        Command::Lint(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "lint")?,
         Command::Commands(_)
         | Command::Plan(_)
         | Command::Serve(_)
@@ -1661,8 +2371,7 @@ fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error:
         | Command::Monetization(_)
         | Command::Img(_)
         | Command::Imgs(_)
-        | Command::Refresh(_)
-        | Command::Lint(_) => {}
+        | Command::Refresh(_) => {}
     }
 
     Ok(())
@@ -1734,6 +2443,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Some(Command::Commands(args)) => run_commands(args),
         Some(Command::Context(args)) => run_context(args),
+        Some(Command::Run(args)) => run_workflow(args).await,
+        Some(Command::Capabilities(args)) => run_capabilities(args).await,
+        Some(Command::Capture(args)) => run_capture(args).await,
+        Some(Command::Playtest(args)) => run_playtest(args).await,
         Some(Command::Plan(args)) => run_plan(args),
         Some(Command::Query(args)) => run_query(args).await,
         Some(Command::Path(args)) => run_path(args).await,
@@ -1785,7 +2498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Enums(args)) => run_enums(args).await,
         Some(Command::Enum(args)) => run_enum(args).await,
         Some(Command::FindAttr(args)) => run_find_attr(args).await,
-        Some(Command::Lint(args)) => run_lint(args),
+        Some(Command::Lint(args)) => run_lint(args).await,
         None => {
             // Back-compat: bare invocation runs the daemon using top-level flags.
             let project = cli.project.ok_or_else(|| -> Box<dyn std::error::Error> {
@@ -1853,7 +2566,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let watcher = Watch::new(args.project.clone())?;
     let canonical_project = watcher.root().to_path_buf();
-    let watch_tx = watcher.sender();
     let conflict_engine = Arc::new(ConflictEngine::new());
     let push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let (request_tx, _) = broadcast::channel::<RequestEnvelope>(256);
@@ -1864,7 +2576,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         canonical_project: Arc::new(canonical_project.clone()),
         events: tx.clone(),
         conflict: conflict_engine.clone(),
-        watch_tx: watch_tx.clone(),
+        artifacts: artifact::ArtifactStore::new(
+            canonical_project.join(".rosync-artifacts"),
+            256 * 1024 * 1024,
+            Duration::from_secs(5 * 60),
+        )?,
         project_name: Arc::new(RwLock::new(cfg.name.clone())),
         game_id: Arc::new(RwLock::new(cfg.game_id.clone())),
         group_id: Arc::new(RwLock::new(cfg.group_id.clone())),
@@ -1872,7 +2588,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         wally_enabled: Arc::new(RwLock::new(cfg.wally_enabled)),
         wally_folder: Arc::new(RwLock::new(cfg.wally_folder.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
-        strict_bootstrap_until: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
         request_tx,
         pending_routes: Arc::new(Mutex::new(HashMap::new())),
@@ -1981,38 +2696,71 @@ async fn wait_for_shutdown_signal() {
 }
 
 async fn run_query(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let tree = live_tree(args.port, "query").await?;
-
-    let matches = query::query(&tree, &args.selector);
+    if !(1..=10_000).contains(&args.limit) {
+        return Err("query: --limit must be between 1 and 10000".into());
+    }
+    let response = remote::request(
+        args.port,
+        "query",
+        serde_json::json!({
+            "selector": args.selector,
+            "props": args.props,
+            "attributes": args.attributes,
+            "tags": args.tags,
+            "limit": args.limit,
+        }),
+    )
+    .await?;
+    let value = response_value_or_err(&response, "query")?;
+    let matches = value
+        .get("matches")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("query: plugin returned an invalid matches payload")?;
+    let truncated = value
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     match args.format {
         QueryFormat::Json => {
-            let arr: Vec<serde_json::Value> = matches
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "path": m.path,
-                        "class": m.class,
-                        "name": m.name,
-                        "childrenCount": m.children_count,
-                    })
-                })
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
-            );
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         QueryFormat::Paths => {
             for m in matches {
-                println!("{}", m.path.join("/"));
+                if let Some(path) = m.get("path").and_then(serde_json::Value::as_str) {
+                    println!("{path}");
+                }
             }
         }
         QueryFormat::Classes => {
             for m in matches {
-                println!("{}\t{}", m.class, m.path.join("/"));
+                let class = m
+                    .get("class")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let path = m
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                println!("{class}\t{path}");
             }
         }
+    }
+    if truncated {
+        let reason = value
+            .get("truncationReason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let guidance = match reason {
+            "matches" => "raise --limit (up to 10000) or narrow the selector",
+            "nodes" | "time" => "narrow the selector to reduce Studio traversal",
+            "response-bytes" => "request fewer properties/attributes/tags or narrow the selector",
+            _ => "narrow the selector",
+        };
+        eprintln!(
+            "query: results were truncated after {} match(es) ({reason}); {guidance}",
+            matches.len()
+        );
     }
     Ok(())
 }
@@ -2192,6 +2940,1522 @@ fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{}", serde_json::to_string_pretty(&context)?);
     Ok(())
+}
+
+async fn run_workflow(args: RunWorkflowArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let source = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("run: read {}: {e}", args.file.display()))?;
+    let workflow = workflow::Workflow::from_json(&source).map_err(|e| format!("run: {e}"))?;
+    workflow.validate().map_err(|e| format!("run: {e}"))?;
+    if args.dry_run {
+        let dependencies = workflow
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let (wire_op, wire_args) = step.operation.request_parts();
+                Ok(serde_json::json!({
+                    "id": step.id,
+                    "op": step.operation.op_name(),
+                    "wire": { "op": wire_op, "args": wire_args },
+                    "dependencies": workflow.dependencies_for(index)?,
+                    "atomicSafe": step.operation.atomic_safe(),
+                }))
+            })
+            .collect::<Result<Vec<_>, workflow::ResolveError>>()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "dryRun": true,
+                "workflow": workflow,
+                "steps": dependencies,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let project = project_or_cwd(args.project.as_deref(), "run")?;
+    let workflow_hash = workflow_content_hash(&workflow)?;
+    let idempotency_path = workflow
+        .idempotency_key
+        .as_deref()
+        .map(|key| workflow_idempotency_path(&project, key));
+    if let Some(path) = &idempotency_path {
+        if workflow_replay_idempotency(path, &workflow_hash)? {
+            return Ok(());
+        }
+    }
+    // Serialize executions for one idempotency key. Without this lock, two
+    // agents starting simultaneously can both miss the result and repeat all
+    // side effects before either writes its record.
+    let _idempotency_lock = idempotency_path
+        .as_deref()
+        .map(WorkflowIdempotencyLock::acquire)
+        .transpose()?;
+    if let Some(path) = &idempotency_path {
+        if workflow_replay_idempotency(path, &workflow_hash)? {
+            return Ok(());
+        }
+    }
+
+    let mut session = remote::RemoteSession::connect(args.port)
+        .await
+        .map_err(|e| format!("run: {e}"))?;
+    workflow_check_environment(&mut session, &workflow).await?;
+    let transaction_defs = workflow
+        .transactions
+        .iter()
+        .map(|group| (group.id.clone(), group.atomic))
+        .collect::<HashMap<_, _>>();
+    let mut results = workflow::StepResults::new();
+    let mut reports = Vec::with_capacity(workflow.steps.len());
+    let mut active_atomic: Option<String> = None;
+    let mut failed = false;
+    let mut rollback_errors = Vec::new();
+    let mut transaction_errors = Vec::new();
+    let mut transaction_outcomes = Vec::new();
+
+    for original_step in &workflow.steps {
+        let resolving_atomic = original_step
+            .transaction
+            .as_ref()
+            .is_some_and(|id| transaction_defs.get(id).copied().unwrap_or(false));
+        let step = match original_step.resolve(&results) {
+            Ok(step) => step,
+            Err(error) => {
+                let response =
+                    workflow_error_response("REFERENCE_RESOLUTION", error.to_string(), false);
+                results.insert(original_step.id.clone(), response.clone());
+                reports.push(workflow_step_report(original_step, &response, 0));
+                failed = true;
+                let failed_inside_atomic = resolving_atomic || active_atomic.is_some();
+                if let Some(id) = active_atomic.take() {
+                    if let Err(cancel_error) = workflow_finish_transaction_recorded(
+                        &mut session,
+                        &id,
+                        "cancel",
+                        &mut transaction_outcomes,
+                    )
+                    .await
+                    {
+                        rollback_errors.push(format!("{id}: {cancel_error}"));
+                    }
+                }
+                // An atomic group is one unit. Continuing later members in a
+                // fresh recording would commit only a suffix of that group.
+                if failed_inside_atomic {
+                    break;
+                }
+                if !args.keep_going {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let desired_atomic = step
+            .transaction
+            .as_ref()
+            .filter(|id| transaction_defs.get(*id).copied().unwrap_or(false))
+            .cloned();
+        if active_atomic != desired_atomic {
+            if let Some(id) = active_atomic.take() {
+                if let Err(commit_error) = workflow_finish_transaction_recorded(
+                    &mut session,
+                    &id,
+                    "commit",
+                    &mut transaction_outcomes,
+                )
+                .await
+                {
+                    failed = true;
+                    transaction_errors.push(format!("{id}: commit failed: {commit_error}"));
+                    if let Err(cancel_error) = workflow_finish_transaction_recorded(
+                        &mut session,
+                        &id,
+                        "cancel",
+                        &mut transaction_outcomes,
+                    )
+                    .await
+                    {
+                        rollback_errors.push(format!("{id}: {cancel_error}"));
+                    }
+                    break;
+                }
+            }
+            if let Some(id) = desired_atomic.clone() {
+                let name = workflow
+                    .name
+                    .as_deref()
+                    .map(|name| format!("{name}: {id}"))
+                    .unwrap_or_else(|| format!("Ro Sync workflow: {id}"));
+                let response = session
+                    .request(
+                        "transaction_begin",
+                        serde_json::json!({ "id": id, "name": name }),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .map_err(|e| format!("run: begin transaction: {e}"))?;
+                response_value_or_err(&response, "run: begin transaction")?;
+                active_atomic = desired_atomic;
+            }
+        }
+
+        let started = Instant::now();
+        let timeout = Duration::from_millis(step.timeout_ms.unwrap_or(30_000));
+        let response =
+            match workflow_execute_step(&mut session, args.port, &project, &step, timeout).await {
+                Ok(response) => response,
+                Err(error) => workflow_error_response("STEP_TRANSPORT", error.to_string(), true),
+            };
+        let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let step_ok = response
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        results.insert(step.id.clone(), response.clone());
+        reports.push(workflow_step_report(&step, &response, duration_ms));
+        if !step_ok {
+            failed = true;
+            if let Some(id) = active_atomic.take() {
+                if let Err(cancel_error) = workflow_finish_transaction_recorded(
+                    &mut session,
+                    &id,
+                    "cancel",
+                    &mut transaction_outcomes,
+                )
+                .await
+                {
+                    rollback_errors.push(format!("{id}: {cancel_error}"));
+                }
+                break;
+            }
+            if !args.keep_going {
+                break;
+            }
+        }
+    }
+
+    if let Some(id) = active_atomic.take() {
+        // Any failure inside this recording cancels and takes the branch above.
+        // A previous unrelated non-atomic failure must not roll back a fully
+        // successful final transaction when --keep-going is used.
+        if let Err(commit_error) = workflow_finish_transaction_recorded(
+            &mut session,
+            &id,
+            "commit",
+            &mut transaction_outcomes,
+        )
+        .await
+        {
+            failed = true;
+            transaction_errors.push(format!("{id}: commit failed: {commit_error}"));
+            if let Err(cancel_error) = workflow_finish_transaction_recorded(
+                &mut session,
+                &id,
+                "cancel",
+                &mut transaction_outcomes,
+            )
+            .await
+            {
+                rollback_errors.push(format!("{id}: {cancel_error}"));
+            }
+        }
+    }
+    let _ = session.close().await;
+    let rolled_back = transaction_outcomes.iter().any(|outcome| {
+        outcome.get("action").and_then(serde_json::Value::as_str) == Some("cancel")
+            && outcome.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    let outcome = serde_json::json!({
+        "ok": !failed,
+        "schema": "ro-sync.workflow-result.v1",
+        "name": workflow.name,
+        "idempotencyKey": workflow.idempotency_key,
+        "workflowHash": workflow_hash,
+        "steps": reports,
+        "results": results,
+        "rollbackErrors": rollback_errors,
+        "transactionErrors": transaction_errors,
+        "transactions": transaction_outcomes,
+        "rolledBack": rolled_back,
+        "replayed": false,
+    });
+    if !failed {
+        if let Some(path) = idempotency_path {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("run: create {}: {e}", parent.display()))?;
+            }
+            write_json_atomic(&path, &outcome)
+                .map_err(|e| format!("run: write idempotency record {}: {e}", path.display()))?;
+        }
+    }
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        for report in outcome["steps"].as_array().into_iter().flatten() {
+            println!(
+                "{} · {} · {}ms",
+                report
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                if report.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                    "ok"
+                } else {
+                    "failed"
+                },
+                report
+                    .get("durationMs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+        }
+    }
+    if failed {
+        return Err("workflow failed; inspect the step results above".into());
+    }
+    Ok(())
+}
+
+fn workflow_idempotency_path(project: &std::path::Path, key: &str) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    project
+        .join(".rosync-workflows")
+        .join(format!("{digest}.json"))
+}
+
+fn workflow_content_hash(
+    workflow: &workflow::Workflow,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+    let normalized = serde_json::to_vec(workflow)?;
+    Ok(format!("{:x}", Sha256::digest(normalized)))
+}
+
+fn workflow_replay_idempotency(
+    path: &std::path::Path,
+    expected_hash: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mut previous: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path)
+            .map_err(|e| format!("run: read idempotency record {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("run: parse idempotency record {}: {e}", path.display()))?;
+    let recorded_hash = previous
+        .get("workflowHash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "run: idempotency record {} predates workflow hashing; choose a new idempotencyKey or remove the stale record",
+                path.display()
+            )
+        })?;
+    if recorded_hash != expected_hash {
+        return Err(format!(
+            "run: idempotencyKey collision at {}: the key was already used for a different workflow",
+            path.display()
+        )
+        .into());
+    }
+    let object = previous
+        .as_object_mut()
+        .ok_or_else(|| format!("run: invalid idempotency record {}", path.display()))?;
+    object.insert("replayed".into(), serde_json::Value::Bool(true));
+    println!("{}", serde_json::to_string_pretty(&previous)?);
+    Ok(true)
+}
+
+struct WorkflowIdempotencyLock {
+    path: PathBuf,
+}
+
+impl WorkflowIdempotencyLock {
+    fn acquire(record_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let parent = record_path
+            .parent()
+            .ok_or("run: invalid idempotency record path")?;
+        std::fs::create_dir_all(parent)?;
+        let path = record_path.with_extension("lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "run: workflow with this idempotencyKey is already active (lock {}); remove the lock only after confirming no run is active",
+                    path.display()
+                )
+            } else {
+                format!("run: create idempotency lock {}: {error}", path.display())
+            }
+        })?;
+        writeln!(file, "pid={}", std::process::id())?;
+        file.sync_all()?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for WorkflowIdempotencyLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn write_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        serde_json::to_writer_pretty(&mut file, value).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn workflow_step_report(
+    step: &workflow::WorkflowStep,
+    response: &serde_json::Value,
+    duration_ms: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": step.id,
+        "op": step.operation.op_name(),
+        "transaction": step.transaction,
+        "ok": response.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        "durationMs": duration_ms,
+        "error": response.get("error"),
+    })
+}
+
+fn workflow_error_response(code: &str, message: String, retryable: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response",
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        }
+    })
+}
+
+async fn workflow_finish_transaction(
+    session: &mut remote::RemoteSession,
+    id: &str,
+    action: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = session
+        .request(
+            "transaction_finish",
+            serde_json::json!({ "id": id, "action": action }),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| format!("run: finish transaction {id}: {e}"))?;
+    response_value_or_err(&response, &format!("run: {action} transaction {id}"))?;
+    Ok(())
+}
+
+async fn workflow_finish_transaction_recorded(
+    session: &mut remote::RemoteSession,
+    id: &str,
+    action: &str,
+    outcomes: &mut Vec<serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = workflow_finish_transaction(session, id, action).await;
+    match &result {
+        Ok(()) => outcomes.push(serde_json::json!({
+            "id": id,
+            "action": action,
+            "ok": true,
+        })),
+        Err(error) => outcomes.push(serde_json::json!({
+            "id": id,
+            "action": action,
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
+    result
+}
+
+async fn workflow_check_environment(
+    session: &mut remote::RemoteSession,
+    workflow: &workflow::Workflow,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if workflow.expected_mode.is_none() && workflow.expected_place_id.is_none() {
+        return Ok(());
+    }
+    let mut responses = session
+        .request_many([remote::RemoteRequest::new(
+            "capabilities",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )])
+        .await
+        .map_err(|e| format!("run: capability precondition: {e}"))?;
+    let response = responses
+        .pop()
+        .ok_or("run: capability precondition returned no response")?;
+    let capabilities = response_value_or_err(&response, "run: capability precondition")?;
+    if let Some(expected_place) = &workflow.expected_place_id {
+        let actual = capabilities
+            .get("placeId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0");
+        if actual != expected_place {
+            return Err(format!(
+                "run: place precondition failed: expected {expected_place}, connected to {actual}"
+            )
+            .into());
+        }
+    }
+    if let Some(mode) = workflow.expected_mode {
+        use workflow::ExpectedMode;
+        match mode {
+            ExpectedMode::Edit => {
+                let actual = capabilities
+                    .get("hostDataModelType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Unknown");
+                if actual != "Edit" {
+                    return Err(format!(
+                        "run: mode precondition failed: expected Edit, connected to {actual}"
+                    )
+                    .into());
+                }
+            }
+            ExpectedMode::PlayServer
+            | ExpectedMode::PlayClient
+            | ExpectedMode::Play
+            | ExpectedMode::Run => {
+                let status = session
+                    .request(
+                        "playtest_status",
+                        serde_json::json!({}),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .map_err(|e| format!("run: playtest mode precondition: {e}"))?;
+                let status = response_value_or_err(&status, "run: playtest mode precondition")?;
+                if status.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err("run: mode precondition failed: no active playtest".into());
+                }
+                if matches!(mode, ExpectedMode::PlayServer | ExpectedMode::PlayClient) {
+                    let role = if matches!(mode, ExpectedMode::PlayServer) {
+                        "server"
+                    } else {
+                        "client"
+                    };
+                    let found = status
+                        .get("contexts")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|contexts| {
+                            contexts.iter().any(|context| {
+                                context.get("role").and_then(serde_json::Value::as_str)
+                                    == Some(role)
+                            })
+                        });
+                    if !found {
+                        return Err(
+                            format!("run: mode precondition failed: no {role} context").into()
+                        );
+                    }
+                }
+                if matches!(mode, ExpectedMode::Run) {
+                    let actual = status
+                        .get("job")
+                        .and_then(|job| job.get("mode"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    if actual != "run" {
+                        return Err(format!(
+                            "run: mode precondition failed: expected run, found {actual}"
+                        )
+                        .into());
+                    }
+                } else if matches!(mode, ExpectedMode::Play) {
+                    let actual = status
+                        .get("job")
+                        .and_then(|job| job.get("mode"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    if actual != "play" {
+                        return Err(format!(
+                            "run: mode precondition failed: expected play, found {actual}"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn workflow_execute_step(
+    session: &mut remote::RemoteSession,
+    port: u16,
+    project: &std::path::Path,
+    step: &workflow::WorkflowStep,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("workflow step deadline overflow")?;
+    if let Some(precondition_failure) = workflow_check_target_precondition(
+        session,
+        step,
+        workflow_deadline_remaining(deadline, "target precondition")?,
+    )
+    .await?
+    {
+        return Ok(precondition_failure);
+    }
+    use workflow::StepOperation;
+    let mut response = match &step.operation {
+        StepOperation::Assert {
+            actual,
+            check,
+            message,
+        } => {
+            let passed = workflow_assertion_matches(actual, check);
+            if passed {
+                serde_json::json!({
+                    "type": "response",
+                    "ok": true,
+                    "value": { "passed": true, "actual": actual },
+                })
+            } else {
+                workflow_error_response(
+                    "ASSERTION_FAILED",
+                    message.clone().unwrap_or_else(|| {
+                        format!("assertion did not match actual value {actual}")
+                    }),
+                    false,
+                )
+            }
+        }
+        StepOperation::Wait {
+            path,
+            property,
+            check,
+            poll_interval_ms,
+        } => {
+            workflow_wait(
+                session,
+                path,
+                property.as_deref(),
+                check,
+                workflow_deadline_remaining(deadline, "wait")?,
+                Duration::from_millis(poll_interval_ms.unwrap_or(100)),
+            )
+            .await?
+        }
+        StepOperation::Capture { .. } => {
+            workflow_capture(session, port, project, &step.operation, deadline).await?
+        }
+        StepOperation::Playtest { action, args } => {
+            let (op, mapped_args) = workflow_playtest_request(*action, args.clone())?;
+            session
+                .request(
+                    op,
+                    mapped_args,
+                    workflow_deadline_remaining(deadline, "playtest")?,
+                )
+                .await
+                .map_err(|e| format!("playtest workflow step: {e}"))?
+        }
+        StepOperation::Upload {
+            paths,
+            asset_type,
+            creator,
+        } => {
+            workflow_upload(
+                project,
+                paths,
+                asset_type.as_deref(),
+                creator.as_deref(),
+                workflow_deadline_remaining(deadline, "upload")?,
+            )
+            .await?
+        }
+        operation => {
+            let (op, args) = workflow_wire_request(operation);
+            session
+                .request(
+                    op,
+                    args,
+                    workflow_deadline_remaining(deadline, operation.op_name())?,
+                )
+                .await
+                .map_err(|e| format!("{}: {e}", operation.op_name()))?
+        }
+    };
+
+    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && step.verify {
+        match workflow_verify_step(
+            session,
+            step,
+            &response,
+            workflow_deadline_remaining(deadline, "verification")?,
+        )
+        .await
+        {
+            Ok(verification) => response["verification"] = verification,
+            Err(error) => {
+                return Ok(workflow_error_response(
+                    "VERIFICATION_FAILED",
+                    error.to_string(),
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(response)
+}
+
+fn workflow_deadline_remaining(
+    deadline: Instant,
+    phase: &str,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(format!("workflow step timed out before {phase}").into())
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn workflow_target_path(operation: &workflow::StepOperation) -> Option<&str> {
+    use workflow::StepOperation;
+    match operation {
+        StepOperation::Get { path, .. }
+        | StepOperation::Set { path, .. }
+        | StepOperation::New { path, .. }
+        | StepOperation::Rm { path }
+        | StepOperation::AttrSet { path, .. }
+        | StepOperation::AttrRm { path, .. }
+        | StepOperation::AttrLs { path }
+        | StepOperation::TagAdd { path, .. }
+        | StepOperation::TagRm { path, .. }
+        | StepOperation::Wait { path, .. }
+        | StepOperation::Call { path, .. } => Some(path),
+        StepOperation::Mv { from, .. } => Some(from),
+        StepOperation::Capture { path, .. } => path.as_deref(),
+        StepOperation::Assert { .. }
+        | StepOperation::Eval { .. }
+        | StepOperation::Playtest { .. }
+        | StepOperation::Upload { .. } => None,
+    }
+}
+
+async fn workflow_check_target_precondition(
+    session: &mut remote::RemoteSession,
+    step: &workflow::WorkflowStep,
+    timeout: Duration,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    if step.expected_class.is_none() && step.etag.is_none() {
+        return Ok(None);
+    }
+    let path = workflow_target_path(&step.operation)
+        .ok_or_else(|| format!("step {} has a precondition but no target path", step.id))?;
+    let response = session
+        .request(
+            "inspect_ref",
+            serde_json::json!({
+                "path": path,
+                "expectedClass": step.expected_class,
+                "etag": step.etag,
+            }),
+            timeout,
+        )
+        .await
+        .map_err(|e| format!("step {} precondition: {e}", step.id))?;
+    if let Some(error) = remote::plugin_error(&response) {
+        return Ok(Some(workflow_error_response(
+            "PRECONDITION_FAILED",
+            format!("step {} precondition: {error}", step.id),
+            false,
+        )));
+    }
+    Ok(None)
+}
+
+fn workflow_wire_request(operation: &workflow::StepOperation) -> (&'static str, serde_json::Value) {
+    use workflow::StepOperation;
+    match operation {
+        StepOperation::Get { path, property } => {
+            ("get", serde_json::json!({ "path": path, "prop": property }))
+        }
+        StepOperation::Set {
+            path,
+            property,
+            value,
+        } => (
+            "set",
+            serde_json::json!({ "path": path, "prop": property, "value": value }),
+        ),
+        StepOperation::New {
+            path,
+            class,
+            name,
+            props,
+        } => (
+            "new",
+            serde_json::json!({ "path": path, "class": class, "name": name, "props": props }),
+        ),
+        StepOperation::Rm { path } => ("rm", serde_json::json!({ "path": path })),
+        StepOperation::Mv { from, to, force } => (
+            "mv",
+            serde_json::json!({ "from": from, "to": to, "force": force }),
+        ),
+        StepOperation::AttrSet { path, name, value } => (
+            "set_attr",
+            serde_json::json!({ "path": path, "name": name, "value": value }),
+        ),
+        StepOperation::AttrRm { path, name } => {
+            ("rm_attr", serde_json::json!({ "path": path, "name": name }))
+        }
+        StepOperation::AttrLs { path } => ("attr_ls", serde_json::json!({ "path": path })),
+        StepOperation::TagAdd { path, tag } => {
+            ("add_tag", serde_json::json!({ "path": path, "tag": tag }))
+        }
+        StepOperation::TagRm { path, tag } => {
+            ("rm_tag", serde_json::json!({ "path": path, "tag": tag }))
+        }
+        StepOperation::Eval { source } => ("eval", serde_json::json!({ "source": source })),
+        StepOperation::Call { path, method, args } => (
+            "call",
+            serde_json::json!({ "path": path, "method": method, "args": args }),
+        ),
+        _ => unreachable!("local/special workflow operations are handled before wire mapping"),
+    }
+}
+
+fn workflow_assertion_matches(actual: &serde_json::Value, check: &workflow::Assertion) -> bool {
+    use workflow::Assertion;
+    match check {
+        Assertion::Equals { expected } => actual == expected,
+        Assertion::NotEquals { expected } => actual != expected,
+        Assertion::Exists { expected } => (actual != &serde_json::Value::Null) == *expected,
+        Assertion::Truthy { expected } => {
+            let truthy = !matches!(
+                actual,
+                serde_json::Value::Null | serde_json::Value::Bool(false)
+            );
+            truthy == *expected
+        }
+        Assertion::Contains { expected } => match (actual, expected) {
+            (serde_json::Value::String(actual), serde_json::Value::String(expected)) => {
+                actual.contains(expected)
+            }
+            (serde_json::Value::Array(actual), expected) => actual.contains(expected),
+            (serde_json::Value::Object(actual), serde_json::Value::String(key)) => {
+                actual.contains_key(key)
+            }
+            (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => expected
+                .iter()
+                .all(|(key, value)| actual.get(key) == Some(value)),
+            _ => false,
+        },
+        Assertion::GreaterThan { expected } => {
+            actual.as_f64().is_some_and(|value| value > *expected)
+        }
+        Assertion::GreaterThanOrEqual { expected } => {
+            actual.as_f64().is_some_and(|value| value >= *expected)
+        }
+        Assertion::LessThan { expected } => actual.as_f64().is_some_and(|value| value < *expected),
+        Assertion::LessThanOrEqual { expected } => {
+            actual.as_f64().is_some_and(|value| value <= *expected)
+        }
+    }
+}
+
+async fn workflow_wait(
+    session: &mut remote::RemoteSession,
+    path: &str,
+    property: Option<&str>,
+    check: &workflow::Assertion,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let poll_interval = poll_interval.clamp(Duration::from_millis(10), Duration::from_secs(5));
+    let mut attempts = 0u64;
+    loop {
+        attempts += 1;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(workflow_error_response(
+                "WAIT_TIMEOUT",
+                format!(
+                    "condition at {path} did not match within {:.3}s",
+                    timeout.as_secs_f64()
+                ),
+                true,
+            ));
+        }
+        let response = session
+            .request(
+                "get",
+                serde_json::json!({ "path": path, "prop": property }),
+                remaining.min(Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|e| format!("wait at {path}: {e}"))?;
+        let actual = if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            response
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        } else if remote::plugin_error(&response)
+            .and_then(|error| error.code)
+            .as_deref()
+            == Some("NOT_FOUND")
+        {
+            // A missing target is the only failure that is meaningfully null;
+            // this permits `exists:false` waits without treating permissions,
+            // invalid properties, or plugin faults as a satisfied condition.
+            serde_json::Value::Null
+        } else {
+            return Err(remote::plugin_error(&response)
+                .map(|error| format!("wait at {path}: {error}"))
+                .unwrap_or_else(|| format!("wait at {path}: request failed"))
+                .into());
+        };
+        if workflow_assertion_matches(&actual, check) {
+            return Ok(serde_json::json!({
+                "type": "response",
+                "ok": true,
+                "value": {
+                    "matched": true,
+                    "actual": actual,
+                    "attempts": attempts,
+                    "elapsedMs": started.elapsed().as_millis(),
+                }
+            }));
+        }
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+async fn workflow_verify_step(
+    session: &mut remote::RemoteSession,
+    step: &workflow::WorkflowStep,
+    response: &serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use workflow::StepOperation;
+    let value = response.get("value").unwrap_or(&serde_json::Value::Null);
+    match &step.operation {
+        StepOperation::Set {
+            path,
+            property,
+            value: expected,
+        } => {
+            let read = session
+                .request(
+                    "inspect_ref",
+                    serde_json::json!({ "path": path, "prop": property }),
+                    timeout,
+                )
+                .await?;
+            let inspected = response_value_or_err(&read, "verify set")?;
+            if inspected.get("value") != Some(expected) {
+                return Err(format!(
+                    "set readback mismatch at {path}.{property}: expected {expected}, found {}",
+                    inspected.get("value").unwrap_or(&serde_json::Value::Null)
+                )
+                .into());
+            }
+            Ok(serde_json::json!({ "verified": true, "ref": inspected }))
+        }
+        StepOperation::New {
+            class, name, props, ..
+        } => {
+            let path = value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("new response omitted path")?;
+            let read = session
+                .request(
+                    "inspect_ref",
+                    serde_json::json!({
+                        "path": path,
+                        "expectedClass": class,
+                        "props": props.keys().collect::<Vec<_>>(),
+                    }),
+                    timeout,
+                )
+                .await?;
+            let inspected = response_value_or_err(&read, "verify new")?;
+            if inspected.get("name").and_then(serde_json::Value::as_str) != Some(name.as_str()) {
+                return Err(format!("new instance name mismatch at {path}").into());
+            }
+            let values = inspected
+                .get("values")
+                .and_then(serde_json::Value::as_object);
+            if !props.is_empty() && values.is_none() {
+                return Err("new verification omitted property values".into());
+            }
+            for (property, expected) in props {
+                if values.and_then(|values| values.get(property)) != Some(expected) {
+                    return Err(format!(
+						"new property readback mismatch at {path}.{property}: expected {expected}, found {}",
+						values
+							.and_then(|values| values.get(property))
+							.unwrap_or(&serde_json::Value::Null)
+					)
+                    .into());
+                }
+            }
+            Ok(serde_json::json!({ "verified": true, "ref": inspected }))
+        }
+        StepOperation::Rm { path } => {
+            let read = session
+                .request("get", serde_json::json!({ "path": path }), timeout)
+                .await?;
+            if read.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Err(format!("removed instance still exists at {path}").into());
+            }
+            let error =
+                remote::plugin_error(&read).ok_or("remove verification failed without an error")?;
+            if error.code.as_deref() != Some("NOT_FOUND") {
+                return Err(format!("remove verification at {path}: {error}").into());
+            }
+            Ok(serde_json::json!({ "verified": true, "absent": path }))
+        }
+        StepOperation::Mv { .. } => {
+            let path = value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("mv response omitted path")?;
+            let read = session
+                .request("inspect_ref", serde_json::json!({ "path": path }), timeout)
+                .await?;
+            let inspected = response_value_or_err(&read, "verify mv")?;
+            Ok(serde_json::json!({ "verified": true, "ref": inspected }))
+        }
+        StepOperation::AttrSet {
+            path,
+            name,
+            value: expected,
+        } => {
+            let read = session
+                .request("attr_ls", serde_json::json!({ "path": path }), timeout)
+                .await?;
+            let attributes = response_value_or_err(&read, "verify attr-set")?;
+            if attributes.get(name) != Some(expected) {
+                return Err(format!("attribute readback mismatch at {path}.{name}").into());
+            }
+            Ok(serde_json::json!({ "verified": true, "attributes": attributes }))
+        }
+        StepOperation::AttrRm { path, name } => {
+            let read = session
+                .request("attr_ls", serde_json::json!({ "path": path }), timeout)
+                .await?;
+            let attributes = response_value_or_err(&read, "verify attr-rm")?;
+            if attributes.get(name).is_some() {
+                return Err(format!("attribute {name} still exists at {path}").into());
+            }
+            Ok(serde_json::json!({ "verified": true, "attributes": attributes }))
+        }
+        StepOperation::TagAdd { path, tag } | StepOperation::TagRm { path, tag } => {
+            let read = session
+                .request("tag_ls", serde_json::json!({ "path": path }), timeout)
+                .await?;
+            let tags = response_value_or_err(&read, "verify tag")?;
+            let has_tag = tags
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(tag)));
+            let expected = matches!(step.operation, StepOperation::TagAdd { .. });
+            if has_tag != expected {
+                return Err(format!("tag {tag} verification mismatch at {path}").into());
+            }
+            Ok(serde_json::json!({ "verified": true, "tags": tags }))
+        }
+        _ => Ok(serde_json::json!({ "verified": true })),
+    }
+}
+
+fn workflow_playtest_request(
+    action: workflow::PlaytestAction,
+    mut args: serde_json::Value,
+) -> Result<(&'static str, serde_json::Value), Box<dyn std::error::Error>> {
+    use workflow::PlaytestAction;
+    if !args.is_object() && !args.is_null() {
+        return Err("playtest workflow args must be an object".into());
+    }
+    if args.is_null() {
+        args = serde_json::json!({});
+    }
+    match action {
+        PlaytestAction::Start => Ok(("playtest_start", args)),
+        PlaytestAction::Stop => Ok(("playtest_stop", args)),
+        PlaytestAction::Status => Ok(("playtest_status", args)),
+        PlaytestAction::Contexts => Ok(("playtest_contexts", args)),
+        PlaytestAction::Wait => Ok(("playtest_wait", args)),
+        PlaytestAction::Exec => {
+            let object = args
+                .as_object_mut()
+                .ok_or("playtest exec args must be an object")?;
+            let context = object
+                .remove("context")
+                .ok_or("playtest exec args require context")?;
+            let timeout = object
+                .get("timeout")
+                .cloned()
+                .unwrap_or(serde_json::json!(30));
+            Ok((
+                "playtest_request",
+                serde_json::json!({
+                    "context": context,
+                    "op": "exec",
+                    "args": serde_json::Value::Object(object.clone()),
+                    "timeout": timeout,
+                }),
+            ))
+        }
+        PlaytestAction::Logs => {
+            let object = args
+                .as_object_mut()
+                .ok_or("playtest logs args must be an object")?;
+            let context = object
+                .remove("context")
+                .ok_or("playtest logs args require context")?;
+            Ok((
+                "playtest_request",
+                serde_json::json!({
+                    "context": context,
+                    "op": "logs",
+                    "args": serde_json::Value::Object(object.clone()),
+                }),
+            ))
+        }
+        PlaytestAction::Ui | PlaytestAction::Input => {
+            let object = args
+                .as_object_mut()
+                .ok_or("playtest runtime args must be an object")?;
+            let context = object
+                .remove("context")
+                .ok_or("playtest runtime args require context")?;
+            let timeout = object.remove("timeout").unwrap_or(serde_json::json!(30));
+            let operation = if matches!(action, PlaytestAction::Ui) {
+                "ui_tree"
+            } else {
+                "input"
+            };
+            Ok((
+                "playtest_request",
+                serde_json::json!({
+                    "context": context,
+                    "op": operation,
+                    "args": serde_json::Value::Object(object.clone()),
+                    "timeout": timeout,
+                }),
+            ))
+        }
+        PlaytestAction::Capture => Ok(("playtest_capture", args)),
+        PlaytestAction::Request => Ok(("playtest_request", args)),
+    }
+}
+
+async fn workflow_capture(
+    session: &mut remote::RemoteSession,
+    port: u16,
+    project: &std::path::Path,
+    operation: &workflow::StepOperation,
+    deadline: Instant,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use workflow::{CaptureTarget, CaptureUi, StepOperation};
+    let StepOperation::Capture {
+        target,
+        path,
+        context,
+        region,
+        output_size,
+        ui,
+        output,
+        ..
+    } = operation
+    else {
+        unreachable!()
+    };
+    let effective_ui = match (target, ui) {
+        (CaptureTarget::Scene | CaptureTarget::Viewport, _)
+        | (_, CaptureUi::None | CaptureUi::Game) => "none",
+        _ => "all",
+    };
+    let mut options = serde_json::Map::new();
+    options.insert("ui".into(), serde_json::Value::String(effective_ui.into()));
+    if let Some(path) = path {
+        options.insert("focus".into(), serde_json::Value::String(path.clone()));
+        options.insert("view".into(), serde_json::Value::String("isometric".into()));
+    }
+    if let Some(region) = region {
+        options.insert(
+            "position".into(),
+            serde_json::json!({ "x": region.x, "y": region.y }),
+        );
+        options.insert(
+            "captureSize".into(),
+            serde_json::json!({ "x": region.width, "y": region.height }),
+        );
+    }
+    if let Some(size) = output_size {
+        options.insert(
+            "outputSize".into(),
+            serde_json::json!({ "x": size.width, "y": size.height }),
+        );
+    }
+    let filename = output
+        .as_deref()
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("workflow-capture.png");
+    let destination = output.as_deref().map(|output| {
+        if std::path::Path::new(output).is_absolute() {
+            PathBuf::from(output)
+        } else {
+            project.join(output)
+        }
+    });
+    let work_deadline = capture_work_deadline(deadline);
+    let mut edit_session_id: Option<String> = None;
+    let mut edit_lease: Option<(String, String)> = None;
+    let mut runtime_artifact_id: Option<String> = None;
+
+    enum CaptureFlow {
+        Response(serde_json::Value),
+        Artifact {
+            response: serde_json::Value,
+            id: String,
+            expected_size: u64,
+            dimensions: (u32, u32),
+            nested_artifact: bool,
+        },
+    }
+
+    let flow: Result<CaptureFlow, Box<dyn std::error::Error>> = async {
+        if let Some(context) = context {
+            let timeout = workflow_deadline_remaining(work_deadline, "runtime capture")?;
+            let response = session
+                .request(
+                    "playtest_capture",
+                    serde_json::json!({
+                        "context": context,
+                        "options": options,
+                        "filename": filename,
+                        "timeout": timeout.as_secs_f64(),
+                    }),
+                    timeout,
+                )
+                .await?;
+            if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Ok(CaptureFlow::Response(response));
+            }
+            let value = response_value_or_err(&response, "workflow runtime capture")?;
+            let artifact = value
+                .get("artifact")
+                .ok_or("workflow runtime capture omitted artifact")?;
+            let id = plugin_artifact_id(artifact, "workflow runtime capture")?.to_string();
+            runtime_artifact_id = Some(id.clone());
+            let capture = value
+                .get("capture")
+                .ok_or("workflow runtime capture omitted capture metadata")?;
+            let expected_size = capture
+                .get("byteLength")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("workflow runtime capture omitted byteLength")?;
+            let width = capture
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("workflow runtime capture omitted valid width")?;
+            let height = capture
+                .get("height")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("workflow runtime capture omitted valid height")?;
+            validate_capture_dimensions(width, height)?;
+            if expected_size == 0 || expected_size > CAPTURE_MAX_ARTIFACT_BYTES {
+                return Err(format!(
+                    "workflow runtime capture reported invalid size {expected_size}"
+                )
+                .into());
+            }
+            return Ok(CaptureFlow::Artifact {
+                response,
+                id,
+                expected_size,
+                dimensions: (width, height),
+                nested_artifact: true,
+            });
+        }
+
+        let prepare_timeout = workflow_deadline_remaining(work_deadline, "capture prepare")?;
+        let mut prepare_options = options;
+        prepare_options.insert(
+            "timeoutSeconds".into(),
+            serde_json::json!(prepare_timeout.as_secs_f64()),
+        );
+        let prepared_response = session
+            .request(
+                "capture_prepare",
+                serde_json::Value::Object(prepare_options),
+                prepare_timeout,
+            )
+            .await?;
+        let prepared_value = response_value_or_err(&prepared_response, "workflow capture prepare")?;
+        edit_session_id = prepared_value
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let prepared: CapturePrepared = serde_json::from_value(prepared_value)
+            .map_err(|error| format!("workflow capture prepare metadata: {error}"))?;
+        validate_capture_dimensions(prepared.width, prepared.height)?;
+        let expected_size = u64::try_from(prepared.byte_length)
+            .map_err(|_| "workflow capture byteLength does not fit u64")?;
+        if expected_size == 0 || expected_size > CAPTURE_MAX_ARTIFACT_BYTES {
+            return Err(format!("workflow capture reported invalid size {expected_size}").into());
+        }
+        edit_session_id = Some(prepared.session_id.clone());
+        let lease_response = http_post_json_until(
+            port,
+            "/artifacts/lease",
+            &serde_json::json!({
+                "filename": filename,
+                "mime": "image/png",
+                "expectedSize": expected_size,
+            }),
+            work_deadline,
+        )
+        .await?;
+        if lease_response
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(format!("workflow capture lease rejected: {lease_response}").into());
+        }
+        let lease = lease_response
+            .get("lease")
+            .cloned()
+            .ok_or("workflow capture lease response omitted lease")?;
+        let id = plugin_artifact_id(&lease, "workflow capture lease")?.to_string();
+        let token = lease
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or("workflow capture lease omitted token")?
+            .to_string();
+        edit_lease = Some((id.clone(), token));
+        let export_timeout = workflow_deadline_remaining(work_deadline, "capture export")?;
+        let export = session
+            .request(
+                "capture_export",
+                serde_json::json!({
+                    "sessionId": prepared.session_id,
+                    "lease": lease,
+                    "timeoutSeconds": export_timeout.as_secs_f64(),
+                }),
+                export_timeout,
+            )
+            .await?;
+        if export.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Ok(CaptureFlow::Response(export));
+        }
+        let plugin_artifact = response_value_or_err(&export, "workflow capture export")?;
+        let returned_id = plugin_artifact_id(&plugin_artifact, "workflow capture export")?;
+        if returned_id != id {
+            return Err(format!(
+                "workflow capture export returned artifact {returned_id}, expected {id}"
+            )
+            .into());
+        }
+        Ok(CaptureFlow::Artifact {
+            response: export,
+            id,
+            expected_size,
+            dimensions: (prepared.width, prepared.height),
+            nested_artifact: false,
+        })
+    }
+    .await;
+
+    if let Some(session_id) = &edit_session_id {
+        if let Ok(remaining) = workflow_deadline_remaining(deadline, "capture close") {
+            let _ = session
+                .request(
+                    "capture_close",
+                    serde_json::json!({ "sessionId": session_id }),
+                    remaining,
+                )
+                .await;
+        }
+    }
+    let flow = match flow {
+        Ok(flow) => flow,
+        Err(error) => {
+            if let Some((id, token)) = &edit_lease {
+                cleanup_artifact_lease_until(port, id, token, deadline).await;
+            }
+            if let Some(id) = &runtime_artifact_id {
+                let _ = consume_artifact_transport_until(port, id, deadline).await;
+            }
+            return Err(error);
+        }
+    };
+    let (mut response, id, expected_size, dimensions, nested_artifact) = match flow {
+        CaptureFlow::Artifact {
+            response,
+            id,
+            expected_size,
+            dimensions,
+            nested_artifact,
+        } => (response, id, expected_size, dimensions, nested_artifact),
+        CaptureFlow::Response(response) => {
+            if let Some((id, token)) = &edit_lease {
+                cleanup_artifact_lease_until(port, id, token, deadline).await;
+            }
+            return Ok(response);
+        }
+    };
+
+    let materialized = match materialize_capture_artifact(
+        port,
+        &id,
+        Some(expected_size),
+        Some(dimensions),
+        destination.as_deref(),
+        deadline,
+        "workflow capture",
+    )
+    .await
+    {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            if let Some((id, token)) = &edit_lease {
+                cleanup_artifact_lease_until(port, id, token, deadline).await;
+            }
+            return Err(error);
+        }
+    };
+    let durable_path = materialized
+        .output_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let transport_metadata = materialized.metadata.clone();
+    let sanitized = serde_json::json!({
+        "id": materialized.metadata.id,
+        "filename": materialized.metadata.filename,
+        "mime": "image/png",
+        "path": durable_path,
+        "size": materialized.size,
+        "sha256": materialized.sha256,
+        "transport": {
+            "metadata": transport_metadata,
+            "consumed": materialized.consumed,
+        },
+    });
+    if nested_artifact {
+        response["value"]["artifact"] = sanitized;
+    } else {
+        response["value"] = sanitized;
+    }
+    if let Some(output_path) = materialized.output_path {
+        response["outputPath"] = serde_json::Value::String(output_path.display().to_string());
+    }
+    Ok(response)
+}
+
+async fn workflow_upload(
+    project: &std::path::Path,
+    paths: &[String],
+    asset_type: Option<&str>,
+    creator: Option<&str>,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let executable = std::env::current_exe().map_err(|e| format!("workflow upload: {e}"))?;
+    let mut command = tokio::process::Command::new(executable);
+    command.kill_on_drop(true);
+    command.arg("upload");
+    for path in paths {
+        command.arg(if std::path::Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            project.join(path)
+        });
+    }
+    command.arg("--project").arg(project).arg("--raw");
+    if let Some(asset_type) = asset_type {
+        command
+            .arg("--asset-type")
+            .arg(asset_type.to_ascii_lowercase());
+    }
+    if let Some(creator) = creator {
+        command.arg("--creator").arg(creator);
+    }
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "workflow upload timed out after {:.3}s",
+                timeout.as_secs_f64()
+            )
+        })??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|_| {
+        serde_json::json!({
+            "stdout": stdout,
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        })
+    });
+    if output.status.success() {
+        Ok(serde_json::json!({ "type": "response", "ok": true, "value": parsed }))
+    } else {
+        Ok(workflow_error_response(
+            "UPLOAD_FAILED",
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", stdout.trim())
+                }
+            ),
+            true,
+        ))
+    }
 }
 
 fn run_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -3384,6 +5648,7 @@ struct UploadBulkResult {
     error: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_asset_job(
     job: UploadJob,
     api_key: String,
@@ -3472,6 +5737,7 @@ fn collect_upload_jobs(
     Ok(jobs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_upload_input(
     input: &std::path::Path,
     recursive: bool,
@@ -3765,7 +6031,7 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{head}...{tail}")
 }
 
-fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
     let project = match args.project {
         Some(p) => p,
         None => std::env::current_dir().map_err(|e| format!("lint: current directory: {e}"))?,
@@ -3780,12 +6046,21 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    let project = std::fs::canonicalize(&project)
+        .map_err(|e| format!("lint: canonicalize {}: {e}", project.display()))?;
 
     if args.scope_only && args.paths.is_empty() {
         return Err("lint: --scope-only requires at least one --path".into());
     }
+    if extra_args_use_plain_formatter(&args.extra_args) {
+        return Err(
+            "lint: --formatter=plain does not preserve analyzer failure exit codes; use the default or GNU formatter"
+                .into(),
+        );
+    }
 
-    let targets = if args.paths.is_empty() {
+    let explicit_targets = !args.paths.is_empty();
+    let mut targets = if args.paths.is_empty() {
         vec![project.clone()]
     } else {
         args.paths
@@ -3798,28 +6073,93 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("lint: path does not exist: {}", target.display()).into());
         }
     }
+    targets = targets
+        .into_iter()
+        .map(|target| std::fs::canonicalize(&target).unwrap_or(target))
+        .collect();
+
+    let compile_report = run_lint_compiler(
+        &project,
+        &targets,
+        explicit_targets,
+        args.compile,
+        args.luau_compile.clone(),
+        args.no_vendor_ignores,
+        &args.ignores,
+    )?;
+    report_lint_compiler(&compile_report, args.raw, args.summary);
 
     let luau_lsp = resolve_luau_lsp(args.luau_lsp);
-    let sourcemap = if args.no_sourcemap || extra_args_include_sourcemap(&args.extra_args) {
+    warn_if_old_luau_lsp(&luau_lsp, &project);
+    let user_sourcemap = extra_args_include_sourcemap(&args.extra_args);
+    if (args.no_sourcemap || user_sourcemap)
+        && matches!(
+            args.data_model,
+            LintDataModelMode::Studio | LintDataModelMode::Filesystem
+        )
+    {
+        return Err(format!(
+            "lint: --data-model {} requires Ro Sync's generated sourcemap; remove --no-sourcemap/custom --sourcemap",
+            args.data_model.as_str()
+        )
+        .into());
+    }
+
+    let (sourcemap, mut coverage) = if args.no_sourcemap || user_sourcemap {
+        (
+            None,
+            LintDataModelCoverage::external(args.data_model, user_sourcemap),
+        )
+    } else {
+        let (map, coverage) = prepare_lint_sourcemap(&project, args.port, args.data_model).await?;
+        (Some(write_temp_sourcemap_value(&map)?), coverage)
+    };
+    let definitions = if extra_args_include_roblox_definitions(&args.extra_args) {
         None
     } else {
-        Some(write_temp_sourcemap(&project)?)
+        find_luau_definitions(&project)
     };
-    let definitions = if extra_args_include_definitions(&args.extra_args) {
-        None
+    let strict_settings = if coverage.strict
+        && !extra_args_include_settings(&args.extra_args)
+        && !extra_args_disable_strict_datamodel(&args.extra_args)
+    {
+        Some(write_temp_lint_settings()?)
     } else {
-        find_bundled_luau_definitions()
+        if coverage.strict && extra_args_include_settings(&args.extra_args) {
+            coverage.note = Some(
+                "A caller-supplied --settings file controls strict DataModel diagnostics."
+                    .to_string(),
+            );
+            coverage.strict = false;
+        }
+        if extra_args_disable_strict_datamodel(&args.extra_args) {
+            coverage.note = Some(
+                "Strict DataModel diagnostics were disabled by --no-strict-dm-types.".to_string(),
+            );
+            coverage.strict = false;
+        }
+        None
     };
+
+    report_lint_coverage(&coverage, args.raw);
     let mut cmd = std::process::Command::new(&luau_lsp);
     cmd.arg("analyze");
+    if !extra_args_include_platform(&args.extra_args) {
+        cmd.arg("--platform=roblox");
+    }
     if let Some(path) = &sourcemap {
         cmd.arg(format!("--sourcemap={}", path.display()));
     }
+    if let Some(path) = &strict_settings {
+        cmd.arg(format!("--settings={}", path.display()));
+    }
     if let Some(path) = &definitions {
-        cmd.arg(format!("--definitions={}", path.display()));
+        cmd.arg(format!("--definitions=@roblox={}", path.display()));
     }
 
-    if !args.no_vendor_ignores && !extra_args_include_ignore(&args.extra_args) {
+    // An explicit --path is an explicit ownership boundary and must never be
+    // silently swallowed by the default vendor filters.
+    if !args.no_vendor_ignores && !explicit_targets {
         for pattern in DEFAULT_LINT_VENDOR_IGNORES {
             cmd.arg(format!("--ignore={pattern}"));
         }
@@ -3833,17 +6173,19 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         .current_dir(&project)
         .stdin(Stdio::null());
 
-    let capture_output = args.scope_only || args.summary;
-    let status = if capture_output {
+    let capture_output = args.scope_only || args.summary || args.raw;
+    let (status, effective_success) = if capture_output {
         let output = match cmd.output() {
             Ok(output) => output,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                cleanup_sourcemap(&sourcemap);
+                cleanup_temp_file(&sourcemap);
+                cleanup_temp_file(&strict_settings);
                 print_luau_lsp_missing(&luau_lsp);
                 std::process::exit(127);
             }
             Err(e) => {
-                cleanup_sourcemap(&sourcemap);
+                cleanup_temp_file(&sourcemap);
+                cleanup_temp_file(&strict_settings);
                 return Err(
                     format!("lint: failed to run {}: {e}", luau_lsp.to_string_lossy()).into(),
                 );
@@ -3852,39 +6194,631 @@ fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut combined = String::new();
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        let all_diagnostics = lint_diagnostics(&project, &combined);
         let rendered = if args.scope_only {
             filter_lint_output_to_targets(&project, &targets, &combined)
         } else {
             combined
         };
-        print!("{rendered}");
-        if args.summary {
-            print_lint_summary(&rendered);
+        let shown_diagnostics = lint_diagnostics(&project, &rendered);
+        let suppressed = all_diagnostics
+            .len()
+            .saturating_sub(shown_diagnostics.len());
+        let retained_unparsed_failure =
+            args.scope_only && lint_has_unparsed_failure(&project, &rendered);
+        let effective_success = lint_analyzer_effective_success(
+            args.scope_only,
+            output.status.success(),
+            all_diagnostics.len(),
+            shown_diagnostics.len(),
+            retained_unparsed_failure,
+        );
+        if args.raw {
+            print_lint_json(
+                &project,
+                &coverage,
+                &compile_report,
+                LintAnalyzerJson {
+                    output: &rendered,
+                    diagnostics: &shown_diagnostics,
+                    suppressed,
+                    exit_code: output.status.code(),
+                    ok: effective_success && compile_report.is_success(),
+                },
+            )?;
+        } else {
+            print!("{rendered}");
+            if args.summary {
+                print_lint_summary(&project, &rendered, &compile_report, suppressed);
+            }
         }
-        output.status
+        (output.status, effective_success)
     } else {
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        match cmd.status() {
+        let status = match cmd.status() {
             Ok(status) => status,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                cleanup_sourcemap(&sourcemap);
+                cleanup_temp_file(&sourcemap);
+                cleanup_temp_file(&strict_settings);
                 print_luau_lsp_missing(&luau_lsp);
                 std::process::exit(127);
             }
             Err(e) => {
-                cleanup_sourcemap(&sourcemap);
+                cleanup_temp_file(&sourcemap);
+                cleanup_temp_file(&strict_settings);
                 return Err(
                     format!("lint: failed to run {}: {e}", luau_lsp.to_string_lossy()).into(),
                 );
             }
-        }
+        };
+        let success = status.success();
+        (status, success)
     };
 
-    cleanup_sourcemap(&sourcemap);
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+    cleanup_temp_file(&sourcemap);
+    cleanup_temp_file(&strict_settings);
+    if !effective_success || !compile_report.is_success() {
+        let exit_code = if effective_success {
+            compile_report.exit_code().unwrap_or(1)
+        } else {
+            status.code().filter(|code| *code != 0).unwrap_or(1)
+        };
+        std::process::exit(exit_code);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LintDataModelCoverage {
+    requested: String,
+    source: String,
+    strict: bool,
+    live_nodes: Option<usize>,
+    note: Option<String>,
+}
+
+impl LintDataModelCoverage {
+    fn external(mode: LintDataModelMode, user_sourcemap: bool) -> Self {
+        Self {
+            requested: mode.as_str().to_string(),
+            source: if user_sourcemap {
+                "caller-supplied".to_string()
+            } else {
+                "disabled".to_string()
+            },
+            strict: false,
+            live_nodes: None,
+            note: Some(if user_sourcemap {
+                "Ro Sync cannot determine strict DataModel coverage for a caller-supplied sourcemap."
+                    .to_string()
+            } else {
+                "DataModel sourcemap generation was disabled.".to_string()
+            }),
+        }
+    }
+}
+
+const LINT_COMPILE_OPTIMIZATIONS: &[u8] = &[0, 1, 2];
+const LINT_COMPILE_BATCH_MAX_FILES: usize = 128;
+const LINT_COMPILE_BATCH_MAX_ARG_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LintCompileReport {
+    requested: String,
+    status: String,
+    executable: Option<String>,
+    source_files: usize,
+    optimizations_checked: Vec<u8>,
+    failures: Vec<LintCompileFailure>,
+    note: Option<String>,
+}
+
+impl LintCompileReport {
+    fn disabled(mode: LintCompileMode) -> Self {
+        Self {
+            requested: mode.as_str().to_string(),
+            status: "disabled".to_string(),
+            executable: None,
+            source_files: 0,
+            optimizations_checked: Vec::new(),
+            failures: Vec::new(),
+            note: None,
+        }
+    }
+
+    fn skipped(mode: LintCompileMode, executable: Option<&OsString>, note: String) -> Self {
+        Self {
+            requested: mode.as_str().to_string(),
+            status: "skipped".to_string(),
+            executable: executable.map(|value| value.to_string_lossy().into_owned()),
+            source_files: 0,
+            optimizations_checked: Vec::new(),
+            failures: Vec::new(),
+            note: Some(note),
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        self.status != "failed"
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        self.failures.iter().find_map(|failure| failure.exit_code)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LintCompileFailure {
+    optimization: u8,
+    batch: usize,
+    exit_code: Option<i32>,
+    output: String,
+}
+
+fn run_lint_compiler(
+    project: &std::path::Path,
+    targets: &[PathBuf],
+    explicit_targets: bool,
+    mode: LintCompileMode,
+    explicit_executable: Option<PathBuf>,
+    no_vendor_ignores: bool,
+    ignores: &[String],
+) -> Result<LintCompileReport, Box<dyn std::error::Error>> {
+    if mode == LintCompileMode::Off {
+        return Ok(LintCompileReport::disabled(mode));
+    }
+
+    let executable = resolve_luau_compile(explicit_executable);
+    let Some(executable) = executable else {
+        let note = "luau-compile was not found; install the Luau compiler, set ROSYNC_LUAU_COMPILE, or pass --luau-compile"
+            .to_string();
+        if mode == LintCompileMode::Required {
+            return Err(format!("lint: {note}").into());
+        }
+        return Ok(LintCompileReport::skipped(mode, None, note));
+    };
+
+    match std::process::Command::new(&executable)
+        .arg("--help")
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            return Err(format!(
+                "lint: {} did not accept --help (exit {}); pass a valid luau-compile executable",
+                executable.to_string_lossy(),
+                status.code().unwrap_or(1)
+            )
+            .into());
+        }
+        Err(error) => {
+            let note = format!(
+                "could not run luau-compile at {}: {error}",
+                executable.to_string_lossy()
+            );
+            if mode == LintCompileMode::Required {
+                return Err(format!("lint: {note}").into());
+            }
+            return Ok(LintCompileReport::skipped(mode, Some(&executable), note));
+        }
+    }
+
+    let use_default_ignores = !no_vendor_ignores && !explicit_targets;
+    let sources = collect_lint_compile_sources(project, targets, use_default_ignores, ignores)?;
+    let mut report = LintCompileReport {
+        requested: mode.as_str().to_string(),
+        status: "passed".to_string(),
+        executable: Some(executable.to_string_lossy().into_owned()),
+        source_files: sources.len(),
+        optimizations_checked: Vec::new(),
+        failures: Vec::new(),
+        note: None,
+    };
+    if sources.is_empty() {
+        report.note = Some("No executable .lua or .luau source files were in scope.".to_string());
+        return Ok(report);
+    }
+
+    let batches = lint_compile_batches(project, &sources);
+    for &optimization in LINT_COMPILE_OPTIMIZATIONS {
+        report.optimizations_checked.push(optimization);
+        for (batch_index, batch) in batches.iter().enumerate() {
+            let output = std::process::Command::new(&executable)
+                .arg("--null")
+                .arg(format!("-O{optimization}"))
+                .args(batch)
+                .current_dir(project)
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| {
+                    format!(
+                        "lint: failed to run {} during bytecode compilation: {error}",
+                        executable.to_string_lossy()
+                    )
+                })?;
+            if output.status.success() {
+                continue;
+            }
+            report.status = "failed".to_string();
+            report.failures.push(LintCompileFailure {
+                optimization,
+                batch: batch_index + 1,
+                exit_code: output.status.code(),
+                output: lint_compile_failure_output(&output),
+            });
+        }
+    }
+    Ok(report)
+}
+
+fn report_lint_compiler(report: &LintCompileReport, raw: bool, summary: bool) {
+    if raw {
+        return;
+    }
+    match report.status.as_str() {
+        "skipped" => {
+            if let Some(note) = &report.note {
+                eprintln!("[rosync lint] bytecode check skipped: {note}");
+            }
+        }
+        "failed" => {
+            for failure in &report.failures {
+                eprintln!(
+                    "[rosync lint] bytecode compilation failed at -O{} (batch {}):",
+                    failure.optimization, failure.batch
+                );
+                eprint!("{}", failure.output);
+                if !failure.output.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+        }
+        "passed" if summary => {
+            let modes = report
+                .optimizations_checked
+                .iter()
+                .map(|optimization| format!("O{optimization}"))
+                .collect::<Vec<_>>()
+                .join("/");
+            if modes.is_empty() {
+                eprintln!(
+                    "[rosync lint] bytecode: {}",
+                    report.note.as_deref().unwrap_or("nothing to compile")
+                );
+            } else {
+                eprintln!(
+                    "[rosync lint] bytecode: {} source file{} passed {modes}",
+                    report.source_files,
+                    plural_s(report.source_files)
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_lint_compile_sources(
+    project: &std::path::Path,
+    targets: &[PathBuf],
+    use_default_ignores: bool,
+    ignores: &[String],
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut sources = Vec::new();
+    for target in targets {
+        if target.is_file() {
+            if is_lint_compile_source(project, target, true)
+                && !lint_compile_path_ignored(project, target, use_default_ignores, ignores)
+            {
+                sources.push(normalize_existing_path(target));
+            }
+            continue;
+        }
+        collect_lint_compile_directory(
+            project,
+            target,
+            use_default_ignores,
+            ignores,
+            &mut sources,
+        )?;
+    }
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+fn collect_lint_compile_directory(
+    project: &std::path::Path,
+    directory: &std::path::Path,
+    use_default_ignores: bool,
+    ignores: &[String],
+    sources: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("lint: read {}: {error}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if lint_compile_path_ignored(project, &path, use_default_ignores, ignores) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_lint_compile_directory(project, &path, use_default_ignores, ignores, sources)?;
+        } else if (file_type.is_file() || (file_type.is_symlink() && path.is_file()))
+            && is_lint_compile_source(project, &path, false)
+        {
+            sources.push(normalize_existing_path(&path));
+        }
+    }
+    Ok(())
+}
+
+fn is_lint_compile_source(
+    project: &std::path::Path,
+    path: &std::path::Path,
+    explicit_file: bool,
+) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if fs_map::classify_script_file(name).is_none() {
+        return false;
+    }
+    if name.ends_with(".d.luau") || name.ends_with(".d.lua") {
+        // Declaration files outside the mirrored DataModel are analyzer inputs,
+        // not executable chunks. Inside a synced service, however, `Foo.d.luau`
+        // is a perfectly valid ModuleScript named `Foo.d`; an explicit file is
+        // likewise an unambiguous request to run the compiler.
+        if explicit_file {
+            return true;
+        }
+        let relative = path.strip_prefix(project).unwrap_or(path);
+        return relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .is_some_and(|service| snapshot::SYNCED_SERVICES.contains(&service));
+    }
+    true
+}
+
+fn lint_compile_path_ignored(
+    project: &std::path::Path,
+    path: &std::path::Path,
+    use_default_ignores: bool,
+    ignores: &[String],
+) -> bool {
+    let relative = path.strip_prefix(project).unwrap_or(path);
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let absolute = path.to_string_lossy().replace('\\', "/");
+    let matches = |pattern: &str| {
+        lint_glob_matches(pattern, &relative)
+            || lint_glob_matches(pattern, &absolute)
+            || (!pattern.contains('/')
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| lint_glob_matches(pattern, name)))
+    };
+    (use_default_ignores
+        && DEFAULT_LINT_VENDOR_IGNORES
+            .iter()
+            .any(|pattern| matches(pattern)))
+        || ignores.iter().any(|pattern| matches(pattern))
+}
+
+fn lint_glob_matches(pattern: &str, value: &str) -> bool {
+    fn recurse(
+        pattern: &[u8],
+        value: &[u8],
+        pattern_index: usize,
+        value_index: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, value_index)) {
+            return *result;
+        }
+        let result = if pattern_index == pattern.len() {
+            value_index == value.len()
+        } else if pattern[pattern_index..].starts_with(b"**/") {
+            recurse(pattern, value, pattern_index + 3, value_index, memo)
+                || (value_index < value.len()
+                    && recurse(pattern, value, pattern_index, value_index + 1, memo))
+        } else if pattern[pattern_index..].starts_with(b"**") {
+            recurse(pattern, value, pattern_index + 2, value_index, memo)
+                || (value_index < value.len()
+                    && recurse(pattern, value, pattern_index, value_index + 1, memo))
+        } else if pattern[pattern_index] == b'*' {
+            recurse(pattern, value, pattern_index + 1, value_index, memo)
+                || (value_index < value.len()
+                    && value[value_index] != b'/'
+                    && recurse(pattern, value, pattern_index, value_index + 1, memo))
+        } else if pattern[pattern_index] == b'?' {
+            value_index < value.len()
+                && value[value_index] != b'/'
+                && recurse(pattern, value, pattern_index + 1, value_index + 1, memo)
+        } else {
+            value_index < value.len()
+                && pattern[pattern_index] == value[value_index]
+                && recurse(pattern, value, pattern_index + 1, value_index + 1, memo)
+        };
+        memo.insert((pattern_index, value_index), result);
+        result
+    }
+
+    let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+    recurse(
+        pattern.as_bytes(),
+        value.as_bytes(),
+        0,
+        0,
+        &mut HashMap::new(),
+    )
+}
+
+fn lint_compile_batches(project: &std::path::Path, sources: &[PathBuf]) -> Vec<Vec<OsString>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut argument_bytes = 0usize;
+    for source in sources {
+        let argument_path = source.strip_prefix(project).unwrap_or(source);
+        let argument = argument_path.as_os_str().to_os_string();
+        let bytes = argument.to_string_lossy().len() + 1;
+        if !batch.is_empty()
+            && (batch.len() >= LINT_COMPILE_BATCH_MAX_FILES
+                || argument_bytes.saturating_add(bytes) > LINT_COMPILE_BATCH_MAX_ARG_BYTES)
+        {
+            batches.push(std::mem::take(&mut batch));
+            argument_bytes = 0;
+        }
+        argument_bytes = argument_bytes.saturating_add(bytes);
+        batch.push(argument);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+fn lint_compile_failure_output(output: &std::process::Output) -> String {
+    let mut rendered = String::new();
+    rendered.push_str(&String::from_utf8_lossy(&output.stderr));
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !line.starts_with("Compiled ") {
+            rendered.push_str(line);
+            rendered.push('\n');
+        }
+    }
+    if rendered.trim().is_empty() {
+        rendered = format!(
+            "luau-compile exited with status {} without an error message\n",
+            output.status.code().unwrap_or(1)
+        );
+    }
+    rendered
+}
+
+async fn prepare_lint_sourcemap(
+    project: &std::path::Path,
+    port: u16,
+    mode: LintDataModelMode,
+) -> Result<(serde_json::Value, LintDataModelCoverage), Box<dyn std::error::Error>> {
+    let mut map = sourcemap::generate(project)?;
+    let mut coverage = LintDataModelCoverage {
+        requested: mode.as_str().to_string(),
+        source: "filesystem".to_string(),
+        strict: mode == LintDataModelMode::Filesystem,
+        live_nodes: None,
+        note: None,
+    };
+
+    match mode {
+        LintDataModelMode::Loose => {
+            coverage.note = Some(
+                "DataModel-derived expressions remain gradual/any in diagnostics.".to_string(),
+            );
+            return Ok((map, coverage));
+        }
+        LintDataModelMode::Filesystem => {
+            coverage.note = Some(
+                "Strict filesystem types can report unknown children for Studio-only instances."
+                    .to_string(),
+            );
+            return Ok((map, coverage));
+        }
+        LintDataModelMode::Auto | LintDataModelMode::Studio => {}
+    }
+
+    let hello = fetch_daemon_hello(port).ok();
+    let matching_daemon = hello
+        .as_ref()
+        .is_some_and(|hello| daemon_hello_matches_project(hello, project));
+    let plugin_connected = hello
+        .as_ref()
+        .and_then(|hello| hello.get("pluginConnected"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if matching_daemon && plugin_connected {
+        match live_tree(port, "lint").await {
+            Ok(tree) => {
+                if diff::has_truncated_tree(&tree) {
+                    return Err("lint: Studio returned a truncated DataModel tree".into());
+                }
+                let live_nodes = count_json_tree_nodes(&tree);
+                sourcemap::merge_live_tree(&mut map, &tree);
+                coverage.source = "studio".to_string();
+                coverage.strict = true;
+                coverage.live_nodes = Some(live_nodes);
+                coverage.note = Some(
+                    "Strict DataModel diagnostics use live Studio classes plus disk file mappings."
+                        .to_string(),
+                );
+                return Ok((map, coverage));
+            }
+            Err(error) if mode == LintDataModelMode::Studio => {
+                return Err(format!("lint: live Studio DataModel request failed: {error}").into());
+            }
+            Err(error) => {
+                coverage.note = Some(format!(
+                    "Live Studio DataModel request failed ({error}); using relaxed filesystem types."
+                ));
+                return Ok((map, coverage));
+            }
+        }
+    }
+
+    if mode == LintDataModelMode::Studio {
+        let reason = if !matching_daemon {
+            format!("no matching Ro Sync daemon is reachable on port {port}")
+        } else {
+            "the Studio plugin is not connected".to_string()
+        };
+        return Err(format!("lint: --data-model studio requires live Studio: {reason}").into());
+    }
+
+    coverage.note = Some(if !matching_daemon {
+        "Studio is unavailable; using relaxed filesystem types. Use --data-model filesystem for an offline strict audit."
+            .to_string()
+    } else {
+        "Studio plugin is disconnected; using relaxed filesystem types. Use --data-model filesystem for an offline strict audit."
+            .to_string()
+    });
+    Ok((map, coverage))
+}
+
+fn count_json_tree_nodes(node: &serde_json::Value) -> usize {
+    1 + node
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .map(|children| children.iter().map(count_json_tree_nodes).sum::<usize>())
+        .unwrap_or(0)
+}
+
+fn report_lint_coverage(coverage: &LintDataModelCoverage, raw: bool) {
+    if raw {
+        return;
+    }
+    let node_detail = coverage
+        .live_nodes
+        .map(|count| format!(", {count} live instances"))
+        .unwrap_or_default();
+    let strict = if coverage.strict { "strict" } else { "relaxed" };
+    eprintln!(
+        "[rosync lint] DataModel: {} ({strict}{node_detail})",
+        coverage.source
+    );
+    if let Some(note) = &coverage.note {
+        eprintln!("[rosync lint] {note}");
+    }
 }
 
 const DEFAULT_LINT_VENDOR_IGNORES: &[&str] = &[
@@ -3893,8 +6827,12 @@ const DEFAULT_LINT_VENDOR_IGNORES: &[&str] = &[
     "**/Madwork*/**",
     "**/PlayerModule/**",
     "**/node_modules/**",
+    "**/.git/**",
     "**/.codex/**",
     "**/.vscode/**",
+    "**/.rosync-artifacts/**",
+    "**/.rosync-backups/**",
+    "**/.rosync-workflows/**",
     "**/tools/**",
 ];
 
@@ -3906,16 +6844,15 @@ fn lint_target_path(project: &std::path::Path, path: &std::path::Path) -> PathBu
     }
 }
 
-fn extra_args_include_ignore(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--ignore" || arg.starts_with("--ignore="))
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LintDiagnostic {
     path: PathBuf,
-    file_label: String,
     category: String,
+    message: String,
+    line: usize,
+    column: usize,
+    end_line: Option<usize>,
+    end_column: Option<usize>,
 }
 
 fn filter_lint_output_to_targets(
@@ -3959,16 +6896,13 @@ fn normalize_existing_path(path: &std::path::Path) -> PathBuf {
 }
 
 fn parse_lint_diagnostic(project: &std::path::Path, line: &str) -> Option<LintDiagnostic> {
-    let (file_part, rest) = line.split_once('(')?;
-    let (location, message) = rest.split_once("): ")?;
-    if !location
-        .split(',')
-        .all(|part| part.chars().all(|ch| ch.is_ascii_digit()))
-    {
-        return None;
-    }
-    let (category, _) = message.split_once(':')?;
-    let file_path = std::path::Path::new(file_part);
+    let (file_part, coordinates, message) = split_lint_diagnostic_line(line)?;
+    let (category, diagnostic_message) = split_lint_diagnostic_message(message)?;
+    // With a sourcemap, luau-lsp appends its virtual DataModel location to the
+    // real filename: `Main.luau [game/ReplicatedStorage/Main]`. Keep the disk
+    // path for ownership filtering and structured output.
+    let file_label = strip_lint_virtual_path_suffix(file_part);
+    let file_path = std::path::Path::new(file_label);
     let absolute = if file_path.is_absolute() {
         file_path.to_path_buf()
     } else {
@@ -3976,24 +6910,204 @@ fn parse_lint_diagnostic(project: &std::path::Path, line: &str) -> Option<LintDi
     };
     Some(LintDiagnostic {
         path: normalize_existing_path(&absolute),
-        file_label: file_part.to_string(),
         category: category.trim().to_string(),
+        message: diagnostic_message.trim().to_string(),
+        line: coordinates[0],
+        column: coordinates[1],
+        end_line: coordinates.get(2).copied(),
+        end_column: coordinates.get(3).copied(),
     })
 }
 
-fn print_lint_summary(output: &str) {
-    let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
-    let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
-    for line in output.lines() {
-        let Some(diag) = parse_lint_diagnostic(std::path::Path::new("."), line) else {
+fn split_lint_diagnostic_line(line: &str) -> Option<(&str, Vec<usize>, &str)> {
+    // Search for a numeric `(line,column[,endLine,endColumn]): ` suffix rather
+    // than splitting at the first `(`. Ro Sync's script-with-children files
+    // intentionally contain parentheses, e.g. `init (MarketService).luau`.
+    for (location_end, _) in line.rmatch_indices("): ") {
+        let prefix = &line[..location_end];
+        let Some(location_start) = prefix.rfind('(') else {
             continue;
         };
-        *by_category.entry(diag.category).or_insert(0) += 1;
-        *by_file.entry(diag.file_label).or_insert(0) += 1;
+        let Ok(coordinates) = prefix[location_start + 1..]
+            .split(',')
+            .map(str::parse::<usize>)
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        let file_part = &prefix[..location_start];
+        let message = &line[location_end + 3..];
+        if (coordinates.len() == 2 || coordinates.len() == 4)
+            && lint_file_part_is_plausible(file_part)
+            && split_lint_diagnostic_message(message).is_some()
+        {
+            return Some((file_part, coordinates, message));
+        }
     }
+
+    // `--formatter=gnu` uses `path:line.column-endLine.endColumn: ...`, while
+    // `--formatter=plain` uses `path:line:column-endColumn: (Wn) ...`.
+    for (location_end, _) in line.rmatch_indices(": ") {
+        let prefix = &line[..location_end];
+        let message = &line[location_end + 2..];
+        if split_lint_diagnostic_message(message).is_none() {
+            continue;
+        }
+        if let Some((file_part, coordinates)) = split_gnu_lint_location(prefix) {
+            if lint_file_part_is_plausible(file_part) {
+                return Some((file_part, coordinates, message));
+            }
+        }
+        if let Some((file_part, coordinates)) = split_plain_lint_location(prefix) {
+            if lint_file_part_is_plausible(file_part) {
+                return Some((file_part, coordinates, message));
+            }
+        }
+    }
+    None
+}
+
+fn lint_file_part_is_plausible(file_part: &str) -> bool {
+    for marker in [" [game/", " [game]"] {
+        if let Some(index) = file_part.rfind(marker) {
+            let disk_label = &file_part[..index];
+            if disk_label.ends_with(".lua") || disk_label.ends_with(".luau") {
+                if !file_part.ends_with(']') {
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+    let disk_label = strip_lint_virtual_path_suffix(file_part);
+    disk_label.ends_with(".lua") || disk_label.ends_with(".luau")
+}
+
+fn split_lint_diagnostic_message(message: &str) -> Option<(&str, &str)> {
+    let mut message = message.trim();
+    if let Some(after_open) = message.strip_prefix('(') {
+        if let Some((severity, rest)) = after_open.split_once(") ") {
+            let has_digit = severity.bytes().any(|byte| byte.is_ascii_digit());
+            if has_digit
+                && severity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                message = rest;
+            }
+        }
+    }
+    let (category, diagnostic_message) = message.split_once(':')?;
+    let category = category.trim();
+    if category.is_empty()
+        || !category
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some((category, diagnostic_message.trim()))
+}
+
+fn split_gnu_lint_location(prefix: &str) -> Option<(&str, Vec<usize>)> {
+    let location_start = prefix.rfind(':')?;
+    let coordinates = parse_gnu_lint_location(&prefix[location_start + 1..])?;
+    Some((&prefix[..location_start], coordinates))
+}
+
+fn split_plain_lint_location(prefix: &str) -> Option<(&str, Vec<usize>)> {
+    let (file_and_line, column_range) = prefix.rsplit_once(':')?;
+    let (file_part, line) = file_and_line.rsplit_once(':')?;
+    let line = line.parse::<usize>().ok()?;
+    let (column, end_column) = match column_range.split_once('-') {
+        Some((column, end_column)) => (
+            column.parse::<usize>().ok()?,
+            Some(end_column.parse::<usize>().ok()?),
+        ),
+        None => (column_range.parse::<usize>().ok()?, None),
+    };
+    let coordinates = match end_column {
+        Some(end_column) => vec![line, column, line, end_column],
+        None => vec![line, column],
+    };
+    Some((file_part, coordinates))
+}
+
+fn parse_gnu_lint_location(location: &str) -> Option<Vec<usize>> {
+    fn point(value: &str) -> Option<(usize, usize)> {
+        let (line, column) = value.split_once('.')?;
+        Some((line.parse().ok()?, column.parse().ok()?))
+    }
+
+    if let Some((start, end)) = location.split_once('-') {
+        let (line, column) = point(start)?;
+        let (end_line, end_column) = point(end)?;
+        Some(vec![line, column, end_line, end_column])
+    } else {
+        let (line, column) = point(location)?;
+        Some(vec![line, column])
+    }
+}
+
+fn strip_lint_virtual_path_suffix(label: &str) -> &str {
+    if !label.ends_with(']') {
+        return label;
+    }
+    for marker in [" [game/", " [game]"] {
+        if let Some(index) = label.rfind(marker) {
+            return &label[..index];
+        }
+    }
+    label
+}
+
+fn lint_diagnostics(project: &std::path::Path, output: &str) -> Vec<LintDiagnostic> {
+    output
+        .lines()
+        .filter_map(|line| parse_lint_diagnostic(project, line))
+        .collect()
+}
+
+fn lint_summary_counts(
+    project: &std::path::Path,
+    analyzer_output: &str,
+    compiler: &LintCompileReport,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let project = normalize_existing_path(project);
+    let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
+    let analyzer_diagnostics = lint_diagnostics(&project, analyzer_output);
+    let compiler_diagnostics = compiler
+        .failures
+        .iter()
+        .flat_map(|failure| lint_diagnostics(&project, &failure.output))
+        .collect::<Vec<_>>();
+    for diag in analyzer_diagnostics.into_iter().chain(compiler_diagnostics) {
+        *by_category.entry(diag.category).or_insert(0) += 1;
+        let file = diag
+            .path
+            .strip_prefix(&project)
+            .unwrap_or(&diag.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        *by_file.entry(file).or_insert(0) += 1;
+    }
+    (by_category, by_file)
+}
+
+fn print_lint_summary(
+    project: &std::path::Path,
+    analyzer_output: &str,
+    compiler: &LintCompileReport,
+    suppressed: usize,
+) {
+    let (by_category, by_file) = lint_summary_counts(project, analyzer_output, compiler);
     let total: usize = by_category.values().sum();
     if total == 0 {
         println!("\nSummary: 0 diagnostics");
+        if suppressed > 0 {
+            println!("Suppressed outside requested scopes: {suppressed}");
+        }
         return;
     }
     println!("\nSummary: {total} diagnostic{}", plural_s(total));
@@ -4005,6 +7119,119 @@ fn print_lint_summary(output: &str) {
     for (file, count) in by_file {
         println!("  {count:>4} {file}");
     }
+    if suppressed > 0 {
+        println!("Suppressed outside requested scopes: {suppressed}");
+    }
+}
+
+struct LintAnalyzerJson<'a> {
+    output: &'a str,
+    diagnostics: &'a [LintDiagnostic],
+    suppressed: usize,
+    exit_code: Option<i32>,
+    ok: bool,
+}
+
+fn print_lint_json(
+    project: &std::path::Path,
+    coverage: &LintDataModelCoverage,
+    compiler: &LintCompileReport,
+    analyzer: LintAnalyzerJson<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let analyzer_messages = lint_unparsed_lines(project, analyzer.output);
+    let analyzer_diagnostic_count = analyzer.diagnostics.len();
+    let mut diagnostics = analyzer
+        .diagnostics
+        .iter()
+        .map(|diagnostic| lint_diagnostic_json(project, diagnostic, "analyzer", None))
+        .collect::<Vec<_>>();
+    let mut compiler_diagnostic_count = 0usize;
+    for failure in &compiler.failures {
+        for diagnostic in lint_diagnostics(project, &failure.output) {
+            compiler_diagnostic_count += 1;
+            diagnostics.push(lint_diagnostic_json(
+                project,
+                &diagnostic,
+                "compiler",
+                Some(failure.optimization),
+            ));
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": analyzer.ok,
+            "project": project,
+            "analyzerExitCode": analyzer.exit_code,
+            "dataModel": coverage,
+            "compiler": compiler,
+            "analyzerDiagnosticCount": analyzer_diagnostic_count,
+            "analyzerMessages": analyzer_messages,
+            "compilerDiagnosticCount": compiler_diagnostic_count,
+            "diagnosticCount": diagnostics.len(),
+            "suppressedDiagnostics": analyzer.suppressed,
+            "diagnostics": diagnostics,
+        }))?
+    );
+    Ok(())
+}
+
+fn lint_unparsed_lines(project: &std::path::Path, output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty() && parse_lint_diagnostic(project, line).is_none())
+        .map(str::to_string)
+        .collect()
+}
+
+fn lint_has_unparsed_failure(project: &std::path::Path, output: &str) -> bool {
+    lint_unparsed_lines(project, output)
+        .iter()
+        .any(|line| !lint_unparsed_line_is_benign(line))
+}
+
+fn lint_analyzer_effective_success(
+    scope_only: bool,
+    process_success: bool,
+    all_diagnostics: usize,
+    shown_diagnostics: usize,
+    retained_unparsed_failure: bool,
+) -> bool {
+    if process_success {
+        return true;
+    }
+    scope_only && all_diagnostics > 0 && shown_diagnostics == 0 && !retained_unparsed_failure
+}
+
+fn lint_unparsed_line_is_benign(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("[INFO]")
+        || line.starts_with("[WARN] client does not allow didChangeWatchedFiles registration")
+}
+
+fn lint_diagnostic_json(
+    project: &std::path::Path,
+    diagnostic: &LintDiagnostic,
+    stage: &str,
+    optimization: Option<u8>,
+) -> serde_json::Value {
+    let path = diagnostic
+        .path
+        .strip_prefix(project)
+        .unwrap_or(&diagnostic.path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    serde_json::json!({
+        "stage": stage,
+        "optimization": optimization,
+        "path": path,
+        "line": diagnostic.line,
+        "column": diagnostic.column,
+        "endLine": diagnostic.end_line,
+        "endColumn": diagnostic.end_column,
+        "category": diagnostic.category,
+        "message": diagnostic.message,
+    })
 }
 
 fn plural_s(count: usize) -> &'static str {
@@ -4015,8 +7242,9 @@ fn plural_s(count: usize) -> &'static str {
     }
 }
 
-fn write_temp_sourcemap(project: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let map = sourcemap::generate(project)?;
+fn write_temp_sourcemap_value(
+    map: &serde_json::Value,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut path = std::env::temp_dir();
     path.push(format!(
         "rosync-sourcemap-{}-{}.json",
@@ -4024,6 +7252,21 @@ fn write_temp_sourcemap(project: &std::path::Path) -> Result<PathBuf, Box<dyn st
         unix_nanos()
     ));
     let text = serde_json::to_string_pretty(&map)?;
+    std::fs::write(&path, text).map_err(|e| format!("lint: write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn write_temp_lint_settings() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "rosync-lint-settings-{}-{}.json",
+        std::process::id(),
+        unix_nanos()
+    ));
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "luau-lsp.diagnostics.strictDatamodelTypes": true,
+        "luau-lsp.platform.type": "roblox",
+    }))?;
     std::fs::write(&path, text).map_err(|e| format!("lint: write {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -4047,16 +7290,64 @@ fn extra_args_include_sourcemap(args: &[String]) -> bool {
         .any(|arg| arg == "--sourcemap" || arg.starts_with("--sourcemap="))
 }
 
-fn extra_args_include_definitions(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        arg == "--definitions"
-            || arg.starts_with("--definitions=")
-            || arg == "--defs"
-            || arg.starts_with("--defs=")
-    })
+fn extra_args_include_platform(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--platform" || arg.starts_with("--platform="))
 }
 
-fn cleanup_sourcemap(path: &Option<PathBuf>) {
+fn extra_args_use_plain_formatter(args: &[String]) -> bool {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--formatter" {
+            if args.get(index + 1).is_some_and(|value| value == "plain") {
+                return true;
+            }
+            continue;
+        }
+        for prefix in ["--formatter=", "--formatter:"] {
+            if arg.strip_prefix(prefix) == Some("plain") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn extra_args_include_settings(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
+}
+
+fn extra_args_disable_strict_datamodel(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--no-strict-dm-types")
+}
+
+fn extra_args_include_roblox_definitions(args: &[String]) -> bool {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--definitions" || arg == "--defs" {
+            if args
+                .get(index + 1)
+                .is_some_and(|value| definition_value_replaces_roblox(value))
+            {
+                return true;
+            }
+            continue;
+        }
+        for prefix in ["--definitions=", "--defs=", "--definitions:", "--defs:"] {
+            if let Some(value) = arg.strip_prefix(prefix) {
+                if definition_value_replaces_roblox(value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn definition_value_replaces_roblox(value: &str) -> bool {
+    !value.starts_with('@') || value.starts_with("@roblox=")
+}
+
+fn cleanup_temp_file(path: &Option<PathBuf>) {
     if let Some(path) = path {
         let _ = std::fs::remove_file(path);
     }
@@ -4074,7 +7365,50 @@ fn resolve_luau_lsp(explicit: Option<PathBuf>) -> OsString {
     if let Some(path) = find_bundled_luau_lsp() {
         return path.into_os_string();
     }
+    if let Some(path) = find_aftman_luau_lsp() {
+        return path.into_os_string();
+    }
     OsString::from("luau-lsp")
+}
+
+fn resolve_luau_compile(explicit: Option<PathBuf>) -> Option<OsString> {
+    if let Some(path) = explicit {
+        return Some(path.into_os_string());
+    }
+    for variable in ["ROSYNC_LUAU_COMPILE", "LUAU_COMPILE"] {
+        if let Some(path) = std::env::var_os(variable) {
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    if let Some(path) = find_bundled_luau_compile() {
+        return Some(path.into_os_string());
+    }
+    if let Some(path) = find_aftman_luau_compile() {
+        return Some(path.into_os_string());
+    }
+    find_executable_on_path(if cfg!(windows) {
+        "luau-compile.exe"
+    } else {
+        "luau-compile"
+    })
+    .map(PathBuf::into_os_string)
+}
+
+fn find_bundled_luau_compile() -> Option<PathBuf> {
+    find_in_tool_bases(&bundled_luau_compile_relative_path())
+}
+
+fn bundled_luau_compile_relative_path() -> PathBuf {
+    PathBuf::from("tools")
+        .join("luau")
+        .join(platform_tool_triple())
+        .join(if cfg!(windows) {
+            "luau-compile.exe"
+        } else {
+            "luau-compile"
+        })
 }
 
 fn find_bundled_luau_lsp() -> Option<PathBuf> {
@@ -4089,12 +7423,108 @@ fn find_bundled_luau_lsp() -> Option<PathBuf> {
     find_in_tool_bases(&rel)
 }
 
+fn find_aftman_luau_lsp() -> Option<PathBuf> {
+    let executable = if cfg!(windows) {
+        "luau-lsp.exe"
+    } else {
+        "luau-lsp"
+    };
+    let path = dirs::home_dir()?
+        .join(".aftman")
+        .join("bin")
+        .join(executable);
+    path.is_file().then_some(path)
+}
+
+fn find_aftman_luau_compile() -> Option<PathBuf> {
+    let executable = if cfg!(windows) {
+        "luau-compile.exe"
+    } else {
+        "luau-compile"
+    };
+    let path = dirs::home_dir()?
+        .join(".aftman")
+        .join("bin")
+        .join(executable);
+    path.is_file().then_some(path)
+}
+
+fn find_executable_on_path(executable: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(executable);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        if std::path::Path::new(executable).extension().is_none() {
+            let extensions = std::env::var_os("PATHEXT")
+                .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+            for extension in extensions.to_string_lossy().split(';') {
+                let candidate = directory.join(format!("{executable}{extension}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_luau_definitions(project: &std::path::Path) -> Option<PathBuf> {
+    // The widget snapshot is paired with the analyzer version Ro Sync tests.
+    // A project copy exists for editor tooling and as a standalone fallback,
+    // but it can be stale until the next `rosync refresh`.
+    if let Some(definitions) = find_bundled_luau_definitions() {
+        return Some(definitions);
+    }
+    let project_definitions = project.join(snapshot::ROBLOX_DEFINITIONS_PATH);
+    if project_definitions.is_file() {
+        return Some(project_definitions);
+    }
+    None
+}
+
 fn find_bundled_luau_definitions() -> Option<PathBuf> {
     let rel = PathBuf::from("tools")
         .join("luau-lsp")
         .join("roblox")
         .join("globalTypes.d.luau");
     find_in_tool_bases(&rel)
+}
+
+fn warn_if_old_luau_lsp(executable: &OsString, project: &std::path::Path) {
+    let Ok(output) = std::process::Command::new(executable)
+        .arg("--version")
+        .current_dir(project)
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let Some(parsed) = parse_semver_triplet(&version) else {
+        return;
+    };
+    if parsed < RECOMMENDED_LUAU_LSP_VERSION {
+        eprintln!(
+            "[rosync lint] warning: luau-lsp {version} is older than tested {}.{}.{}; run `aftman install` after `rosync refresh`",
+            RECOMMENDED_LUAU_LSP_VERSION.0,
+            RECOMMENDED_LUAU_LSP_VERSION.1,
+            RECOMMENDED_LUAU_LSP_VERSION.2,
+        );
+    }
+}
+
+fn parse_semver_triplet(value: &str) -> Option<(u64, u64, u64)> {
+    let version = value.trim().trim_start_matches('v');
+    let mut parts = version.split(|character: char| !character.is_ascii_digit());
+    let major = parts.find(|part| !part.is_empty())?.parse().ok()?;
+    let minor = parts.find(|part| !part.is_empty())?.parse().ok()?;
+    let patch = parts.find(|part| !part.is_empty())?.parse().ok()?;
+    Some((major, minor, patch))
 }
 
 fn resolve_img_api_key(preferred_env: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -4324,7 +7754,7 @@ fn find_in_tool_bases(rel: &std::path::Path) -> Option<PathBuf> {
     }
 
     for base in bases {
-        let candidate = base.join(&rel);
+        let candidate = base.join(rel);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -4394,7 +7824,7 @@ async fn run_set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
     if prop == "Parent" && !args.force_parent {
         eprintln!("========================================================");
         eprintln!("  rosync set: refusing to assign .Parent from the CLI.");
-        eprintln!("");
+        eprintln!();
         eprintln!("  Reparenting via raw property writes is the single most");
         eprintln!("  common way to corrupt a DataModel. Use `rosync mv` to");
         eprintln!("  reparent safely, or re-run with `--force-parent` if");
@@ -4439,10 +7869,7 @@ async fn send_waypoint(port: u16, name: &str) -> Result<(), Box<dyn std::error::
         Ok(resp) => {
             let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             if !ok {
-                let err = resp
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
+                let err = response_error_message(&resp);
                 eprintln!("warning: waypoint {name:?}: {err}");
             }
             Ok(())
@@ -4466,6 +7893,26 @@ async fn run_set_batch(
             batch_path.display()
         )
     })?;
+    if !args.force_parent {
+        if let Some((index, path)) = entries.iter().enumerate().find_map(|(index, entry)| {
+            (entry.get("prop").and_then(|value| value.as_str()) == Some("Parent")).then(|| {
+                (
+                    index,
+                    entry
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<missing path>"),
+                )
+            })
+        }) {
+            return Err(format!(
+                "set: refusing batch entry {} that assigns .Parent on {} without --force-parent (use `rosync mv` instead)",
+                index + 1,
+                path
+            )
+            .into());
+        }
+    }
     let total = entries.len();
     let mut ok_count = 0usize;
     let mut fail_count = 0usize;
@@ -4498,10 +7945,7 @@ async fn run_set_batch(
                     ok_count += 1;
                 } else {
                     fail_count += 1;
-                    let err = resp
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("<no error>");
+                    let err = response_error_message(&resp);
                     eprintln!("  ! {err}");
                     if !args.keep_going {
                         return Err(format!("aborting at entry {}/{total}: {err}", i + 1).into());
@@ -4530,7 +7974,7 @@ async fn run_set_batch(
 async fn run_ls(args: LsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let req_args = serde_json::json!({ "path": args.path });
     let resp = remote::request(args.port, "ls", req_args).await?;
-    print_response(&resp, args.raw, |v| print_ls(v));
+    print_response(&resp, args.raw, print_ls);
     ok_or_err(&resp)
 }
 
@@ -4626,11 +8070,13 @@ fn response_value_or_err(
             .cloned()
             .unwrap_or(serde_json::Value::Null));
     }
-    let err = resp
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("request failed");
-    Err(format!("{context}: {err}").into())
+    Err(format!("{context}: {}", response_error_message(resp)).into())
+}
+
+fn response_error_message(resp: &serde_json::Value) -> String {
+    remote::plugin_error(resp)
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "request failed".to_string())
 }
 
 fn collect_snapshot_paths(node: &serde_json::Value, path: &str, out: &mut Vec<String>) {
@@ -4884,12 +8330,7 @@ async fn run_where(args: WhereArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         out.insert(
             "liveError".into(),
-            serde_json::Value::String(
-                resp.get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("live search failed")
-                    .to_string(),
-            ),
+            serde_json::Value::String(response_error_message(&resp)),
         );
     }
 
@@ -5349,7 +8790,7 @@ async fn run_find(args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
         req_args.insert("under".into(), serde_json::Value::String(u.clone()));
     }
     let resp = remote::request(args.port, "find", serde_json::Value::Object(req_args)).await?;
-    print_response(&resp, args.raw, |v| print_find(v));
+    print_response(&resp, args.raw, print_find);
     ok_or_err(&resp)
 }
 
@@ -5360,6 +8801,2252 @@ async fn run_eval(args: EvalArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     });
     ok_or_err(&resp)
+}
+
+async fn run_capabilities(args: CapabilitiesArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = remote::request(args.port, "capabilities", serde_json::json!({})).await?;
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        let value = response_value_or_err(&resp, "capabilities")?;
+        let plugin = value
+            .get("pluginVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let protocol = value
+            .get("protocolVersion")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let host = value
+            .get("hostDataModelType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        println!("plugin {plugin} · protocol {protocol} · {host}");
+        if let Some(features) = value.get("features").and_then(serde_json::Value::as_object) {
+            for (name, supported) in features {
+                let state = if supported.as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "no"
+                };
+                println!("  {name}: {state}");
+            }
+        }
+    }
+    ok_or_err(&resp)
+}
+
+async fn run_capture(args: CaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        CaptureCommand::Status(args) => run_capture_status(args).await,
+        CaptureCommand::Authorize(args) => run_capture_authorize(args).await,
+        CaptureCommand::Screen(args) => run_capture_screen(args).await,
+        CaptureCommand::Photo(args) => run_capture_photo(args).await,
+        CaptureCommand::Scene(args) => run_capture_scene(args).await,
+    }
+}
+
+async fn run_capture_scene(args: CaptureSceneArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !(1.0..=4.0).contains(&args.padding) || !args.padding.is_finite() {
+        return Err("capture scene: --padding must be between 1.0 and 4.0".into());
+    }
+    parse_capture_size(&args.size)?;
+    if args.resample != CaptureResampleMode::Default {
+        return Err("capture scene: --resample pixelated is not supported by the Photo engine; use `capture photo` and resize the PNG after capture".into());
+    }
+    run_capture_photo(CapturePhotoArgs {
+        project: args.project,
+        port: args.port,
+        focus: Some(args.focus),
+        region: None,
+        size: Some(args.size),
+        view: args.view,
+        direction: None,
+        camera_cframe: None,
+        padding: args.padding,
+        fov: 32.0,
+        background: CapturePhotoBackground::Transparent,
+        alpha_bleed: true,
+        include_world: false,
+        ui: None,
+        ui_target: None,
+        include_ui: false,
+        delay: 0.05,
+        output: args.output,
+        timeout: args.timeout,
+        raw: args.raw,
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotoPrepared {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    width: u32,
+    height: u32,
+    #[serde(rename = "byteLength")]
+    byte_length: usize,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default, rename = "uiMode")]
+    ui_mode: Option<String>,
+    #[serde(default, rename = "cameraCFrame")]
+    camera_cframe: Option<serde_json::Value>,
+    #[serde(default, rename = "uiTarget")]
+    ui_target: Option<String>,
+    #[serde(default, rename = "uiTargetClass")]
+    ui_target_class: Option<String>,
+    #[serde(default, rename = "fieldOfView")]
+    field_of_view: Option<f64>,
+    #[serde(default)]
+    isolated: Option<bool>,
+    #[serde(default, rename = "fullSize")]
+    full_size: Option<serde_json::Value>,
+    #[serde(default)]
+    region: Option<serde_json::Value>,
+    #[serde(default, rename = "regionSource")]
+    region_source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotoChunk {
+    offset: usize,
+    #[serde(rename = "nextOffset")]
+    next_offset: usize,
+    eof: bool,
+    #[serde(rename = "bytesBase64")]
+    bytes_base64: String,
+}
+
+fn parse_capture_direction(value: &str) -> Result<[f64; 3], Box<dyn std::error::Error>> {
+    let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err("capture photo: --direction must be x,y,z".into());
+    }
+    let mut direction = [0.0; 3];
+    for (index, field) in fields.iter().enumerate() {
+        direction[index] = field.parse::<f64>().map_err(|error| {
+            format!(
+                "capture photo: invalid direction component {}: {error}",
+                index + 1
+            )
+        })?;
+        if !direction[index].is_finite() {
+            return Err("capture photo: --direction components must be finite".into());
+        }
+    }
+    let magnitude = direction[0].hypot(direction[1]).hypot(direction[2]);
+    if !magnitude.is_finite() {
+        return Err("capture photo: --direction magnitude must be finite".into());
+    }
+    if magnitude <= 1e-6 {
+        return Err("capture photo: --direction cannot be the zero vector".into());
+    }
+    for component in &mut direction {
+        *component /= magnitude;
+    }
+    Ok(direction)
+}
+
+fn parse_capture_camera_cframe(value: &str) -> Result<[f64; 12], Box<dyn std::error::Error>> {
+    const ORTHONORMAL_EPSILON: f64 = 1e-3;
+
+    let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != 12 {
+        return Err(
+            "capture photo: --camera-cframe must contain the 12 comma-separated values returned by CFrame:GetComponents()"
+                .into(),
+        );
+    }
+
+    let mut components = [0.0; 12];
+    for (index, field) in fields.iter().enumerate() {
+        components[index] = field.parse::<f64>().map_err(|error| {
+            format!(
+                "capture photo: invalid --camera-cframe component {}: {error}",
+                index + 1
+            )
+        })?;
+        if !components[index].is_finite() {
+            return Err("capture photo: --camera-cframe components must be finite".into());
+        }
+    }
+
+    let rows = [
+        [components[3], components[4], components[5]],
+        [components[6], components[7], components[8]],
+        [components[9], components[10], components[11]],
+    ];
+    let dot = |left: [f64; 3], right: [f64; 3]| {
+        left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+    };
+    let rows_are_unit = rows
+        .iter()
+        .all(|row| (dot(*row, *row) - 1.0).abs() <= ORTHONORMAL_EPSILON);
+    let rows_are_orthogonal = dot(rows[0], rows[1]).abs() <= ORTHONORMAL_EPSILON
+        && dot(rows[0], rows[2]).abs() <= ORTHONORMAL_EPSILON
+        && dot(rows[1], rows[2]).abs() <= ORTHONORMAL_EPSILON;
+    let determinant = rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+        - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+        + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0]);
+    if !rows_are_unit
+        || !rows_are_orthogonal
+        || !determinant.is_finite()
+        || (determinant - 1.0).abs() > ORTHONORMAL_EPSILON
+    {
+        return Err(
+            "capture photo: --camera-cframe rotation must be an orthonormal right-handed matrix from CFrame:GetComponents()"
+                .into(),
+        );
+    }
+
+    Ok(components)
+}
+
+fn build_capture_photo_request(
+    args: &CapturePhotoArgs,
+    ui_mode: CapturePhotoUiMode,
+    region: Option<CaptureRegion>,
+    size: Option<[u32; 2]>,
+    direction: Option<[f64; 3]>,
+    camera_cframe: Option<[f64; 12]>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut request = serde_json::Map::new();
+    request.insert(
+        "background".into(),
+        serde_json::Value::String(args.background.as_wire_str().to_string()),
+    );
+    request.insert("alphaBleed".into(), serde_json::json!(args.alpha_bleed));
+    request.insert(
+        "uiMode".into(),
+        serde_json::Value::String(ui_mode.as_wire_str().to_string()),
+    );
+    request.insert(
+        "hideUI".into(),
+        serde_json::json!(ui_mode == CapturePhotoUiMode::None),
+    );
+    request.insert("delay".into(), serde_json::json!(args.delay));
+    request.insert("timeoutSeconds".into(), serde_json::json!(args.timeout));
+    if let Some(ui_target) = &args.ui_target {
+        request.insert(
+            "uiTarget".into(),
+            serde_json::Value::String(ui_target.clone()),
+        );
+    }
+    if let Some(focus) = &args.focus {
+        request.insert("focus".into(), serde_json::Value::String(focus.clone()));
+        request.insert("fieldOfView".into(), serde_json::json!(args.fov));
+        request.insert("isolate".into(), serde_json::json!(!args.include_world));
+        if let Some(components) = camera_cframe {
+            request.insert(
+                "cameraCFrame".into(),
+                serde_json::json!({
+                    "__type": "CFrame",
+                    "components": components,
+                }),
+            );
+        } else {
+            request.insert(
+                "view".into(),
+                serde_json::Value::String(args.view.as_plugin_str().to_string()),
+            );
+            request.insert("padding".into(), serde_json::json!(args.padding));
+            if let Some(direction) = direction {
+                request.insert(
+                    "direction".into(),
+                    serde_json::json!({ "x": direction[0], "y": direction[1], "z": direction[2] }),
+                );
+            }
+        }
+    }
+    if let Some(region) = region {
+        request.insert(
+            "nativeRect".into(),
+            serde_json::json!({
+                "x": region.x,
+                "y": region.y,
+                "width": region.width,
+                "height": region.height,
+            }),
+        );
+    }
+    if let Some([width, height]) = size {
+        request.insert(
+            "outputSize".into(),
+            serde_json::json!({ "x": width, "y": height }),
+        );
+    }
+    request
+}
+
+fn validate_photo_dimensions(width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if width == 0 || height == 0 {
+        return Err("capture photo: dimensions must be positive".into());
+    }
+    validate_capture_dimensions(width, height)?;
+    if width > PHOTO_MAX_DIMENSION || height > PHOTO_MAX_DIMENSION {
+        return Err(format!(
+            "capture photo: dimensions {width}x{height} exceed the {PHOTO_MAX_DIMENSION}px Photo limit"
+        )
+        .into());
+    }
+    if u64::from(width) * u64::from(height) > PHOTO_MAX_PIXELS {
+        return Err(format!(
+            "capture photo: dimensions {width}x{height} exceed the {PHOTO_MAX_PIXELS}-pixel Photo limit"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn encode_photo_png(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let expected = usize::try_from(u64::from(width) * u64::from(height) * 4)
+        .map_err(|_| "capture photo: RGBA byte length does not fit this platform")?;
+    if rgba.len() != expected {
+        return Err(format!(
+            "capture photo: received {} RGBA bytes, expected {expected} for {width}x{height}",
+            rgba.len()
+        )
+        .into());
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("capture photo: encode PNG header: {error}"))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|error| format!("capture photo: encode PNG pixels: {error}"))?;
+    }
+    Ok(png_bytes)
+}
+
+async fn capture_remote_session_connect_until(
+    port: u16,
+    deadline: Instant,
+    phase: &str,
+) -> Result<remote::RemoteSession, String> {
+    let remaining = capture_deadline_remaining(deadline, phase)?;
+    tokio::time::timeout(remaining, remote::RemoteSession::connect(port))
+        .await
+        .map_err(|_| format!("capture deadline expired during {phase}"))?
+}
+
+async fn capture_remote_session_request_until(
+    session: &mut remote::RemoteSession,
+    op: &str,
+    args: serde_json::Value,
+    deadline: Instant,
+    phase: &str,
+) -> Result<serde_json::Value, String> {
+    let remaining = capture_deadline_remaining(deadline, phase)?;
+    tokio::time::timeout(remaining, session.request(op, args, remaining))
+        .await
+        .map_err(|_| format!("capture deadline expired during {phase}"))?
+}
+
+fn confirm_photo_close_response(response: &serde_json::Value) -> Result<(), String> {
+    let value = response_value_or_err(response, "capture photo close")
+        .map_err(|error| error.to_string())?;
+    if value.as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err("capture photo close: plugin did not confirm session cleanup".into())
+    }
+}
+
+async fn close_photo_session_until(
+    session: &mut remote::RemoteSession,
+    session_id: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    let response = capture_remote_session_request_until(
+        session,
+        "photo_close",
+        serde_json::json!({ "sessionId": session_id }),
+        deadline,
+        "capture photo close",
+    )
+    .await?;
+    confirm_photo_close_response(&response)
+}
+
+async fn run_capture_photo(args: CapturePhotoArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    if !args.timeout.is_finite() || !(1.0..=120.0).contains(&args.timeout) {
+        return Err("capture photo: --timeout must be between 1 and 120 seconds".into());
+    }
+    let deadline = capture_deadline(args.timeout, "capture photo")?;
+    if !(1.0..=4.0).contains(&args.padding) || !args.padding.is_finite() {
+        return Err("capture photo: --padding must be between 1.0 and 4.0".into());
+    }
+    if !(1.0..=120.0).contains(&args.fov) || !args.fov.is_finite() {
+        return Err("capture photo: --fov must be between 1 and 120 degrees".into());
+    }
+    if !(0.0..=5.0).contains(&args.delay) || !args.delay.is_finite() {
+        return Err("capture photo: --delay must be between 0 and 5 seconds".into());
+    }
+    if args.delay >= args.timeout {
+        return Err("capture photo: --delay must be shorter than --timeout".into());
+    }
+    if let Some(ui_target) = &args.ui_target {
+        if ui_target.trim().is_empty() {
+            return Err(
+                "capture photo: --ui-target must be a non-empty Studio instance path".into(),
+            );
+        }
+        if let Some(mode) = args.ui {
+            if mode != CapturePhotoUiMode::Only {
+                return Err("capture photo: --ui-target implies --ui only and cannot be combined with --ui none or --ui overlay".into());
+            }
+        }
+        if args.include_ui {
+            return Err(
+                "capture photo: --ui-target cannot be combined with the --include-ui overlay alias"
+                    .into(),
+            );
+        }
+        if args.focus.is_some() {
+            return Err("capture photo: --ui-target cannot be combined with --focus".into());
+        }
+        if args.background != CapturePhotoBackground::Transparent {
+            return Err("capture photo: --ui-target requires --background transparent".into());
+        }
+    }
+    let ui_mode = if args.ui_target.is_some() {
+        CapturePhotoUiMode::Only
+    } else {
+        args.ui.unwrap_or(if args.include_ui {
+            CapturePhotoUiMode::Overlay
+        } else {
+            CapturePhotoUiMode::None
+        })
+    };
+    if ui_mode == CapturePhotoUiMode::Only {
+        if args.focus.is_some() {
+            return Err(
+                "capture photo: --ui only captures the current viewport and cannot be combined with --focus"
+                    .into(),
+            );
+        }
+        if args.background != CapturePhotoBackground::Transparent {
+            return Err("capture photo: --ui only requires --background transparent".into());
+        }
+    }
+    if args.camera_cframe.is_some() && args.focus.is_none() {
+        return Err("capture photo: --camera-cframe requires --focus".into());
+    }
+    if args.camera_cframe.is_some()
+        && (args.direction.is_some()
+            || args.view != CaptureView::Isometric
+            || (args.padding - 1.25).abs() > f64::EPSILON)
+    {
+        return Err(
+            "capture photo: --camera-cframe cannot be combined with --view, --direction, or --padding"
+                .into(),
+        );
+    }
+    if args.focus.is_none()
+        && (args.direction.is_some() || args.include_world || args.view != CaptureView::Isometric)
+    {
+        return Err(
+            "capture photo: --view, --direction, and --include-world require --focus".into(),
+        );
+    }
+    if args.focus.is_some() && args.region.is_some() {
+        return Err(
+            "capture photo: --region captures the current viewport and cannot be combined with --focus; use --size to frame a subject".into(),
+        );
+    }
+
+    let region = args
+        .region
+        .as_deref()
+        .map(parse_capture_region)
+        .transpose()?;
+    if let Some(region) = region {
+        if region.x < 0 || region.y < 0 {
+            return Err(
+                "capture photo: viewport-native --region x and y must be non-negative".into(),
+            );
+        }
+        validate_photo_dimensions(region.width, region.height)?;
+    }
+    let size = match args.size.as_deref() {
+        Some(value) => Some(parse_capture_size(value)?),
+        None if args.focus.is_some() => Some([1024, 1024]),
+        None => None,
+    };
+    if let Some([width, height]) = size {
+        validate_photo_dimensions(width, height)?;
+    }
+    let direction = args
+        .direction
+        .as_deref()
+        .map(parse_capture_direction)
+        .transpose()?;
+    let camera_cframe = args
+        .camera_cframe
+        .as_deref()
+        .map(parse_capture_camera_cframe)
+        .transpose()?;
+
+    let request =
+        build_capture_photo_request(&args, ui_mode, region, size, direction, camera_cframe);
+
+    let work_deadline = capture_work_deadline(deadline);
+    let mut photo_remote =
+        capture_remote_session_connect_until(args.port, work_deadline, "capture photo connect")
+            .await?;
+    if ui_mode == CapturePhotoUiMode::Only || camera_cframe.is_some() || args.ui_target.is_some() {
+        let capability_response = capture_remote_session_request_until(
+            &mut photo_remote,
+            "capabilities",
+            serde_json::json!({}),
+            work_deadline,
+            "capture photo capabilities",
+        )
+        .await?;
+        let capability_value =
+            response_value_or_err(&capability_response, "capture photo capabilities")?;
+        let features = capability_value
+            .get("features")
+            .and_then(serde_json::Value::as_object);
+        let supported = |name: &str| {
+            features
+                .and_then(|features| features.get(name))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        };
+        if camera_cframe.is_some() && !supported("photoCameraCFrame") {
+            return Err(
+                "capture photo: the connected Studio plugin does not support --camera-cframe; reinstall the current Ro Sync plugin and reload Studio"
+                    .into(),
+            );
+        }
+        if args.ui_target.is_some() && !supported("photoUiTarget") {
+            return Err(
+                "capture photo: the connected Studio plugin does not support --ui-target; reinstall the current Ro Sync plugin and reload Studio"
+                    .into(),
+            );
+        }
+        if ui_mode == CapturePhotoUiMode::Only && !supported("photoUiOnly") {
+            return Err(
+                "capture photo: the connected Studio plugin does not support --ui only; reinstall the current Ro Sync plugin and reload Studio"
+                    .into(),
+            );
+        }
+    }
+    let prepare_response = capture_remote_session_request_until(
+        &mut photo_remote,
+        "photo_prepare",
+        serde_json::Value::Object(request),
+        work_deadline,
+        "capture photo prepare",
+    )
+    .await?;
+    let prepared_value = response_value_or_err(&prepare_response, "capture photo prepare")?;
+    let session_hint = prepared_value
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let prepared: PhotoPrepared = match serde_json::from_value(prepared_value) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(session_id) = session_hint {
+                if let Err(cleanup) =
+                    close_photo_session_until(&mut photo_remote, &session_id, deadline).await
+                {
+                    return Err(format!(
+                        "capture photo: plugin returned invalid metadata: {error}; session cleanup also failed: {cleanup}"
+                    )
+                    .into());
+                }
+            }
+            return Err(format!("capture photo: plugin returned invalid metadata: {error}").into());
+        }
+    };
+    let session_id = prepared.session_id.clone();
+
+    let flow: Result<(PathBuf, usize, String), Box<dyn std::error::Error>> = async {
+        validate_photo_dimensions(prepared.width, prepared.height)?;
+        let expected_u64 = u64::from(prepared.width)
+            .checked_mul(u64::from(prepared.height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("capture photo: RGBA byte length overflowed")?;
+        let expected = usize::try_from(expected_u64)
+            .map_err(|_| "capture photo: RGBA byte length does not fit this platform")?;
+        if expected_u64 > CAPTURE_MAX_ARTIFACT_BYTES || prepared.byte_length != expected {
+            return Err(format!(
+                "capture photo: plugin reported {} bytes for {}x{} RGBA; expected {expected}",
+                prepared.byte_length, prepared.width, prepared.height
+            )
+            .into());
+        }
+
+        let mut rgba = Vec::with_capacity(expected);
+        let mut offset = 0usize;
+        while offset < expected {
+            let response = capture_remote_session_request_until(
+                &mut photo_remote,
+                "photo_read",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "offset": offset,
+                    "maxBytes": 384 * 1024,
+                }),
+                capture_work_deadline(deadline),
+                "capture photo read",
+            )
+            .await?;
+            let value = response_value_or_err(&response, "capture photo read")?;
+            let chunk: PhotoChunk = serde_json::from_value(value)
+                .map_err(|error| format!("capture photo: invalid chunk metadata: {error}"))?;
+            if chunk.offset != offset
+                || chunk.next_offset <= chunk.offset
+                || chunk.next_offset > expected
+            {
+                return Err(format!(
+                    "capture photo: invalid chunk range {}..{} at expected offset {offset}",
+                    chunk.offset, chunk.next_offset
+                )
+                .into());
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&chunk.bytes_base64)
+                .map_err(|error| format!("capture photo: decode RGBA chunk: {error}"))?;
+            let declared = chunk.next_offset - chunk.offset;
+            if decoded.len() != declared || decoded.len() > 384 * 1024 {
+                return Err(format!(
+                    "capture photo: chunk decoded to {} bytes, expected {declared}",
+                    decoded.len()
+                )
+                .into());
+            }
+            rgba.extend_from_slice(&decoded);
+            offset = chunk.next_offset;
+            if chunk.eof != (offset == expected) {
+                return Err(
+                    "capture photo: plugin returned inconsistent end-of-file metadata".into(),
+                );
+            }
+        }
+
+        let png_bytes = encode_photo_png(prepared.width, prepared.height, &rgba)?;
+        if u64::try_from(png_bytes.len()).unwrap_or(u64::MAX) > CAPTURE_MAX_ARTIFACT_BYTES {
+            return Err("capture photo: encoded PNG exceeds the artifact byte limit".into());
+        }
+        verify_capture_png(
+            &png_bytes,
+            Some((prepared.width, prepared.height)),
+            capture_work_deadline(deadline),
+        )?;
+        if let Some(parent) = args.output.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!("capture photo: create {}: {error}", parent.display())
+                })?;
+            }
+        }
+        std::fs::write(&args.output, &png_bytes)
+            .map_err(|error| format!("capture photo: write {}: {error}", args.output.display()))?;
+        let absolute = std::fs::canonicalize(&args.output).unwrap_or_else(|_| args.output.clone());
+        let sha256 = format!("{:x}", Sha256::digest(&png_bytes));
+        Ok((absolute, png_bytes.len(), sha256))
+    }
+    .await;
+
+    let close_result = close_photo_session_until(&mut photo_remote, &session_id, deadline).await;
+    let ((absolute, png_size, sha256), consumed) = match (flow, close_result) {
+        (Ok(result), Ok(())) => (result, true),
+        (Ok(result), Err(cleanup)) => {
+            eprintln!("capture photo: warning: session cleanup failed: {cleanup}");
+            (result, false)
+        }
+        (Err(error), Ok(())) => return Err(error),
+        (Err(error), Err(cleanup)) => {
+            return Err(format!("{error}; session cleanup also failed: {cleanup}").into());
+        }
+    };
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "artifact": {
+                    "path": absolute,
+                    "provider": "rosync-photo",
+                    "source": "locally-packaged",
+                    "mime": "image/png",
+                    "size": png_size,
+                    "sha256": sha256,
+                    "width": prepared.width,
+                    "height": prepared.height,
+                    "background": prepared.background,
+                    "uiMode": prepared.ui_mode,
+                    "cameraCFrame": prepared.camera_cframe,
+                    "uiTarget": prepared.ui_target,
+                    "uiTargetClass": prepared.ui_target_class,
+                    "fieldOfView": prepared.field_of_view,
+                    "isolated": prepared.isolated,
+                    "fullSize": prepared.full_size,
+                    "region": prepared.region,
+                    "regionSource": prepared.region_source,
+                    "transport": {
+                        "kind": "bounded-rgba-chunks",
+                        "consumed": consumed,
+                    },
+                }
+            }))?
+        );
+    } else {
+        println!(
+            "wrote {} ({}x{}, {} bytes, sha256 {}; locally packaged Photo engine)",
+            absolute.display(),
+            prepared.width,
+            prepared.height,
+            png_size,
+            sha256
+        );
+    }
+    Ok(())
+}
+
+async fn run_capture_status(args: CaptureStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut resp = remote::request(args.port, "capture_status", serde_json::json!({})).await?;
+    let native = native_capture::screen_capture_permission_status();
+    if resp.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let mut value = resp
+            .get("value")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let studio_authorized = value
+            .get("authorized")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let provider_unsupported = value
+            .get("providerUnsupported")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        value.insert(
+            "nativeFallback".into(),
+            serde_json::json!({
+                "available": native.available,
+                "authorized": native.authorized,
+                "scope": "screen-ui-all",
+            }),
+        );
+        value.insert(
+            "effectiveProvider".into(),
+            serde_json::Value::String(
+                capture_effective_provider(studio_authorized, provider_unsupported, native)
+                    .to_string(),
+            ),
+        );
+        resp["value"] = serde_json::Value::Object(value);
+    }
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        let value = response_value_or_err(&resp, "capture status")?;
+        let available = value
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let authorized = value
+            .get("authorized")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let provider = value
+            .get("effectiveProvider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("none");
+        let photo_available = value
+            .get("photoAvailable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let photo_ui_only_available = value
+            .get("photoUiOnlyAvailable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        println!(
+            "capture API: {}; Studio permission: {}; effective provider: {}; packaged Photo: {}; UI-only: {}",
+            if available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            if authorized { "granted" } else { "not granted" },
+            provider,
+            if photo_available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            if photo_ui_only_available {
+                "available"
+            } else {
+                "unavailable"
+            },
+        );
+    }
+    ok_or_err(&resp)
+}
+
+fn capture_effective_provider(
+    studio_authorized: bool,
+    provider_unsupported: bool,
+    native: native_capture::NativePermissionStatus,
+) -> &'static str {
+    if studio_authorized {
+        "studio"
+    } else if provider_unsupported && native.available && native.authorized {
+        "macos-window"
+    } else {
+        "none"
+    }
+}
+
+async fn run_capture_authorize(
+    args: CaptureAuthorizeArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = remote::request_with_timeout(
+        args.port,
+        "capture_authorize",
+        serde_json::json!({}),
+        Duration::from_secs(120),
+    )
+    .await?;
+    let value = match response_value_or_err(&resp, "capture authorize") {
+        Ok(value) => value,
+        Err(error) => {
+            if args.raw {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+            return Err(error);
+        }
+    };
+    let studio_authorized = value
+        .get("authorized")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let provider_unsupported = value
+        .get("providerUnsupported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let provider_error = value.get("providerError").cloned();
+    let native_before = native_capture::screen_capture_permission_status();
+    let mut native = native_before;
+    let mut native_prompted = false;
+    if provider_unsupported && native.available && !native.authorized {
+        native_prompted = true;
+        native = native_capture::request_screen_capture_permission()?;
+    }
+    let provider = capture_effective_provider(studio_authorized, provider_unsupported, native);
+    let authorized = provider != "none";
+    let aggregate = serde_json::json!({
+        "ok": authorized,
+        "provider": provider,
+        "studio": {
+            "available": true,
+            "authorized": studio_authorized,
+            "providerUnsupported": provider_unsupported,
+            "providerError": provider_error,
+        },
+        "nativeFallback": {
+            "available": native.available,
+            "authorized": native.authorized,
+            "prompted": native_prompted,
+            "scope": "screen-ui-all",
+        }
+    });
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&aggregate)?);
+    } else if studio_authorized {
+        println!("screenshot permission: granted (Studio provider)");
+    } else if provider_unsupported && native.authorized {
+        println!(
+            "screenshot permission: granted (macOS Roblox Studio window fallback; Studio provider unsupported)"
+        );
+    } else if provider_unsupported && native.available {
+        println!(
+            "screenshot permission: denied (Studio provider unsupported; macOS Screen & System Audio Recording permission not granted)"
+        );
+    } else {
+        println!("screenshot permission: denied");
+    }
+    if authorized {
+        Ok(())
+    } else if provider_unsupported && !native.available {
+        Err("capture authorize: Studio screenshot provider is unsupported and the native fallback is only available on macOS".into())
+    } else if provider_unsupported {
+        Err("capture authorize: macOS Screen & System Audio Recording permission was not granted; enable it for the app running rosync, then retry".into())
+    } else {
+        Err("capture authorize: Studio screenshot permission was denied".into())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CapturePrepared {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    width: u32,
+    height: u32,
+    #[serde(rename = "byteLength")]
+    byte_length: usize,
+    #[serde(default)]
+    position: Option<CapturePoint>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CapturePoint {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureRegion {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn parse_capture_region(value: &str) -> Result<CaptureRegion, Box<dyn std::error::Error>> {
+    let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err("capture: --region must be x,y,width,height with positive dimensions".into());
+    }
+    let x = fields[0]
+        .parse::<i32>()
+        .map_err(|e| format!("capture: invalid region x coordinate: {e}"))?;
+    let y = fields[1]
+        .parse::<i32>()
+        .map_err(|e| format!("capture: invalid region y coordinate: {e}"))?;
+    let width = fields[2]
+        .parse::<u32>()
+        .map_err(|e| format!("capture: invalid region width: {e}"))?;
+    let height = fields[3]
+        .parse::<u32>()
+        .map_err(|e| format!("capture: invalid region height: {e}"))?;
+    if width == 0 || height == 0 {
+        return Err("capture: region dimensions must be positive".into());
+    }
+    Ok(CaptureRegion {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn parse_capture_size(value: &str) -> Result<[u32; 2], Box<dyn std::error::Error>> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let Some((width, height)) = normalized.split_once('x') else {
+        return Err("capture: --output-size must be WIDTHxHEIGHT".into());
+    };
+    let width = width
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("capture: invalid output width: {e}"))?;
+    let height = height
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| format!("capture: invalid output height: {e}"))?;
+    if width == 0 || height == 0 {
+        return Err("capture: output dimensions must be positive".into());
+    }
+    Ok([width, height])
+}
+
+fn validate_capture_dimensions(width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if width > CAPTURE_MAX_DIMENSION || height > CAPTURE_MAX_DIMENSION {
+        return Err(format!(
+            "capture: dimensions {width}x{height} exceed the {CAPTURE_MAX_DIMENSION}px per-axis limit"
+        )
+        .into());
+    }
+    if u64::from(width) * u64::from(height) > CAPTURE_MAX_PIXELS {
+        return Err(format!(
+            "capture: dimensions {width}x{height} exceed the {CAPTURE_MAX_PIXELS}-pixel limit"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn capture_deadline(
+    timeout_seconds: f64,
+    context: &str,
+) -> Result<Instant, Box<dyn std::error::Error>> {
+    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 || timeout_seconds > 120.0 {
+        return Err(format!(
+            "{context}: timeout must be finite, greater than zero, and at most 120 seconds"
+        )
+        .into());
+    }
+    Instant::now()
+        .checked_add(Duration::from_secs_f64(timeout_seconds))
+        .ok_or_else(|| format!("{context}: timeout is too large").into())
+}
+
+fn capture_deadline_remaining(deadline: Instant, phase: &str) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(format!("capture deadline expired before {phase}"))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn capture_work_deadline(deadline: Instant) -> Instant {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let reserve = CAPTURE_CLEANUP_RESERVE.min(remaining / 5);
+    deadline.checked_sub(reserve).unwrap_or(deadline)
+}
+
+async fn capture_remote_request_until(
+    port: u16,
+    op: &str,
+    args: serde_json::Value,
+    deadline: Instant,
+    phase: &str,
+) -> Result<serde_json::Value, String> {
+    let remaining = capture_deadline_remaining(deadline, phase)?;
+    tokio::time::timeout(
+        remaining,
+        remote::request_with_timeout(port, op, args, remaining),
+    )
+    .await
+    .map_err(|_| format!("capture deadline expired during {phase}"))?
+}
+
+fn validate_artifact_id(id: &str) -> Result<&str, String> {
+    if id.len() == 48 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(id)
+    } else {
+        Err("capture artifact id must be exactly 48 hexadecimal characters".into())
+    }
+}
+
+fn plugin_artifact_id<'a>(
+    artifact: &'a serde_json::Value,
+    context: &str,
+) -> Result<&'a str, String> {
+    let id = artifact
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{context}: response omitted artifact id"))?;
+    validate_artifact_id(id).map_err(|error| format!("{context}: {error}"))
+}
+
+async fn lookup_artifact_transport_until(
+    port: u16,
+    id: &str,
+    deadline: Instant,
+) -> Result<artifact::ArtifactMetadata, String> {
+    validate_artifact_id(id)?;
+    let response = http_get_json_until(port, &format!("/artifacts/{id}"), deadline).await?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("artifact lookup rejected: {response}"));
+    }
+    let metadata: artifact::ArtifactMetadata = serde_json::from_value(
+        response
+            .get("artifact")
+            .cloned()
+            .ok_or_else(|| "artifact lookup omitted metadata".to_string())?,
+    )
+    .map_err(|error| format!("artifact lookup returned invalid metadata: {error}"))?;
+    if metadata.id != id {
+        return Err(format!(
+            "artifact lookup returned id {}, expected {id}",
+            metadata.id
+        ));
+    }
+    if metadata.mime != "image/png" {
+        return Err(format!(
+            "artifact {id} has MIME {}, expected image/png",
+            metadata.mime
+        ));
+    }
+    if metadata.size == 0 || metadata.size > CAPTURE_MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact {id} size {} is outside the capture limit",
+            metadata.size
+        ));
+    }
+    if metadata.sha256.len() != 64 || !metadata.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("artifact {id} has an invalid SHA-256 digest"));
+    }
+    if !metadata.path.is_absolute() {
+        return Err(format!("artifact {id} path is not absolute"));
+    }
+    Ok(metadata)
+}
+
+fn read_bounded_capture_file(
+    metadata: &artifact::ArtifactMetadata,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    if metadata.size == 0 || metadata.size > CAPTURE_MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "artifact size {} is outside the capture limit",
+            metadata.size
+        ));
+    }
+    let expected = usize::try_from(metadata.size)
+        .map_err(|_| "artifact size does not fit this platform".to_string())?;
+    let file_metadata = std::fs::metadata(&metadata.path).map_err(|error| {
+        format!(
+            "read artifact metadata {}: {error}",
+            metadata.path.display()
+        )
+    })?;
+    if !file_metadata.is_file() {
+        return Err(format!(
+            "artifact path is not a regular file: {}",
+            metadata.path.display()
+        ));
+    }
+    if file_metadata.len() != metadata.size {
+        return Err(format!(
+            "artifact file size {} does not match daemon metadata {}",
+            file_metadata.len(),
+            metadata.size
+        ));
+    }
+    let mut file = std::fs::File::open(&metadata.path)
+        .map_err(|error| format!("open artifact {}: {error}", metadata.path.display()))?;
+    let mut bytes = Vec::with_capacity(expected);
+    let mut buffer = [0u8; 64 * 1024];
+    let bounded_length = expected + 1;
+    while bytes.len() < bounded_length {
+        capture_deadline_remaining(deadline, "artifact read")?;
+        let available = (bounded_length - bytes.len()).min(buffer.len());
+        let count = file
+            .read(&mut buffer[..available])
+            .map_err(|error| format!("read artifact {}: {error}", metadata.path.display()))?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if bytes.len() != expected {
+        return Err(format!(
+            "artifact read {} bytes, expected {expected}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn verify_capture_png(
+    bytes: &[u8],
+    expected_dimensions: Option<(u32, u32)>,
+    deadline: Instant,
+) -> Result<(u32, u32), String> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("capture artifact is not a PNG".into());
+    }
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("decode capture PNG header: {error}"))?;
+    let width = reader.info().width;
+    let height = reader.info().height;
+    validate_capture_dimensions(width, height).map_err(|error| error.to_string())?;
+    if let Some((expected_width, expected_height)) = expected_dimensions {
+        if (width, height) != (expected_width, expected_height) {
+            return Err(format!(
+                "capture PNG dimensions {width}x{height} do not match reported {expected_width}x{expected_height}"
+            ));
+        }
+    }
+    loop {
+        capture_deadline_remaining(deadline, "PNG verification")?;
+        match reader
+            .next_row()
+            .map_err(|error| format!("decode capture PNG: {error}"))?
+        {
+            Some(_) => {}
+            None => break,
+        }
+    }
+    Ok((width, height))
+}
+
+#[derive(Debug)]
+struct MaterializedCapture {
+    metadata: artifact::ArtifactMetadata,
+    output_path: Option<PathBuf>,
+    size: usize,
+    sha256: String,
+    width: u32,
+    height: u32,
+    consumed: bool,
+}
+
+async fn materialize_capture_artifact(
+    port: u16,
+    id: &str,
+    expected_size: Option<u64>,
+    expected_dimensions: Option<(u32, u32)>,
+    destination: Option<&std::path::Path>,
+    deadline: Instant,
+    context: &str,
+) -> Result<MaterializedCapture, Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+
+    validate_artifact_id(id).map_err(|error| format!("{context}: {error}"))?;
+    let work_deadline = capture_work_deadline(deadline);
+    let primary: Result<MaterializedCapture, Box<dyn std::error::Error>> = async {
+        let metadata = lookup_artifact_transport_until(port, id, work_deadline).await?;
+        if let Some(expected_size) = expected_size {
+            if metadata.size != expected_size {
+                return Err(format!(
+                    "{context}: daemon artifact size {} does not match reported {expected_size}",
+                    metadata.size
+                )
+                .into());
+            }
+        }
+        let bytes = read_bounded_capture_file(&metadata, work_deadline)?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if !sha256.eq_ignore_ascii_case(&metadata.sha256) {
+            return Err(format!(
+                "{context}: SHA-256 mismatch (computed {sha256}, daemon {})",
+                metadata.sha256
+            )
+            .into());
+        }
+        let (width, height) = verify_capture_png(&bytes, expected_dimensions, work_deadline)
+            .map_err(|error| format!("{context}: {error}"))?;
+        let output_path = if let Some(destination) = destination {
+            capture_deadline_remaining(work_deadline, "capture output")?;
+            if let Some(parent) = destination.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!("{context}: create {}: {error}", parent.display())
+                    })?;
+                }
+            }
+            std::fs::write(destination, &bytes)
+                .map_err(|error| format!("{context}: write {}: {error}", destination.display()))?;
+            Some(std::fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf()))
+        } else {
+            None
+        };
+        Ok(MaterializedCapture {
+            metadata,
+            output_path,
+            size: bytes.len(),
+            sha256,
+            width,
+            height,
+            consumed: false,
+        })
+    }
+    .await;
+
+    let consume_result = consume_artifact_transport_until(port, id, deadline).await;
+    match primary {
+        Ok(mut materialized) => {
+            materialized.consumed = consume_result.is_ok();
+            if let Err(error) = consume_result {
+                eprintln!("{context}: warning: could not remove transport artifact: {error}");
+            }
+            Ok(materialized)
+        }
+        Err(error) => {
+            if let Err(cleanup) = consume_result {
+                Err(format!("{error}; artifact cleanup also failed: {cleanup}").into())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn cleanup_artifact_lease_until(port: u16, id: &str, token: &str, deadline: Instant) {
+    if consume_artifact_transport_until(port, id, deadline)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    if capture_deadline_remaining(deadline, "artifact abort").is_ok() {
+        let _ = http_post_json_until(
+            port,
+            &format!("/artifacts/{id}/abort"),
+            &serde_json::json!({ "token": token }),
+            deadline,
+        )
+        .await;
+    }
+}
+
+fn capture_error_allows_macos_window_fallback(args: &CaptureScreenArgs, error: &str) -> bool {
+    if !cfg!(target_os = "macos")
+        || args.ui != CaptureUiMode::All
+        || args.focus.is_some()
+        || args.view.is_some()
+        || args.padding.is_some()
+    {
+        return false;
+    }
+    let normalized = error.to_ascii_lowercase();
+    normalized
+        .contains("studio screenshot provider is unsupported after explicit capture authorization")
+        && normalized.contains("feature not supported yet")
+}
+
+async fn run_macos_window_capture_fallback(
+    args: &CaptureScreenArgs,
+    region: Option<CaptureRegion>,
+    output_size: Option<[u32; 2]>,
+    deadline: Instant,
+    studio_error: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+
+    eprintln!(
+        "capture: Studio screenshot provider unavailable ({studio_error}); using the macOS Roblox Studio window fallback for --ui all"
+    );
+    let project_hint = args
+        .project
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str);
+    let result = native_capture::capture_studio_window(native_capture::NativeCaptureRequest {
+        project_hint,
+        region: region.map(|region| native_capture::CaptureRegion {
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+        }),
+        output_size,
+        pixelated: args.resample == CaptureResampleMode::Pixelated,
+        output: &args.output,
+        deadline,
+        limits: native_capture::CaptureLimits {
+            max_dimension: CAPTURE_MAX_DIMENSION,
+            max_pixels: CAPTURE_MAX_PIXELS,
+            max_bytes: CAPTURE_MAX_ARTIFACT_BYTES,
+        },
+    })
+    .await
+    .map_err(|native_error| {
+        format!(
+            "capture: Studio provider failed ({studio_error}); macOS window fallback failed: {native_error}"
+        )
+    })?;
+
+    // Run the same structural/decode verification used for Studio transport
+    // artifacts before reporting a native capture as successful.
+    let bytes = std::fs::read(&result.output_path).map_err(|error| {
+        format!(
+            "capture: verify native output {}: {error}",
+            result.output_path.display()
+        )
+    })?;
+    if bytes.len() != result.size
+        || bytes.is_empty()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CAPTURE_MAX_ARTIFACT_BYTES
+    {
+        let _ = std::fs::remove_file(&result.output_path);
+        return Err("capture: native output changed size before verification".into());
+    }
+    let (width, height) = match verify_capture_png(
+        &bytes,
+        Some((result.width, result.height)),
+        capture_work_deadline(deadline),
+    ) {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            let _ = std::fs::remove_file(&result.output_path);
+            return Err(format!("capture: verify native output: {error}").into());
+        }
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if sha256 != result.sha256 {
+        let _ = std::fs::remove_file(&result.output_path);
+        return Err("capture: native output SHA-256 changed before verification".into());
+    }
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "artifact": {
+                    "path": result.output_path,
+                    "transport": {
+                        "kind": "direct-local",
+                        "consumed": true,
+                    },
+                    "provider": "macos-window",
+                    "fallbackFrom": "StudioCaptureService",
+                    "mime": "image/png",
+                    "size": result.size,
+                    "sha256": sha256,
+                    "width": width,
+                    "height": height,
+                    "position": {
+                        "x": result.position[0],
+                        "y": result.position[1],
+                    },
+                    "window": result.window,
+                }
+            }))?
+        );
+    } else {
+        println!(
+            "wrote {} ({}x{}, {} bytes, sha256 {}; macOS Roblox Studio window fallback)",
+            result.output_path.display(),
+            width,
+            height,
+            result.size,
+            sha256
+        );
+    }
+    Ok(())
+}
+
+async fn run_capture_screen(args: CaptureScreenArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = capture_deadline(args.timeout, "capture")?;
+
+    let region = args
+        .region
+        .as_deref()
+        .map(parse_capture_region)
+        .transpose()?;
+    let output_size = args
+        .output_size
+        .as_deref()
+        .map(parse_capture_size)
+        .transpose()?;
+    if let Some(region) = region {
+        validate_capture_dimensions(region.width, region.height)?;
+    }
+    if let Some([width, height]) = output_size {
+        validate_capture_dimensions(width, height)?;
+    }
+    let mut request = serde_json::Map::new();
+    request.insert(
+        "ui".into(),
+        serde_json::Value::String(args.ui.as_plugin_str().to_string()),
+    );
+    request.insert(
+        "resample".into(),
+        serde_json::Value::String(args.resample.as_plugin_str().to_string()),
+    );
+    request.insert("timeoutSeconds".into(), serde_json::json!(args.timeout));
+    if let Some(region) = region {
+        request.insert(
+            "position".into(),
+            serde_json::json!({ "x": region.x, "y": region.y }),
+        );
+        request.insert(
+            "captureSize".into(),
+            serde_json::json!({ "x": region.width, "y": region.height }),
+        );
+    }
+    if let Some([width, height]) = output_size {
+        request.insert(
+            "outputSize".into(),
+            serde_json::json!({ "x": width, "y": height }),
+        );
+    }
+    if let Some(focus) = &args.focus {
+        request.insert("focus".into(), serde_json::Value::String(focus.clone()));
+    }
+    if let Some(view) = args.view {
+        request.insert(
+            "view".into(),
+            serde_json::Value::String(view.as_plugin_str().to_string()),
+        );
+    }
+    if let Some(padding) = args.padding {
+        request.insert("padding".into(), serde_json::json!(padding));
+    }
+
+    let work_deadline = capture_work_deadline(deadline);
+    let prepare_resp = capture_remote_request_until(
+        args.port,
+        "capture_prepare",
+        serde_json::Value::Object(request),
+        work_deadline,
+        "capture prepare",
+    )
+    .await?;
+    let prepared_value = match response_value_or_err(&prepare_resp, "capture prepare") {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.to_string();
+            if capture_error_allows_macos_window_fallback(&args, &error) {
+                return run_macos_window_capture_fallback(
+                    &args,
+                    region,
+                    output_size,
+                    deadline,
+                    &error,
+                )
+                .await;
+            }
+            return Err(error.into());
+        }
+    };
+    let session_hint = prepared_value
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let prepared: CapturePrepared = match serde_json::from_value(prepared_value) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(session_id) = session_hint {
+                let _ = capture_remote_request_until(
+                    args.port,
+                    "capture_close",
+                    serde_json::json!({ "sessionId": session_id }),
+                    deadline,
+                    "capture close",
+                )
+                .await;
+            }
+            return Err(format!("capture: plugin returned invalid metadata: {error}").into());
+        }
+    };
+    let session_id = prepared.session_id.clone();
+    let mut lease_credentials: Option<(String, String)> = None;
+    let flow: Result<MaterializedCapture, Box<dyn std::error::Error>> = async {
+        validate_capture_dimensions(prepared.width, prepared.height)?;
+        let prepared_size = u64::try_from(prepared.byte_length)
+            .map_err(|_| "capture: reported artifact size does not fit u64")?;
+        if prepared_size == 0 || prepared_size > CAPTURE_MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "capture: plugin reported an invalid artifact size of {} bytes",
+                prepared.byte_length
+            )
+            .into());
+        }
+        let lease_response = http_post_json_until(
+            args.port,
+            "/artifacts/lease",
+            &serde_json::json!({
+                "filename": "studio-capture.png",
+                "mime": "image/png",
+                "expectedSize": prepared_size,
+            }),
+            work_deadline,
+        )
+        .await
+        .map_err(|error| format!("capture: create artifact lease: {error}"))?;
+        if lease_response
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(format!("capture: artifact lease rejected: {lease_response}").into());
+        }
+        let lease = lease_response
+            .get("lease")
+            .cloned()
+            .ok_or("capture: artifact lease response omitted lease")?;
+        let lease_id = plugin_artifact_id(&lease, "capture lease")?.to_string();
+        let lease_token = lease
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or("capture: artifact lease omitted token")?
+            .to_string();
+        lease_credentials = Some((lease_id.clone(), lease_token));
+        let export_timeout = capture_deadline_remaining(work_deadline, "capture export")?;
+        let export_response = capture_remote_request_until(
+            args.port,
+            "capture_export",
+            serde_json::json!({
+                "sessionId": session_id,
+                "lease": lease,
+                "timeoutSeconds": export_timeout.as_secs_f64(),
+            }),
+            work_deadline,
+            "capture export",
+        )
+        .await?;
+        let plugin_artifact = response_value_or_err(&export_response, "capture export")?;
+        let returned_id = plugin_artifact_id(&plugin_artifact, "capture export")?;
+        if returned_id != lease_id {
+            return Err(format!(
+                "capture: plugin finalized artifact {returned_id}, expected lease {lease_id}"
+            )
+            .into());
+        }
+        materialize_capture_artifact(
+            args.port,
+            &lease_id,
+            Some(prepared_size),
+            Some((prepared.width, prepared.height)),
+            Some(&args.output),
+            deadline,
+            "capture",
+        )
+        .await
+    }
+    .await;
+
+    if capture_deadline_remaining(deadline, "capture close").is_ok() {
+        let _ = capture_remote_request_until(
+            args.port,
+            "capture_close",
+            serde_json::json!({ "sessionId": session_id }),
+            deadline,
+            "capture close",
+        )
+        .await;
+    }
+    let mut materialized = match flow {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            if let Some((id, token)) = &lease_credentials {
+                cleanup_artifact_lease_until(args.port, id, token, deadline).await;
+            }
+            return Err(error);
+        }
+    };
+    if !materialized.consumed {
+        if consume_artifact_transport_until(args.port, &materialized.metadata.id, deadline)
+            .await
+            .is_ok()
+        {
+            materialized.consumed = true;
+        } else if let Some((id, token)) = &lease_credentials {
+            cleanup_artifact_lease_until(args.port, id, token, deadline).await;
+        }
+    }
+    let absolute = materialized
+        .output_path
+        .clone()
+        .ok_or("capture: output path was not materialized")?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "artifact": {
+                    "path": absolute,
+                    "provider": "studio",
+                    "transport": {
+                        "metadata": materialized.metadata,
+                        "consumed": materialized.consumed,
+                    },
+                    "mime": "image/png",
+                    "size": materialized.size,
+                    "sha256": materialized.sha256,
+                    "width": materialized.width,
+                    "height": materialized.height,
+                    "position": prepared.position,
+                }
+            }))?
+        );
+    } else {
+        println!(
+            "wrote {} ({}x{}, {} bytes, sha256 {})",
+            absolute.display(),
+            materialized.width,
+            materialized.height,
+            materialized.size,
+            materialized.sha256
+        );
+    }
+    Ok(())
+}
+
+async fn run_playtest(args: PlaytestArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        PlaytestCommand::Start(args) => run_playtest_start(args).await,
+        PlaytestCommand::Status(args) => run_playtest_status(args).await,
+        PlaytestCommand::Contexts(args) => run_playtest_contexts(args).await,
+        PlaytestCommand::Wait(args) => run_playtest_wait(args).await,
+        PlaytestCommand::Stop(args) => run_playtest_stop(args).await,
+        PlaytestCommand::Exec(args) => run_playtest_exec(args).await,
+        PlaytestCommand::Logs(args) => run_playtest_logs(args).await,
+        PlaytestCommand::Ui(args) => run_playtest_ui(args).await,
+        PlaytestCommand::Input(args) => run_playtest_input(args).await,
+        PlaytestCommand::Capture(args) => run_playtest_capture(args).await,
+        PlaytestCommand::Request(args) => run_playtest_direct_request(args).await,
+    }
+}
+
+fn parse_json_object(
+    value: &str,
+    context: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|e| format!("{context}: invalid JSON: {e}"))?;
+    if !parsed.is_object() {
+        return Err(format!("{context}: expected a JSON object").into());
+    }
+    Ok(parsed)
+}
+
+fn validate_runtime_timeout(timeout: f64) -> Result<Duration, Box<dyn std::error::Error>> {
+    if timeout <= 0.0 || !timeout.is_finite() || timeout > 120.0 {
+        return Err("playtest: timeout must be finite and between 0 and 120 seconds".into());
+    }
+    Ok(Duration::from_secs_f64(timeout + 2.0))
+}
+
+async fn runtime_request(
+    port: u16,
+    context: &str,
+    op: &str,
+    args: serde_json::Value,
+    timeout: f64,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let outer_timeout = validate_runtime_timeout(timeout)?;
+    Ok(remote::request_with_timeout(
+        port,
+        "playtest_request",
+        serde_json::json!({
+            "context": context,
+            "op": op,
+            "args": args,
+            "timeout": timeout,
+        }),
+        outer_timeout,
+    )
+    .await?)
+}
+
+fn print_playtest_contexts(value: &serde_json::Value) {
+    let Some(contexts) = value.get("contexts").and_then(serde_json::Value::as_array) else {
+        println!("no playtest contexts");
+        return;
+    };
+    if contexts.is_empty() {
+        println!("no playtest contexts");
+        return;
+    }
+    for context in contexts {
+        let id = context
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let role = context
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let player = context
+            .get("playerName")
+            .and_then(serde_json::Value::as_str)
+            .map(|name| format!(" · {name}"))
+            .unwrap_or_default();
+        println!("{id} · {role}{player}");
+    }
+}
+
+async fn run_playtest_start(args: PlaytestStartArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !(1..=8).contains(&args.players) {
+        return Err("playtest start: --players must be between 1 and 8".into());
+    }
+    let test_args = match args.test_args {
+        Some(value) => parse_json_object(&value, "playtest start --test-args")?,
+        None => serde_json::json!({}),
+    };
+    let response = remote::request_with_timeout(
+        args.port,
+        "playtest_start",
+        serde_json::json!({
+            "mode": args.mode.as_plugin_str(),
+            "players": args.players,
+            "testArgs": test_args,
+        }),
+        Duration::from_secs(15),
+    )
+    .await?;
+    let job = response_value_or_err(&response, "playtest start")?;
+    let mut output = serde_json::json!({ "job": job });
+    if args.wait {
+        let minimum = match args.mode {
+            PlaytestMode::Multiplayer => usize::from(args.players) + 1,
+            PlaytestMode::Play => 2,
+            PlaytestMode::Run => 1,
+        };
+        let wait_response = remote::request_with_timeout(
+            args.port,
+            "playtest_wait",
+            serde_json::json!({ "minimum": minimum, "timeout": args.timeout }),
+            validate_runtime_timeout(args.timeout)?,
+        )
+        .await?;
+        let contexts = response_value_or_err(&wait_response, "playtest wait")?;
+        output["contexts"] = contexts;
+    }
+    if args.raw {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        let id = output["job"]
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let status = output["job"]
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("starting");
+        println!("playtest {id}: {status}");
+        if let Some(contexts) = output.get("contexts") {
+            print_playtest_contexts(contexts);
+        }
+    }
+    Ok(())
+}
+
+async fn run_playtest_status(args: PlaytestStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = serde_json::Map::new();
+    if let Some(job_id) = args.job_id {
+        request.insert("jobId".into(), serde_json::Value::String(job_id));
+    }
+    let response = remote::request(
+        args.port,
+        "playtest_status",
+        serde_json::Value::Object(request),
+    )
+    .await?;
+    print_response(&response, args.raw, |value| {
+        if let Some(job) = value.get("job") {
+            println!(
+                "{}: {}",
+                job.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("playtest"),
+                job.get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            );
+        } else {
+            println!("no playtest job");
+        }
+        print_playtest_contexts(value);
+    });
+    ok_or_err(&response)
+}
+
+async fn run_playtest_contexts(
+    args: PlaytestContextsArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = remote::request(args.port, "playtest_contexts", serde_json::json!({})).await?;
+    print_response(&response, args.raw, print_playtest_contexts);
+    ok_or_err(&response)
+}
+
+async fn run_playtest_wait(args: PlaytestWaitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.minimum == 0 || args.minimum > 9 {
+        return Err("playtest wait: --minimum must be between 1 and 9".into());
+    }
+    let response = remote::request_with_timeout(
+        args.port,
+        "playtest_wait",
+        serde_json::json!({ "minimum": args.minimum, "timeout": args.timeout }),
+        validate_runtime_timeout(args.timeout)?,
+    )
+    .await?;
+    print_response(&response, args.raw, print_playtest_contexts);
+    ok_or_err(&response)
+}
+
+async fn run_playtest_stop(args: PlaytestStopArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = serde_json::Map::new();
+    if let Some(job_id) = args.job_id {
+        request.insert("jobId".into(), serde_json::Value::String(job_id));
+    }
+    let response = remote::request_with_timeout(
+        args.port,
+        "playtest_stop",
+        serde_json::Value::Object(request),
+        Duration::from_secs(15),
+    )
+    .await?;
+    print_response(&response, args.raw, |_| println!("playtest stop requested"));
+    ok_or_err(&response)
+}
+
+async fn run_playtest_exec(args: PlaytestExecArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let source = match (args.source, args.source_file) {
+        (Some(source), None) => source,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|e| format!("playtest exec: read {}: {e}", path.display()))?,
+        (None, None) => return Err("playtest exec: provide --source or --source-file".into()),
+        (Some(_), Some(_)) => {
+            return Err("playtest exec: use --source or --source-file, not both".into())
+        }
+    };
+    let response = runtime_request(
+        args.port,
+        &args.context,
+        "exec",
+        serde_json::json!({
+            "source": source,
+            "identity": args.identity.as_plugin_str(),
+            "timeout": args.timeout,
+        }),
+        args.timeout,
+    )
+    .await?;
+    print_response(&response, args.raw, |value| {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
+    });
+    ok_or_err(&response)
+}
+
+async fn run_playtest_logs(args: PlaytestLogsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let response = runtime_request(
+        args.port,
+        &args.context,
+        "logs",
+        serde_json::json!({ "sinceSeq": args.since_seq, "limit": args.limit }),
+        args.timeout,
+    )
+    .await?;
+    print_response(&response, args.raw, |value| {
+        if let Some(entries) = value.get("entries").and_then(serde_json::Value::as_array) {
+            for entry in entries {
+                println!(
+                    "[{}] {}",
+                    entry
+                        .get("level")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("info"),
+                    entry
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                );
+            }
+        }
+    });
+    ok_or_err(&response)
+}
+
+async fn run_playtest_ui(args: PlaytestUiArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = serde_json::Map::new();
+    request.insert("limit".into(), serde_json::json!(args.limit));
+    if let Some(root) = args.root {
+        request.insert("root".into(), serde_json::Value::String(root));
+    }
+    if let Some(class_name) = args.class_name {
+        request.insert("class".into(), serde_json::Value::String(class_name));
+    }
+    if let Some(name) = args.name {
+        request.insert("name".into(), serde_json::Value::String(name));
+    }
+    let response = runtime_request(
+        args.port,
+        &args.context,
+        "ui_tree",
+        serde_json::Value::Object(request),
+        args.timeout,
+    )
+    .await?;
+    print_response(&response, args.raw, |value| {
+        if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+            for item in items {
+                let path = item
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let geometry = match (item.get("position"), item.get("size")) {
+                    (Some(position), Some(size)) => format!(
+                        " @ {},{} {}x{}",
+                        position
+                            .get("x")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0),
+                        position
+                            .get("y")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0),
+                        size.get("x")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0),
+                        size.get("y")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0)
+                    ),
+                    _ => String::new(),
+                };
+                println!("{path}{geometry}");
+            }
+        }
+    });
+    ok_or_err(&response)
+}
+
+async fn run_playtest_input(args: PlaytestInputArgs) -> Result<(), Box<dyn std::error::Error>> {
+    validate_runtime_timeout(args.timeout)?;
+    let source = match (args.actions, args.file) {
+        (Some(source), None) => source,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|e| format!("playtest input: read {}: {e}", path.display()))?,
+        (None, None) => return Err("playtest input: provide --actions or --file".into()),
+        (Some(_), Some(_)) => {
+            return Err("playtest input: use --actions or --file, not both".into())
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&source)
+        .map_err(|e| format!("playtest input: invalid action JSON: {e}"))?;
+    let actions = if let Some(actions) = value.as_array() {
+        actions.as_slice()
+    } else if let Some(actions) = value.get("actions").and_then(serde_json::Value::as_array) {
+        actions.as_slice()
+    } else if value.is_object() {
+        std::slice::from_ref(&value)
+    } else {
+        &[]
+    };
+    if actions.is_empty() || actions.len() > 200 {
+        return Err("playtest input: action count must be between 1 and 200".into());
+    }
+    let mut planned_seconds = 0.0;
+    for (index, action) in actions.iter().enumerate() {
+        let object = action
+            .as_object()
+            .ok_or_else(|| format!("playtest input: action {} must be an object", index + 1))?;
+        let kind = object
+            .get("type")
+            .or_else(|| object.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let duration = match kind {
+            "key_press" | "click" => object
+                .get("duration")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.05),
+            "wait" => object
+                .get("seconds")
+                .or_else(|| object.get("duration"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            "key" | "mouse_move" | "mouse_delta" | "mouse_button" | "text" => 0.0,
+            _ => {
+                return Err(format!(
+                    "playtest input: action {} has unknown type {kind:?}",
+                    index + 1
+                )
+                .into())
+            }
+        };
+        if !duration.is_finite() || !(0.0..=30.0).contains(&duration) {
+            return Err(format!(
+                "playtest input: action {} duration must be between 0 and 30 seconds",
+                index + 1
+            )
+            .into());
+        }
+        planned_seconds += duration;
+    }
+    if planned_seconds > args.timeout.min(30.0) {
+        return Err(format!(
+            "playtest input: planned duration {planned_seconds}s exceeds the request budget"
+        )
+        .into());
+    }
+    let request = if value.is_array() {
+        serde_json::json!({ "actions": value })
+    } else if value.is_object() {
+        value
+    } else {
+        return Err("playtest input: actions must be a JSON object or array".into());
+    };
+    let response =
+        runtime_request(args.port, &args.context, "input", request, args.timeout).await?;
+    print_response(&response, args.raw, |value| {
+        println!(
+            "applied {} input action(s)",
+            value
+                .get("applied")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+    });
+    ok_or_err(&response)
+}
+
+async fn run_playtest_capture(args: PlaytestCaptureArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = capture_deadline(args.timeout, "playtest capture")?;
+    let region = args
+        .region
+        .as_deref()
+        .map(parse_capture_region)
+        .transpose()?;
+    let output_size = args
+        .output_size
+        .as_deref()
+        .map(parse_capture_size)
+        .transpose()?;
+    if let Some(region) = region {
+        validate_capture_dimensions(region.width, region.height)?;
+    }
+    if let Some([width, height]) = output_size {
+        validate_capture_dimensions(width, height)?;
+    }
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "ui".into(),
+        serde_json::Value::String(args.ui.as_plugin_str().to_string()),
+    );
+    options.insert(
+        "resample".into(),
+        serde_json::Value::String(args.resample.as_plugin_str().to_string()),
+    );
+    if let Some(region) = region {
+        options.insert(
+            "position".into(),
+            serde_json::json!({ "x": region.x, "y": region.y }),
+        );
+        options.insert(
+            "captureSize".into(),
+            serde_json::json!({ "x": region.width, "y": region.height }),
+        );
+    }
+    if let Some([width, height]) = output_size {
+        options.insert(
+            "outputSize".into(),
+            serde_json::json!({ "x": width, "y": height }),
+        );
+    }
+    let filename = args
+        .output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("playtest-capture.png");
+    let work_deadline = capture_work_deadline(deadline);
+    let request_timeout = capture_deadline_remaining(work_deadline, "playtest capture")?;
+    let response = capture_remote_request_until(
+        args.port,
+        "playtest_capture",
+        serde_json::json!({
+            "context": args.context,
+            "options": options,
+            "filename": filename,
+            "timeout": request_timeout.as_secs_f64(),
+        }),
+        work_deadline,
+        "playtest capture",
+    )
+    .await?;
+    let value = response_value_or_err(&response, "playtest capture")?;
+    let artifact = value
+        .get("artifact")
+        .ok_or("playtest capture: response omitted artifact metadata")?;
+    let artifact_id = plugin_artifact_id(artifact, "playtest capture")?.to_string();
+    let capture_details = (|| -> Result<(u64, u32, u32), Box<dyn std::error::Error>> {
+        let capture = value
+            .get("capture")
+            .ok_or("playtest capture: response omitted capture metadata")?;
+        let size = capture
+            .get("byteLength")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("playtest capture: response omitted capture byteLength")?;
+        if size == 0 || size > CAPTURE_MAX_ARTIFACT_BYTES {
+            return Err(format!("playtest capture: invalid capture size {size}").into());
+        }
+        let width = capture
+            .get("width")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("playtest capture: response omitted valid capture width")?;
+        let height = capture
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("playtest capture: response omitted valid capture height")?;
+        validate_capture_dimensions(width, height)?;
+        Ok((size, width, height))
+    })();
+    let (capture_size, capture_width, capture_height) = match capture_details {
+        Ok(details) => details,
+        Err(error) => {
+            let _ = consume_artifact_transport_until(args.port, &artifact_id, deadline).await;
+            return Err(error);
+        }
+    };
+    let materialized = materialize_capture_artifact(
+        args.port,
+        &artifact_id,
+        Some(capture_size),
+        Some((capture_width, capture_height)),
+        Some(&args.output),
+        deadline,
+        "playtest capture",
+    )
+    .await?;
+    let absolute = materialized
+        .output_path
+        .clone()
+        .ok_or("playtest capture: output path was not materialized")?;
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "path": absolute.clone(),
+                "artifact": {
+                    "path": absolute,
+                    "mime": "image/png",
+                    "size": materialized.size,
+                    "sha256": materialized.sha256,
+                    "transport": {
+                        "metadata": materialized.metadata,
+                        "consumed": materialized.consumed,
+                    },
+                },
+                "capture": value.get("capture"),
+                "context": value.get("context"),
+            }))?
+        );
+    } else {
+        println!(
+            "wrote {} ({}x{})",
+            absolute.display(),
+            materialized.width,
+            materialized.height
+        );
+    }
+    Ok(())
+}
+
+async fn run_playtest_direct_request(
+    args: PlaytestRequestArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = parse_json_object(&args.args, "playtest request --args")?;
+    let response =
+        runtime_request(args.port, &args.context, &args.op, request, args.timeout).await?;
+    print_response(&response, args.raw, |value| {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
+    });
+    ok_or_err(&response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -5714,12 +11401,9 @@ async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if !ok {
-        let err = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unknown>");
+        let err = response_error_message(&resp);
         eprintln!("error: {err}");
-        return Err(err.to_string().into());
+        return Err(err.into());
     }
     let empty = serde_json::Value::Null;
     let value = resp.get("value").unwrap_or(&empty);
@@ -5746,8 +11430,7 @@ async fn run_logs_tail(
                 let resp = resp?;
                 let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 if !ok {
-                    let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("<unknown>");
-                    return Err(err.to_string().into());
+                    return Err(response_error_message(&resp).into());
                 }
                 let empty = serde_json::Value::Null;
                 let value = resp.get("value").unwrap_or(&empty);
@@ -5927,17 +11610,14 @@ async fn run_ping(args: PingArgs) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if !ok {
-        let err = ping_resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unknown>");
+        let err = response_error_message(&ping_resp);
         if args.raw {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&ping_resp).unwrap_or_default()
             );
         }
-        return Err(err.to_string().into());
+        return Err(err.into());
     }
     // Version is a separate round-trip; failures are non-fatal.
     let plugin_version = match remote::request(args.port, "version", serde_json::json!({})).await {
@@ -5973,7 +11653,7 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
             if args.raw {
                 println!(
                     "{}",
-                    serde_json::json!({ "daemon": daemon, "plugin": null, "error": e }).to_string()
+                    serde_json::json!({ "daemon": daemon, "plugin": null, "error": e })
                 );
             } else {
                 println!("daemon: rosync {daemon}");
@@ -5985,7 +11665,7 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
     if args.raw {
         println!(
             "{}",
-            serde_json::json!({ "daemon": daemon, "plugin": value }).to_string()
+            serde_json::json!({ "daemon": daemon, "plugin": value })
         );
         return Ok(());
     }
@@ -6008,11 +11688,7 @@ async fn fetch_plugin_version(port: u16) -> Result<serde_json::Value, String> {
         .await
         .map_err(|e| e.to_string())?;
     if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let err = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("plugin request failed");
-        return Err(err.to_string());
+        return Err(response_error_message(&resp));
     }
     Ok(resp
         .get("value")
@@ -6112,8 +11788,10 @@ async fn run_doctor(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> 
     checks.push(check_project_config(&project));
     checks.push(check_sourcemap(&project));
     checks.push(check_daemon_hello(args.port));
-    checks.push(check_luau_lsp());
-    checks.push(check_luau_definitions());
+    checks.push(check_luau_lsp(&project));
+    checks.push(check_luau_compile(&project));
+    checks.push(check_luau_definitions(&project));
+    checks.push(check_luaurc(&project));
     checks.push(check_writes_log_path());
     checks.push(check_plugin_version(args.port).await);
 
@@ -6218,7 +11896,7 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
     files.push(RefreshFileStatus {
         path: snapshot::AFTMAN_TOML,
         status: refresh_file_status(aftman_existed, aftman_changed),
-        note: Some("StyLua tool pin ensured"),
+        note: Some("StyLua and luau-lsp tool pins ensured"),
     });
 
     let definitions_existed = project.join(snapshot::ROBLOX_DEFINITIONS_PATH).exists();
@@ -6234,7 +11912,7 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
     files.push(RefreshFileStatus {
         path: snapshot::LUAURC,
         status: refresh_file_status(luaurc_existed, luaurc_changed),
-        note: Some("luau-lsp Roblox definitions wired"),
+        note: Some("Luau configuration ensured; obsolete definitions key removed"),
     });
 
     let changed = files
@@ -6429,18 +12107,36 @@ async fn check_plugin_version(port: u16) -> DoctorCheck {
     }
 }
 
-fn check_luau_lsp() -> DoctorCheck {
+fn check_luau_lsp(project: &std::path::Path) -> DoctorCheck {
     let luau_lsp = resolve_luau_lsp(None);
     match std::process::Command::new(&luau_lsp)
         .arg("--version")
+        .current_dir(project)
         .output()
     {
         Ok(out) if out.status.success() => {
             let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let status = if parse_semver_triplet(&version)
+                .is_some_and(|version| version < RECOMMENDED_LUAU_LSP_VERSION)
+            {
+                DoctorStatus::Warn
+            } else {
+                DoctorStatus::Ok
+            };
+            let recommendation = if status == DoctorStatus::Warn {
+                format!(
+                    "; tested with {}.{}.{} (run `aftman install` after `rosync refresh`)",
+                    RECOMMENDED_LUAU_LSP_VERSION.0,
+                    RECOMMENDED_LUAU_LSP_VERSION.1,
+                    RECOMMENDED_LUAU_LSP_VERSION.2,
+                )
+            } else {
+                String::new()
+            };
             doctor_check(
                 "luau-lsp",
-                DoctorStatus::Ok,
-                format!("{} ({version})", luau_lsp.to_string_lossy()),
+                status,
+                format!("{} ({version}){recommendation}", luau_lsp.to_string_lossy()),
             )
         }
         Ok(out) => doctor_check(
@@ -6455,11 +12151,176 @@ fn check_luau_lsp() -> DoctorCheck {
     }
 }
 
-fn check_luau_definitions() -> DoctorCheck {
-    match find_bundled_luau_definitions() {
-        Some(path) => doctor_check("roblox defs", DoctorStatus::Ok, path.display().to_string()),
-        None => doctor_check("roblox defs", DoctorStatus::Warn, "not bundled"),
+fn check_luau_definitions(project: &std::path::Path) -> DoctorCheck {
+    use sha2::{Digest as _, Sha256};
+
+    let project_copy = project.join(snapshot::ROBLOX_DEFINITIONS_PATH);
+    let Some(active_path) = find_luau_definitions(project) else {
+        return doctor_check("roblox defs", DoctorStatus::Warn, "not found");
+    };
+    let read_hash = |path: &std::path::Path| -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|error| format!("read: {error}"))?;
+        Ok(format!("{:x}", Sha256::digest(&bytes)))
+    };
+    let active_hash = match read_hash(&active_path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return doctor_check(
+                "roblox defs",
+                DoctorStatus::Fail,
+                format!("lint: {} ({error})", active_path.display()),
+            );
+        }
+    };
+    let mut status = if active_hash == ROBLOX_DEFINITIONS_SHA256 {
+        DoctorStatus::Ok
+    } else {
+        DoctorStatus::Warn
+    };
+    let mut details = vec![format!(
+        "lint: {} ({})",
+        active_path.display(),
+        if active_hash == ROBLOX_DEFINITIONS_SHA256 {
+            "security=None, current".to_string()
+        } else {
+            format!("untested sha256 {active_hash}")
+        }
+    )];
+
+    if active_path != project_copy {
+        match read_hash(&project_copy) {
+            Ok(hash) if hash == ROBLOX_DEFINITIONS_SHA256 => details.push(format!(
+                "editor: {} (security=None, current)",
+                project_copy.display()
+            )),
+            Ok(hash) => {
+                status = DoctorStatus::Warn;
+                details.push(format!(
+                    "editor: {} (stale sha256 {hash}; run `rosync refresh`)",
+                    project_copy.display()
+                ));
+            }
+            Err(_) if !project_copy.exists() => {
+                status = DoctorStatus::Warn;
+                details.push(format!(
+                    "editor: {} (missing; run `rosync refresh`)",
+                    project_copy.display()
+                ));
+            }
+            Err(error) => {
+                status = DoctorStatus::Warn;
+                details.push(format!("editor: {} ({error})", project_copy.display()));
+            }
+        }
+    } else if active_hash == ROBLOX_DEFINITIONS_SHA256 {
+        details[0] = format!(
+            "lint/editor: {} (security=None, current)",
+            active_path.display()
+        );
     }
+
+    if active_hash != ROBLOX_DEFINITIONS_SHA256 {
+        details.push("run `rosync refresh` or update the installed Ro Sync bundle".to_string());
+    }
+    doctor_check("roblox defs", status, details.join("; "))
+}
+
+fn check_luau_compile(project: &std::path::Path) -> DoctorCheck {
+    let Some(executable) = resolve_luau_compile(None) else {
+        return doctor_check(
+            "luau-compile",
+            DoctorStatus::Warn,
+            "not found; `rosync lint --compile auto` will skip bytecode checks",
+        );
+    };
+    match std::process::Command::new(&executable)
+        .arg("--help")
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => doctor_check(
+            "luau-compile",
+            DoctorStatus::Ok,
+            executable.to_string_lossy(),
+        ),
+        Ok(status) => doctor_check(
+            "luau-compile",
+            DoctorStatus::Fail,
+            format!(
+                "{} rejected --help (exit {})",
+                executable.to_string_lossy(),
+                status.code().unwrap_or(1)
+            ),
+        ),
+        Err(error) => doctor_check(
+            "luau-compile",
+            DoctorStatus::Fail,
+            format!("run {}: {error}", executable.to_string_lossy()),
+        ),
+    }
+}
+
+fn check_luaurc(project: &std::path::Path) -> DoctorCheck {
+    let path = project.join(snapshot::LUAURC);
+    if !path.exists() {
+        return doctor_check(".luaurc", DoctorStatus::Warn, "missing");
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            return doctor_check(".luaurc", DoctorStatus::Fail, format!("read: {error}"));
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return doctor_check(
+                ".luaurc",
+                DoctorStatus::Fail,
+                format!("invalid JSON: {error}"),
+            );
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return doctor_check(
+            ".luaurc",
+            DoctorStatus::Fail,
+            "top-level value must be a JSON object",
+        );
+    };
+    if object.contains_key("definitions") {
+        return doctor_check(
+            ".luaurc",
+            DoctorStatus::Warn,
+            "contains unsupported `definitions`; run `rosync refresh` to remove it",
+        );
+    }
+    let language_mode = match object.get("languageMode") {
+        None => "default".to_string(),
+        Some(serde_json::Value::String(mode))
+            if matches!(mode.as_str(), "nocheck" | "nonstrict" | "strict") =>
+        {
+            mode.clone()
+        }
+        Some(value) => {
+            return doctor_check(
+                ".luaurc",
+                DoctorStatus::Fail,
+                format!(
+                    "invalid languageMode {}; expected nocheck, nonstrict, or strict",
+                    value
+                ),
+            );
+        }
+    };
+    doctor_check(
+        ".luaurc",
+        DoctorStatus::Ok,
+        format!("{} (languageMode={language_mode})", path.display()),
+    )
 }
 
 fn check_writes_log_path() -> DoctorCheck {
@@ -6493,26 +12354,164 @@ fn http_get_json(port: u16, path: &str) -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let timeout = Duration::from_millis(750);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "HTTP deadline overflow".to_string())?;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
         .map_err(|e| format!("connect http://127.0.0.1:{port}{path}: {e}"))?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("set HTTP write timeout: {error}"))?;
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("write request: {e}"))?;
-    let mut resp = String::new();
-    stream
-        .read_to_string(&mut resp)
-        .map_err(|e| format!("read response: {e}"))?;
-    let mut parts = resp.splitn(2, "\r\n\r\n");
-    let head = parts.next().unwrap_or("");
-    let body = parts.next().unwrap_or("");
+    const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+    let max_wire_bytes = LOCAL_HTTP_MAX_JSON_BYTES + MAX_HTTP_HEADER_BYTES;
+    let mut response = Vec::with_capacity(8 * 1024);
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("GET http://127.0.0.1:{port}{path} timed out"));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| format!("set HTTP read timeout: {error}"))?;
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read response: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        if response.len().saturating_add(count) > max_wire_bytes {
+            return Err(format!(
+                "GET http://127.0.0.1:{port}{path} response exceeded {max_wire_bytes} bytes"
+            ));
+        }
+        response.extend_from_slice(&buffer[..count]);
+    }
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "HTTP response omitted the header separator".to_string())?;
+    if separator > MAX_HTTP_HEADER_BYTES {
+        return Err("HTTP response headers exceeded the byte limit".into());
+    }
+    let head = std::str::from_utf8(&response[..separator])
+        .map_err(|error| format!("HTTP response headers are not UTF-8: {error}"))?;
+    let body = &response[separator + 4..];
+    if body.len() > LOCAL_HTTP_MAX_JSON_BYTES {
+        return Err(format!(
+            "HTTP JSON response exceeded {} bytes",
+            LOCAL_HTTP_MAX_JSON_BYTES
+        ));
+    }
     if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
         let status = head.lines().next().unwrap_or("no HTTP status");
         return Err(status.to_string());
     }
-    serde_json::from_str(body).map_err(|e| format!("parse response JSON: {e}"))
+    serde_json::from_slice(body).map_err(|e| format!("parse response JSON: {e}"))
+}
+
+async fn read_bounded_json_response(
+    mut response: reqwest::Response,
+    url: &str,
+) -> Result<(reqwest::StatusCode, serde_json::Value), String> {
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > LOCAL_HTTP_MAX_JSON_BYTES as u64)
+    {
+        return Err(format!(
+            "{url} response exceeds the {}-byte JSON limit",
+            LOCAL_HTTP_MAX_JSON_BYTES
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(LOCAL_HTTP_MAX_JSON_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("read {url} response: {error}"))?
+    {
+        let next = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{url} response size overflow"))?;
+        if next > LOCAL_HTTP_MAX_JSON_BYTES {
+            return Err(format!(
+                "{url} response exceeds the {}-byte JSON limit",
+                LOCAL_HTTP_MAX_JSON_BYTES
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {url} response JSON: {error}"))?;
+    Ok((status, value))
+}
+
+async fn http_json_until(
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    if !path.starts_with('/') || path.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        return Err("invalid local HTTP path".into());
+    }
+    let remaining = capture_deadline_remaining(deadline, "local HTTP request")?;
+    let connect_timeout = LOCAL_HTTP_CONNECT_TIMEOUT.min(remaining);
+    let client = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(remaining)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("build local HTTP client: {error}"))?;
+    let remaining = capture_deadline_remaining(deadline, "local HTTP request")?;
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let method_name = method.as_str().to_string();
+    let mut request = client.request(method, &url).timeout(remaining);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let operation = async {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("{method_name} {url}: {error}"))?;
+        let (status, value) = read_bounded_json_response(response, &url).await?;
+        if !status.is_success() {
+            return Err(format!("{method_name} {url}: {status}: {value}"));
+        }
+        Ok(value)
+    };
+    tokio::time::timeout(remaining, operation)
+        .await
+        .map_err(|_| format!("{method_name} {url} timed out"))?
+}
+
+async fn http_get_json_until(
+    port: u16,
+    path: &str,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    http_json_until(port, reqwest::Method::GET, path, None, deadline).await
+}
+
+async fn http_post_json_until(
+    port: u16,
+    path: &str,
+    body: &serde_json::Value,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    http_json_until(port, reqwest::Method::POST, path, Some(body), deadline).await
 }
 
 async fn http_post_json(
@@ -6520,22 +12519,30 @@ async fn http_post_json(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    let status = resp.status();
-    let value = resp
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("parse response JSON: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("{status}: {value}"));
+    let deadline = Instant::now()
+        .checked_add(LOCAL_HTTP_DEFAULT_TIMEOUT)
+        .ok_or_else(|| "local HTTP deadline overflow".to_string())?;
+    http_post_json_until(port, path, body, deadline).await
+}
+
+async fn consume_artifact_transport_until(
+    port: u16,
+    id: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    validate_artifact_id(id)?;
+    let response = http_post_json_until(
+        port,
+        &format!("/artifacts/{id}/consume"),
+        &serde_json::json!({}),
+        deadline,
+    )
+    .await?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("artifact consume rejected: {response}"))
     }
-    Ok(value)
 }
 
 fn project_or_cwd(
@@ -6634,16 +12641,15 @@ fn compact_command_registry(
 fn command_output_cost(name: &str) -> &'static str {
     match name {
         "commands" => "high-full-or-low-single",
-        "context" | "plan" | "query" | "path" | "meta" | "services" | "where" | "open"
-        | "classinfo" | "enums" | "enum" | "ping" | "version" => "low",
+        "context" | "capabilities" | "plan" | "query" | "path" | "meta" | "services" | "where"
+        | "open" | "classinfo" | "enums" | "enum" | "ping" | "version" => "low",
         "status" | "doctor" | "ls" | "tree" | "props" | "find" | "find-attr" | "logs"
         | "resolve" | "decision" | "lint" | "upload" | "monetization" | "set" | "new" | "rm"
-        | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo" | "refresh" => {
-            "medium"
-        }
+        | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo" | "refresh"
+        | "repair" | "capture" | "playtest" | "run" => "medium",
         "source" | "conflicts" => "medium-special-case",
         "diff" | "changes" | "snapshot" | "get" | "eval" | "transmit" | "call" | "tail"
-        | "watch" => "high-or-streaming",
+        | "watch" | "serve" => "high-or-streaming",
         _ => "unknown",
     }
 }
@@ -6655,19 +12661,29 @@ fn command_safety_class(name: &str) -> &'static str {
         }
         "resolve" | "decision" => "mutates-disk-or-studio",
         "eval" | "call" | "transmit" => "risky-live-execution",
+        "playtest" => "controls-playtest-and-runtime-execution",
+        "run" => "workflow-declared-mutations",
+        "capture" => "captures-screen-and-writes-local-artifacts",
         "select" | "open" => "mutates-studio-selection",
         "upload" | "monetization" => "open-cloud-mutating",
-        "refresh" | "snapshot" => "writes-local-files",
+        "refresh" | "snapshot" | "repair" => "writes-local-files",
         "tail" | "watch" => "streaming-read",
-        _ => "read-only",
+        "serve" => "starts-local-service",
+        "commands" | "context" | "capabilities" | "plan" | "query" | "path" | "lint" | "get"
+        | "ls" | "tree" | "diff" | "changes" | "services" | "meta" | "props" | "source"
+        | "where" | "conflicts" | "find" | "find-attr" | "classinfo" | "enums" | "enum"
+        | "logs" | "status" | "doctor" | "ping" | "version" => "read-only",
+        _ => "unclassified-assume-mutating",
     }
 }
 
 fn command_requirements(name: &str) -> Vec<&'static str> {
     match name {
-        "query" | "path" | "meta" | "services" | "source" | "decision" => {
+        "query" | "path" | "meta" | "services" | "source" | "decision" | "capabilities"
+        | "capture" | "playtest" => {
             vec!["project", "daemon", "studio-plugin"]
         }
+        "run" => vec!["project", "daemon", "studio-plugin", "workflow-file"],
         "lint" => vec!["project"],
         "upload" | "monetization" => vec!["project", "roblox-open-cloud-credential"],
         "commands" | "context" | "plan" | "snapshot" | "diff" | "changes" | "status" | "doctor"
@@ -6698,6 +12714,16 @@ fn command_prefer_before(name: &str) -> Vec<&'static str> {
             vec!["status --raw", "waypoint for multi-step edits"]
         }
         "upload" => vec!["enumerate exact files", "use --manifest for bulk uploads"],
+        "capture" => vec![
+            "capabilities",
+            "capture status",
+            "authorize only when required",
+        ],
+        "playtest" => vec!["capabilities", "playtest status", "playtest contexts"],
+        "run" => vec![
+            "run --dry-run",
+            "use transactions for multi-step Studio writes",
+        ],
         "monetization" => vec![
             "monetization discover",
             "monetization list",
@@ -7061,11 +13087,7 @@ fn print_response<F: FnOnce(&serde_json::Value)>(resp: &serde_json::Value, raw: 
     }
     let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     if !ok {
-        let err = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unknown error>");
-        eprintln!("error: {err}");
+        eprintln!("error: {}", response_error_message(resp));
         return;
     }
     let empty = serde_json::Value::Null;
@@ -7078,12 +13100,7 @@ fn ok_or_err(resp: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>>
     if ok {
         Ok(())
     } else {
-        let err = resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("request failed")
-            .to_string();
-        Err(err.into())
+        Err(response_error_message(resp).into())
     }
 }
 
@@ -7340,6 +13357,14 @@ fn spawn_watch_bridge(
     // of the daemon.
     tokio::spawn(async move {
         let _watcher = watcher;
+        // Empty folders are intentionally absent from Studio. Seed every
+        // existing disk directory and remember newly created ones so the first
+        // script added beneath an unmaterialized folder can create its parent
+        // chain before its own `set` arrives. Without this ordering, `mkdir
+        // Workspace/tools`, followed later (even after a daemon restart) by
+        // `Workspace/tools/Test.luau`, sends a child op whose parent does not
+        // exist in Studio and the plugin has no safe way to infer it.
+        let mut pending_parent_dirs = collect_existing_parent_candidates(&root);
         loop {
             match rx.recv().await {
                 Ok(op) => {
@@ -7356,13 +13381,182 @@ fn spawn_watch_bridge(
                             continue;
                         }
                     }
-                    handle_op(op, &events, &conflicts)
+                    if op.kind == OpKind::Rename && op.path.is_dir() {
+                        if let Some(from) = &op.from {
+                            rebase_pending_parent_candidates(
+                                &mut pending_parent_dirs,
+                                from,
+                                &op.path,
+                            );
+                        }
+                    }
+                    if op.kind == OpKind::Add && op.content.is_none() && op.path.is_dir() {
+                        pending_parent_dirs.insert(op.path.clone());
+                    }
+                    for parent in
+                        take_pending_parent_materializations(&op, &root, &mut pending_parent_dirs)
+                    {
+                        emit_op(
+                            &events,
+                            &Op {
+                                kind: OpKind::Update,
+                                path: parent,
+                                from: None,
+                                content: None,
+                            },
+                        );
+                    }
+                    if matches!(op.kind, OpKind::Delete | OpKind::Rename) {
+                        if let Err(error) = begin_fs_destructive_preflight(&op, &conflicts) {
+                            emit_sync_error(&events, &op.path, &error);
+                            let _ = http::write_log_entry(axum::Json(serde_json::json!({
+                                "source": "filesystem-sync-conflict",
+                                "op": match op.kind {
+                                    OpKind::Delete => "delete",
+                                    OpKind::Rename => "rename",
+                                    OpKind::Add | OpKind::Update => "update",
+                                },
+                                "path": op.path,
+                                "from": op.from,
+                                "outcome": "blocked-read-error",
+                                "error": error,
+                            })));
+                            continue;
+                        }
+                        // ScriptDocument callbacks and filesystem notifications
+                        // are independent streams. Hold destructive ops briefly
+                        // so an already-in-flight Studio source push can prove
+                        // whether Studio still matches the agreed baseline.
+                        tokio::time::sleep(Duration::from_millis(FS_DESTRUCTIVE_PREFLIGHT_MS))
+                            .await;
+                    }
+                    if let Some(blocked) = handle_op(op, &events, &conflicts) {
+                        let _ = http::write_log_entry(axum::Json(serde_json::json!({
+                            "source": "filesystem-sync-conflict",
+                            "op": blocked.kind,
+                            "path": blocked.path,
+                            "from": blocked.from,
+                            "outcome": "blocked-conflict",
+                        })));
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+}
+
+// ScriptEditorService source notifications are debounced for 350 ms in the
+// plugin. Keep this slightly above that bound so an edit and a filesystem
+// delete/rename started together are ordered deterministically in practice.
+const FS_DESTRUCTIVE_PREFLIGHT_MS: u64 = 500;
+
+fn deleted_sync_path_is_dir(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    fs_map::classify_script_file(name).is_none() && !fs_map::is_init_file(name)
+}
+
+fn begin_fs_destructive_preflight(op: &Op, conflicts: &ConflictEngine) -> Result<(), String> {
+    match op.kind {
+        OpKind::Delete => {
+            conflicts.begin_fs_delete(&op.path, deleted_sync_path_is_dir(&op.path));
+        }
+        OpKind::Rename => {
+            if let Some(from) = &op.from {
+                let is_dir = op.path.is_dir();
+                let retained_bytes = if is_dir {
+                    None
+                } else {
+                    Some(std::fs::read(&op.path).map_err(|error| {
+                        format!(
+                            "read retained rename destination {}: {error}",
+                            op.path.display()
+                        )
+                    })?)
+                };
+                conflicts.begin_fs_rename(from, &op.path, is_dir, retained_bytes);
+            }
+        }
+        OpKind::Add | OpKind::Update => {}
+    }
+    Ok(())
+}
+
+fn collect_existing_parent_candidates(root: &std::path::Path) -> HashSet<PathBuf> {
+    fn collect(dir: &std::path::Path, candidates: &mut HashSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            candidates.insert(path.clone());
+            collect(&path, candidates);
+        }
+    }
+
+    let mut candidates = HashSet::new();
+    for service in snapshot::SYNCED_SERVICES {
+        collect(&root.join(service), &mut candidates);
+    }
+    candidates
+}
+
+fn rebase_pending_parent_candidates(
+    candidates: &mut HashSet<PathBuf>,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) {
+    let moved = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .strip_prefix(from)
+                .ok()
+                .map(|suffix| (candidate.clone(), to.join(suffix)))
+        })
+        .collect::<Vec<_>>();
+    for (old, new) in moved {
+        candidates.remove(&old);
+        candidates.insert(new);
+    }
+}
+
+fn take_pending_parent_materializations(
+    op: &Op,
+    root: &std::path::Path,
+    pending_empty_dirs: &mut HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    if op.content.is_none() || !matches!(op.kind, OpKind::Add | OpKind::Update) {
+        return Vec::new();
+    }
+
+    let mut parents = Vec::new();
+    let mut cursor = op.path.parent();
+    while let Some(parent) = cursor {
+        let Ok(relative) = parent.strip_prefix(root) else {
+            break;
+        };
+        // The first relative component is the existing Studio service. Never
+        // attempt to materialize or replace that root as a Folder.
+        if relative.components().count() <= 1 {
+            break;
+        }
+        if pending_empty_dirs.remove(parent) {
+            parents.push(parent.to_path_buf());
+        }
+        cursor = parent.parent();
+    }
+    parents.reverse();
+    parents
 }
 
 fn is_synced_service_root_op(op: &Op, root: &std::path::Path) -> bool {
@@ -7378,9 +13572,7 @@ fn is_synced_service_root_op(op: &Op, root: &std::path::Path) -> bool {
     let Some(name) = rel.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
-    snapshot::SYNCED_SERVICES
-        .iter()
-        .any(|service| *service == name)
+    snapshot::SYNCED_SERVICES.contains(&name)
 }
 
 fn is_push_quiet(
@@ -7495,7 +13687,18 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
     Some(())
 }
 
-fn handle_op(op: Op, events: &broadcast::Sender<String>, conflicts: &ConflictEngine) {
+#[derive(Debug, Clone)]
+struct BlockedFsDestructive {
+    kind: &'static str,
+    path: PathBuf,
+    from: Option<PathBuf>,
+}
+
+fn handle_op(
+    op: Op,
+    events: &broadcast::Sender<String>,
+    conflicts: &ConflictEngine,
+) -> Option<BlockedFsDestructive> {
     match op.kind {
         OpKind::Add | OpKind::Update => {
             let bytes = match &op.content {
@@ -7503,7 +13706,7 @@ fn handle_op(op: Op, events: &broadcast::Sender<String>, conflicts: &ConflictEng
                 None => {
                     // Directory or unreadable file — forward as-is.
                     emit_op(events, &op);
-                    return;
+                    return None;
                 }
             };
             // Normalize line endings so CRLF-on-disk vs LF-from-Studio don't
@@ -7515,13 +13718,42 @@ fn handle_op(op: Op, events: &broadcast::Sender<String>, conflicts: &ConflictEng
                 FsDecision::Propagate => emit_op(events, &op),
                 FsDecision::Conflict => emit_conflict(events, &op.path),
             }
+            None
         }
-        OpKind::Delete | OpKind::Rename => {
-            // Deletes and renames bypass the hash-baseline check (no bytes to
-            // compare) and are always forwarded. Conflict resolution for
-            // concurrent delete-edit or rename-edit is handled at the
-            // studio-push boundary.
-            emit_op(events, &op);
+        OpKind::Delete => match conflicts.finish_fs_destructive(&op.path) {
+            FsDecision::Conflict => {
+                emit_conflict(events, &op.path);
+                Some(BlockedFsDestructive {
+                    kind: "delete",
+                    path: op.path,
+                    from: None,
+                })
+            }
+            FsDecision::NoChange | FsDecision::Propagate => {
+                emit_op(events, &op);
+                conflicts.commit_fs_delete(&op.path);
+                None
+            }
+        },
+        OpKind::Rename => {
+            let source = op.from.as_deref().unwrap_or(op.path.as_path());
+            match conflicts.finish_fs_destructive(source) {
+                FsDecision::Conflict => {
+                    emit_conflict(events, source);
+                    Some(BlockedFsDestructive {
+                        kind: "rename",
+                        path: op.path,
+                        from: op.from,
+                    })
+                }
+                FsDecision::NoChange | FsDecision::Propagate => {
+                    emit_op(events, &op);
+                    if let Some(from) = &op.from {
+                        conflicts.commit_fs_rename(from, &op.path);
+                    }
+                    None
+                }
+            }
         }
     }
 }
@@ -7537,6 +13769,17 @@ fn emit_conflict(events: &broadcast::Sender<String>, path: &std::path::Path) {
     let payload = serde_json::json!({ "type": "conflict", "path": path });
     if let Ok(s) = serde_json::to_string(&payload) {
         let _ = events.send(s);
+    }
+}
+
+fn emit_sync_error(events: &broadcast::Sender<String>, path: &std::path::Path, error: &str) {
+    let payload = serde_json::json!({
+        "type": "sync-error",
+        "path": path,
+        "error": error,
+    });
+    if let Ok(serialized) = serde_json::to_string(&payload) {
+        let _ = events.send(serialized);
     }
 }
 
@@ -7557,7 +13800,7 @@ fn fs_mtime(path: &std::path::Path) -> u64 {
 pub struct ClassInfoArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Class name to introspect, e.g. `BasePart`, `TextLabel`, `Model`.
     #[arg(long = "class")]
@@ -7570,7 +13813,7 @@ pub struct ClassInfoArgs {
 pub struct EnumsArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     #[arg(long)]
     pub raw: bool,
@@ -7580,7 +13823,7 @@ pub struct EnumsArgs {
 pub struct EnumArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Enum type name, e.g. `Material`, `Font`, `KeyCode`.
     #[arg(long)]
@@ -7593,7 +13836,7 @@ pub struct EnumArgs {
 pub struct FindAttrArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
-    #[arg(long, default_value_t = 7878)]
+    #[arg(long, default_value_t = DEFAULT_DAEMON_PORT)]
     pub port: u16,
     /// Attribute name to search for.
     #[arg(long)]
@@ -7651,7 +13894,7 @@ async fn run_find_attr(args: FindAttrArgs) -> Result<(), Box<dyn std::error::Err
         req.insert("value".into(), parsed);
     }
     let resp = remote::request(args.port, "find_by_attr", serde_json::Value::Object(req)).await?;
-    print_response(&resp, args.raw, |v| print_find(v));
+    print_response(&resp, args.raw, print_find);
     ok_or_err(&resp)
 }
 
@@ -7747,6 +13990,7 @@ fn print_enum_items(enum_name: &str, value: &serde_json::Value) {
 #[cfg(test)]
 mod tier2_tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parse_duration_seconds_units() {
@@ -7789,6 +14033,130 @@ mod tier2_tests {
 
         assert!(is_synced_service_root_op(&service_op, &root));
         assert!(!is_synced_service_root_op(&script_op, &root));
+    }
+
+    #[test]
+    fn new_script_materializes_pending_empty_parent_chain_first() {
+        let root = PathBuf::from("/tmp/ro-sync-test-project");
+        let tools = root.join("Workspace/tools");
+        let nested = tools.join("nested");
+        let mut pending = HashSet::from([tools.clone(), nested.clone()]);
+        let script_op = Op {
+            kind: OpKind::Add,
+            path: nested.join("Test.luau"),
+            from: None,
+            content: Some(b"return true".to_vec()),
+        };
+
+        assert_eq!(
+            take_pending_parent_materializations(&script_op, &root, &mut pending),
+            vec![tools, nested]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn startup_seeds_preexisting_empty_service_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("Workspace");
+        let tools = workspace.join("tools");
+        let nested = tools.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(temp.path().join("tools/root-only")).unwrap();
+
+        let candidates = collect_existing_parent_candidates(temp.path());
+
+        assert!(candidates.contains(&tools));
+        assert!(candidates.contains(&nested));
+        assert!(!candidates.contains(&workspace));
+        assert!(!candidates.contains(&temp.path().join("tools/root-only")));
+    }
+
+    #[test]
+    fn empty_directory_rename_rebases_pending_descendant_candidates() {
+        let from = PathBuf::from("/project/Workspace/tools");
+        let to = PathBuf::from("/project/Workspace/utilities");
+        let mut candidates = HashSet::from([from.clone(), from.join("nested")]);
+
+        rebase_pending_parent_candidates(&mut candidates, &from, &to);
+
+        assert_eq!(candidates, HashSet::from([to.clone(), to.join("nested")]));
+    }
+
+    #[test]
+    fn existing_parent_chain_does_not_add_materialization_noise() {
+        let root = PathBuf::from("/tmp/ro-sync-test-project");
+        let script_op = Op {
+            kind: OpKind::Update,
+            path: root.join("ReplicatedStorage/Shared/Config.luau"),
+            from: None,
+            content: Some(b"return true".to_vec()),
+        };
+
+        assert!(
+            take_pending_parent_materializations(&script_op, &root, &mut HashSet::new()).is_empty()
+        );
+    }
+
+    #[test]
+    fn watcher_blocks_disk_delete_when_studio_source_is_divergent() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Workspace/Controller.server.luau");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"disk edit\n").unwrap();
+        let conflicts = ConflictEngine::new();
+        conflicts.record_sync(&source, conflict::hash(b"agreed\n"), 1);
+        assert_eq!(
+            conflicts.on_studio_push(&source, b"studio edit\n", Some((b"disk edit\n", 2))),
+            conflict::StudioDecision::Conflict
+        );
+        std::fs::remove_file(&source).unwrap();
+
+        let op = Op {
+            kind: OpKind::Delete,
+            path: source.clone(),
+            from: None,
+            content: None,
+        };
+        let (events, mut receiver) = broadcast::channel(4);
+        begin_fs_destructive_preflight(&op, &conflicts).unwrap();
+        let blocked = handle_op(op, &events, &conflicts).expect("delete must be blocked");
+
+        assert_eq!(blocked.kind, "delete");
+        let event: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "conflict");
+        assert!(receiver.try_recv().is_err(), "no delete op may be emitted");
+    }
+
+    #[test]
+    fn watcher_blocks_disk_rename_when_studio_source_is_divergent() {
+        let temp = tempfile::tempdir().unwrap();
+        let from = temp.path().join("ReplicatedStorage/Old.luau");
+        let to = temp.path().join("ReplicatedStorage/New.luau");
+        std::fs::create_dir_all(from.parent().unwrap()).unwrap();
+        std::fs::write(&from, b"disk edit\n").unwrap();
+        let conflicts = ConflictEngine::new();
+        conflicts.record_sync(&from, conflict::hash(b"agreed\n"), 1);
+        assert_eq!(
+            conflicts.on_studio_push(&from, b"studio edit\n", Some((b"disk edit\n", 2))),
+            conflict::StudioDecision::Conflict
+        );
+        std::fs::rename(&from, &to).unwrap();
+
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: None,
+        };
+        let (events, mut receiver) = broadcast::channel(4);
+        begin_fs_destructive_preflight(&op, &conflicts).unwrap();
+        let blocked = handle_op(op, &events, &conflicts).expect("rename must be blocked");
+
+        assert_eq!(blocked.kind, "rename");
+        let event: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "conflict");
+        assert!(receiver.try_recv().is_err(), "no rename op may be emitted");
     }
 
     #[test]
@@ -7925,6 +14293,11 @@ mod tier2_tests {
         assert!(args.scope_only);
         assert!(args.summary);
         assert!(!args.no_vendor_ignores);
+        assert_eq!(args.port, DEFAULT_DAEMON_PORT);
+        assert_eq!(args.data_model, LintDataModelMode::Auto);
+        assert!(!args.raw);
+        assert_eq!(args.compile, LintCompileMode::Auto);
+        assert!(args.luau_compile.is_none());
 
         let cli =
             Cli::try_parse_from(["rosync", "lint", "--owned-only", "--path", "A.luau"]).unwrap();
@@ -7932,6 +14305,459 @@ mod tier2_tests {
             panic!("expected lint command");
         };
         assert!(args.scope_only);
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "lint",
+            "--compile",
+            "required",
+            "--luau-compile",
+            "/tmp/luau-compile",
+        ])
+        .unwrap();
+        let Some(Command::Lint(args)) = cli.command else {
+            panic!("expected lint command");
+        };
+        assert_eq!(args.compile, LintCompileMode::Required);
+        assert_eq!(
+            args.luau_compile.unwrap(),
+            PathBuf::from("/tmp/luau-compile")
+        );
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "lint",
+            "--port",
+            "9004",
+            "--data-model",
+            "studio",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Lint(args)) = cli.command else {
+            panic!("expected lint command");
+        };
+        assert_eq!(args.port, 9004);
+        assert_eq!(args.data_model, LintDataModelMode::Studio);
+        assert!(args.raw);
+    }
+
+    #[test]
+    fn lint_extra_argument_detection_preserves_named_definition_sets() {
+        let strings = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        };
+
+        assert!(!extra_args_include_roblox_definitions(&strings(&[
+            "--definitions:@testez=types/testez.d.luau"
+        ])));
+        assert!(extra_args_include_roblox_definitions(&strings(&[
+            "--definitions:@roblox=types/custom.d.luau"
+        ])));
+        assert!(extra_args_include_roblox_definitions(&strings(&[
+            "--definitions",
+            "@roblox=types/custom.d.luau"
+        ])));
+        assert!(extra_args_include_roblox_definitions(&strings(&[
+            "--definitions",
+            "types/legacy.d.luau"
+        ])));
+        assert!(extra_args_include_platform(&strings(&[
+            "--platform=roblox"
+        ])));
+        assert!(extra_args_use_plain_formatter(&strings(&[
+            "--formatter=plain"
+        ])));
+        assert!(extra_args_use_plain_formatter(&strings(&[
+            "--formatter",
+            "plain"
+        ])));
+        assert!(!extra_args_use_plain_formatter(&strings(&[
+            "--formatter=gnu"
+        ])));
+        assert!(extra_args_include_settings(&strings(&[
+            "--settings",
+            "lint-settings.json"
+        ])));
+        assert!(extra_args_disable_strict_datamodel(&strings(&[
+            "--no-strict-dm-types"
+        ])));
+    }
+
+    #[test]
+    fn lint_diagnostic_parser_preserves_ranges_and_messages() {
+        let root = PathBuf::from("/tmp/project");
+        let diagnostic = parse_lint_diagnostic(
+            &root,
+            "ReplicatedStorage/Main.luau [game/ReplicatedStorage/Main](2,7,2,19): TypeError: expected boolean, got string",
+        )
+        .unwrap();
+        assert_eq!(diagnostic.path, root.join("ReplicatedStorage/Main.luau"));
+        assert_eq!(diagnostic.line, 2);
+        assert_eq!(diagnostic.column, 7);
+        assert_eq!(diagnostic.end_line, Some(2));
+        assert_eq!(diagnostic.end_column, Some(19));
+        assert_eq!(diagnostic.category, "TypeError");
+        assert_eq!(diagnostic.message, "expected boolean, got string");
+
+        let diagnostic = parse_lint_diagnostic(
+            &root,
+            "ServerScriptService/Server/MarketService/init (MarketService).luau [game/ServerScriptService/Server/MarketService](12,3): TypeError: bad return type",
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostic.path,
+            root.join("ServerScriptService/Server/MarketService/init (MarketService).luau")
+        );
+        assert_eq!(diagnostic.line, 12);
+        assert_eq!(diagnostic.column, 3);
+        assert_eq!(diagnostic.message, "bad return type");
+
+        let diagnostic = parse_lint_diagnostic(
+            &root,
+            "ReplicatedStorage/Main.luau:8.4-8.16: TypeError: GNU formatter error",
+        )
+        .unwrap();
+        assert_eq!(diagnostic.path, root.join("ReplicatedStorage/Main.luau"));
+        assert_eq!((diagnostic.line, diagnostic.column), (8, 4));
+        assert_eq!(
+            (diagnostic.end_line, diagnostic.end_column),
+            (Some(8), Some(16))
+        );
+        assert_eq!(diagnostic.message, "GNU formatter error");
+
+        let diagnostic = parse_lint_diagnostic(
+            &root,
+            "ReplicatedStorage/Main.luau:8:4-16: (W0) TypeError: plain formatter error",
+        )
+        .unwrap();
+        assert_eq!(diagnostic.path, root.join("ReplicatedStorage/Main.luau"));
+        assert_eq!((diagnostic.line, diagnostic.column), (8, 4));
+        assert_eq!(
+            (diagnostic.end_line, diagnostic.end_column),
+            (Some(8), Some(16))
+        );
+        assert_eq!(diagnostic.category, "TypeError");
+        assert_eq!(diagnostic.message, "plain formatter error");
+
+        let diagnostic = parse_lint_diagnostic(
+            &root,
+            "ReplicatedStorage/Main.luau [game/ReplicatedStorage/Foo](1,2): TypeError: decoy](21,7): TypeError: real default error",
+        )
+        .unwrap();
+        assert_eq!(diagnostic.path, root.join("ReplicatedStorage/Main.luau"));
+        assert_eq!((diagnostic.line, diagnostic.column), (21, 7));
+        assert_eq!(diagnostic.message, "real default error");
+
+        let diagnostic = parse_lint_diagnostic(
+            &root,
+            "ReplicatedStorage/Main.luau [game/ReplicatedStorage/Foo]:1.2-1.3: TypeError: decoy]:22.8-22.19: TypeError: real GNU error",
+        )
+        .unwrap();
+        assert_eq!(diagnostic.path, root.join("ReplicatedStorage/Main.luau"));
+        assert_eq!((diagnostic.line, diagnostic.column), (22, 8));
+        assert_eq!(
+            (diagnostic.end_line, diagnostic.end_column),
+            (Some(22), Some(19))
+        );
+        assert_eq!(diagnostic.message, "real GNU error");
+
+        let output = "[INFO] loading definitions\nReplicatedStorage/Main.luau:8.4-8.16: TypeError: GNU formatter error\nfatal configuration error\n";
+        assert_eq!(
+            lint_unparsed_lines(&root, output),
+            vec!["[INFO] loading definitions", "fatal configuration error"]
+        );
+        assert!(lint_has_unparsed_failure(&root, output));
+        assert!(!lint_has_unparsed_failure(
+            &root,
+            "[INFO] loading definitions\nReplicatedStorage/Main.luau(1,1): TypeError: hidden\n"
+        ));
+        assert!(!lint_has_unparsed_failure(
+            &root,
+            "[INFO] loading definitions\n[WARN] client does not allow didChangeWatchedFiles registration - automatic updating on sourcemap changes disabled\nReplicatedStorage/Main.luau(1,1): TypeError: hidden\n"
+        ));
+        assert!(lint_has_unparsed_failure(
+            &root,
+            "[INFO] loading definitions\n[ERROR] failed to load configuration\nReplicatedStorage/Main.luau(1,1): TypeError: hidden\n"
+        ));
+        assert!(lint_analyzer_effective_success(false, true, 1, 1, false));
+        assert!(lint_analyzer_effective_success(true, true, 1, 0, true));
+        assert!(lint_analyzer_effective_success(true, false, 1, 0, false));
+        assert!(!lint_analyzer_effective_success(true, false, 1, 0, true));
+        assert!(!lint_analyzer_effective_success(true, false, 0, 0, false));
+    }
+
+    #[test]
+    fn lint_strict_settings_and_version_parsing_are_pinned() {
+        let path = write_temp_lint_settings().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(value["luau-lsp.diagnostics.strictDatamodelTypes"], true);
+        assert_eq!(value["luau-lsp.platform.type"], "roblox");
+        assert_eq!(parse_semver_triplet("1.68.1"), Some((1, 68, 1)));
+        assert_eq!(parse_semver_triplet("luau-lsp v1.68.1"), Some((1, 68, 1)));
+        assert_eq!(parse_semver_triplet("unknown"), None);
+    }
+
+    #[test]
+    fn bundled_roblox_definitions_match_pinned_hash() {
+        use sha2::{Digest as _, Sha256};
+
+        let bytes = include_bytes!("../../tools/luau-lsp/roblox/globalTypes.d.luau");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            ROBLOX_DEFINITIONS_SHA256
+        );
+    }
+
+    #[test]
+    fn doctor_reports_lint_and_editor_definition_snapshots_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let editor_copy = dir.path().join(snapshot::ROBLOX_DEFINITIONS_PATH);
+        std::fs::create_dir_all(editor_copy.parent().unwrap()).unwrap();
+        std::fs::write(&editor_copy, "stale definitions\n").unwrap();
+
+        let check = check_luau_definitions(dir.path());
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.contains("lint:"), "{}", check.detail);
+        assert!(check.detail.contains("editor:"), "{}", check.detail);
+        assert!(check.detail.contains("stale sha256"), "{}", check.detail);
+    }
+
+    #[test]
+    fn doctor_flags_obsolete_luaurc_definitions_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(snapshot::LUAURC),
+            r#"{"languageMode":"strict","definitions":["old.d.luau"]}"#,
+        )
+        .unwrap();
+        let check = check_luaurc(dir.path());
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.contains("unsupported `definitions`"));
+
+        std::fs::write(
+            dir.path().join(snapshot::LUAURC),
+            r#"{"languageMode":"strict"}"#,
+        )
+        .unwrap();
+        let check = check_luaurc(dir.path());
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(check.detail.contains("languageMode=strict"));
+
+        std::fs::write(dir.path().join(snapshot::LUAURC), "[]").unwrap();
+        assert_eq!(check_luaurc(dir.path()).status, DoctorStatus::Fail);
+
+        std::fs::write(
+            dir.path().join(snapshot::LUAURC),
+            r#"{"languageMode":"strcit"}"#,
+        )
+        .unwrap();
+        assert_eq!(check_luaurc(dir.path()).status, DoctorStatus::Fail);
+    }
+
+    #[test]
+    fn lint_compile_source_collection_respects_scope_and_ignores() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let main = root.join("ReplicatedStorage/Main.luau");
+        let dotted_module = root.join("ReplicatedStorage/Foo.d.luau");
+        let vendor = root.join("ReplicatedStorage/Packages/Dep.luau");
+        let ignored = root.join("Generated/Skip.lua");
+        let definitions = root.join("types.d.luau");
+        for path in [&main, &dotted_module, &vendor, &ignored, &definitions] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "return true\n").unwrap();
+        }
+
+        let sources = collect_lint_compile_sources(
+            root,
+            &[root.to_path_buf()],
+            true,
+            &["**/Generated/**".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                normalize_existing_path(&dotted_module),
+                normalize_existing_path(&main)
+            ]
+        );
+
+        let sources =
+            collect_lint_compile_sources(root, std::slice::from_ref(&definitions), false, &[])
+                .unwrap();
+        assert_eq!(sources, vec![normalize_existing_path(&definitions)]);
+
+        let sources =
+            collect_lint_compile_sources(root, std::slice::from_ref(&vendor), false, &[]).unwrap();
+        assert_eq!(sources, vec![normalize_existing_path(&vendor)]);
+
+        let sources =
+            collect_lint_compile_sources(root, &[main], false, &["**/Main.luau".to_string()])
+                .unwrap();
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn lint_compile_globs_match_recursive_vendor_paths() {
+        assert!(lint_glob_matches(
+            "**/Packages/**",
+            "ReplicatedStorage/Packages/Dep.luau"
+        ));
+        assert!(lint_glob_matches("**/Packages/**", "Packages/Dep.luau"));
+        assert!(lint_glob_matches(
+            "**/Madwork*/**",
+            "ReplicatedStorage/Madwork/Profile.luau"
+        ));
+        assert!(lint_glob_matches(
+            "**/.rosync-backups/**",
+            ".rosync-backups/123/ServerScriptService/Old.server.luau"
+        ));
+        assert!(!lint_glob_matches(
+            "**/Packages/**",
+            "ReplicatedStorage/Package/Dep.luau"
+        ));
+    }
+
+    #[test]
+    fn bundled_luau_compile_path_uses_platform_tool_layout() {
+        let expected_name = if cfg!(windows) {
+            "luau-compile.exe"
+        } else {
+            "luau-compile"
+        };
+        assert_eq!(
+            bundled_luau_compile_relative_path(),
+            PathBuf::from("tools")
+                .join("luau")
+                .join(platform_tool_triple())
+                .join(expected_name)
+        );
+        let explicit = PathBuf::from("/definitely/custom/luau-compile");
+        assert_eq!(
+            resolve_luau_compile(Some(explicit.clone())),
+            Some(explicit.into_os_string())
+        );
+    }
+
+    #[test]
+    fn lint_compiler_auto_skips_missing_tool_but_required_rejects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Main.luau");
+        let missing = dir.path().join("missing-luau-compile");
+        std::fs::write(&source, "return true\n").unwrap();
+
+        let auto = run_lint_compiler(
+            dir.path(),
+            std::slice::from_ref(&source),
+            true,
+            LintCompileMode::Auto,
+            Some(missing.clone()),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(auto.status, "skipped");
+        assert!(auto.note.unwrap().contains("could not run"));
+
+        let required = run_lint_compiler(
+            dir.path(),
+            std::slice::from_ref(&source),
+            true,
+            LintCompileMode::Required,
+            Some(missing),
+            false,
+            &[],
+        );
+        assert!(required.is_err());
+        assert!(required.unwrap_err().to_string().contains("could not run"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lint_compiler_runs_all_optimization_levels_and_reports_compile_errors() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Main.luau");
+        let compiler = dir.path().join("luau-compile");
+        std::fs::write(&source, "return true\n").unwrap();
+        std::fs::write(
+            &compiler,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--help\" ]; then exit 0; fi\n\
+             if [ \"$2\" = \"-O0\" ] || [ \"$2\" = \"-O2\" ]; then\n\
+               echo \"$3(2,7): CompileError: Out of local registers: exceeded limit 200\" >&2\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&compiler).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&compiler, permissions).unwrap();
+
+        let report = run_lint_compiler(
+            dir.path(),
+            &[source],
+            true,
+            LintCompileMode::Required,
+            Some(compiler),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.optimizations_checked, vec![0, 1, 2]);
+        assert_eq!(report.failures.len(), 2);
+        assert_eq!(
+            report
+                .failures
+                .iter()
+                .map(|failure| failure.optimization)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(report.failures[0].output.contains("Out of local registers"));
+        let diagnostics = lint_diagnostics(dir.path(), &report.failures[0].output);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].category, "CompileError");
+    }
+
+    #[test]
+    fn lint_summary_includes_compiler_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir
+            .path()
+            .join("ReplicatedStorage")
+            .join("RegisterLimit.luau");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "return true\n").unwrap();
+        let compiler = LintCompileReport {
+            requested: "required".to_string(),
+            status: "failed".to_string(),
+            executable: Some("luau-compile".to_string()),
+            source_files: 1,
+            optimizations_checked: vec![0],
+            failures: vec![LintCompileFailure {
+                optimization: 0,
+                batch: 1,
+                exit_code: Some(1),
+                output: "./ReplicatedStorage/RegisterLimit.luau(3,7): CompileError: exceeded limit 200\n"
+                    .to_string(),
+            }],
+            note: None,
+        };
+
+        let (by_category, by_file) = lint_summary_counts(dir.path(), "", &compiler);
+        assert_eq!(by_category.get("CompileError"), Some(&1));
+        assert_eq!(
+            by_file.get("ReplicatedStorage/RegisterLimit.luau"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -7951,6 +14777,20 @@ ReplicatedStorage/Client/Main.luau(1,1): TypeError: owned
 ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
 ";
         let filtered = filter_lint_output_to_targets(&root, &[owned], output);
+        assert!(filtered.contains("[INFO] sourcemap loaded"));
+        assert!(filtered.contains("Client/Main.luau"));
+        assert!(!filtered.contains("Packages/Dep.luau"));
+
+        let plain_output = "\
+[INFO] sourcemap loaded
+ReplicatedStorage/Client/Main.luau:1:1-8: (W0) TypeError: owned
+ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
+";
+        let filtered = filter_lint_output_to_targets(
+            &root,
+            &[root.join("ReplicatedStorage/Client")],
+            plain_output,
+        );
         assert!(filtered.contains("[INFO] sourcemap loaded"));
         assert!(filtered.contains("Client/Main.luau"));
         assert!(!filtered.contains("Packages/Dep.luau"));
@@ -8023,6 +14863,20 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
             }
             _ => panic!("expected plan set"),
         }
+    }
+
+    #[test]
+    fn command_docs_match_the_clap_registry_exactly() {
+        let bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON).unwrap();
+        let mut documented = command_names_from_bundle(&bundle);
+        documented.sort();
+        let mut clap_commands: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set())
+            .map(|command| command.get_name().to_string())
+            .collect();
+        clap_commands.sort();
+        assert_eq!(documented, clap_commands);
     }
 
     #[test]
@@ -8484,5 +15338,1014 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
             !msg.contains("refusing to set .Parent"),
             "--force-parent should bypass the guardrail: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_batch_parent_is_refused_before_network_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let batch = temp.path().join("writes.json");
+        std::fs::write(
+            &batch,
+            r#"[{"path":"Workspace/Foo","prop":"Parent","value":"Workspace"}]"#,
+        )
+        .unwrap();
+        let mut args = set_args_for_parent(false);
+        args.batch = Some(batch.clone());
+        args.path = None;
+        args.prop = None;
+        args.value = None;
+
+        let err = run_set_batch(args, batch)
+            .await
+            .expect_err("batch Parent must be refused without --force-parent");
+        let msg = err.to_string();
+        assert!(msg.contains("batch entry 1"));
+        assert!(msg.contains("--force-parent"));
+        assert!(
+            !msg.contains("connect"),
+            "guardrail must run before network IO: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_documented_command_has_an_explicit_safety_class() {
+        let bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON).unwrap();
+        let unclassified: Vec<String> = command_names_from_bundle(&bundle)
+            .into_iter()
+            .filter(|name| command_safety_class(name) == "unclassified-assume-mutating")
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "commands missing an explicit safety class: {unclassified:?}"
+        );
+    }
+
+    #[test]
+    fn every_documented_command_has_an_explicit_output_cost() {
+        let bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON).unwrap();
+        let unknown: Vec<String> = command_names_from_bundle(&bundle)
+            .into_iter()
+            .filter(|name| command_output_cost(name) == "unknown")
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "commands missing an explicit output cost: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_idempotency_records_are_content_bound_and_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("record.json");
+        let outcome = serde_json::json!({
+            "ok": true,
+            "workflowHash": "hash-a",
+            "replayed": false
+        });
+        write_json_atomic(&path, &outcome).unwrap();
+        assert!(workflow_replay_idempotency(&path, "hash-a").unwrap());
+        let collision = workflow_replay_idempotency(&path, "hash-b").unwrap_err();
+        assert!(collision.to_string().contains("idempotencyKey collision"));
+        assert!(temp.path().read_dir().unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("tmp-")));
+    }
+
+    #[test]
+    fn workflow_idempotency_lock_prevents_parallel_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("record.json");
+        let first = WorkflowIdempotencyLock::acquire(&record).unwrap();
+        assert!(WorkflowIdempotencyLock::acquire(&record).is_err());
+        drop(first);
+        WorkflowIdempotencyLock::acquire(&record).unwrap();
+    }
+
+    #[test]
+    fn capture_photo_args_parse_defaults() {
+        let cli = Cli::try_parse_from(["rosync", "capture", "photo"]).unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture command");
+        };
+        let CaptureCommand::Photo(args) = args.command else {
+            panic!("expected capture photo command");
+        };
+
+        assert!(args.project.is_none());
+        assert_eq!(args.port, DEFAULT_DAEMON_PORT);
+        assert!(args.focus.is_none());
+        assert!(args.region.is_none());
+        assert!(args.size.is_none());
+        assert_eq!(args.view, CaptureView::Isometric);
+        assert!(args.direction.is_none());
+        assert!(args.camera_cframe.is_none());
+        assert_eq!(args.padding, 1.25);
+        assert_eq!(args.fov, 32.0);
+        assert_eq!(args.background, CapturePhotoBackground::Transparent);
+        assert!(!args.alpha_bleed);
+        assert!(!args.include_world);
+        assert!(args.ui.is_none());
+        assert!(args.ui_target.is_none());
+        assert!(!args.include_ui);
+        assert_eq!(args.delay, 0.05);
+        assert_eq!(args.output, PathBuf::from("rosync-photo.png"));
+        assert_eq!(args.timeout, 120.0);
+        assert!(!args.raw);
+    }
+
+    #[test]
+    fn capture_photo_background_uses_standalone_wire_values() {
+        assert_eq!(
+            CapturePhotoBackground::Transparent.as_wire_str(),
+            "transparent"
+        );
+        assert_eq!(CapturePhotoBackground::Scene.as_wire_str(), "scene");
+        assert_eq!(CapturePhotoUiMode::None.as_wire_str(), "none");
+        assert_eq!(CapturePhotoUiMode::Overlay.as_wire_str(), "overlay");
+        assert_eq!(CapturePhotoUiMode::Only.as_wire_str(), "only");
+
+        let prepared: PhotoPrepared = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "width": 32,
+            "height": 16,
+            "byteLength": 2048,
+            "background": "transparent",
+            "uiMode": "only",
+            "cameraCFrame": {
+                "__type": "CFrame",
+                "components": [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]
+            },
+            "uiTarget": "StarterGui/Hud/Panel",
+            "uiTargetClass": "Frame",
+            "fieldOfView": 45,
+            "regionSource": "ui-target"
+        }))
+        .unwrap();
+        assert_eq!(prepared.background.as_deref(), Some("transparent"));
+        assert_eq!(prepared.ui_mode.as_deref(), Some("only"));
+        assert_eq!(
+            prepared
+                .camera_cframe
+                .as_ref()
+                .and_then(|value| value.get("__type"))
+                .and_then(serde_json::Value::as_str),
+            Some("CFrame")
+        );
+        assert_eq!(prepared.ui_target.as_deref(), Some("StarterGui/Hud/Panel"));
+        assert_eq!(prepared.ui_target_class.as_deref(), Some("Frame"));
+        assert_eq!(prepared.field_of_view, Some(45.0));
+        assert_eq!(prepared.region_source.as_deref(), Some("ui-target"));
+    }
+
+    fn capture_photo_args_for_validation() -> CapturePhotoArgs {
+        CapturePhotoArgs {
+            project: None,
+            port: 1,
+            focus: None,
+            region: None,
+            size: Some("1x1".into()),
+            view: CaptureView::Isometric,
+            direction: None,
+            camera_cframe: None,
+            padding: 1.25,
+            fov: 32.0,
+            background: CapturePhotoBackground::Transparent,
+            alpha_bleed: false,
+            include_world: false,
+            ui: None,
+            ui_target: None,
+            include_ui: false,
+            delay: 0.05,
+            output: PathBuf::from("unused.png"),
+            timeout: 120.0,
+            raw: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_photo_rejects_timeout_and_delay_mismatch_before_network_io() {
+        let mut short = capture_photo_args_for_validation();
+        short.timeout = 0.5;
+        let error = run_capture_photo(short).await.unwrap_err().to_string();
+        assert!(error.contains("--timeout must be between 1 and 120"));
+        assert!(!error.contains("connect"));
+
+        let mut delayed = capture_photo_args_for_validation();
+        delayed.timeout = 1.0;
+        delayed.delay = 1.0;
+        let error = run_capture_photo(delayed).await.unwrap_err().to_string();
+        assert!(error.contains("--delay must be shorter than --timeout"));
+        assert!(!error.contains("connect"));
+    }
+
+    #[tokio::test]
+    async fn capture_scene_rejects_pixelated_resampling_before_network_io() {
+        let error = run_capture_scene(CaptureSceneArgs {
+            project: None,
+            port: 1,
+            focus: "Workspace/Test".into(),
+            view: CaptureView::Isometric,
+            padding: 1.25,
+            size: "64x64".into(),
+            resample: CaptureResampleMode::Pixelated,
+            output: PathBuf::from("unused.png"),
+            timeout: 30.0,
+            raw: true,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--resample pixelated is not supported"));
+        assert!(!error.contains("connect"));
+    }
+
+    #[test]
+    fn capture_photo_close_requires_positive_plugin_confirmation() {
+        assert!(confirm_photo_close_response(&serde_json::json!({
+            "ok": true,
+            "value": true,
+        }))
+        .is_ok());
+        assert!(confirm_photo_close_response(&serde_json::json!({
+            "ok": true,
+            "value": false,
+        }))
+        .is_err());
+        assert!(confirm_photo_close_response(&serde_json::json!({
+            "ok": false,
+            "error": "session still active",
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn capture_photo_args_parse_all_custom_flags() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--project",
+            "/tmp/race-stars",
+            "--port",
+            "9003",
+            "--focus",
+            "Workspace/Map/Boss",
+            "--size",
+            "2048x1024",
+            "--view",
+            "top",
+            "--direction",
+            "-1,2,3",
+            "--padding",
+            "1.75",
+            "--fov",
+            "50.5",
+            "--background",
+            "scene",
+            "--alpha-bleed",
+            "--include-world",
+            "--include-ui",
+            "--delay",
+            "0.25",
+            "--output",
+            "captures/boss.png",
+            "--timeout",
+            "45",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture command");
+        };
+        let CaptureCommand::Photo(args) = args.command else {
+            panic!("expected capture photo command");
+        };
+
+        assert_eq!(args.project, Some(PathBuf::from("/tmp/race-stars")));
+        assert_eq!(args.port, 9003);
+        assert_eq!(args.focus.as_deref(), Some("Workspace/Map/Boss"));
+        assert!(args.region.is_none());
+        assert_eq!(args.size.as_deref(), Some("2048x1024"));
+        assert_eq!(args.view, CaptureView::Top);
+        assert_eq!(args.direction.as_deref(), Some("-1,2,3"));
+        assert!(args.camera_cframe.is_none());
+        assert_eq!(args.padding, 1.75);
+        assert_eq!(args.fov, 50.5);
+        assert_eq!(args.background, CapturePhotoBackground::Scene);
+        assert!(args.alpha_bleed);
+        assert!(args.include_world);
+        assert!(args.ui.is_none());
+        assert!(args.ui_target.is_none());
+        assert!(args.include_ui);
+        assert_eq!(args.delay, 0.25);
+        assert_eq!(args.output, PathBuf::from("captures/boss.png"));
+        assert_eq!(args.timeout, 45.0);
+        assert!(args.raw);
+    }
+
+    const VALID_CAMERA_CFRAME: &str =
+        "-10,5,20,1,0,0,0,0.939692621,-0.342020143,0,0.342020143,0.939692621";
+
+    #[test]
+    fn capture_photo_camera_cframe_parses_with_fov_and_world_context() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--focus",
+            "Workspace/Car",
+            "--camera-cframe",
+            VALID_CAMERA_CFRAME,
+            "--fov",
+            "47.5",
+            "--include-world",
+        ])
+        .unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture command");
+        };
+        let CaptureCommand::Photo(args) = args.command else {
+            panic!("expected capture photo command");
+        };
+        assert_eq!(args.focus.as_deref(), Some("Workspace/Car"));
+        assert_eq!(args.camera_cframe.as_deref(), Some(VALID_CAMERA_CFRAME));
+        assert_eq!(args.fov, 47.5);
+        assert!(args.include_world);
+
+        assert!(Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--camera-cframe",
+            VALID_CAMERA_CFRAME,
+        ])
+        .is_err());
+        for conflicting in [
+            ["--view", "isometric"],
+            ["--direction", "1,0,0"],
+            ["--padding", "1.25"],
+        ] {
+            assert!(Cli::try_parse_from([
+                "rosync",
+                "capture",
+                "photo",
+                "--focus",
+                "Workspace/Car",
+                "--camera-cframe",
+                VALID_CAMERA_CFRAME,
+                conflicting[0],
+                conflicting[1],
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn capture_photo_camera_cframe_parser_requires_a_rigid_right_handed_transform() {
+        let components = parse_capture_camera_cframe(VALID_CAMERA_CFRAME).unwrap();
+        assert_eq!(&components[..3], &[-10.0, 5.0, 20.0]);
+        assert!((components[7] - 0.939692621).abs() < 1e-12);
+
+        for invalid in [
+            "",
+            "0,0,0,1,0,0,0,1,0,0,0",
+            "0,0,0,1,0,0,0,1,0,0,0,1,2",
+            "NaN,0,0,1,0,0,0,1,0,0,0,1",
+            "0,0,0,inf,0,0,0,1,0,0,0,1",
+            "0,0,0,2,0,0,0,1,0,0,0,1",
+            "0,0,0,1,0.5,0,0,1,0,0,0,1",
+            "0,0,0,1,0,0,0,1,0,0,0,-1",
+        ] {
+            assert!(
+                parse_capture_camera_cframe(invalid).is_err(),
+                "accepted invalid camera CFrame {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_photo_camera_cframe_uses_tagged_wire_value_and_skips_auto_framing() {
+        let mut args = capture_photo_args_for_validation();
+        args.focus = Some("Workspace/Car".into());
+        args.camera_cframe = Some(VALID_CAMERA_CFRAME.into());
+        args.fov = 47.5;
+        args.include_world = true;
+        let camera_cframe = parse_capture_camera_cframe(VALID_CAMERA_CFRAME).unwrap();
+        let request = build_capture_photo_request(
+            &args,
+            CapturePhotoUiMode::None,
+            None,
+            Some([640, 360]),
+            None,
+            Some(camera_cframe),
+        );
+        assert_eq!(
+            request.get("focus"),
+            Some(&serde_json::json!("Workspace/Car"))
+        );
+        assert_eq!(request.get("fieldOfView"), Some(&serde_json::json!(47.5)));
+        assert_eq!(request.get("isolate"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            request.get("cameraCFrame"),
+            Some(&serde_json::json!({
+                "__type": "CFrame",
+                "components": camera_cframe,
+            }))
+        );
+        assert!(!request.contains_key("view"));
+        assert!(!request.contains_key("direction"));
+        assert!(!request.contains_key("padding"));
+    }
+
+    #[tokio::test]
+    async fn capture_photo_camera_cframe_rejects_programmatic_invalid_combinations_before_connect()
+    {
+        let mut no_focus = capture_photo_args_for_validation();
+        no_focus.camera_cframe = Some(VALID_CAMERA_CFRAME.into());
+        let error = run_capture_photo(no_focus).await.unwrap_err().to_string();
+        assert!(error.contains("--camera-cframe requires --focus"));
+        assert!(!error.contains("connect"));
+
+        let mut auto_framing = capture_photo_args_for_validation();
+        auto_framing.focus = Some("Workspace/Car".into());
+        auto_framing.camera_cframe = Some(VALID_CAMERA_CFRAME.into());
+        auto_framing.direction = Some("1,0,0".into());
+        let error = run_capture_photo(auto_framing)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be combined"));
+        assert!(!error.contains("connect"));
+
+        let mut malformed = capture_photo_args_for_validation();
+        malformed.focus = Some("Workspace/Car".into());
+        malformed.camera_cframe = Some("0,0,0,1,0,0,0,1,0,0,0,-1".into());
+        let error = run_capture_photo(malformed).await.unwrap_err().to_string();
+        assert!(error.contains("orthonormal right-handed"));
+        assert!(!error.contains("connect"));
+    }
+
+    #[test]
+    fn capture_photo_region_parses_with_optional_output_size() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--region",
+            "10,20,640,480",
+            "--size",
+            "1280x960",
+        ])
+        .unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture command");
+        };
+        let CaptureCommand::Photo(args) = args.command else {
+            panic!("expected capture photo command");
+        };
+        assert_eq!(args.region.as_deref(), Some("10,20,640,480"));
+        assert_eq!(args.size.as_deref(), Some("1280x960"));
+    }
+
+    #[test]
+    fn capture_photo_ui_mode_parses_and_legacy_alias_conflicts() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--ui",
+            "only",
+            "--size",
+            "1920x1080",
+        ])
+        .unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture command");
+        };
+        let CaptureCommand::Photo(args) = args.command else {
+            panic!("expected capture photo command");
+        };
+        assert_eq!(args.ui, Some(CapturePhotoUiMode::Only));
+        assert!(!args.include_ui);
+
+        assert!(Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--ui",
+            "overlay",
+            "--include-ui",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn capture_photo_ui_target_allows_region_and_size_and_serializes_both() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "capture",
+            "photo",
+            "--ui-target",
+            "StarterGui/Hud/Panel",
+            "--region",
+            "10,20,640,480",
+            "--size",
+            "1280x960",
+        ])
+        .unwrap();
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected capture command");
+        };
+        let CaptureCommand::Photo(args) = args.command else {
+            panic!("expected capture photo command");
+        };
+        assert_eq!(args.ui_target.as_deref(), Some("StarterGui/Hud/Panel"));
+        assert_eq!(args.region.as_deref(), Some("10,20,640,480"));
+        assert_eq!(args.size.as_deref(), Some("1280x960"));
+        assert!(args.ui.is_none());
+
+        let region = parse_capture_region(args.region.as_deref().unwrap()).unwrap();
+        let size = parse_capture_size(args.size.as_deref().unwrap()).unwrap();
+        let request = build_capture_photo_request(
+            &args,
+            CapturePhotoUiMode::Only,
+            Some(region),
+            Some(size),
+            None,
+            None,
+        );
+        assert_eq!(request.get("uiMode"), Some(&serde_json::json!("only")));
+        assert_eq!(
+            request.get("uiTarget"),
+            Some(&serde_json::json!("StarterGui/Hud/Panel"))
+        );
+        assert_eq!(
+            request.get("nativeRect"),
+            Some(&serde_json::json!({
+                "x": 10,
+                "y": 20,
+                "width": 640,
+                "height": 480,
+            }))
+        );
+        assert_eq!(
+            request.get("outputSize"),
+            Some(&serde_json::json!({ "x": 1280, "y": 960 }))
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_photo_ui_target_rejects_incompatible_modes_before_connect() {
+        let mut empty = capture_photo_args_for_validation();
+        empty.ui_target = Some("   ".into());
+        let error = run_capture_photo(empty).await.unwrap_err().to_string();
+        assert!(error.contains("non-empty Studio instance path"));
+        assert!(!error.contains("connect"));
+
+        for mode in [CapturePhotoUiMode::None, CapturePhotoUiMode::Overlay] {
+            let mut args = capture_photo_args_for_validation();
+            args.ui_target = Some("StarterGui/Hud/Panel".into());
+            args.ui = Some(mode);
+            let error = run_capture_photo(args).await.unwrap_err().to_string();
+            assert!(error.contains("implies --ui only"));
+            assert!(!error.contains("connect"));
+        }
+
+        let mut include_ui = capture_photo_args_for_validation();
+        include_ui.ui_target = Some("StarterGui/Hud/Panel".into());
+        include_ui.include_ui = true;
+        let error = run_capture_photo(include_ui).await.unwrap_err().to_string();
+        assert!(error.contains("--include-ui"));
+        assert!(!error.contains("connect"));
+
+        let mut focused = capture_photo_args_for_validation();
+        focused.ui_target = Some("StarterGui/Hud/Panel".into());
+        focused.focus = Some("Workspace/Car".into());
+        let error = run_capture_photo(focused).await.unwrap_err().to_string();
+        assert!(error.contains("--ui-target cannot be combined with --focus"));
+        assert!(!error.contains("connect"));
+
+        let mut scene = capture_photo_args_for_validation();
+        scene.ui_target = Some("StarterGui/Hud/Panel".into());
+        scene.background = CapturePhotoBackground::Scene;
+        let error = run_capture_photo(scene).await.unwrap_err().to_string();
+        assert!(error.contains("requires --background transparent"));
+        assert!(!error.contains("connect"));
+    }
+
+    #[tokio::test]
+    async fn capture_photo_ui_only_rejects_world_options_before_network_io() {
+        let mut focused = capture_photo_args_for_validation();
+        focused.ui = Some(CapturePhotoUiMode::Only);
+        focused.focus = Some("Workspace/Test".into());
+        let error = run_capture_photo(focused).await.unwrap_err().to_string();
+        assert!(error.contains("--ui only") && error.contains("--focus"));
+        assert!(!error.contains("connect"));
+
+        let mut scene = capture_photo_args_for_validation();
+        scene.ui = Some(CapturePhotoUiMode::Only);
+        scene.background = CapturePhotoBackground::Scene;
+        let error = run_capture_photo(scene).await.unwrap_err().to_string();
+        assert!(error.contains("--ui only requires --background transparent"));
+        assert!(!error.contains("connect"));
+    }
+
+    #[test]
+    fn capture_photo_size_parser_accepts_dimensions_and_rejects_invalid_values() {
+        assert_eq!(parse_capture_size("1x1").unwrap(), [1, 1]);
+        assert_eq!(parse_capture_size(" 2048 X 1024 ").unwrap(), [2048, 1024]);
+
+        for invalid in [
+            "",
+            "1024",
+            "1024x",
+            "x1024",
+            "1024x768x2",
+            "0x1",
+            "1x0",
+            "NaNx1",
+            "infx1",
+            "-1x1",
+            "1.5x2",
+        ] {
+            assert!(
+                parse_capture_size(invalid).is_err(),
+                "accepted invalid Photo size {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_photo_direction_parser_rejects_zero_nonfinite_and_malformed_values() {
+        let direction = parse_capture_direction(" 1, -2.5, 3 ").unwrap();
+        let magnitude = direction[0].hypot(direction[1]).hypot(direction[2]);
+        assert!((magnitude - 1.0).abs() < 1e-12);
+        assert!((direction[1] / direction[0] + 2.5).abs() < 1e-12);
+        assert!((direction[2] / direction[0] - 3.0).abs() < 1e-12);
+
+        let huge = parse_capture_direction("1e308,1e308,0").unwrap();
+        assert!(huge.iter().all(|component| component.is_finite()));
+        assert!((huge[0].hypot(huge[1]).hypot(huge[2]) - 1.0).abs() < 1e-12);
+
+        for invalid in [
+            "",
+            "1,2",
+            "1,2,3,4",
+            "one,2,3",
+            "0,0,0",
+            "0,-0,0.0",
+            "0.000001,0,0",
+            "NaN,0,1",
+            "inf,0,1",
+            "-inf,0,1",
+            "1.7976931348623157e308,1.7976931348623157e308,0",
+        ] {
+            assert!(
+                parse_capture_direction(invalid).is_err(),
+                "accepted invalid Photo direction {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_photo_dimensions_enforce_exact_native_caps() {
+        assert_eq!(
+            u64::from(PHOTO_MAX_DIMENSION) * u64::from(PHOTO_MAX_DIMENSION),
+            PHOTO_MAX_PIXELS
+        );
+        assert!(validate_photo_dimensions(0, 1).is_err());
+        assert!(validate_photo_dimensions(1, 0).is_err());
+        assert!(validate_photo_dimensions(1, 1).is_ok());
+        assert!(validate_photo_dimensions(PHOTO_MAX_DIMENSION, PHOTO_MAX_DIMENSION).is_ok());
+
+        for (width, height) in [(PHOTO_MAX_DIMENSION + 1, 1), (1, PHOTO_MAX_DIMENSION + 1)] {
+            let error = validate_photo_dimensions(width, height)
+                .expect_err("dimensions above the Photo cap must be rejected")
+                .to_string();
+            assert!(error.contains("Photo limit"), "unexpected error: {error}");
+        }
+
+        let huge_error = validate_photo_dimensions(u32::MAX, u32::MAX)
+            .expect_err("huge dimensions must be rejected without arithmetic overflow")
+            .to_string();
+        assert!(huge_error.contains("per-axis limit"));
+    }
+
+    #[test]
+    fn capture_photo_png_encoder_preserves_exact_rgba_and_dimensions() {
+        let rgba = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let encoded = encode_photo_png(2, 2, &rgba).unwrap();
+        assert!(encoded.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(&encoded));
+        let mut reader = decoder.read_info().unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!((info.width, info.height), (2, 2));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        assert_eq!(&decoded[..info.buffer_size()], &rgba);
+    }
+
+    #[test]
+    fn capture_photo_png_encoder_rejects_short_and_long_rgba_buffers() {
+        for rgba in [vec![0; 15], vec![0; 17]] {
+            let error = encode_photo_png(2, 2, &rgba)
+                .expect_err("RGBA byte length mismatch must be rejected")
+                .to_string();
+            assert!(
+                error.contains("expected 16 for 2x2"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    fn tiny_test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![0x7f; width as usize * height as usize * 4])
+                .unwrap();
+        }
+        bytes
+    }
+
+    fn test_artifact_metadata(id: &str, path: PathBuf, bytes: &[u8]) -> artifact::ArtifactMetadata {
+        use sha2::{Digest as _, Sha256};
+        artifact::ArtifactMetadata {
+            id: id.to_string(),
+            filename: "capture.png".into(),
+            mime: "image/png".into(),
+            path,
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            created_at_unix_ms: 1,
+            finalized_at_unix_ms: 2,
+        }
+    }
+
+    async fn spawn_raw_http_responses(
+        responses: Vec<Vec<u8>>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let task = tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                recorded.lock().unwrap().push(first_line);
+                socket.write_all(&response).await.unwrap();
+                let _ = socket.shutdown().await;
+            }
+        });
+        (port, requests, task)
+    }
+
+    fn raw_json_response(value: &serde_json::Value) -> Vec<u8> {
+        let body = serde_json::to_vec(value).unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        response
+    }
+
+    #[test]
+    fn capture_artifact_ids_are_strictly_bounded_hex() {
+        assert!(validate_artifact_id(&"a".repeat(48)).is_ok());
+        for invalid in [
+            "a".repeat(47),
+            "a".repeat(49),
+            format!("{}g", "a".repeat(47)),
+            "../../artifacts/capture".into(),
+        ] {
+            assert!(
+                validate_artifact_id(&invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    fn capture_screen_args_for_fallback(ui: CaptureUiMode) -> CaptureScreenArgs {
+        CaptureScreenArgs {
+            project: None,
+            port: DEFAULT_DAEMON_PORT,
+            region: None,
+            output_size: None,
+            ui,
+            resample: CaptureResampleMode::Default,
+            output: PathBuf::from("unused.png"),
+            timeout: 30.0,
+            raw: true,
+            focus: None,
+            view: None,
+            padding: None,
+        }
+    }
+
+    #[test]
+    fn macos_window_fallback_is_narrowly_scoped_to_ui_all_provider_errors() {
+        let all = capture_screen_args_for_fallback(CaptureUiMode::All);
+        let unsupported = "capture prepare: Studio screenshot provider is unsupported after explicit capture authorization: StudioCaptureService: Feature not supported yet.";
+        assert_eq!(
+            capture_error_allows_macos_window_fallback(&all, unsupported),
+            cfg!(target_os = "macos")
+        );
+        assert!(!capture_error_allows_macos_window_fallback(
+            &all,
+            "capture prepare: PERMISSION_REQUIRED: screenshot permission is not granted"
+        ));
+        assert!(!capture_error_allows_macos_window_fallback(
+            &all,
+            "capture prepare: request timed out"
+        ));
+
+        let none = capture_screen_args_for_fallback(CaptureUiMode::None);
+        assert!(!capture_error_allows_macos_window_fallback(
+            &none,
+            unsupported
+        ));
+        let mut scene = capture_screen_args_for_fallback(CaptureUiMode::All);
+        scene.focus = Some("Workspace/Map".into());
+        assert!(!capture_error_allows_macos_window_fallback(
+            &scene,
+            unsupported
+        ));
+    }
+
+    #[test]
+    fn capture_provider_selection_requires_explicit_unsupported_state() {
+        let native = native_capture::NativePermissionStatus {
+            available: true,
+            authorized: true,
+        };
+        assert_eq!(capture_effective_provider(true, false, native), "studio");
+        assert_eq!(
+            capture_effective_provider(false, true, native),
+            "macos-window"
+        );
+        assert_eq!(capture_effective_provider(false, false, native), "none");
+    }
+
+    #[test]
+    fn capture_png_verification_decodes_structure_and_dimensions() {
+        let bytes = tiny_test_png(2, 3);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            verify_capture_png(&bytes, Some((2, 3)), deadline).unwrap(),
+            (2, 3)
+        );
+        assert!(verify_capture_png(&bytes, Some((3, 2)), deadline).is_err());
+
+        let truncated = &bytes[..bytes.len() / 2];
+        assert!(verify_capture_png(truncated, Some((2, 3)), deadline).is_err());
+    }
+
+    #[test]
+    fn bounded_capture_read_rejects_file_size_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("capture.png");
+        std::fs::write(&path, b"two bytes").unwrap();
+        let mut metadata = test_artifact_metadata(&"b".repeat(48), path, b"x");
+        metadata.size = 1;
+        let error = read_bounded_capture_file(&metadata, Instant::now() + Duration::from_secs(1))
+            .unwrap_err();
+        assert!(error.contains("file size"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn artifact_is_consumed_even_when_png_verification_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"not a png".to_vec();
+        let path = temp.path().join("capture.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let id = "c".repeat(48);
+        let metadata = test_artifact_metadata(&id, path, &bytes);
+        let lookup = raw_json_response(&serde_json::json!({
+            "ok": true,
+            "artifact": metadata,
+        }));
+        let consumed = raw_json_response(&serde_json::json!({
+            "ok": true,
+            "consumed": true,
+        }));
+        let (port, requests, server) = spawn_raw_http_responses(vec![lookup, consumed]).await;
+        let error = materialize_capture_artifact(
+            port,
+            &id,
+            Some(bytes.len() as u64),
+            None,
+            None,
+            Instant::now() + Duration::from_secs(2),
+            "test capture",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not a PNG"));
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(&format!("/artifacts/{id} ")));
+        assert!(requests[1].contains(&format!("/artifacts/{id}/consume ")));
+    }
+
+    #[tokio::test]
+    async fn artifact_sha_mismatch_is_rejected_and_consumed() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = tiny_test_png(1, 1);
+        let path = temp.path().join("capture.png");
+        std::fs::write(&path, &bytes).unwrap();
+        let id = "d".repeat(48);
+        let mut metadata = test_artifact_metadata(&id, path, &bytes);
+        metadata.sha256 = "0".repeat(64);
+        let lookup = raw_json_response(&serde_json::json!({
+            "ok": true,
+            "artifact": metadata,
+        }));
+        let consumed = raw_json_response(&serde_json::json!({
+            "ok": true,
+            "consumed": true,
+        }));
+        let (port, requests, server) = spawn_raw_http_responses(vec![lookup, consumed]).await;
+        let error = materialize_capture_artifact(
+            port,
+            &id,
+            Some(bytes.len() as u64),
+            Some((1, 1)),
+            None,
+            Instant::now() + Duration::from_secs(2),
+            "test capture",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+        server.await.unwrap();
+        assert!(requests.lock().unwrap()[1].contains("/consume "));
+    }
+
+    #[tokio::test]
+    async fn bounded_http_json_rejects_declared_oversize_response() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            LOCAL_HTTP_MAX_JSON_BYTES + 1
+        )
+        .into_bytes();
+        let (port, _, server) = spawn_raw_http_responses(vec![response]).await;
+        let error = http_get_json_until(port, "/oversize", Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("JSON limit"), "unexpected error: {error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_http_request_obeys_one_absolute_deadline() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let started = Instant::now();
+        let error =
+            http_get_json_until(port, "/stall", Instant::now() + Duration::from_millis(100))
+                .await
+                .unwrap_err();
+        assert!(!error.is_empty(), "timeout should return a diagnostic");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.abort();
     }
 }

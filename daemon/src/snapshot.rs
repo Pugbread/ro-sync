@@ -78,7 +78,12 @@ and Codex share the same project instructions through AGENTS.md.
 @AGENTS.md
 "#;
 
-const STYLUA_TOOL_LINE: &str = "stylua = \"JohnnyMorganz/StyLua@2.4.1\"";
+const STYLUA_TOOL_SPEC: &str = "JohnnyMorganz/StyLua@2.5.2";
+const LUAU_LSP_TOOL_SPEC: &str = "JohnnyMorganz/luau-lsp@1.68.1";
+#[cfg(test)]
+const STYLUA_TOOL_LINE: &str = "stylua = \"JohnnyMorganz/StyLua@2.5.2\"";
+#[cfg(test)]
+const LUAU_LSP_TOOL_LINE: &str = "luau-lsp = \"JohnnyMorganz/luau-lsp@1.68.1\"";
 const STYLUA_TOML_TEMPLATE: &str = r#"column_width = 120
 line_endings = "Unix"
 indent_type = "Tabs"
@@ -92,7 +97,8 @@ const AFTMAN_TOML_TEMPLATE: &str = concat!(
     "# This file lists tools managed by Aftman, a cross-platform toolchain manager.\n",
     "# For more information, see https://github.com/LPGhatguy/aftman\n\n",
     "[tools]\n",
-    "stylua = \"JohnnyMorganz/StyLua@2.4.1\"\n",
+    "stylua = \"JohnnyMorganz/StyLua@2.5.2\"\n",
+    "luau-lsp = \"JohnnyMorganz/luau-lsp@1.68.1\"\n",
 );
 const ROBLOX_GLOBAL_TYPES: &str = include_str!("../../tools/luau-lsp/roblox/globalTypes.d.luau");
 const DEFAULT_WALLY_FOLDER: &str = "ReplicatedStorage/Packages";
@@ -110,6 +116,7 @@ pub const SYNCED_SERVICES: &[&str] = &[
     "Lighting",
 ];
 
+#[allow(clippy::useless_concat)]
 const RO_SYNC_MD_TEMPLATE: &str = concat!(
     r#"# Ro Sync project memory
 
@@ -257,8 +264,10 @@ Additional sync rules:
   exclude that subtree from filesystem sync. Use live `rosync tree` or
   `rosync meta` to inspect AvoidSync boundaries.
 
-Names containing characters POSIX paths can't express (`/`, control characters,
-leading `.`) are percent-encoded.
+Names containing non-ASCII characters or characters POSIX paths can't express
+(`/`, control characters, leading `.`) are percent-encoded. Encoding non-ASCII
+UTF-8 keeps distinct Studio names distinct on case-insensitive or
+Unicode-normalizing filesystems.
 
 **Out of scope:** `.meta.json` files, attribute/tag serialization, non-`Folder`
 non-script Roblox classes (e.g. `Part`, `TextLabel`, `RemoteEvent`, `Sound`).
@@ -305,18 +314,30 @@ present in the live Studio tree.
 
 ## 5b. Linting Luau
 
-`rosync lint` delegates to an installed `luau-lsp` executable and runs its
-standalone analyzer with a temporary Ro-Sync sourcemap for Roblox-style require
-resolution. It does not require the daemon or Studio to be connected. If
-`luau-lsp` is not on `PATH`, set `ROSYNC_LUAU_LSP` or pass `--luau-lsp`.
-When present, `tools/luau-lsp/roblox/globalTypes.d.luau` is passed as the
-Roblox definitions file automatically.
+`rosync lint` runs `luau-lsp analyze` with current Roblox definitions and a
+temporary Ro-Sync sourcemap. Its default `--data-model auto` mode merges the
+complete live Studio tree and enables strict DataModel diagnostics when the
+matching daemon/plugin is connected; offline it reports a relaxed fallback.
+Use `--data-model studio` to require live strict coverage, `filesystem` for a
+strict disk-only audit (which can flag Studio-only children), or `loose` for
+gradual disk types.
+
+The default `--compile auto` pass also runs in-scope scripts through
+`luau-compile` at `-O0`, `-O1`, and `-O2` when available, catching compiler-only
+failures such as the 200-register limit. Use `--compile required` to require it
+or `off` to skip it. `--raw` returns structured analyzer/compiler diagnostics
+and coverage metadata. Ro Sync checks bundled tools and environment/PATH
+overrides; `rosync doctor` reports the selected toolchain. Human `--summary`
+includes both stages. Default and GNU analyzer output are supported;
+`--formatter=plain` is rejected because it does not preserve failure status.
 
 ```
 rosync lint --project .
 rosync lint --project . --path ServerScriptService/Foo.server.luau
 rosync lint --project . --path ServerScriptService --path ReplicatedStorage/Shared --owned-only --summary
-rosync lint --project . --no-sourcemap
+rosync lint --project . --data-model studio --raw
+rosync lint --project . --data-model filesystem
+rosync lint --project . --compile required
 rosync lint --project . -- --no-flags-enabled
 rosync lint --project . --luau-lsp /path/to/luau-lsp
 ```
@@ -349,8 +370,8 @@ ambiguous `.rbxm`/`.rbxmx` model or animation files.
 When the daemon is running (the user has Ro Sync connected to Studio), these
 subcommands speak to the plugin over WebSocket and inspect or mutate live
 instances. They work across the entire DataModel — not just the four
-filesystem-synced classes. Every call that mutates state is appended to
-`writes.log` at the project root for audit.
+filesystem-synced classes. Every call that mutates state is appended to the
+widget audit log at `~/.terminal64/widgets/ro-sync/writes.log`.
 
 Treat these live explorer commands as authoritative when deciding what exists in
 Studio. The filesystem view is intentionally narrower and can omit empty
@@ -438,8 +459,9 @@ rosync redo --project .
 
 ## 6c. Structured writes — construct, destroy, reparent, attrs, tags, call, select
 
-Live-DataModel ops beyond `set`/`eval`. Each write is appended to `writes.log`.
-`mv` requires `--force` to cross a top-level service boundary.
+Live-DataModel ops beyond `set`/`eval`. Each write is appended to the widget
+audit log at `~/.terminal64/widgets/ro-sync/writes.log`. `mv` requires
+`--force` to cross a top-level service boundary.
 
 ```
 # Create a new instance. --path is the parent; --props is an optional JSON
@@ -501,7 +523,186 @@ rosync find-attr --project . --name Color --value \
   '{"__type":"Color3","r":1,"g":0,"b":0}'
 ```
 
-## 6e. LLM-first command budget
+## 6e. Capability discovery and screenshots
+
+Protocol 2 / plugin 2.0.0 exposes optional Studio features explicitly. Check
+them before choosing capture or playtest commands:
+
+```
+rosync capabilities --project . --raw
+rosync capture status --project . --raw
+```
+
+Capture status is read-only, reports both screen and packaged-Photo
+availability, and never prompts. Screen authorization is a separate, explicit
+action that may show a Studio permission dialog. The locally packaged Photo
+engine is self-contained and needs no screenshot authorization:
+
+```
+rosync capture authorize --project .
+rosync capture screen --project . --region 200,120,1280,720 \
+  --output-size 1024x576 --ui all --output ./captures/studio.png --raw
+rosync capture photo --project . --focus Workspace/Map/Boss \
+  --view isometric --size 1024x1024 --padding 1.25 --fov 32 \
+  --background transparent --alpha-bleed --output ./captures/boss.png --raw
+rosync capture photo --project . --focus Workspace/Map/Boss \
+  --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --fov 40 \
+  --size 1600x900 --output ./captures/boss-exact-camera.png --raw
+rosync capture photo --project . --region 120,80,1280,720 \
+  --background scene --ui overlay --output ./captures/viewport.png --raw
+rosync capture photo --project . --ui only --region 120,80,1280,720 --size 1920x1080 \
+  --alpha-bleed --output ./captures/hud.png --raw
+rosync capture photo --project . --ui-target StarterGui/HUD/InventoryPanel \
+  --size 1200x800 --alpha-bleed --output ./captures/inventory-panel.png --raw
+rosync capture scene --project . --focus Workspace/Map/Boss \
+  --view isometric --size 1024x1024 --output ./captures/boss.png --raw
+```
+
+Photo `--focus` is optional. With it, Ro Sync normally makes a script-free
+isolated clone and frames it with `--view` or `--direction x,y,z`; use
+`--include-world` to frame the original in place. `--size WIDTHxHEIGHT` is
+exact; `--padding` and `--fov` tune framing. `--camera-cframe` takes the 12
+`CFrame:GetComponents()` values for an exact subject-relative camera pose (or
+an exact world pose with `--include-world`) and works with `--fov`. Without a
+focus, `--region` is
+`x,y,width,height` in native viewport pixels. Combine `--region` with `--size`
+to crop an arbitrary viewport or UI rectangle and resample it to exact output
+dimensions. `--background` is `transparent` or `scene`; `--alpha-bleed`
+preserves transparent-edge RGB and `--delay` allows rendering to settle. `--ui`
+is `none` (default), `overlay`, or `only`.
+`overlay` keeps ScreenGui layers over the scene; `only` produces transparent
+edit-mode ScreenGui RGBA without the 3D world or Studio chrome. UI-only capture
+requires a transparent background and cannot use `--focus`. A full UI-only
+capture with `--size` preserves the native viewport aspect ratio and centers it
+in the exact output canvas with transparent padding. An explicit `--region`
+continues to fill the requested output exactly. `--ui-target` implies UI-only,
+isolates one ScreenGui or GuiObject subtree, and tight-crops it automatically;
+`--size` aspect-contains the target while an explicit region overrides the
+automatic crop. Legacy `--include-ui` remains
+an alias for `--ui overlay`. All Photo paths accept
+`--output`, `--timeout`, and `--raw`, with a 4096-pixel axis and 16777216-pixel
+total limit. `capture scene` is an alias for this Photo engine and also requires
+no authorization or place-provided capture dependency.
+
+Photo RGBA moves in bounded chunks and is length-checked before local PNG
+encoding. Camera, UI, and lighting state are restored and temporary clones are
+destroyed after success or failure. For `capture screen`, `--region` is the
+global logical-screen rectangle and `--output-size` is the output size; use
+`--ui none` for only the 3D viewport. On macOS, explicit `capture authorize`
+records Studio's exact `Feature not supported yet` result and requests system
+Screen & System Audio Recording permission. Only then can a window-only native
+capture serve `capture screen --ui all`. CoreGraphics selection is restricted
+to a visible Roblox Studio window, and the requested region must fit completely
+inside it. A merely unauthorized Studio provider does not trigger fallback;
+`--ui none` does not use it. Studio PNG bytes use a short-lived, tokenized,
+bounded-chunk artifact lease; native PNGs receive the same bounds, decode, and
+SHA checks and are written directly. The CLI verifies and consumes Studio
+transport artifacts after writing the requested output; orphaned finalized
+artifacts are bounded by TTL, LRU, and a total-byte budget.
+
+## 6f. Playtest agents
+
+Playtests run as asynchronous jobs. Runtime plugin copies communicate with the
+edit plugin through PluginConnectionService and appear as `server` and
+`client:N`; they do not open their own localhost connections. Every CLI-started
+job uses a private generation token, and stale contexts cannot satisfy a later
+job's wait or receive its runtime requests.
+
+```
+rosync playtest start --project . --mode play --wait --raw
+rosync playtest start --project . --mode multiplayer --players 2 --wait --raw
+rosync playtest status --project . --raw
+rosync playtest contexts --project . --raw
+rosync playtest wait --project . --minimum 2 --timeout 60 --raw
+
+rosync playtest exec --project . --context server \
+  --source 'return #game.Players:GetPlayers()' --identity game --raw
+rosync playtest logs --project . --context client:1 --since-seq 0 --raw
+rosync playtest ui --project . --context client:1 --class TextButton --raw
+rosync playtest input --project . --context client:1 \
+  --actions '[{"type":"click","x":640,"y":420}]' --raw
+rosync playtest capture --project . --context client:1 \
+  --output ./captures/client-1.png --raw
+rosync playtest stop --project . --raw
+```
+
+`exec` accepts `--source` or `--source-file`; game identity uses a temporary
+Script/LocalScript, while plugin identity must be requested explicitly. UI
+inspection returns resolved visibility, text, position, and size. Input action
+types are `key`, `key_press`, `mouse_move`, `mouse_delta`, `mouse_button`,
+`click`, `text`, and `wait`; use `--file` for longer sequences. Use
+`playtest request --context ... --op ... --args '{}'` only for advanced runtime
+operations. Start/stop, exec, and input require explicit user intent. Runtime
+changes are temporary and never sync back into edit mode. Input sequences are
+bounded to 200 actions and 30 seconds; runtime screenshots use the same axis,
+pixel, byte, session-count, and TTL limits as edit-mode capture. Plugin-identity
+timeouts are cooperative, so code that spawns its own tasks remains responsible
+for stopping them.
+
+## 6g. Versioned workflows
+
+`rosync run` validates schema version 1, then executes all steps over one
+persistent remote session:
+
+```
+rosync run --file ./workflow.json --project . --dry-run
+rosync run --file ./workflow.json --project . --raw
+```
+
+Minimal workflow shape:
+
+```json
+{
+  "version": 1,
+  "expectedMode": "edit",
+  "transactions": [{ "id": "edit", "atomic": true }],
+  "steps": [
+    {
+      "id": "write",
+      "op": "set",
+      "path": "Workspace/Box",
+      "property": "Transparency",
+      "value": 0.5,
+      "expectedClass": "Part",
+      "transaction": "edit",
+      "verify": true
+    },
+    {
+      "id": "read",
+      "op": "get",
+      "path": "Workspace/Box",
+      "property": "Transparency"
+    },
+    {
+      "id": "check",
+      "op": "assert",
+      "actual": "$read.value",
+      "check": { "op": "equals", "expected": 0.5 }
+    }
+  ]
+}
+```
+
+Supported steps are `get`, `set`, `new`, `rm`, `mv`, `attr-set`, `attr-rm`,
+`attr-ls`, `tag-add`, `tag-rm`, `assert`, `wait`, `eval`, `capture`, `call`,
+`playtest`, and `upload`. An exact string such as `$read.value` inserts an
+earlier result with its JSON type intact; `$$literal` escapes `$`. References
+cannot point forward or to the current step.
+
+Use `expectedMode` / `expectedPlaceId` on the workflow and `expectedClass` /
+`etag` on target steps to reject stale state. `verify: true` reads supported
+writes back. Atomic transaction members must be contiguous; failure cancels the
+Studio change-history recording. `eval`, `call`, `wait`, `capture`, `playtest`,
+and `upload` are forbidden inside atomic groups. Assertions support equality,
+existence, truthiness, containment, and numeric comparisons; `wait` polls until
+its assertion passes or `timeoutMs` expires. A successful `idempotencyKey` is
+stored under `.rosync-workflows/` and replays without rerunning side effects.
+
+Workflows do not grant write authority: inspect live targets and confirm user
+intent before running a workflow that mutates Studio, starts a test, sends
+input, or uploads assets.
+
+## 6h. LLM-first command budget
 
 Do not paste or request the full command registry by default. It is large and
 usually worse for agent reasoning. Use this flow instead:
@@ -605,9 +806,14 @@ Two write-path flags every agent should know:
   reparenting. If you genuinely need the raw write, pass `--force-parent`
   explicitly.
 
-`writes.log` auto-rotates once it passes 10 MiB: the current file is renamed
-to `writes.log.1` (overwriting any prior generation) and a fresh `writes.log`
-takes its place. Only one prior generation is preserved.
+The widget audit log auto-rotates once it passes 10 MiB: `writes.log` is
+renamed to `writes.log.1` in the same widget directory (overwriting any prior
+generation), and a fresh `writes.log` takes its place. Only one prior
+generation is preserved.
+
+Any explicit force-overwrite/strict-prune path copies the removed script tree
+to `.rosync-backups/<timestamp>/` before deletion. The backup directory is
+ignored by sync and Git; remove old backups after confirming the retained place.
 
 ## 7. Safety note
 
@@ -616,8 +822,8 @@ The filesystem → Studio sync covers only `Folder`/`Script`/`LocalScript`/
 `tag add|rm`, and `call` are **user-initiated escape hatches**, not automated
 tools — never invoke them from a plugin or a script, and prefer asking the
 user before running them even at the CLI. Every successful write is appended
-to `writes.log` so the user can audit or replay anything an agent ran on
-their behalf.
+to the widget audit log at `~/.terminal64/widgets/ro-sync/writes.log` so the
+user can audit or replay anything an agent ran on their behalf.
 
 This build deliberately skips Roblox property sync through the filesystem;
 attempts to push property changes by editing files are silently ignored. Use
@@ -828,7 +1034,7 @@ pub fn write_aftman_stylua_if_missing_or_merge(root: &Path) -> io::Result<bool> 
     }
 
     let existing = fs::read_to_string(&p)?;
-    let merged = merge_aftman_stylua_tool(&existing);
+    let merged = merge_aftman_stylua_tool(&existing)?;
     if merged == existing {
         return Ok(false);
     }
@@ -899,55 +1105,53 @@ pub fn write_luaurc_if_missing_or_cleanup(root: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn merge_aftman_stylua_tool(existing: &str) -> String {
-    let lines: Vec<&str> = existing.lines().collect();
-    let mut tools_header_index = None;
-    let mut in_tools = false;
+fn merge_aftman_stylua_tool(existing: &str) -> io::Result<String> {
+    use toml_edit::{value, DocumentMut, Item, Table, Value as TomlValue};
 
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_tools = trimmed == "[tools]";
-            if in_tools && tools_header_index.is_none() {
-                tools_header_index = Some(index);
-            }
-            continue;
-        }
-
-        if in_tools && toml_key(trimmed) == Some("stylua") {
-            return existing.to_string();
-        }
+    let mut document = existing.parse::<DocumentMut>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse aftman.toml: {error}"),
+        )
+    })?;
+    if !document.contains_key("tools") {
+        document.insert("tools", Item::Table(Table::new()));
     }
+    let tools = document
+        .get_mut("tools")
+        .expect("tools was inserted immediately above");
 
-    let mut merged = String::new();
-    if let Some(index) = tools_header_index {
-        for (line_index, line) in lines.iter().enumerate() {
-            merged.push_str(line);
-            merged.push('\n');
-            if line_index == index {
-                merged.push_str(STYLUA_TOOL_LINE);
-                merged.push('\n');
-            }
-        }
+    let (has_stylua, has_luau_lsp) = if let Some(table) = tools.as_table() {
+        (table.contains_key("stylua"), table.contains_key("luau-lsp"))
+    } else if let Some(table) = tools.as_inline_table() {
+        (table.contains_key("stylua"), table.contains_key("luau-lsp"))
     } else {
-        merged.push_str(existing);
-        if !merged.ends_with('\n') {
-            merged.push('\n');
-        }
-        if !merged.ends_with("\n\n") {
-            merged.push('\n');
-        }
-        merged.push_str("[tools]\n");
-        merged.push_str(STYLUA_TOOL_LINE);
-        merged.push('\n');
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "aftman.toml `tools` must be a table or inline table",
+        ));
+    };
+    if has_stylua && has_luau_lsp {
+        return Ok(existing.to_string());
     }
-    merged
-}
 
-fn toml_key(trimmed_line: &str) -> Option<&str> {
-    let before_comment = trimmed_line.split('#').next()?.trim();
-    let (key, _) = before_comment.split_once('=')?;
-    Some(key.trim().trim_matches(|c| c == '"' || c == '\''))
+    if let Some(table) = tools.as_table_mut() {
+        if !has_stylua {
+            table.insert("stylua", value(STYLUA_TOOL_SPEC));
+        }
+        if !has_luau_lsp {
+            table.insert("luau-lsp", value(LUAU_LSP_TOOL_SPEC));
+        }
+    } else if let Some(table) = tools.as_inline_table_mut() {
+        if !has_stylua {
+            table.insert("stylua", TomlValue::from(STYLUA_TOOL_SPEC));
+        }
+        if !has_luau_lsp {
+            table.insert("luau-lsp", TomlValue::from(LUAU_LSP_TOOL_SPEC));
+        }
+    }
+
+    Ok(document.to_string())
 }
 
 pub fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
@@ -1376,9 +1580,9 @@ fn build_whitelisted_node_at(
     let mut props: Map<String, Value> = Map::new();
     if is_script {
         let source = if inst.is_script_with_children {
-            read_init_source(path, inst.script_class)
+            read_init_source(path, inst.script_class)?
         } else {
-            fs::read_to_string(path).unwrap_or_default()
+            fs::read_to_string(path)?
         };
         props.insert("Source".to_string(), Value::String(source));
     }
@@ -1448,13 +1652,12 @@ fn looks_like_windows_rooted_path(path: &str) -> bool {
 }
 
 /// Read the `init (...).luau` file inside a script-with-children directory.
-/// Returns "" when the directory is malformed (the walker already decided the
-/// parent is a script instance, so an empty Source is the safest fallback).
-fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> String {
-    let Ok(iter) = fs::read_dir(dir) else {
-        return String::new();
-    };
-    for entry in iter.flatten() {
+/// Returns an error when the directory or source cannot be read. Treating an
+/// unreadable script as empty can later push destructive empty Source text.
+fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> io::Result<String> {
+    let iter = fs::read_dir(dir)?;
+    for entry in iter {
+        let entry = entry?;
         let fname = entry.file_name();
         let Some(name_str) = fname.to_str() else {
             continue;
@@ -1464,10 +1667,13 @@ fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> String {
             .or_else(|| parse_plain_init_file(name_str));
         let Some(class) = class else { continue };
         if sc.map(|want| want == class).unwrap_or(true) {
-            return fs::read_to_string(entry.path()).unwrap_or_default();
+            return fs::read_to_string(entry.path());
         }
     }
-    String::new()
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no init source found in {}", dir.display()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +1783,15 @@ mod tests {
                 "ro-sync.md template missing {token:?}"
             );
         }
+    }
+
+    #[test]
+    fn checked_in_ro_sync_md_matches_the_refresh_template() {
+        assert_eq!(
+            include_str!("../../ro-sync.md"),
+            RO_SYNC_MD_TEMPLATE,
+            "edit daemon/src/snapshot.rs whenever generated ro-sync.md changes"
+        );
     }
 
     #[test]
@@ -1792,6 +2007,7 @@ mod tests {
         let aftman = fs::read_to_string(d.path().join(AFTMAN_TOML)).unwrap();
         assert!(aftman.contains("[tools]"));
         assert!(aftman.contains(STYLUA_TOOL_LINE));
+        assert!(aftman.contains(LUAU_LSP_TOOL_LINE));
 
         let luaurc = fs::read_to_string(d.path().join(LUAURC)).unwrap();
         assert!(luaurc.contains("\"languageMode\""));
@@ -1853,9 +2069,12 @@ mod tests {
         let merged = fs::read_to_string(&p).unwrap();
         assert!(merged.contains("wally = \"UpliftGames/wally@0.3.2\""));
         assert!(merged.contains(STYLUA_TOOL_LINE));
-        assert!(
-            merged.find(STYLUA_TOOL_LINE).unwrap() < merged.find("wally =").unwrap(),
-            "stylua should be inserted inside [tools]; got:\n{merged}"
+        assert!(merged.contains(LUAU_LSP_TOOL_LINE));
+        let parsed = merged.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(parsed["tools"]["stylua"].as_str(), Some(STYLUA_TOOL_SPEC));
+        assert_eq!(
+            parsed["tools"]["luau-lsp"].as_str(),
+            Some(LUAU_LSP_TOOL_SPEC)
         );
     }
 
@@ -1866,8 +2085,57 @@ mod tests {
         let existing = "[tools]\nstylua = \"JohnnyMorganz/StyLua@2.4.1\"\nwally = \"UpliftGames/wally@0.3.2\"\n";
         fs::write(&p, existing).unwrap();
 
+        assert!(write_aftman_stylua_if_missing_or_merge(d.path()).unwrap());
+        let merged = fs::read_to_string(&p).unwrap();
+        assert!(merged.contains("stylua = \"JohnnyMorganz/StyLua@2.4.1\""));
+        assert!(merged.contains(LUAU_LSP_TOOL_LINE));
+        assert!(merged.contains("wally = \"UpliftGames/wally@0.3.2\""));
+
+        let custom = "[tools]\nstylua = \"JohnnyMorganz/StyLua@2.4.1\"\nluau-lsp = \"JohnnyMorganz/luau-lsp@1.67.0\"\n";
+        fs::write(&p, custom).unwrap();
         assert!(!write_aftman_stylua_if_missing_or_merge(d.path()).unwrap());
-        assert_eq!(fs::read_to_string(&p).unwrap(), existing);
+        assert_eq!(fs::read_to_string(&p).unwrap(), custom);
+    }
+
+    #[test]
+    fn aftman_merge_handles_valid_table_spellings_without_duplicate_tools() {
+        let cases = [
+            "[tools] # managed\nwally = \"UpliftGames/wally@0.3.2\"\n",
+            "['tools']\nwally = \"UpliftGames/wally@0.3.2\"\n",
+            "tools.wally = \"UpliftGames/wally@0.3.2\"\n",
+            "tools = { wally = \"UpliftGames/wally@0.3.2\" }\n",
+        ];
+
+        for (index, existing) in cases.into_iter().enumerate() {
+            let d = TempDir::new(&format!("aftman-valid-{index}"));
+            let path = d.path().join(AFTMAN_TOML);
+            fs::write(&path, existing).unwrap();
+
+            assert!(write_aftman_stylua_if_missing_or_merge(d.path()).unwrap());
+            let merged = fs::read_to_string(&path).unwrap();
+            let parsed = merged.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(
+                parsed["tools"]["wally"].as_str(),
+                Some("UpliftGames/wally@0.3.2")
+            );
+            assert_eq!(parsed["tools"]["stylua"].as_str(), Some(STYLUA_TOOL_SPEC));
+            assert_eq!(
+                parsed["tools"]["luau-lsp"].as_str(),
+                Some(LUAU_LSP_TOOL_SPEC)
+            );
+        }
+    }
+
+    #[test]
+    fn aftman_merge_rejects_non_table_tools_without_modifying_file() {
+        let d = TempDir::new("aftman-invalid-tools");
+        let path = d.path().join(AFTMAN_TOML);
+        let existing = "tools = \"not a table\"\n";
+        fs::write(&path, existing).unwrap();
+
+        let error = write_aftman_stylua_if_missing_or_merge(d.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(path).unwrap(), existing);
     }
 
     #[test]

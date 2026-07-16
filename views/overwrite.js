@@ -6,6 +6,7 @@
 //   - initial-choice-made   : { choiceId, ... }  (dismiss if still showing)
 // On button click it POSTs {choiceId, choice} to <daemonBase>/initial-choice.
 import { installDocumentEscape } from "./runtime.js";
+import { daemonJson } from "../bridge.js";
 
 export function mountOverwriteModal(api) {
   // api is { onBus, getDaemonBase, toast }.
@@ -181,13 +182,14 @@ export function mountOverwriteModal(api) {
     }
     setBusy(true);
     try {
-      const url = base.replace(/\/+$/, "") + "/initial-choice";
-      const res = await fetch(url, {
+      const result = await daemonJson(base, "/initial-choice", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ choiceId: currentChoiceId, choice }),
       });
-      if (!res.ok) throw new Error(`status ${res.status}`);
+      if (result && result.ok === false) {
+        throw new Error(result.error || "choice rejected");
+      }
       api.toast && api.toast(
         choice === "cancel" ? "Canceled" : `Keeping ${choice}`
       );

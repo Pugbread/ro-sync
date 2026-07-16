@@ -4,20 +4,31 @@ daemon/target/
 # Generated plugin build inputs
 plugin-src/Packages/
 plugin-src/src/RoSync.server.luau
+plugin-src/src/Photo.luau
 
 # Runtime state & logs (contain absolute paths / project-specific data)
 state.json
-writes.log
+writes.log*
+terminal64-delegation-*.md
 
 # Terminal 64 runtime data
 .t64-attachments/
+.t64/
+/t64/
 .codex/
 .mcp.json
+.rosync-artifacts/
+.rosync-workflows/
+.rosync-backups/
 
 # Pre-built binaries (ship via GitHub Releases instead)
 rosync-darwin-arm64
 rosync-linux-x86_64
 rosync-windows-x86_64.exe
+tools/luau-lsp/*/luau-lsp
+tools/luau-lsp/*/luau-lsp.exe
+tools/luau/*/luau-compile
+tools/luau/*/luau-compile.exe
 
 # macOS
 .DS_Store

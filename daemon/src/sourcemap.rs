@@ -6,6 +6,7 @@
 use crate::fs_map::{is_init_file, path_to_instance_meta};
 use crate::snapshot::SYNCED_SERVICES;
 use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,156 @@ pub fn generate(project: &Path) -> io::Result<Value> {
         "className": "DataModel",
         "children": children,
     }))
+}
+
+/// Enrich a disk-backed luau-lsp sourcemap with the full live Studio tree.
+///
+/// Disk nodes remain canonical so their `filePaths` are never lost. A disk
+/// `Folder` may be a projection of a Studio-owned container such as a `Model`
+/// or `Tool`; when the live node matches, its actual class replaces the
+/// projected `Folder` class. Live-only nodes are converted from the plugin's
+/// `class` shape to luau-lsp's `className` shape and appended in live order.
+///
+/// The remote `tree` command returns a root object, while the plugin's cached
+/// full-tree push is an array of service nodes. Accepting both shapes keeps the
+/// merge independent of how callers obtained the live tree.
+pub fn merge_live_tree(sourcemap: &mut Value, live_tree: &Value) {
+    if let Some(live_children) = live_tree.as_array() {
+        merge_children(sourcemap, live_children);
+    } else if live_tree.is_object() {
+        merge_node(sourcemap, live_tree);
+    }
+}
+
+fn merge_node(disk_node: &mut Value, live_node: &Value) {
+    let Some(live_class) = live_node.get("class").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(disk_object) = disk_node.as_object_mut() else {
+        return;
+    };
+
+    if disk_object.get("className").and_then(Value::as_str) == Some("Folder") {
+        disk_object.insert("className".into(), Value::String(live_class.to_string()));
+    }
+
+    let Some(live_children) = live_node.get("children").and_then(Value::as_array) else {
+        return;
+    };
+    merge_children(disk_node, live_children);
+}
+
+fn merge_children(disk_parent: &mut Value, live_children: &[Value]) {
+    let Some(disk_object) = disk_parent.as_object_mut() else {
+        return;
+    };
+    let disk_children = disk_object
+        .entry("children")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(disk_children) = disk_children.as_array_mut() else {
+        return;
+    };
+
+    // Match exact name+class pairs first. This prevents an earlier projected
+    // Folder from taking a same-named script that has its own exact disk node.
+    let mut exact_live: HashMap<(String, String), VecDeque<usize>> = HashMap::new();
+    let mut named_live: HashMap<String, VecDeque<usize>> = HashMap::new();
+    for (index, node) in live_children.iter().enumerate() {
+        let Some(name) = node.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(class) = node.get("class").and_then(Value::as_str) else {
+            continue;
+        };
+        exact_live
+            .entry((name.to_string(), class.to_string()))
+            .or_default()
+            .push_back(index);
+        named_live
+            .entry(name.to_string())
+            .or_default()
+            .push_back(index);
+    }
+
+    let original_disk_len = disk_children.len();
+    let mut live_matched = vec![false; live_children.len()];
+    let mut matches = vec![None; original_disk_len];
+
+    for (disk_index, node) in disk_children.iter().take(original_disk_len).enumerate() {
+        let Some(name) = node.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(class) = node.get("className").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = (name.to_string(), class.to_string());
+        if let Some(queue) = exact_live.get_mut(&key) {
+            if let Some(live_index) = take_unmatched(queue, &live_matched) {
+                live_matched[live_index] = true;
+                matches[disk_index] = Some(live_index);
+            }
+        }
+    }
+
+    // Pair any remaining same-named siblings in occurrence order. A vector of
+    // indices (rather than name -> node) preserves duplicate instances.
+    for (disk_index, node) in disk_children.iter().take(original_disk_len).enumerate() {
+        if matches[disk_index].is_some() {
+            continue;
+        }
+        let Some(name) = node.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(queue) = named_live.get_mut(name) {
+            if let Some(live_index) = take_unmatched(queue, &live_matched) {
+                live_matched[live_index] = true;
+                matches[disk_index] = Some(live_index);
+            }
+        }
+    }
+
+    for (disk_index, live_index) in matches.into_iter().enumerate() {
+        if let Some(live_index) = live_index {
+            merge_node(&mut disk_children[disk_index], &live_children[live_index]);
+        }
+    }
+
+    for (live_index, live_node) in live_children.iter().enumerate() {
+        if !live_matched[live_index] {
+            if let Some(node) = live_to_sourcemap(live_node) {
+                disk_children.push(node);
+            }
+        }
+    }
+}
+
+fn take_unmatched(queue: &mut VecDeque<usize>, matched: &[bool]) -> Option<usize> {
+    while let Some(index) = queue.pop_front() {
+        if !matched[index] {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn live_to_sourcemap(live_node: &Value) -> Option<Value> {
+    let name = live_node.get("name")?.as_str()?;
+    let class = live_node.get("class")?.as_str()?;
+    let mut object = serde_json::Map::new();
+    object.insert("name".into(), Value::String(name.to_string()));
+    object.insert("className".into(), Value::String(class.to_string()));
+
+    if let Some(live_children) = live_node.get("children").and_then(Value::as_array) {
+        let children = live_children
+            .iter()
+            .filter_map(live_to_sourcemap)
+            .collect::<Vec<_>>();
+        if !children.is_empty() {
+            object.insert("children".into(), Value::Array(children));
+        }
+    }
+
+    Some(Value::Object(object))
 }
 
 fn walk_children(project: &Path, dir: &Path) -> io::Result<Vec<Value>> {
@@ -307,5 +458,128 @@ mod tests {
         .unwrap();
 
         assert!(default_project_path(&package).unwrap().is_none());
+    }
+
+    #[test]
+    fn live_tree_replaces_projected_folder_class_and_preserves_file_paths() {
+        let mut map = json!({
+            "name": "DataModel",
+            "className": "DataModel",
+            "children": [{
+                "name": "ReplicatedStorage",
+                "className": "ReplicatedStorage",
+                "filePaths": ["ReplicatedStorage"],
+                "children": [{
+                    "name": "Vehicles",
+                    "className": "Folder",
+                    "filePaths": ["ReplicatedStorage/Vehicles"],
+                    "children": [{
+                        "name": "Config",
+                        "className": "ModuleScript",
+                        "filePaths": ["ReplicatedStorage/Vehicles/Config.luau"]
+                    }]
+                }]
+            }]
+        });
+        let live = json!({
+            "name": "Race Stars",
+            "class": "DataModel",
+            "children": [{
+                "name": "ReplicatedStorage",
+                "class": "ReplicatedStorage",
+                "children": [{
+                    "name": "Vehicles",
+                    "class": "Model",
+                    "children": [
+                        {"name": "Config", "class": "ModuleScript", "children": []},
+                        {"name": "Primary", "class": "Part", "children": []}
+                    ]
+                }]
+            }]
+        });
+
+        merge_live_tree(&mut map, &live);
+
+        let service = &map["children"][0];
+        let vehicles = &service["children"][0];
+        assert_eq!(service["filePaths"][0], "ReplicatedStorage");
+        assert_eq!(vehicles["className"], "Model");
+        assert_eq!(vehicles["filePaths"][0], "ReplicatedStorage/Vehicles");
+        assert_eq!(
+            vehicles["children"][0]["filePaths"][0],
+            "ReplicatedStorage/Vehicles/Config.luau"
+        );
+        assert_eq!(vehicles["children"][1]["className"], "Part");
+    }
+
+    #[test]
+    fn live_service_array_adds_studio_only_nested_instances() {
+        let mut map = json!({
+            "name": "DataModel",
+            "className": "DataModel",
+            "children": []
+        });
+        let live_services = json!([{
+            "name": "Workspace",
+            "class": "Workspace",
+            "children": [{
+                "name": "Spawn",
+                "class": "SpawnLocation",
+                "children": [{"name": "Attachment", "class": "Attachment", "children": []}]
+            }]
+        }]);
+
+        merge_live_tree(&mut map, &live_services);
+
+        assert_eq!(map["children"][0]["className"], "Workspace");
+        assert_eq!(
+            map["children"][0]["children"][0]["className"],
+            "SpawnLocation"
+        );
+        assert_eq!(
+            map["children"][0]["children"][0]["children"][0]["className"],
+            "Attachment"
+        );
+    }
+
+    #[test]
+    fn duplicate_names_match_one_to_one_without_collapsing_nodes() {
+        let mut map = json!({
+            "name": "DataModel",
+            "className": "DataModel",
+            "children": [{
+                "name": "Workspace",
+                "className": "Workspace",
+                "children": [
+                    {"name": "Thing", "className": "Folder", "filePaths": ["Workspace/Thing [1]"]},
+                    {"name": "Thing", "className": "ModuleScript", "filePaths": ["Workspace/Thing [2].luau"]}
+                ]
+            }]
+        });
+        // Put the exact script match first to prove the projected Folder does
+        // not consume it merely because the names are equal.
+        let live = json!({
+            "name": "Race Stars",
+            "class": "DataModel",
+            "children": [{
+                "name": "Workspace",
+                "class": "Workspace",
+                "children": [
+                    {"name": "Thing", "class": "ModuleScript", "children": []},
+                    {"name": "Thing", "class": "Model", "children": []},
+                    {"name": "Thing", "class": "Part", "children": []}
+                ]
+            }]
+        });
+
+        merge_live_tree(&mut map, &live);
+
+        let things = map["children"][0]["children"].as_array().unwrap();
+        assert_eq!(things.len(), 3);
+        assert_eq!(things[0]["className"], "Model");
+        assert_eq!(things[0]["filePaths"][0], "Workspace/Thing [1]");
+        assert_eq!(things[1]["className"], "ModuleScript");
+        assert_eq!(things[1]["filePaths"][0], "Workspace/Thing [2].luau");
+        assert_eq!(things[2]["className"], "Part");
     }
 }

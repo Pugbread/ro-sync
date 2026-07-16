@@ -2,6 +2,10 @@
   "commands": [
     "commands",
     "context",
+    "capabilities",
+    "capture",
+    "playtest",
+    "run",
     "plan",
     "query",
     "path",

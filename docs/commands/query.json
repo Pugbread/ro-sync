@@ -2,14 +2,17 @@
   "name": "query",
   "title": "rosync query",
   "category": "Live inspection",
-  "description": "Matches a selector against the live Studio tree through the daemon/plugin bridge.",
-  "usage": "rosync query [--project <path>] [--port <port>] <selector> [--format json|paths|classes]",
+  "description": "Matches a selector inside Studio and optionally projects selected properties, attributes, and tags without downloading the full live tree.",
+  "usage": "rosync query [--project <path>] [--port <port>] <selector> [--prop <name>]... [--attributes] [--tags] [--limit <n>] [--format json|paths|classes]",
   "examples": [
     "rosync query --project . 'Workspace/**/Camera'",
-    "rosync query --project . '**/RemoteEvent' --format paths"
+    "rosync query --project . '**/RemoteEvent' --format paths",
+    "rosync query --project . 'Workspace/**/Camera' --prop CFrame --prop FieldOfView --attributes --tags --limit 500 --format json"
   ],
   "notes": [
     "`*` matches one path segment and `**` matches zero or more segments.",
-    "Use this when you need to discover what exists in the current Studio tree."
+    "Matching and projection run in Studio, making this preferable to requesting a deep full tree for broad searches.",
+    "Repeat `--prop` for only the properties you need; `--attributes` and `--tags` add those maps to each JSON match.",
+    "`--limit` defaults to 5000 and accepts 1-10000. JSON output is `{matches,count,truncated,truncationReason,limit,visitedNodes,responseBytes}`; paths/classes are line formats and print a reason-specific warning to stderr when the result is truncated."
   ]
 }

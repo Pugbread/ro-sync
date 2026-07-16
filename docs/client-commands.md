@@ -59,6 +59,139 @@ rosync context --project . --port 7878
 - Use `--full-commands` only when the caller needs the complete embedded command registry in the same response.
 
 ---
+### `rosync capabilities`
+
+Negotiates the connected daemon, Studio plugin, host DataModel, and optional LLM automation features before an agent chooses a command path.
+
+**Category:** Agent Runtime
+
+**Usage**
+
+```sh
+rosync capabilities [--project <path>] [--port <port>] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync capabilities --project .
+rosync capabilities --project . --raw
+```
+
+**Notes**
+
+- The protocol 2 / plugin 2.0.0 document reports feature flags for screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.photo`, `features.photoTransparent`, and `features.photoUiOnly`, plus the `photoAxis`, `photoPixels`, and `photoChunkBytes` limits, are independent of Studio screenshot authorization.
+- Use this cheap read before relying on optional Studio APIs; Studio version and permission differences are reported instead of guessed.
+- `--raw` prints the complete correlated response envelope for machine use.
+
+---
+### `rosync capture`
+
+Captures the Studio surface, the 3D viewport, or its in-game UI layer and writes a verified PNG without placing image bytes on stdout. The self-contained Photo engine can capture the current viewport, extract transparent ScreenGui layers, or clone and frame a Studio subject without place-provided capture dependencies or screenshot authorization.
+
+**Category:** Agent Runtime
+
+**Usage**
+
+```sh
+rosync capture status|authorize|screen|photo|scene [options]
+```
+
+**Examples**
+
+```sh
+rosync capture status --project . --raw
+rosync capture authorize --project .
+rosync capture screen --project . --region 200,120,1280,720 --output-size 1024x576 --ui all --output ./captures/studio.png --raw
+rosync capture photo --project . --focus Workspace/Map/Boss --size 1024x1024 --view isometric --padding 1.25 --fov 32 --background transparent --alpha-bleed --delay 0.1 --output ./captures/boss.png --timeout 120 --raw
+rosync capture photo --project . --focus Workspace/Map/Boss --camera-cframe '0,10,20,1,0,0,0,1,0,0,0,1' --fov 40 --size 1600x900 --background transparent --output ./captures/boss-exact-camera.png --raw
+rosync capture photo --project . --focus Workspace/Vehicle --size 1600x900 --direction 1,-0.65,1 --background scene --include-world --ui overlay --output ./captures/vehicle-scene.png
+rosync capture photo --project . --region 120,80,1280,720 --background scene --ui overlay --output ./captures/viewport.png --raw
+rosync capture photo --project . --ui only --region 120,80,1280,720 --size 1920x1080 --alpha-bleed --output ./captures/hud.png --raw
+rosync capture photo --project . --ui-target StarterGui/HUD/InventoryPanel --size 1200x800 --alpha-bleed --output ./captures/inventory-panel.png --raw
+rosync capture scene --project . --focus Workspace/Map/Boss --view isometric --size 1024x1024 --padding 1.25 --output ./captures/boss.png --raw
+```
+
+**Notes**
+
+- `capture authorize` and screenshot permission apply only to `capture screen`; `capture status` also reports whether packaged Photo and UI-only extraction are available. `capture photo` uses Ro Sync's self-contained packaged Photo module, never loads a capture module from the open place, and never requests screenshot authorization. `capture scene` is a compatibility alias for this same Photo engine; its legacy `--resample pixelated` mode is not supported.
+- Photo `--focus` is optional. With it, Ro Sync clones the target without scripts, isolates and frames the clone by default, and defaults `--size` to 1024x1024. Without it, Photo captures the current native viewport. `--include-world` requires `--focus` and frames the original target in place.
+- Photo `--ui` accepts `none` (the default), `overlay`, or `only`. `overlay` preserves in-game ScreenGui layers over the rendered scene. `only` captures the current edit-mode ScreenGui layer as transparent RGBA, excludes the 3D world and Studio chrome, cannot be combined with `--focus`, and requires `--background transparent`. `--ui-target <Studio/path>` implies `--ui only`, accepts a ScreenGui or GuiObject, and captures only that element and its descendants while hiding unrelated UI. Without an explicit region the rendered target is tight-cropped; `--size` aspect-contains that crop in the exact transparent canvas. An explicit `--region` overrides automatic targeting bounds and retains exact-fill behavior. A full untargeted UI-only capture with `--size` preserves the native viewport aspect ratio and is centered in the exact output canvas with transparent padding. The legacy `--include-ui` flag remains an alias for `--ui overlay`.
+- Photo `--region x,y,width,height` uses native viewport pixels from the viewport's top-left and cannot be combined with `--focus`. Combine it with `--size WIDTHxHEIGHT` to crop an arbitrary viewport/UI rectangle and resample it to exact output dimensions. Each Photo axis is limited to 4096 pixels and the image to 16777216 pixels.
+- For focused Photo captures, `--view` accepts isometric, front, back, left, right, top, or bottom; `--direction x,y,z` overrides it. `--camera-cframe` instead accepts exactly 12 finite CFrame:GetComponents() values, preserves the exact subject-relative camera pose for isolated captures (or uses it directly in world space with `--include-world`), and conflicts with `--view`, `--direction`, and `--padding`. `--padding` is 1.0-4.0 and `--fov` is 1-120 degrees. `--background transparent` reconstructs alpha while `scene` preserves the rendered world; `--alpha-bleed` retains RGB at transparent edges. UI-only capture reconstructs alpha from two temporary foreground color passes without changing the world. `--delay` is 0-5 seconds.
+- All Photo paths accept `--output`, `--timeout`, and `--raw`. The plugin sends bounded RGBA chunks, the CLI validates the exact RGBA length and encodes PNG locally, and temporary sessions are closed after the write. Camera, UI, and lighting state are restored and temporary clones are destroyed on both success and failure.
+- For `capture screen`, run `capture status` first. `capture authorize` is the only subcommand that requests screenshot permission and may show Studio's prompt or, when that provider reports `Feature not supported yet` on macOS, the system Screen & System Audio Recording prompt.
+- Status reports `effectiveProvider` plus native-fallback availability/authorization. Authorize returns an aggregate Studio/native result and succeeds only when the provider it selects is authorized.
+- Screen `--region` is the global logical-screen rectangle `x,y,width,height`; screen `--output-size` uses `WIDTHxHEIGHT`. Each screen-capture axis is capped at 16384 pixels and screen captures are capped at 67108864 pixels. Screen `--ui` is `all` or `none`.
+- On macOS, `capture screen --ui all` can fall back to a window-only native capture only after explicit `capture authorize` observes Studio's exact `Feature not supported yet` result and macOS screen-capture permission is granted. CoreGraphics discovery is restricted to visible Roblox Studio windows, and a requested region must fit completely inside the selected Studio window. A merely unauthorized Studio provider never triggers fallback; `--ui none`, `capture photo`, and `capture scene` never use it.
+- Studio-provider PNG data moves through a short-lived, tokenized artifact lease in bounded chunks; native fallback writes a locally verified PNG directly. `--raw` identifies the provider and returns absolute output path, MIME type, byte size, dimensions, position, and SHA-256 metadata.
+
+---
+### `rosync playtest`
+
+Runs asynchronous Studio playtests and controls isolated PlayServer and PlayClient runtime agents for execution, logs, resolved UI inspection, virtual input, and screenshots.
+
+**Category:** Agent Runtime
+
+**Usage**
+
+```sh
+rosync playtest start|status|contexts|wait|exec|logs|ui|input|capture|stop|request [options]
+```
+
+**Examples**
+
+```sh
+rosync playtest start --project . --mode play --wait --raw
+rosync playtest start --project . --mode multiplayer --players 2 --wait --timeout 60 --raw
+rosync playtest contexts --project . --raw
+rosync playtest exec --project . --context server --source 'return #game.Players:GetPlayers()' --identity game --raw
+rosync playtest logs --project . --context client:1 --since-seq 0 --limit 200 --raw
+rosync playtest ui --project . --context client:1 --class TextButton --limit 200 --raw
+rosync playtest input --project . --context client:1 --file ./input-actions.json --raw
+rosync playtest capture --project . --context client:1 --region 0,0,1280,720 --output-size 1024x576 --ui all --output ./captures/client-1.png --raw
+rosync playtest stop --project . --raw
+```
+
+**Notes**
+
+- `start` returns a job immediately. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N` context arrival; multiplayer supports 1-8 clients.
+- Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost and their temporary DataModel changes never sync back to edit mode.
+- `exec --identity game` uses a temporary Script/LocalScript in the playtest; `--identity plugin` runs with plugin identity. Provide exactly one of `--source` or `--source-file`.
+- `ui` defaults to PlayerGui and CoreGui and returns actual GUI paths, visibility, text, absolute position, and absolute size. A supplied `--root` is a full DataModel path. `input` accepts a JSON object/array via `--actions` or `--file`; advanced operations use `request --op <name> --args <json>`.
+- Runtime capture uses the same bounded artifact transport as edit-mode capture. Start/stop, execution, and virtual input require explicit user intent.
+
+---
+### `rosync run`
+
+Validates and executes a versioned JSON workflow over one persistent daemon session with typed references, preconditions, transactions, assertions, waits, verification, and idempotent replay.
+
+**Category:** Agent Runtime
+
+**Usage**
+
+```sh
+rosync run --file <workflow.json> [--project <path>] [--port <port>] [--dry-run] [--keep-going] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync run --file ./workflow.json --project . --dry-run
+rosync run --file ./workflow.json --project . --raw
+rosync run --file ./diagnostics.json --project . --keep-going --raw
+```
+
+**Notes**
+
+- Schema version 1 supports get, set, new, rm, mv, attr-set, attr-rm, attr-ls, tag-add, tag-rm, assert, wait, eval, capture, call, playtest, and upload steps.
+- A string containing exactly `$stepId.value.path` references an earlier result while preserving its JSON type; use `$$literal` to emit a string beginning with `$`. Forward, self, unknown, and missing-path references fail validation or execution precisely.
+- Declare contiguous atomic transaction groups and assign steps with `transaction`. Atomic groups use Studio change-history recording and cancel automatically on failure; eval, call, wait, capture, playtest, and upload are rejected inside atomic groups.
+- Use workflow/step `expectedMode`, `expectedPlaceId`, `expectedClass`, and `etag` preconditions to reject stale targets. Set `verify: true` on supported writes for read-back verification.
+- Assertions support equals, not-equals, exists, truthy, contains, and numeric comparisons. Wait polls one path/property until its assertion passes or `timeoutMs` expires.
+- A successful workflow with `idempotencyKey` is recorded under `.rosync-workflows/`; rerunning the same key returns the prior result with `replayed: true`. `--dry-run` validates and prints normalized dependencies without executing.
+
+---
 ### `rosync plan`
 
 Builds a read-only JSON plan for a mutating command without executing it.
@@ -93,14 +226,14 @@ rosync plan resolve --path ReplicatedStorage/Client/UIController.client.luau --s
 ---
 ### `rosync query`
 
-Matches a selector against the live Studio tree through the daemon/plugin bridge.
+Matches a selector inside Studio and optionally projects selected properties, attributes, and tags without downloading the full live tree.
 
 **Category:** Live inspection
 
 **Usage**
 
 ```sh
-rosync query [--project <path>] [--port <port>] <selector> [--format json|paths|classes]
+rosync query [--project <path>] [--port <port>] <selector> [--prop <name>]... [--attributes] [--tags] [--limit <n>] [--format json|paths|classes]
 ```
 
 **Examples**
@@ -108,12 +241,15 @@ rosync query [--project <path>] [--port <port>] <selector> [--format json|paths|
 ```sh
 rosync query --project . 'Workspace/**/Camera'
 rosync query --project . '**/RemoteEvent' --format paths
+rosync query --project . 'Workspace/**/Camera' --prop CFrame --prop FieldOfView --attributes --tags --limit 500 --format json
 ```
 
 **Notes**
 
 - `*` matches one path segment and `**` matches zero or more segments.
-- Use this when you need to discover what exists in the current Studio tree.
+- Matching and projection run in Studio, making this preferable to requesting a deep full tree for broad searches.
+- Repeat `--prop` for only the properties you need; `--attributes` and `--tags` add those maps to each JSON match.
+- `--limit` defaults to 5000 and accepts 1-10000. JSON output is `{matches,count,truncated,truncationReason,limit,visitedNodes,responseBytes}`; paths/classes are line formats and print a reason-specific warning to stderr when the result is truncated.
 
 ---
 ### `rosync path`
@@ -143,31 +279,41 @@ rosync path --project . --from fs ReplicatedStorage/Config.luau
 ---
 ### `rosync lint`
 
-Runs `luau-lsp analyze` against a project or one or more paths with a Ro Sync sourcemap, Roblox definitions, and dependency-aware diagnostic filtering.
+Runs `luau-lsp analyze` with named Roblox definitions and selectable live-Studio or filesystem DataModel typing, then optionally compiles bytecode at every optimization level to catch compiler-only failures.
 
-**Category:** Offline inspection
+**Category:** Live diagnostics
 
 **Usage**
 
 ```sh
-rosync lint [--project <path>] [--path <file-or-dir>]... [--ignore <glob>]... [--scope-only|--owned-only] [--summary] [--luau-lsp <path>] [--no-sourcemap] [--no-vendor-ignores] [-- <luau-lsp args>...]
+rosync lint [--project <path>] [--port <port>] [--path <file-or-dir>]... [--data-model <auto|studio|filesystem|loose>] [--compile <auto|required|off>] [--luau-compile <path>] [--ignore <glob>]... [--scope-only|--owned-only] [--summary] [--raw] [--luau-lsp <path>] [--no-sourcemap] [--no-vendor-ignores] [-- <luau-lsp args>...]
 ```
 
 **Examples**
 
 ```sh
 rosync lint --project .
+rosync lint --project . --data-model studio --port 7878 --raw
 rosync lint --project . --path ServerScriptService/Foo.server.luau --path ReplicatedStorage/Shared
 rosync lint --project . --path ServerScriptService --owned-only --summary
-rosync lint --project . --no-sourcemap --no-vendor-ignores
+rosync lint --project . --data-model filesystem --raw
+rosync lint --project . --data-model loose --no-vendor-ignores
+rosync lint --project . --compile required --luau-compile /path/to/luau-compile
 ```
 
 **Notes**
 
-- If `--luau-lsp` is omitted, Ro Sync checks `ROSYNC_LUAU_LSP` and then `PATH`.
-- Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`.
-- Default vendor ignores hide diagnostics under common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.codex`, and `.vscode`; pass `--no-vendor-ignores` to disable them.
-- `--scope-only` / `--owned-only` requires at least one `--path` and filters captured diagnostics down to those requested paths while preserving non-diagnostic luau-lsp log lines.
+- The default `--data-model auto` mode merges the complete live Studio tree into disk script mappings and enables strict DataModel diagnostics when a matching daemon/plugin is connected; otherwise it reports a relaxed filesystem fallback.
+- `--data-model studio` requires that live full-DataModel strict check. `filesystem` performs a strict offline audit that may report false unknown children for Studio-only instances, while `loose` keeps filesystem DataModel expressions gradual.
+- `--port` selects the daemon used for auto/studio discovery. `--raw` returns JSON diagnostics plus DataModel coverage, strictness, live-node count, analyzer status, and suppressed counts.
+- Without `--path`, default vendor ignores hide common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.git`, `.codex`, `.vscode`, and Ro Sync's `.rosync-*` runtime/backup folders. Any explicit `--path` overrides those defaults so the requested target is never silently skipped.
+- `--scope-only` / `--owned-only` requires at least one `--path`, shows only diagnostics in those scopes, reports suppressed dependency diagnostics, and does not fail solely for diagnostics outside the requested scopes.
+- Ro Sync injects bundled Roblox definitions as the named `@roblox` set. Extra named sets such as `--definitions:@testez=...` coexist; an explicit `--definitions:@roblox=...` after `--` replaces the bundled set.
+- Ro Sync recommends luau-lsp 1.68.1 or newer. If `--luau-lsp` is omitted, it checks `ROSYNC_LUAU_LSP`, bundled/Aftman locations, and then `PATH`.
+- The default `--compile auto` pass runs every in-scope executable script through `luau-compile --null` at `-O0`, `-O1`, and `-O2` when the compiler is available. It catches bytecode-generation failures such as the 200-local-register limit. Use `required` to fail when the compiler is unavailable or `off` to disable this pass.
+- Compiler resolution checks `--luau-compile`, `ROSYNC_LUAU_COMPILE`, `LUAU_COMPILE`, the bundled platform tool, Aftman, and `PATH`. Raw JSON distinguishes analyzer and compiler diagnostics, includes compiler coverage/failure metadata, and preserves unparsed analyzer messages such as configuration errors.
+- Structured diagnostics recognize luau-lsp's default and GNU formatters, including adversarial Studio instance names. `--formatter=plain` is rejected because luau-lsp 1.68.1 can emit TypeErrors in that mode while returning a successful process status.
+- `--no-sourcemap` disables Ro Sync DataModel coverage. Requiring `studio` or `filesystem` mode while disabling or replacing the generated sourcemap is rejected.
 
 ---
 ### `rosync upload`
@@ -1201,14 +1347,15 @@ rosync transmit [--project <path>] [--port <port>] [--source <luau> | --source-f
 ```sh
 rosync transmit --project . --source-file render.luau --from Workspace/Exports --output renders
 rosync transmit --project . --path StarterGui/Example --output ./example.png
-rosync transmit --project . --source 'local Photobooth = require(game.ServerStorage.Photobooth.Bindings); return Photobooth.captureViewport({rect = Rect.new(0, 0, 300, 300), type = "NoSkybox"})' --output renders
+rosync transmit --project . --source 'return game:GetService("AssetService"):CreateEditableImage({Size = Vector2.new(64, 64)})' --output ./renders/blank.png
 ```
 
 **Notes**
 
 - The plugin accepts EditableImage objects directly and can also read ImageLabel/ImageButton content through AssetService.
-- Photobooth captures may return MeshParts with object-backed TextureContent. Ro Sync reads Content.Object directly when it is already an EditableImage, otherwise it falls back to CreateEditableImageAsync for TextureContent or TextureID.
-- --source and --source-file execute with loadstring in the plugin's real Studio environment, so normal globals like game, workspace, require, Rect, Vector2, and Photobooth bindings are available without a custom sandbox.
+- Use `rosync capture photo` for viewport crops and isolated subject renders. It uses Ro Sync's self-contained packaged Photo engine.
+- MeshParts with object-backed TextureContent are supported. Ro Sync reads Content.Object directly when it is already an EditableImage, otherwise it falls back to CreateEditableImageAsync for TextureContent or TextureID.
+- --source and --source-file execute with loadstring in the plugin's real Studio environment, so normal globals like game, workspace, require, Rect, and Vector2 are available without a custom sandbox.
 - Large batches are prepared once, then downloaded one image per request so full 768x768 render sets do not have to fit in one WebSocket response.
 - If --source or --source-file returns images, those are captured. If --from is supplied, Ro Sync also walks that Studio subtree after the source runs and captures any image-like instances found there.
 - The command writes PNG files locally. Use `rosync upload` afterwards when you want to publish the edited images to Roblox Open Cloud.

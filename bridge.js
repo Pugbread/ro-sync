@@ -13,6 +13,7 @@
 // Matching is by payload.id — NOT a top-level id.
 const pending = new Map();          // id -> {resolve, reject, timer}
 const listeners = new Map();        // t64 event type -> Set<fn>
+let daemonAuthToken = null;
 
 function nextId() {
   return "r" + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -86,9 +87,26 @@ window.addEventListener("message", (ev) => {
 
 // --------- Daemon HTTP helpers ---------
 
-export async function daemonFetch(base, path, init = {}) {
+// Browser-backed widgets carry an Origin header and therefore authenticate to
+// the localhost daemon with the same unguessable owner token used for process
+// lifecycle control. Native Studio/CLI requests have no browser Origin and do
+// not use this query capability.
+export function setDaemonAuthToken(token) {
+  daemonAuthToken = typeof token === "string" && token.length ? token : null;
+}
+
+export function daemonURL(base, path = "") {
   if (!base) throw new Error("daemon not running");
-  const url = base.replace(/\/+$/, "") + path;
+  const url = new URL(base.replace(/\/+$/, "") + path);
+  if (!["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
+    throw new Error("daemon URL must use a loopback host");
+  }
+  if (daemonAuthToken) url.searchParams.set("widgetToken", daemonAuthToken);
+  return url.toString();
+}
+
+export async function daemonFetch(base, path, init = {}) {
+  const url = daemonURL(base, path);
   const res = await fetch(url, {
     ...init,
     headers: { "content-type": "application/json", ...(init.headers || {}) },
@@ -106,8 +124,7 @@ export async function daemonJson(base, path, init) {
 // Thin SSE wrapper. handlers = { open, message, error, [customEventName]: fn }.
 // Returns { close }.
 export function daemonSSE(base, path, handlers = {}) {
-  if (!base) throw new Error("daemon not running");
-  const url = base.replace(/\/+$/, "") + path;
+  const url = daemonURL(base, path);
   const es = new EventSource(url);
   es.onopen = (e) => handlers.open && handlers.open(e);
   es.onerror = (e) => handlers.error && handlers.error(e);
@@ -133,7 +150,7 @@ function parseMaybe(s) {
 // Returns { close, send }. close() stops reconnects and shuts the socket.
 export function daemonWS(base, path = "/ws", handlers = {}) {
   if (!base) throw new Error("daemon not running");
-  const wsUrl = base.replace(/^http/i, "ws").replace(/\/+$/, "") + path;
+  const wsUrl = daemonURL(base, path).replace(/^http/i, "ws");
 
   let ws = null;
   let stopped = false;
@@ -162,6 +179,17 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
     }
     ws.onopen = (e) => {
       backoff = 1000;
+      // Identify this socket before subscribing to privileged daemon traffic.
+      // The daemon rejects request/push/response frames from unidentified or
+      // role-mismatched peers; widget streams are read-only clients.
+      try {
+        ws.send(JSON.stringify({
+          type: "hello",
+          clientId: "terminal64-widget",
+          role: "watch",
+          protocol: 2,
+        }));
+      } catch {}
       if (handlers.open) { try { handlers.open(e); } catch (err) { console.error(err); } }
     };
     ws.onmessage = (e) => {

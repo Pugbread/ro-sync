@@ -1,6 +1,7 @@
 use axum::body::Bytes;
+use axum::http::{header, request::Parts, HeaderValue, Method};
 use axum::{
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -19,22 +20,20 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
 use crate::diff;
 use crate::fs_map::{
     classify_script_file, encode_name, instance_to_path, is_empty_plain_folder, is_init_file,
-    normalize_line_endings, parse_disambiguated, parse_init_file, path_to_instance_meta,
-    InstanceDescriptor, PathInstance, ScriptClass, META_FILE,
+    normalize_line_endings, parse_disambiguated, parse_init_file, parse_plain_init_file,
+    path_to_instance_meta, InstanceDescriptor, PathInstance, ScriptClass, META_FILE,
 };
 
 /// Roblox classes the daemon will materialize on disk. Everything else is
 /// Studio-authoritative and must be inspected through the live plugin bridge.
-const SCOPED_CLASSES: &[&str] = &["Folder", "Script", "LocalScript", "ModuleScript"];
-
 fn is_scoped_class(class: &str) -> bool {
-    SCOPED_CLASSES.contains(&class)
+    crate::sync_scope::contains(class)
 }
 
 #[derive(Clone)]
@@ -50,14 +49,33 @@ use crate::watch::{Op, OpKind};
 use crate::{AppState, PUSH_QUIET_MS};
 
 pub fn router(state: AppState) -> Router {
+    // The Terminal 64 widget is rendered in an embedded browser, but ordinary
+    // web pages must not be able to call this privileged localhost API. Browser
+    // origins need both an allowlisted app origin (or file-webview `null`) and
+    // the owning widget's capability; native Studio/CLI requests carry no
+    // Origin header and bypass this browser-only CORS gate.
+    let cors_widget_owned = state.widget_owned;
+    let cors_owner_token = state.widget_owner_token.clone();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, request: &Parts| {
+                is_authorized_widget_browser_request(
+                    origin,
+                    &request.uri,
+                    cors_widget_owned,
+                    cors_owner_token.as_ref().as_deref(),
+                )
+            },
+        ))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
 
     // Axum's default body limit is 2 MiB — a full-place bootstrap from the
     // plugin easily exceeds that. Lift it to 512 MiB so large places fit.
     const MAX_BODY: usize = 512 * 1024 * 1024;
+
+    const ARTIFACT_CONTROL_BODY: usize = 4 * 1024;
+    const ARTIFACT_CHUNK_BODY: usize = 768 * 1024;
 
     Router::new()
         .route("/hello", get(hello))
@@ -75,11 +93,298 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/tree", post(tree_post))
         .route("/writelog", post(writelog))
+        .route(
+            "/artifacts/lease",
+            post(artifact_lease).layer(DefaultBodyLimit::max(ARTIFACT_CONTROL_BODY)),
+        )
+        .route("/artifacts/:id", get(artifact_lookup))
+        .route(
+            "/artifacts/:id/chunk",
+            post(artifact_chunk).layer(DefaultBodyLimit::max(ARTIFACT_CHUNK_BODY)),
+        )
+        .route(
+            "/artifacts/:id/finalize",
+            post(artifact_finalize).layer(DefaultBodyLimit::max(ARTIFACT_CONTROL_BODY)),
+        )
+        .route(
+            "/artifacts/:id/abort",
+            post(artifact_abort).layer(DefaultBodyLimit::max(ARTIFACT_CONTROL_BODY)),
+        )
+        .route(
+            "/artifacts/:id/consume",
+            post(artifact_consume).layer(DefaultBodyLimit::max(ARTIFACT_CONTROL_BODY)),
+        )
         .route("/widget-heartbeat", post(widget_heartbeat))
         .route("/widget-close", post(widget_close))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
         .layer(cors)
+}
+
+// ---------------------------------------------------------------------------
+// Bounded binary artifact channel. A CLI creates a lease, hands its opaque
+// token to the Studio plugin, and the plugin appends base64 chunks directly to
+// localhost HTTP. Final metadata contains an absolute private file path, size,
+// and SHA-256; image/audio/model bytes never need to cross the command WS.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactLeaseBody {
+    filename: String,
+    mime: Option<String>,
+    expected_size: Option<u64>,
+}
+
+async fn artifact_lease(
+    State(state): State<AppState>,
+    Json(body): Json<ArtifactLeaseBody>,
+) -> Json<Value> {
+    match state
+        .artifacts
+        .create_lease(&body.filename, body.mime.as_deref(), body.expected_size)
+    {
+        Ok(lease) => Json(json!({ "ok": true, "lease": lease })),
+        Err(error) => artifact_error_json(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactChunkBody {
+    token: String,
+    offset: u64,
+    bytes_base64: String,
+}
+
+async fn artifact_chunk(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ArtifactChunkBody>,
+) -> Json<Value> {
+    use base64::Engine as _;
+    const MAX_CHUNK_BYTES: usize = 512 * 1024;
+    const MAX_ENCODED_CHUNK_BYTES: usize = MAX_CHUNK_BYTES.div_ceil(3) * 4;
+    if body.bytes_base64.len() > MAX_ENCODED_CHUNK_BYTES {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_CHUNK_TOO_LARGE",
+                "message": format!(
+                    "encoded artifact chunk is {} bytes; maximum is {MAX_ENCODED_CHUNK_BYTES}",
+                    body.bytes_base64.len()
+                ),
+                "retryable": false,
+            }
+        }));
+    }
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&body.bytes_base64) {
+        Ok(bytes) if bytes.len() <= MAX_CHUNK_BYTES => bytes,
+        Ok(bytes) => {
+            return Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "ARTIFACT_CHUNK_TOO_LARGE",
+                    "message": format!("artifact chunk is {} bytes; maximum is {MAX_CHUNK_BYTES}", bytes.len()),
+                    "retryable": false,
+                }
+            }));
+        }
+        Err(error) => {
+            return Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "INVALID_ARTIFACT_BASE64",
+                    "message": error.to_string(),
+                    "retryable": false,
+                }
+            }));
+        }
+    };
+    match state
+        .artifacts
+        .append(&id, &body.token, body.offset, &bytes)
+    {
+        Ok(receipt) => Json(json!({ "ok": true, "receipt": receipt })),
+        Err(error) => artifact_error_json(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactFinalizeBody {
+    token: String,
+    expected_sha256: Option<String>,
+}
+
+async fn artifact_finalize(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ArtifactFinalizeBody>,
+) -> Json<Value> {
+    match state
+        .artifacts
+        .finalize(&id, &body.token, body.expected_sha256.as_deref())
+    {
+        Ok(artifact) => Json(json!({ "ok": true, "artifact": artifact })),
+        Err(error) => artifact_error_json(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ArtifactAbortBody {
+    token: String,
+}
+
+async fn artifact_abort(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ArtifactAbortBody>,
+) -> Json<Value> {
+    match state.artifacts.abort(&id, &body.token) {
+        Ok(()) => Json(json!({ "ok": true, "aborted": true })),
+        Err(error) => artifact_error_json(error),
+    }
+}
+
+async fn artifact_lookup(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Json<Value> {
+    match state.artifacts.lookup(&id) {
+        Ok(Some(artifact)) => Json(json!({ "ok": true, "artifact": artifact })),
+        Ok(None) => Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_NOT_FOUND",
+                "message": "artifact was not found or is not finalized",
+                "retryable": false,
+            }
+        })),
+        Err(error) => artifact_error_json(error),
+    }
+}
+
+async fn artifact_consume(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Json<Value> {
+    match state.artifacts.consume(&id) {
+        Ok(Some(artifact)) => Json(json!({ "ok": true, "artifact": artifact, "consumed": true })),
+        Ok(None) => Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_NOT_FOUND",
+                "message": "artifact was not found or is not finalized",
+                "retryable": false,
+            }
+        })),
+        Err(error) => artifact_error_json(error),
+    }
+}
+
+fn artifact_error_json(error: crate::artifact::ArtifactError) -> Json<Value> {
+    use crate::artifact::ArtifactError;
+    let (code, retryable) = match &error {
+        ArtifactError::LeaseNotFound => ("ARTIFACT_LEASE_NOT_FOUND", false),
+        ArtifactError::InvalidToken => ("ARTIFACT_INVALID_TOKEN", false),
+        ArtifactError::LeaseExpired => ("ARTIFACT_LEASE_EXPIRED", true),
+        ArtifactError::OffsetMismatch { .. } => ("ARTIFACT_OFFSET_MISMATCH", true),
+        ArtifactError::ByteLimitExceeded { .. }
+        | ArtifactError::ExpectedSizeExceeded { .. }
+        | ArtifactError::PendingByteLimitExceeded { .. }
+        | ArtifactError::SizeMismatch { .. }
+        | ArtifactError::ChecksumMismatch { .. } => ("ARTIFACT_VALIDATION_FAILED", false),
+        ArtifactError::PendingLeaseLimitExceeded { .. } => ("ARTIFACT_CAPACITY", true),
+        ArtifactError::Io(_) | ArtifactError::LockPoisoned => ("ARTIFACT_IO", true),
+        _ => ("ARTIFACT_INVALID_REQUEST", false),
+    };
+    Json(json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": error.to_string(),
+            "retryable": retryable,
+        }
+    }))
+}
+
+/// Return whether a browser Origin belongs to the local application shell.
+/// Terminal 64 serves widget iframes from an ephemeral loopback HTTP port, while
+/// packaged shells may use one of the custom origins below. This is only an
+/// eligibility check: every browser request must additionally present the
+/// per-daemon widget capability.
+pub(crate) fn is_trusted_local_app_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let normalized = origin.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "t64://widget"
+            | "terminal64://widget"
+            | "app://localhost"
+            | "tauri://localhost"
+            | "wry://localhost"
+    ) {
+        return true;
+    }
+
+    let Ok(url) = reqwest::Url::parse(origin.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    )
+}
+
+/// Authorize a browser request from an eligible app origin (or the opaque
+/// `null` origin used by a file-backed webview) with the widget owner token in
+/// `?widgetToken=...`. Native Studio and CLI requests have no Origin header and
+/// bypass this browser-only gate.
+pub(crate) fn is_authorized_widget_browser_request(
+    origin: &HeaderValue,
+    uri: &axum::http::Uri,
+    widget_owned: bool,
+    expected_token: Option<&str>,
+) -> bool {
+    if !widget_owned {
+        return false;
+    }
+    let Ok(origin_text) = origin.to_str() else {
+        return false;
+    };
+    if !origin_text.trim().eq_ignore_ascii_case("null") && !is_trusted_local_app_origin(origin) {
+        return false;
+    }
+    let Some(expected_token) = expected_token else {
+        return false;
+    };
+    let candidate = uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == "widgetToken").then_some(value)
+        })
+    });
+    candidate.is_some_and(|candidate| constant_time_text_eq(candidate, expected_token))
+}
+
+fn constant_time_text_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (&left, &right) in left.as_bytes().iter().zip(right.as_bytes()) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +399,10 @@ pub fn router(state: AppState) -> Router {
 /// verbatim (after a timestamp is merged in) — callers should post a JSON
 /// object describing the write they just performed.
 async fn writelog(body: Json<Value>) -> Json<Value> {
+    write_log_entry(body)
+}
+
+pub(crate) fn write_log_entry(body: Json<Value>) -> Json<Value> {
     let home = match rosync_home_dir() {
         Some(h) => h,
         None => {
@@ -265,6 +574,10 @@ struct Hello {
     widget_owned: bool,
     #[serde(rename = "pluginConnected")]
     plugin_connected: bool,
+    #[serde(rename = "pluginProtocol")]
+    plugin_protocol: u64,
+    #[serde(rename = "pluginCapability")]
+    plugin_capability: &'static str,
 }
 
 async fn hello(State(state): State<AppState>) -> Json<Hello> {
@@ -280,6 +593,8 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         wally_folder: state.wally_folder.read().unwrap().clone(),
         widget_owned: state.widget_owned,
         plugin_connected,
+        plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
+        plugin_capability: crate::ws::plugin_capability(),
     })
 }
 
@@ -293,6 +608,8 @@ struct InitialCompareBody {
     studio_stats: Stats,
     #[serde(rename = "studioSnapshot", default)]
     studio_snapshot: Vec<Value>,
+    #[serde(rename = "pluginProtocol", default)]
+    plugin_protocol: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +645,15 @@ async fn initial_compare(
     State(state): State<AppState>,
     Json(body): Json<InitialCompareBody>,
 ) -> Json<Value> {
+    if body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
+        return Json(json!({
+            "ok": false,
+            "error": format!(
+                "incompatible Studio plugin protocol; expected {}. Reinstall the Studio plugin.",
+                crate::ws::PLUGIN_PROTOCOL_VERSION
+            ),
+        }));
+    }
     let disk_stats = match compute_disk_stats(state.canonical_project.as_path()) {
         Ok(s) => s,
         Err(e) => {
@@ -359,42 +685,38 @@ async fn initial_compare(
         }));
     }
 
-    let mut comparison = None;
-    if !body.studio_snapshot.is_empty() {
+    if body.studio_snapshot.is_empty() {
+        return Json(json!({
+            "ok": false,
+            "error": "Studio snapshot is required to compare two non-empty sync trees",
+        }));
+    }
+    let comparison =
         match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot)
         {
             Ok(report) if report.is_clean() => {
+                if let Err(error) = seed_clean_script_baselines(
+                    state.canonical_project.as_path(),
+                    state.conflict.as_ref(),
+                ) {
+                    return Json(json!({
+                        "ok": false,
+                        "error": format!("seed conflict baselines: {error}"),
+                    }));
+                }
                 return Json(json!({
                     "action": "in-sync",
                     "diskStats": disk_stats,
                 }));
             }
-            Ok(report) => {
-                comparison = Some(report);
-            }
+            Ok(report) => Some(report),
             Err(e) => {
                 return Json(json!({
                     "ok": false,
                     "error": format!("snapshot compare: {e}"),
                 }));
             }
-        }
-    } else {
-        // Legacy plugin fallback: use counts only when they agree. Counts are
-        // not strong enough to prove a conflict because scripts-with-children
-        // and pass-through containers can make disk/Studio totals differ even
-        // when the actual mirrored data is identical.
-        let d = disk_stats;
-        let s = body.studio_stats;
-        let script_drift = (d.script_count as i64 - s.script_count as i64).abs();
-        let instance_drift = (d.instance_count as i64 - s.instance_count as i64).abs();
-        if script_drift == 0 && instance_drift <= 2 {
-            return Json(json!({
-                "action": "in-sync",
-                "diskStats": disk_stats,
-            }));
-        }
-    }
+        };
 
     // Both non-empty → park a pending decision and tell the plugin to drive the UI.
     let choice_id = new_choice_id();
@@ -424,6 +746,49 @@ async fn initial_compare(
         "diskStats": disk_stats,
         "comparison": comparison,
     }))
+}
+
+fn seed_clean_script_baselines(
+    root: &Path,
+    conflicts: &crate::conflict::ConflictEngine,
+) -> Result<usize, String> {
+    let mut seeded = 0usize;
+    for service in snapshot::SYNCED_SERVICES {
+        let service_dir = root.join(service);
+        if service_dir.is_dir() {
+            seeded += seed_script_baselines_in_dir(&service_dir, conflicts)?;
+        }
+    }
+    Ok(seeded)
+}
+
+fn seed_script_baselines_in_dir(
+    dir: &Path,
+    conflicts: &crate::conflict::ConflictEngine,
+) -> Result<usize, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| format!("read dir {}: {error}", dir.display()))?;
+    let mut seeded = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read dir {}: {error}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            seeded += seed_script_baselines_in_dir(&path, conflicts)?;
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if classify_script_file(&name).is_none() && !is_init_file(&name) {
+            continue;
+        }
+        let bytes =
+            std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        let normalized = normalize_line_endings(&bytes).into_owned();
+        conflicts.record_sync(&path, hash(&normalized), fs_mtime(&path));
+        seeded += 1;
+    }
+    Ok(seeded)
 }
 
 #[cfg(test)]
@@ -587,17 +952,6 @@ async fn initial_choice(
         }
     }
 
-    {
-        let mut strict_until = state.strict_bootstrap_until.lock().unwrap();
-        *strict_until = match choice {
-            // Keep Studio resolves initial drift by pushing the live Studio
-            // tree to disk and pruning disk-only scoped paths. Store this in
-            // the daemon too so already-loaded older plugins still resolve.
-            Choice::Studio => Some(Instant::now() + Duration::from_secs(300)),
-            Choice::Disk | Choice::Cancel => None,
-        };
-    }
-
     let choice_str = match choice {
         Choice::Disk => "disk",
         Choice::Studio => "studio",
@@ -609,18 +963,6 @@ async fn initial_choice(
     }
 
     Json(json!({ "ok": true }))
-}
-
-fn strict_bootstrap_active(state: &AppState) -> bool {
-    let mut strict_until = state.strict_bootstrap_until.lock().unwrap();
-    match *strict_until {
-        Some(deadline) if deadline >= Instant::now() => true,
-        Some(_) => {
-            *strict_until = None;
-            false
-        }
-        None => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -680,11 +1022,24 @@ struct PushBody {
     force_prune: bool,
     #[serde(default)]
     services: Vec<Value>,
+    #[serde(rename = "pluginProtocol", default)]
+    plugin_protocol: Option<u64>,
 }
 
 async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json<Value> {
+    if body.bootstrap && body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
+        return Json(json!({
+            "ok": false,
+            "applied": 0,
+            "skipped": 0,
+            "conflicts": [],
+            "errors": [format!(
+                "incompatible Studio plugin protocol; expected {}. Reinstall the Studio plugin.",
+                crate::ws::PLUGIN_PROTOCOL_VERSION
+            )],
+        }));
+    }
     let root = state.canonical_project.as_path();
-    let strict_from_initial_choice = body.bootstrap && strict_bootstrap_active(&state);
     let ctx = PushCtx {
         conflicts: state.conflict.as_ref(),
         push_quiet: state.push_quiet.as_ref(),
@@ -699,8 +1054,8 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
             conflicts: state.conflict.as_ref(),
             push_quiet: state.push_quiet.as_ref(),
             force_overwrite: true,
-            strict: body.strict || strict_from_initial_choice,
-            force_prune: body.force_prune || strict_from_initial_choice,
+            strict: body.strict,
+            force_prune: body.force_prune,
         };
         for svc in &body.services {
             match apply_service_node(root, svc, &bootstrap_ctx) {
@@ -798,21 +1153,28 @@ struct PollParams {
 }
 
 async fn poll(State(state): State<AppState>, Query(_params): Query<PollParams>) -> Json<Value> {
-    let mut rx = state.watch_tx.subscribe();
+    let mut rx = state.events.subscribe();
     let root = state.canonical_project.as_path();
     let mut out: Vec<Value> = Vec::new();
 
-    // Wait up to 30s for the first op, then drain anything else that arrived
-    // within a brief coalesce window so bursts go out together.
-    let first = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
-    match first {
-        Ok(Ok(op)) => {
-            if let Some(po) = fs_op_to_plugin_op(root, &op) {
-                out.push(po);
+    // Wait up to 30s for the first conflict-filtered op, then drain anything
+    // else that arrived within a brief coalesce window so bursts go together.
+    let first = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Some(op) = event_to_plugin_op(root, &event) {
+                        return Some(op);
+                    }
+                }
+                Err(_) => return None,
             }
         }
-        Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-        Ok(Err(broadcast::error::RecvError::Closed)) => {}
+    })
+    .await;
+    match first {
+        Ok(Some(op)) => out.push(op),
+        Ok(None) => {}
         Err(_) => {
             // Timeout — return empty, plugin re-polls immediately.
             return Json(json!({ "ok": true, "ops": out }));
@@ -820,18 +1182,451 @@ async fn poll(State(state): State<AppState>, Query(_params): Query<PollParams>) 
     }
 
     // Brief drain window.
-    loop {
-        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-            Ok(Ok(op)) => {
-                if let Some(po) = fs_op_to_plugin_op(root, &op) {
-                    out.push(po);
-                }
-            }
-            _ => break,
+    while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        if let Some(op) = event_to_plugin_op(root, &event) {
+            out.push(op);
         }
     }
 
     Json(json!({ "ok": true, "ops": out }))
+}
+
+pub(crate) fn event_to_plugin_op(root: &Path, event: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(event).ok()?;
+    if value.get("type").and_then(Value::as_str) == Some("plugin-op") {
+        return value.get("op").cloned();
+    }
+    if value.get("type").and_then(Value::as_str) != Some("op") {
+        return None;
+    }
+    let op: Op = serde_json::from_value(value.get("op")?.clone()).ok()?;
+    fs_op_to_plugin_op(root, &op)
+}
+
+fn broadcast_filtered_op(events: &broadcast::Sender<String>, op: &Op) -> Result<(), String> {
+    let payload = serde_json::to_string(&json!({ "type": "op", "op": op }))
+        .map_err(|error| format!("serialize op: {error}"))?;
+    events
+        .send(payload)
+        .map(|_| ())
+        .map_err(|_| "no connected client can receive the resolved conflict".to_string())
+}
+
+fn broadcast_plugin_op(events: &broadcast::Sender<String>, op: Value) -> Result<(), String> {
+    let payload = serde_json::to_string(&json!({ "type": "plugin-op", "op": op }))
+        .map_err(|error| format!("serialize plugin op: {error}"))?;
+    events
+        .send(payload)
+        .map(|_| ())
+        .map_err(|_| "no connected client can receive the resolved conflict".to_string())
+}
+
+fn deliver_prepared_rename(
+    events: &broadcast::Sender<String>,
+    rename: &Value,
+    retained: &[Value],
+) -> Result<usize, (String, usize)> {
+    deliver_prepared_rename_with(rename, retained, |op| {
+        broadcast_plugin_op(events, op.clone())
+    })
+}
+
+fn deliver_prepared_rename_with<F>(
+    rename: &Value,
+    retained: &[Value],
+    mut deliver: F,
+) -> Result<usize, (String, usize)>
+where
+    F: FnMut(&Value) -> Result<(), String>,
+{
+    let mut delivered = 0usize;
+    for op in std::iter::once(rename).chain(retained.iter()) {
+        if let Err(error) = deliver(op) {
+            return Err((error, delivered));
+        }
+        delivered += 1;
+    }
+    Ok(delivered)
+}
+
+fn compensate_studio_rename(
+    events: &broadcast::Sender<String>,
+    root: &Path,
+    applied_rename: &Value,
+    from: &Path,
+    to: &Path,
+    conflict_path: &Path,
+    studio_bytes: &[u8],
+) -> bool {
+    if applied_rename.get("op").and_then(Value::as_str) != Some("rename") {
+        // Class-changing renames require reconstructing the original class and
+        // cannot be safely guessed after a partial apply.
+        return false;
+    }
+    let Some(rename_from) = applied_rename.get("from").cloned() else {
+        return false;
+    };
+    let Some(rename_to) = applied_rename.get("to").cloned() else {
+        return false;
+    };
+
+    let destination_conflict = if conflict_path == from {
+        to.to_path_buf()
+    } else if let Ok(suffix) = conflict_path.strip_prefix(from) {
+        to.join(suffix)
+    } else {
+        return false;
+    };
+    let Ok(relative) = destination_conflict.strip_prefix(root) else {
+        return false;
+    };
+    let segments = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(String::from))
+        .collect::<Vec<_>>();
+    let Some(destination_lookup) = segs_to_lookup_path(&segments) else {
+        return false;
+    };
+    let Ok(studio_source) = std::str::from_utf8(studio_bytes) else {
+        return false;
+    };
+
+    let restore_source = json!({
+        "op": "update",
+        "path": destination_lookup,
+        "properties": { "Source": studio_source },
+    });
+    let reverse_rename = json!({
+        "op": "rename",
+        "from": rename_to,
+        "to": rename_from,
+    });
+    broadcast_plugin_op(events, restore_source).is_ok()
+        && broadcast_plugin_op(events, reverse_rename).is_ok()
+}
+
+fn mark_conflict_resolution_quiet(state: &AppState, path: &Path) {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let deadline = Instant::now() + Duration::from_millis(PUSH_QUIET_MS);
+    state.push_quiet.lock().unwrap().insert(canon, deadline);
+}
+
+fn audit_conflict_resolution(action: &str, fields: Value) {
+    let mut entry = json!({
+        "source": "filesystem-sync-conflict",
+        "action": action,
+        "outcome": "resolved",
+    });
+    if let (Some(entry), Some(fields)) = (entry.as_object_mut(), fields.as_object()) {
+        entry.extend(fields.clone());
+    }
+    let _ = write_log_entry(Json(entry));
+}
+
+fn conflict_swap_path(parent: &Path, label: &str) -> Result<PathBuf, String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    use std::sync::atomic::Ordering;
+    for _ in 0..64 {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".rosync-conflict-{label}-{}-{sequence}.swp",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "could not allocate conflict rollback path in {}",
+        parent.display()
+    ))
+}
+
+fn write_conflict_temp(parent: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create conflict temp parent {}: {error}", parent.display()))?;
+    for _ in 0..64 {
+        let path = conflict_swap_path(parent, "write")?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("write conflict temp {}: {error}", path.display()));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("create conflict temp {}: {error}", path.display()));
+            }
+        }
+    }
+    Err(format!(
+        "could not create conflict temp file in {}",
+        parent.display()
+    ))
+}
+
+fn restore_fs_rename_transactional(
+    from: &Path,
+    to: &Path,
+    conflict_path: &Path,
+    studio_bytes: &[u8],
+) -> Result<(), String> {
+    restore_fs_rename_transactional_with(from, to, conflict_path, studio_bytes, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn restore_fs_deleted_source(path: &Path, studio_bytes: &[u8]) -> Result<(), String> {
+    restore_fs_deleted_source_with(path, studio_bytes, |from, to| std::fs::rename(from, to))
+}
+
+const DIRECTORY_DELETE_RESTORE_ERROR: &str =
+    "cannot safely restore a directory deleted from disk from one conflicted source; no files were written and the conflict remains parked. Restore the full subtree from Studio before resolving it";
+
+fn validate_fs_delete_restore(is_dir: bool) -> Result<(), &'static str> {
+    if is_dir {
+        Err(DIRECTORY_DELETE_RESTORE_ERROR)
+    } else {
+        Ok(())
+    }
+}
+
+fn restore_fs_deleted_source_with<R>(
+    path: &Path,
+    studio_bytes: &[u8],
+    mut rename: R,
+) -> Result<(), String>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    if path.exists() {
+        return Err(format!(
+            "refusing to restore deleted source because {} already exists",
+            path.display()
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("restored source has no parent: {}", path.display()))?;
+    let temporary = write_conflict_temp(parent, studio_bytes)?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "refusing to restore deleted source because {} appeared during restore",
+            path.display()
+        ));
+    }
+    if let Err(error) = rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "install restored source {}: {error}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn restore_fs_rename_transactional_with<R>(
+    from: &Path,
+    to: &Path,
+    conflict_path: &Path,
+    studio_bytes: &[u8],
+    mut rename: R,
+) -> Result<(), String>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    if from.exists() || !to.exists() {
+        return Err(format!(
+            "restore rename requires only the retained destination to exist (from={}, to={})",
+            from.exists(),
+            to.exists()
+        ));
+    }
+    let temp_parent = from.parent().ok_or_else(|| {
+        format!(
+            "restore rename has no parent for original path {}",
+            from.display()
+        )
+    })?;
+    let write_temp = write_conflict_temp(temp_parent, studio_bytes)?;
+
+    if let Err(error) = rename(to, from) {
+        let _ = std::fs::remove_file(&write_temp);
+        return Err(format!(
+            "restore rename {} -> {}: {error}",
+            to.display(),
+            from.display()
+        ));
+    }
+
+    if let Some(parent) = conflict_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            let rollback = rename(from, to);
+            let _ = std::fs::remove_file(&write_temp);
+            return Err(format!(
+                "create restored source parent {}: {error}; directory rollback: {}",
+                parent.display(),
+                rollback
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|rollback| rollback.to_string())
+            ));
+        }
+    }
+
+    let backup = if conflict_path.exists() {
+        let parent = conflict_path.parent().unwrap_or(temp_parent);
+        let backup = match conflict_swap_path(parent, "backup") {
+            Ok(backup) => backup,
+            Err(error) => {
+                let rollback = rename(from, to);
+                let _ = std::fs::remove_file(&write_temp);
+                return Err(format!(
+                    "{error}; directory rollback: {}",
+                    rollback
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|rollback| rollback.to_string())
+                ));
+            }
+        };
+        if let Err(error) = rename(conflict_path, &backup) {
+            let rollback = rename(from, to);
+            let _ = std::fs::remove_file(&write_temp);
+            return Err(format!(
+                "backup restored source {}: {error}; directory rollback: {}",
+                conflict_path.display(),
+                rollback
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|rollback| rollback.to_string())
+            ));
+        }
+        Some(backup)
+    } else {
+        None
+    };
+
+    if let Err(error) = rename(&write_temp, conflict_path) {
+        let source_rollback = backup.as_ref().map(|backup| rename(backup, conflict_path));
+        let directory_rollback = rename(from, to);
+        let _ = std::fs::remove_file(&write_temp);
+        return Err(format!(
+            "install restored Studio source {}: {error}; source rollback: {}; directory rollback: {}",
+            conflict_path.display(),
+            source_rollback
+                .map(|result| result.map(|_| "ok".to_string()).unwrap_or_else(|error| error.to_string()))
+                .unwrap_or_else(|| "not-needed".to_string()),
+            directory_rollback
+                .map(|_| "ok".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        ));
+    }
+
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn collect_tree_update_ops(path: &Path, out: &mut Vec<Op>) -> Result<(), String> {
+    let is_dir = path.is_dir();
+    let content = if is_dir {
+        None
+    } else {
+        Some(std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?)
+    };
+    out.push(Op {
+        kind: OpKind::Update,
+        path: path.to_path_buf(),
+        from: None,
+        content,
+    });
+
+    if !is_dir {
+        return Ok(());
+    }
+
+    let mut children = std::fs::read_dir(path)
+        .map_err(|error| format!("read dir {}: {error}", path.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("read dir {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    children.sort();
+    for child in children {
+        if child.is_dir() {
+            collect_tree_update_ops(&child, out)?;
+            continue;
+        }
+        let Some(name) = child.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if classify_script_file(name).is_some() || is_init_file(name) {
+            collect_tree_update_ops(&child, out)?;
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_source_acks(
+    conflicts: &crate::conflict::ConflictEngine,
+    ops: &[Op],
+    timeout: Duration,
+) -> bool {
+    let expected: Vec<(&Path, Vec<u8>)> = ops
+        .iter()
+        .filter_map(|op| {
+            op.content.as_deref().map(|content| {
+                (
+                    op.path.as_path(),
+                    normalize_line_endings(content).into_owned(),
+                )
+            })
+        })
+        .collect();
+    if expected.is_empty() {
+        return true;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if expected
+            .iter()
+            .all(|(path, content)| conflicts.matches_baseline(path, content))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn restore_resolved_conflict(
+    state: &AppState,
+    target: &Path,
+    bytes: Vec<u8>,
+    is_dir: bool,
+    rejected_studio: Option<Vec<u8>>,
+) {
+    if let Some(studio_bytes) = rejected_studio {
+        state
+            .conflict
+            .park_studio_update(target, bytes, studio_bytes, fs_mtime(target));
+    } else {
+        state
+            .conflict
+            .park_studio_delete(target, bytes, fs_mtime(target), is_dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +1699,13 @@ async fn resolve(
     };
 
     let target = resolve_conflict_target(&state.canonical_project, &body.path);
+    if resolution == Resolution::KeepLocal && state.active_plugin.lock().unwrap().is_none() {
+        return Json(json!({
+            "ok": false,
+            "error": "cannot keep local while the Studio plugin is disconnected",
+            "path": body.path,
+        }));
+    }
     let Some(decision) = state.conflict.resolve(&target, resolution) else {
         return Json(json!({
             "ok": false,
@@ -936,18 +1738,359 @@ async fn resolve(
             }
             Json(json!({ "ok": true, "action": "wrote-fs", "path": body.path }))
         }
-        Resolved::PushStudio(bytes) => {
-            let op = Op {
-                kind: OpKind::Update,
-                path: target.clone(),
-                from: None,
-                content: Some(bytes.clone()),
+        Resolved::PushStudio {
+            bytes,
+            is_dir,
+            rejected_studio,
+        } => {
+            let ops = if is_dir {
+                let mut ops = Vec::new();
+                if let Err(error) = collect_tree_update_ops(&target, &mut ops) {
+                    state
+                        .conflict
+                        .park_studio_delete(&target, bytes, fs_mtime(&target), true);
+                    return Json(json!({ "ok": false, "error": error }));
+                }
+                ops
+            } else {
+                vec![Op {
+                    kind: OpKind::Update,
+                    path: target.clone(),
+                    from: None,
+                    content: Some(bytes.clone()),
+                }]
             };
-            let _ = state.watch_tx.send(op);
-            state
-                .conflict
-                .record_sync(&target, hash(&bytes), fs_mtime(&target));
+            let delivery = ops
+                .iter()
+                .try_for_each(|op| broadcast_filtered_op(&state.events, op));
+            if let Err(error) = delivery {
+                restore_resolved_conflict(&state, &target, bytes, is_dir, rejected_studio);
+                return Json(json!({ "ok": false, "error": error }));
+            }
+            if !wait_for_source_acks(state.conflict.as_ref(), &ops, Duration::from_secs(5)).await {
+                restore_resolved_conflict(&state, &target, bytes, is_dir, rejected_studio);
+                return Json(json!({
+                    "ok": false,
+                    "error": "Studio did not acknowledge the resolved source; conflict remains parked",
+                }));
+            }
             Json(json!({ "ok": true, "action": "pushed-studio", "path": body.path }))
+        }
+        Resolved::DeleteFs { bytes, is_dir } => {
+            {
+                let canon = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+                let deadline = Instant::now() + Duration::from_millis(PUSH_QUIET_MS);
+                state.push_quiet.lock().unwrap().insert(canon, deadline);
+            }
+            let result = if target.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else {
+                std::fs::remove_file(&target)
+            };
+            if let Err(error) = result {
+                state
+                    .conflict
+                    .park_studio_delete(&target, bytes, fs_mtime(&target), is_dir);
+                return Json(json!({ "ok": false, "error": format!("delete: {error}") }));
+            }
+            state.conflict.forget_path(&target);
+            Json(json!({ "ok": true, "action": "deleted-fs", "path": body.path }))
+        }
+        Resolved::DeleteStudio {
+            path,
+            conflict_path,
+            studio_bytes,
+            is_dir,
+        } => {
+            let op = Op {
+                kind: OpKind::Delete,
+                path: path.clone(),
+                from: None,
+                content: None,
+            };
+            if fs_op_to_plugin_op(state.canonical_project.as_path(), &op).is_none() {
+                state
+                    .conflict
+                    .park_fs_delete_conflict(&conflict_path, &path, studio_bytes, is_dir);
+                return Json(json!({
+                    "ok": false,
+                    "error": format!("cannot map disk delete {} to a Studio path", path.display()),
+                }));
+            }
+            if let Err(error) = broadcast_filtered_op(&state.events, &op) {
+                state
+                    .conflict
+                    .park_fs_delete_conflict(&conflict_path, &path, studio_bytes, is_dir);
+                return Json(json!({ "ok": false, "error": error }));
+            }
+            state.conflict.commit_fs_delete(&path);
+            audit_conflict_resolution(
+                "delete-studio",
+                json!({ "path": path, "resolution": "keep-disk" }),
+            );
+            Json(json!({
+                "ok": true,
+                "action": "deleted-studio",
+                "path": body.path,
+            }))
+        }
+        Resolved::RenameStudio {
+            from,
+            to,
+            is_dir,
+            conflict_path,
+            studio_bytes,
+            local_bytes,
+        } => {
+            let rename = Op {
+                kind: OpKind::Rename,
+                path: to.clone(),
+                from: Some(from.clone()),
+                content: None,
+            };
+            let mut ops = Vec::new();
+            if let Err(error) = collect_tree_update_ops(&to, &mut ops) {
+                state.conflict.park_fs_rename_conflict(
+                    &conflict_path,
+                    &from,
+                    &to,
+                    local_bytes,
+                    studio_bytes,
+                    is_dir,
+                );
+                return Json(json!({ "ok": false, "error": error }));
+            }
+            let mut retained_plugin_ops = Vec::with_capacity(ops.len());
+            for op in &ops {
+                let Some(plugin_op) = fs_op_to_plugin_op(state.canonical_project.as_path(), op)
+                else {
+                    state.conflict.park_fs_rename_conflict(
+                        &conflict_path,
+                        &from,
+                        &to,
+                        local_bytes,
+                        studio_bytes,
+                        is_dir,
+                    );
+                    return Json(json!({
+                        "ok": false,
+                        "error": format!(
+                            "cannot map retained rename source {} to Studio",
+                            op.path.display()
+                        ),
+                    }));
+                };
+                retained_plugin_ops.push(plugin_op);
+            }
+            let Some(plugin_op) = fs_op_to_plugin_op(state.canonical_project.as_path(), &rename)
+            else {
+                state.conflict.park_fs_rename_conflict(
+                    &conflict_path,
+                    &from,
+                    &to,
+                    local_bytes,
+                    studio_bytes,
+                    is_dir,
+                );
+                return Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "cannot map disk rename {} -> {} to Studio paths",
+                        from.display(),
+                        to.display()
+                    ),
+                }));
+            };
+            // Every retained source was read and translated before the first
+            // Studio mutation. Rename first, then re-apply the destination
+            // tree so Keep Disk means both name and source win.
+            if let Err((error, delivered)) =
+                deliver_prepared_rename(&state.events, &plugin_op, &retained_plugin_ops)
+            {
+                let compensated = delivered > 0
+                    && compensate_studio_rename(
+                        &state.events,
+                        state.canonical_project.as_path(),
+                        &plugin_op,
+                        &from,
+                        &to,
+                        &conflict_path,
+                        &studio_bytes,
+                    );
+                state.conflict.park_fs_rename_conflict(
+                    &conflict_path,
+                    &from,
+                    &to,
+                    local_bytes,
+                    studio_bytes,
+                    is_dir,
+                );
+                return Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "{error} after {delivered} queued op(s); Studio rename compensation {}",
+                        if compensated { "was queued" } else { "was unavailable" }
+                    ),
+                }));
+            }
+            if !wait_for_source_acks(state.conflict.as_ref(), &ops, Duration::from_secs(5)).await {
+                let compensated = compensate_studio_rename(
+                    &state.events,
+                    state.canonical_project.as_path(),
+                    &plugin_op,
+                    &from,
+                    &to,
+                    &conflict_path,
+                    &studio_bytes,
+                );
+                state.conflict.park_fs_rename_conflict(
+                    &conflict_path,
+                    &from,
+                    &to,
+                    local_bytes,
+                    studio_bytes,
+                    is_dir,
+                );
+                return Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "Studio did not acknowledge retained disk source after rename; compensation {}",
+                        if compensated { "was queued" } else { "was unavailable" }
+                    ),
+                }));
+            }
+            state.conflict.forget_path(&from);
+            audit_conflict_resolution(
+                "rename-studio",
+                json!({
+                    "from": from,
+                    "to": to,
+                    "isDirectory": is_dir,
+                    "resolution": "keep-disk",
+                }),
+            );
+            Json(json!({
+                "ok": true,
+                "action": "renamed-studio",
+                "path": body.path,
+            }))
+        }
+        Resolved::RestoreFsDelete {
+            delete_root,
+            conflict_path,
+            studio_bytes,
+            is_dir,
+        } => {
+            if let Err(error) = validate_fs_delete_restore(is_dir) {
+                let _ = write_log_entry(Json(json!({
+                    "source": "filesystem-sync-conflict",
+                    "action": "restore-disk-delete",
+                    "deleteRoot": &delete_root,
+                    "path": &conflict_path,
+                    "resolution": "keep-studio",
+                    "outcome": "blocked-directory-restore",
+                    "error": error,
+                })));
+                state.conflict.park_fs_delete_conflict(
+                    &conflict_path,
+                    &delete_root,
+                    studio_bytes,
+                    is_dir,
+                );
+                return Json(json!({
+                    "ok": false,
+                    "code": "DIRECTORY_DELETE_RESTORE_REQUIRES_STUDIO_PULL",
+                    "error": error,
+                    "conflictRemains": true,
+                }));
+            }
+            mark_conflict_resolution_quiet(&state, &conflict_path);
+            if let Err(error) = restore_fs_deleted_source(&conflict_path, &studio_bytes) {
+                state.conflict.park_fs_delete_conflict(
+                    &conflict_path,
+                    &delete_root,
+                    studio_bytes,
+                    is_dir,
+                );
+                return Json(json!({ "ok": false, "error": error }));
+            }
+            state.conflict.record_sync(
+                &conflict_path,
+                hash(&studio_bytes),
+                fs_mtime(&conflict_path),
+            );
+            mark_conflict_resolution_quiet(&state, &conflict_path);
+            audit_conflict_resolution(
+                "restore-disk-delete",
+                json!({
+                    "deleteRoot": delete_root,
+                    "path": conflict_path,
+                    "resolution": "keep-studio",
+                }),
+            );
+            Json(json!({
+                "ok": true,
+                "action": "restored-fs",
+                "path": body.path,
+            }))
+        }
+        Resolved::RestoreFsRename {
+            from,
+            to,
+            conflict_path,
+            studio_bytes,
+            is_dir,
+            local_bytes,
+        } => {
+            let repark = || {
+                if from.exists() && !to.exists() {
+                    state.conflict.park_studio_update(
+                        &conflict_path,
+                        local_bytes.clone(),
+                        studio_bytes.clone(),
+                        fs_mtime(&conflict_path),
+                    );
+                } else {
+                    state.conflict.park_fs_rename_conflict(
+                        &conflict_path,
+                        &from,
+                        &to,
+                        local_bytes.clone(),
+                        studio_bytes.clone(),
+                        is_dir,
+                    );
+                }
+            };
+            mark_conflict_resolution_quiet(&state, &from);
+            mark_conflict_resolution_quiet(&state, &to);
+            if let Err(error) =
+                restore_fs_rename_transactional(&from, &to, &conflict_path, &studio_bytes)
+            {
+                repark();
+                return Json(json!({ "ok": false, "error": error }));
+            }
+            state.conflict.record_sync(
+                &conflict_path,
+                hash(&studio_bytes),
+                fs_mtime(&conflict_path),
+            );
+            mark_conflict_resolution_quiet(&state, &from);
+            mark_conflict_resolution_quiet(&state, &to);
+            mark_conflict_resolution_quiet(&state, &conflict_path);
+            audit_conflict_resolution(
+                "restore-disk-rename",
+                json!({
+                    "from": from,
+                    "to": to,
+                    "path": conflict_path,
+                    "resolution": "keep-studio",
+                }),
+            );
+            Json(json!({
+                "ok": true,
+                "action": "restored-fs-rename",
+                "path": body.path,
+            }))
         }
     }
 }
@@ -994,7 +2137,7 @@ fn apply_op(root: &Path, op: &Value, ctx: &PushCtx<'_>) -> Result<ApplyOutcome, 
         }
         "delete" | "remove" => {
             let segs = op.get("path").map(path_segments).unwrap_or_default();
-            apply_delete(root, &segs, ctx).map(ApplyOutcome::Applied)
+            apply_delete(root, &segs, ctx)
         }
         "update" => {
             let segs = op.get("path").map(path_segments).unwrap_or_default();
@@ -1015,7 +2158,7 @@ fn apply_op(root: &Path, op: &Value, ctx: &PushCtx<'_>) -> Result<ApplyOutcome, 
             let to_segs = op.get("to").map(path_segments).unwrap_or_default();
             apply_move(root, &from_segs, &to_segs, ctx).map(ApplyOutcome::Applied)
         }
-        other if other.is_empty() => Err("op missing kind".to_string()),
+        "" => Err("op missing kind".to_string()),
         other => Err(format!("unknown op: {other}")),
     }
 }
@@ -1037,14 +2180,13 @@ fn apply_service_node(root: &Path, node: &Value, ctx: &PushCtx<'_>) -> Result<us
         .unwrap_or_default();
     let wanted = wanted_child_names_for_prune(&children);
     for child in child_fragment_assignments(&children) {
-        match apply_set_in_dir(
+        if let ApplyOutcome::Applied(k) = apply_set_in_dir(
             &svc_dir,
             child.node,
             ctx,
             Some((&child.fragment, child.fallback_by_name)),
         )? {
-            ApplyOutcome::Applied(k) => n += k,
-            _ => {}
+            n += k
         }
     }
     if ctx.strict && ctx.force_prune {
@@ -1098,7 +2240,7 @@ fn apply_set_in_dir(
     if class == "Folder" && !has_children {
         return Ok(ApplyOutcome::Skipped);
     }
-    std::fs::create_dir_all(&parent_dir)
+    std::fs::create_dir_all(parent_dir)
         .map_err(|e| format!("mkdir {}: {e}", parent_dir.display()))?;
 
     // If a node with this name already exists on disk, reuse its path; otherwise
@@ -1108,12 +2250,12 @@ fn apply_set_in_dir(
             if parent_dir.join(fragment).exists() {
                 Some(fragment.to_string())
             } else if fallback_by_name {
-                find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?
+                find_child_fragment_by_name(parent_dir, name).map_err(|e| e.to_string())?
             } else {
                 None
             }
         }
-        None => find_child_fragment_by_name(&parent_dir, name).map_err(|e| e.to_string())?,
+        None => find_child_fragment_by_name(parent_dir, name).map_err(|e| e.to_string())?,
     };
     if let Some(fragment) = existing.as_deref() {
         let existing_path = parent_dir.join(fragment);
@@ -1126,7 +2268,7 @@ fn apply_set_in_dir(
             }
         }
     }
-    let taken = siblings_except(&parent_dir, existing.as_deref())?;
+    let taken = siblings_except(parent_dir, existing.as_deref())?;
 
     let frag = match &existing {
         Some(f) => {
@@ -1182,7 +2324,12 @@ fn apply_set_in_dir(
                 .map_err(|e| format!("mkdir {}: {e}", target.display()))?;
             ctx.mark_quiet(&target);
             let init_name = format!("init ({}){}", encode_name(name), sc.suffix());
-            let init_path = target.join(&init_name);
+            let preferred_init_path = target.join(&init_name);
+            let init_path = if preferred_init_path.exists() {
+                preferred_init_path
+            } else {
+                find_existing_init_source(&target, name, sc)?.unwrap_or(preferred_init_path)
+            };
             let raw_bytes = source.unwrap_or_default().into_bytes();
             let bytes = normalize_line_endings(&raw_bytes).into_owned();
             match apply_source_bytes(&init_path, &bytes, ctx)? {
@@ -1226,6 +2373,44 @@ fn apply_set_in_dir(
         }
     }
     Ok(ApplyOutcome::Applied(applied))
+}
+
+/// Find the source file for an existing script-with-children without assuming
+/// it already uses the latest portable filename encoding. Older projects may
+/// have a literal-Unicode `init (<Name>)` file; reuse it instead of creating a
+/// second encoded init file beside it.
+fn find_existing_init_source(
+    dir: &Path,
+    expected_name: &str,
+    expected_class: ScriptClass,
+) -> Result<Option<PathBuf>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| format!("read dir {}: {error}", dir.display()))?;
+    let mut named_matches = Vec::new();
+    let mut plain_match = None;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read dir {}: {error}", dir.display()))?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some((class, name)) = parse_init_file(&file_name) {
+            if class == expected_class && name == expected_name {
+                named_matches.push(entry.path());
+            }
+            continue;
+        }
+        if parse_plain_init_file(&file_name) == Some(expected_class) {
+            plain_match = Some(entry.path());
+        }
+    }
+    if named_matches.len() > 1 {
+        return Err(format!(
+            "multiple init sources in {} map to {}",
+            dir.display(),
+            expected_name
+        ));
+    }
+    Ok(named_matches.pop().or(plain_match))
 }
 
 fn child_fragment_assignments(children: &[Value]) -> Vec<ChildAssignment<'_>> {
@@ -1440,6 +2625,9 @@ fn folder_contains_sync_owned_path(dir: &Path) -> bool {
 }
 
 fn remove_path_for_replace(path: &Path, ctx: &PushCtx<'_>) -> Result<(), String> {
+    if path.exists() && (ctx.force_overwrite || (ctx.strict && ctx.force_prune)) {
+        backup_forced_removal(path)?;
+    }
     mark_quiet_tree(path, ctx);
     if path.is_dir() {
         std::fs::remove_dir_all(path).map_err(|e| format!("rmdir {}: {e}", path.display()))?;
@@ -1447,6 +2635,76 @@ fn remove_path_for_replace(path: &Path, ctx: &PushCtx<'_>) -> Result<(), String>
         std::fs::remove_file(path).map_err(|e| format!("rm {}: {e}", path.display()))?;
     }
     ctx.mark_quiet(path);
+    Ok(())
+}
+
+fn backup_forced_removal(path: &Path) -> Result<PathBuf, String> {
+    let service_dir = path
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| snapshot::SYNCED_SERVICES.contains(&name))
+        })
+        .ok_or_else(|| {
+            format!(
+                "refusing destructive write outside a synced service: {}",
+                path.display()
+            )
+        })?;
+    let project_root = service_dir
+        .parent()
+        .ok_or_else(|| format!("cannot locate project root for {}", path.display()))?;
+    let relative = path
+        .strip_prefix(project_root)
+        .map_err(|error| format!("backup path {}: {error}", path.display()))?;
+    static BACKUP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = BACKUP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let destination = project_root
+        .join(".rosync-backups")
+        .join(format!("{stamp}-{sequence}"))
+        .join(relative);
+    copy_backup_path(path, &destination)?;
+    Ok(destination)
+}
+
+fn copy_backup_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| format!("backup metadata {}: {error}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing destructive write through symlink {}; move it manually",
+            source.display()
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination)
+            .map_err(|error| format!("backup mkdir {}: {error}", destination.display()))?;
+        let entries = std::fs::read_dir(source)
+            .map_err(|error| format!("backup read dir {}: {error}", source.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("backup read dir {}: {error}", source.display()))?;
+            copy_backup_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("backup mkdir {}: {error}", parent.display()))?;
+        }
+        std::fs::copy(source, destination).map_err(|error| {
+            format!(
+                "backup copy {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -1480,7 +2738,10 @@ fn apply_source_bytes(
     }
 
     let current = if target.is_file() {
-        Some((std::fs::read(target).unwrap_or_default(), fs_mtime(target)))
+        Some((
+            std::fs::read(target).map_err(|e| format!("read {}: {e}", target.display()))?,
+            fs_mtime(target),
+        ))
     } else {
         None
     };
@@ -1505,24 +2766,69 @@ fn apply_source_bytes(
     }
 }
 
-fn apply_delete(root: &Path, segs: &[String], ctx: &PushCtx<'_>) -> Result<usize, String> {
+fn apply_delete(root: &Path, segs: &[String], ctx: &PushCtx<'_>) -> Result<ApplyOutcome, String> {
     if segs.is_empty() {
         return Err("delete: empty path".into());
     }
     let target = match resolve_segments_to_path(root, segs)? {
         Some(p) => p,
-        None => return Ok(0),
+        None => return Ok(ApplyOutcome::Skipped),
     };
     if target.is_dir() && !disk_path_is_sync_owned(&target) {
-        return Ok(0);
+        return Ok(ApplyOutcome::Skipped);
+    }
+    if !ctx.force_overwrite && !path_tree_matches_baselines(&target, ctx.conflicts)? {
+        let is_dir = target.is_dir();
+        let local = if is_dir {
+            format!("[directory retained on disk: {}]", target.display()).into_bytes()
+        } else {
+            std::fs::read(&target).map_err(|e| format!("read {}: {e}", target.display()))?
+        };
+        ctx.conflicts
+            .park_studio_delete(&target, local, fs_mtime(&target), is_dir);
+        return Ok(ApplyOutcome::Conflict(target));
     }
     if target.is_dir() {
         std::fs::remove_dir_all(&target).map_err(|e| format!("rmdir {}: {e}", target.display()))?;
     } else if target.is_file() {
         std::fs::remove_file(&target).map_err(|e| format!("rm {}: {e}", target.display()))?;
     }
+    ctx.conflicts.forget_path(&target);
     ctx.mark_quiet(&target);
-    Ok(1)
+    Ok(ApplyOutcome::Applied(1))
+}
+
+fn path_tree_matches_baselines(
+    path: &Path,
+    conflicts: &crate::conflict::ConflictEngine,
+) -> Result<bool, String> {
+    if path.is_file() {
+        let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        return Ok(conflicts.matches_baseline(path, &normalize_line_endings(&bytes)));
+    }
+    let entries =
+        std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", path.display()))?;
+        let child = entry.path();
+        if child.is_dir() {
+            if !path_tree_matches_baselines(&child, conflicts)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        let Some(name) = child.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if classify_script_file(name).is_none() && !is_init_file(name) {
+            continue;
+        }
+        let bytes = std::fs::read(&child).map_err(|e| format!("read {}: {e}", child.display()))?;
+        if !conflicts.matches_baseline(&child, &normalize_line_endings(&bytes)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn apply_update(
@@ -1547,7 +2853,7 @@ fn apply_update(
             let raw_bytes = source.as_bytes().to_vec();
             let bytes = normalize_line_endings(&raw_bytes).into_owned();
             let current = Some((
-                std::fs::read(&target).unwrap_or_default(),
+                std::fs::read(&target).map_err(|e| format!("read {}: {e}", target.display()))?,
                 fs_mtime(&target),
             ));
             let normalized_current: Option<Vec<u8>> = current
@@ -1594,14 +2900,16 @@ fn apply_rename(
         .ok_or_else(|| format!("rename: no parent for {}", target.display()))?
         .to_path_buf();
 
-    let (class, has_children) = match path_to_instance_meta(&target).map_err(|e| e.to_string())? {
-        Some(inst) => (
-            inst.class,
-            inst.is_dir && !inst.is_script_with_children
-                || inst.is_script_with_children && children_exist(&target),
-        ),
-        None => ("Folder".to_string(), target.is_dir()),
-    };
+    let (class, has_children, script_with_children) =
+        match path_to_instance_meta(&target).map_err(|e| e.to_string())? {
+            Some(inst) => (
+                inst.class,
+                inst.is_dir && !inst.is_script_with_children
+                    || inst.is_script_with_children && children_exist(&target),
+                inst.is_script_with_children,
+            ),
+            None => ("Folder".to_string(), target.is_dir(), false),
+        };
     let current_frag = target
         .file_name()
         .and_then(|s| s.to_str())
@@ -1616,30 +2924,231 @@ fn apply_rename(
         &taken,
     );
     let new_path = parent_dir.join(&new_frag.fragment);
-    std::fs::rename(&target, &new_path)
-        .map_err(|e| format!("rename {} → {}: {e}", target.display(), new_path.display()))?;
-    ctx.mark_quiet(&target);
-    ctx.mark_quiet(&new_path);
-
-    // If this was a script-with-children dir, also rename the init file.
+    rename_path_and_init(&target, &new_path, new_name, script_with_children, ctx)?;
+    // The source bytes did not change, but conflict baselines are keyed by
+    // filesystem path. Leaving them under the old name makes the next clean
+    // Studio edit/delete look like an unknown post-restart divergence. Rebase
+    // only after the outer + named-init rename has completed successfully.
+    ctx.conflicts.forget_path(&target);
     if new_path.is_dir() {
-        if let Ok(iter) = std::fs::read_dir(&new_path) {
-            for e in iter.flatten() {
-                let fname = e.file_name();
-                let Some(n) = fname.to_str() else { continue };
-                if let Some((sc, _)) = parse_init_file(n) {
-                    let new_init = format!("init ({}){}", encode_name(new_name), sc.suffix());
-                    let old_init_path = e.path();
-                    let new_init_path = new_path.join(new_init);
-                    let _ = std::fs::rename(&old_init_path, &new_init_path);
-                    ctx.mark_quiet(&old_init_path);
-                    ctx.mark_quiet(&new_init_path);
-                    break;
-                }
-            }
-        }
+        seed_script_baselines_in_dir(&new_path, ctx.conflicts)?;
+    } else if classify_script_file(
+        new_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    )
+    .is_some()
+    {
+        let bytes = std::fs::read(&new_path)
+            .map_err(|error| format!("read renamed source {}: {error}", new_path.display()))?;
+        let normalized = normalize_line_endings(&bytes).into_owned();
+        ctx.conflicts
+            .record_sync(&new_path, hash(&normalized), fs_mtime(&new_path));
     }
     Ok(1)
+}
+
+#[derive(Debug)]
+struct InitRenamePlan {
+    old_name: std::ffi::OsString,
+    new_name: String,
+}
+
+fn prepare_init_rename(
+    dir: &Path,
+    new_instance_name: &str,
+    script_with_children: bool,
+) -> Result<Option<InitRenamePlan>, String> {
+    if !script_with_children {
+        return Ok(None);
+    }
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| format!("read dir {}: {error}", dir.display()))?;
+    let mut named = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read dir {}: {error}", dir.display()))?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?
+            .is_file()
+        {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if let Some((class, _)) = parse_init_file(name) {
+            named.push((file_name, class));
+        }
+    }
+    if named.len() > 1 {
+        return Err(format!(
+            "rename: multiple named init sources found in {}",
+            dir.display()
+        ));
+    }
+    let Some((old_name, class)) = named.pop() else {
+        // Plain Wally/Rojo `init.lua` roots derive their identity from the
+        // directory name and therefore need no inner rename.
+        return Ok(None);
+    };
+    let new_name = format!(
+        "init ({}){}",
+        encode_name(new_instance_name),
+        class.suffix()
+    );
+    if old_name == std::ffi::OsStr::new(&new_name) {
+        return Ok(None);
+    }
+
+    Ok(Some(InitRenamePlan { old_name, new_name }))
+}
+
+fn init_rename_temp_path(dir: &Path) -> Result<PathBuf, String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    for _ in 0..32 {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!(
+            ".rosync-init-rename-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "rename: could not allocate a temporary init path in {}",
+        dir.display()
+    ))
+}
+
+fn rename_path_and_init(
+    target: &Path,
+    new_path: &Path,
+    new_instance_name: &str,
+    script_with_children: bool,
+    ctx: &PushCtx<'_>,
+) -> Result<(), String> {
+    rename_path_and_init_with(
+        target,
+        new_path,
+        new_instance_name,
+        script_with_children,
+        ctx,
+        |from, to| std::fs::rename(from, to),
+    )
+}
+
+fn rename_path_and_init_with<R>(
+    target: &Path,
+    new_path: &Path,
+    new_instance_name: &str,
+    script_with_children: bool,
+    ctx: &PushCtx<'_>,
+    mut rename: R,
+) -> Result<(), String>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let init_plan = prepare_init_rename(target, new_instance_name, script_with_children)?;
+    let temp_name = if init_plan.is_some() {
+        Some(
+            init_rename_temp_path(target)?
+                .file_name()
+                .ok_or_else(|| {
+                    format!("rename: invalid temporary path under {}", target.display())
+                })?
+                .to_os_string(),
+        )
+    } else {
+        None
+    };
+    ctx.mark_quiet(target);
+    ctx.mark_quiet(new_path);
+    rename(target, new_path).map_err(|error| {
+        format!(
+            "rename {} → {}: {error}",
+            target.display(),
+            new_path.display()
+        )
+    })?;
+
+    let Some(init_plan) = init_plan else {
+        return Ok(());
+    };
+    let old_init = new_path.join(&init_plan.old_name);
+    let new_init = new_path.join(&init_plan.new_name);
+    let temp_init = new_path.join(temp_name.expect("init plan allocates a temporary name"));
+    ctx.mark_quiet(&old_init);
+    ctx.mark_quiet(&new_init);
+    ctx.mark_quiet(&temp_init);
+
+    if let Err(init_error) = rename(&old_init, &temp_init) {
+        let rollback = rename(new_path, target);
+        return match rollback {
+            Ok(()) => Err(format!(
+                "rename init {} → {}: {init_error}; outer rename was rolled back",
+                old_init.display(),
+                new_init.display()
+            )),
+            Err(rollback_error) => Err(format!(
+                "rename init {} → {}: {init_error}; rollback {} → {} also failed: {rollback_error}",
+                old_init.display(),
+                new_init.display(),
+                new_path.display(),
+                target.display()
+            )),
+        };
+    }
+
+    // Check only after moving the old file aside. On case-insensitive
+    // filesystems a case-only destination aliases the old path and disappears
+    // at this point; on case-sensitive filesystems a genuinely distinct
+    // destination remains and must never be overwritten.
+    if new_init.exists() {
+        let restore_init = rename(&temp_init, &old_init);
+        let rollback_outer = rename(new_path, target);
+        return Err(format!(
+            "rename: init destination already exists: {}; init rollback: {}; outer rollback: {}",
+            new_init.display(),
+            restore_init
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string()),
+            rollback_outer
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string())
+        ));
+    }
+
+    if let Err(init_error) = rename(&temp_init, &new_init) {
+        let restore_init = rename(&temp_init, &old_init);
+        let rollback_outer = rename(new_path, target);
+        if restore_init.is_ok() && rollback_outer.is_ok() {
+            return Err(format!(
+                "rename init {} → {}: {init_error}; init and outer rename were rolled back",
+                old_init.display(),
+                new_init.display()
+            ));
+        }
+        return Err(format!(
+            "rename init {} → {}: {init_error}; init rollback: {}; outer rollback: {}",
+            old_init.display(),
+            new_init.display(),
+            restore_init
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string()),
+            rollback_outer
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string())
+        ));
+    }
+    Ok(())
 }
 
 fn apply_move(
@@ -1714,22 +3223,22 @@ fn resolve_segments_to_path(root: &Path, segs: &[String]) -> Result<Option<PathB
 /// Resolve the segments to a filesystem *directory* to be used as a parent
 /// (creating-along-the-way is deferred to the caller).
 fn resolve_segments_to_dir(root: &Path, segs: &[String]) -> Result<PathBuf, String> {
-    if segs.is_empty() {
-        return Ok(root.to_path_buf());
-    }
-    if let Some(p) = resolve_segments_to_path(root, segs)? {
-        if p.is_dir() {
-            return Ok(p);
-        }
-        return Err(format!(
-            "path {} is a file, not a directory (needed as parent)",
-            p.display()
-        ));
-    }
-    // Doesn't exist yet — build the literal encoded path.
+    // Resolve each existing segment before appending a missing one. Rebuilding
+    // the whole path after the first miss would discard a legacy literal-
+    // Unicode or disambiguated prefix and create a second encoded branch.
     let mut p = root.to_path_buf();
     for seg in segs {
-        p = p.join(encode_name(seg));
+        let next = match find_child_fragment_by_name(&p, seg).map_err(|e| e.to_string())? {
+            Some(fragment) => p.join(fragment),
+            None => p.join(encode_name(seg)),
+        };
+        if next.exists() && !next.is_dir() {
+            return Err(format!(
+                "path {} is a file, not a directory (needed as parent)",
+                next.display()
+            ));
+        }
+        p = next;
     }
     Ok(p)
 }
@@ -1879,12 +3388,13 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                 (from_script, to_script)
             {
                 if from_class != to_class {
+                    let source = source_for_path(&op.path, op.content.as_deref())?;
                     return Some(json!({
                         "op": "class_change",
                         "path": from_lookup_path,
                         "to": to_naming_path,
                         "class": to_class,
-                        "properties": { "Source": source_for_path(&op.path, op.content.as_deref()) },
+                        "properties": { "Source": source },
                     }));
                 }
             }
@@ -2032,13 +3542,13 @@ fn script_identity_from_segments(
     None
 }
 
-fn source_for_path(path: &Path, content: Option<&[u8]>) -> String {
+fn source_for_path(path: &Path, content: Option<&[u8]>) -> Option<String> {
     if let Some(content) = content {
-        return String::from_utf8_lossy(content).to_string();
+        return Some(String::from_utf8_lossy(content).to_string());
     }
     std::fs::read(path)
         .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        .unwrap_or_default()
+        .ok()
 }
 
 fn deleted_path_is_shadowed_ignored_folder(root: &Path, segs: &[String], path: &Path) -> bool {
@@ -2247,8 +3757,14 @@ fn fs_mtime(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::conflict::ConflictEngine;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, RwLock};
+    use tokio::sync::broadcast;
+    use tower::ServiceExt as _;
 
     struct TempDir(tempfile::TempDir);
     impl TempDir {
@@ -2308,6 +3824,385 @@ mod tests {
         Mutex::new(HashMap::new())
     }
 
+    fn artifact_test_app(temp: &TempDir) -> Router {
+        let project = std::fs::canonicalize(temp.path()).unwrap();
+        let (events, _) = broadcast::channel::<String>(16);
+        let (request_tx, _) = broadcast::channel::<crate::RequestEnvelope>(16);
+        let (shutdown_tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
+        router(AppState {
+            project: Arc::new(project.clone()),
+            canonical_project: Arc::new(project.clone()),
+            events,
+            conflict: Arc::new(ConflictEngine::new()),
+            artifacts: crate::artifact::ArtifactStore::new(
+                project.join(".rosync-artifacts"),
+                8 * 1024 * 1024,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+            project_name: Arc::new(RwLock::new("artifact-test".into())),
+            game_id: Arc::new(RwLock::new(None)),
+            group_id: Arc::new(RwLock::new(None)),
+            place_ids: Arc::new(RwLock::new(Vec::new())),
+            wally_enabled: Arc::new(RwLock::new(false)),
+            wally_folder: Arc::new(RwLock::new(None)),
+            pending_initial: Arc::new(Mutex::new(None)),
+            push_quiet: Arc::new(Mutex::new(HashMap::new())),
+            request_tx,
+            pending_routes: Arc::new(Mutex::new(HashMap::new())),
+            active_plugin: Arc::new(Mutex::new(None)),
+            widget_owned: true,
+            widget_owner_token: Arc::new(Some("artifact-widget-token".into())),
+            widget_last_seen: Arc::new(Mutex::new(None)),
+            shutdown_tx,
+        })
+    }
+
+    async fn artifact_json_request(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap();
+        (status, headers, body)
+    }
+
+    async fn create_artifact_lease(
+        app: &Router,
+        filename: &str,
+        expected_size: Option<usize>,
+    ) -> (String, String) {
+        let (_, _, response) = artifact_json_request(
+            app,
+            Method::POST,
+            "/artifacts/lease",
+            json!({
+                "filename": filename,
+                "mime": "application/octet-stream",
+                "expectedSize": expected_size,
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], true, "lease response: {response}");
+        (
+            response["lease"]["id"].as_str().unwrap().to_owned(),
+            response["lease"]["token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_complete_lease_chunk_finalize_lookup_cycle() {
+        let temp = TempDir::new("artifact-http-happy");
+        let app = artifact_test_app(&temp);
+        let payload = b"\x89PNG\r\n\x1a\nroute-test";
+        let expected_sha256 = format!("{:x}", Sha256::digest(payload));
+        let (id, token) = create_artifact_lease(&app, "capture.png", Some(payload.len())).await;
+
+        let (status, _, chunk) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({
+                "token": token,
+                "offset": 0,
+                "bytesBase64": base64::engine::general_purpose::STANDARD.encode(payload),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(chunk["ok"], true, "chunk response: {chunk}");
+        assert_eq!(chunk["receipt"]["totalBytes"], payload.len());
+
+        let (_, _, finalized) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/finalize"),
+            json!({ "token": token, "expectedSha256": expected_sha256 }),
+        )
+        .await;
+        assert_eq!(finalized["ok"], true, "finalize response: {finalized}");
+        assert_eq!(finalized["artifact"]["id"], id);
+        assert_eq!(finalized["artifact"]["size"], payload.len());
+        assert_eq!(finalized["artifact"]["sha256"], expected_sha256);
+        let artifact_path = PathBuf::from(finalized["artifact"]["path"].as_str().unwrap());
+        assert!(artifact_path.is_absolute());
+        assert_eq!(std::fs::read(&artifact_path).unwrap(), payload);
+
+        let (_, _, lookup) =
+            artifact_json_request(&app, Method::GET, &format!("/artifacts/{id}"), Value::Null)
+                .await;
+        assert_eq!(lookup["ok"], true, "lookup response: {lookup}");
+        assert_eq!(lookup["artifact"], finalized["artifact"]);
+
+        let (_, _, consumed) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/consume"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(consumed["ok"], true, "consume response: {consumed}");
+        assert!(!artifact_path.exists());
+        let (_, _, missing) =
+            artifact_json_request(&app, Method::GET, &format!("/artifacts/{id}"), Value::Null)
+                .await;
+        assert_eq!(missing["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn artifact_chunk_rejects_the_wrong_lease_token() {
+        let temp = TempDir::new("artifact-http-token");
+        let app = artifact_test_app(&temp);
+        let (id, token) = create_artifact_lease(&app, "token.bin", Some(2)).await;
+
+        let (_, _, rejected) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": "not-the-token", "offset": 0, "bytesBase64": "b2s=" }),
+        )
+        .await;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "ARTIFACT_INVALID_TOKEN");
+
+        let (_, _, accepted) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 0, "bytesBase64": "b2s=" }),
+        )
+        .await;
+        assert_eq!(accepted["ok"], true, "valid token must remain usable");
+    }
+
+    #[tokio::test]
+    async fn artifact_chunks_enforce_the_exact_next_offset_without_corruption() {
+        let temp = TempDir::new("artifact-http-offset");
+        let app = artifact_test_app(&temp);
+        let (id, token) = create_artifact_lease(&app, "ordered.bin", Some(6)).await;
+
+        let (_, _, first) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 0, "bytesBase64": "YWJj" }),
+        )
+        .await;
+        assert_eq!(first["receipt"]["totalBytes"], 3);
+
+        let (_, _, rejected) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 1, "bytesBase64": "ZGVm" }),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], "ARTIFACT_OFFSET_MISMATCH");
+        assert_eq!(rejected["error"]["retryable"], true);
+
+        let (_, _, second) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 3, "bytesBase64": "ZGVm" }),
+        )
+        .await;
+        assert_eq!(second["receipt"]["totalBytes"], 6);
+
+        let (_, _, finalized) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/finalize"),
+            json!({ "token": token }),
+        )
+        .await;
+        let path = finalized["artifact"]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn artifact_chunk_rejects_invalid_base64_and_decoded_oversize_payloads() {
+        const MAX_CHUNK_BYTES: usize = 512 * 1024;
+        let temp = TempDir::new("artifact-http-chunk-validation");
+        let app = artifact_test_app(&temp);
+        let (id, token) = create_artifact_lease(&app, "validation.bin", None).await;
+
+        let (_, _, invalid) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 0, "bytesBase64": "%%%not-base64%%%" }),
+        )
+        .await;
+        assert_eq!(invalid["error"]["code"], "INVALID_ARTIFACT_BASE64");
+
+        let oversized =
+            base64::engine::general_purpose::STANDARD.encode(vec![0x5a; MAX_CHUNK_BYTES + 1]);
+        let (_, _, too_large) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 0, "bytesBase64": oversized }),
+        )
+        .await;
+        assert_eq!(too_large["error"]["code"], "ARTIFACT_CHUNK_TOO_LARGE");
+
+        let (_, _, accepted) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/chunk"),
+            json!({ "token": token, "offset": 0, "bytesBase64": "eg==" }),
+        )
+        .await;
+        assert_eq!(accepted["receipt"]["totalBytes"], 1);
+    }
+
+    #[tokio::test]
+    async fn artifact_chunk_route_rejects_large_json_before_deserialization() {
+        let temp = TempDir::new("artifact-http-body-limit");
+        let app = artifact_test_app(&temp);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/artifacts/not-a-real-id/chunk")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b'x'; 2 * 1024 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn artifact_preflight_exposes_cors_only_to_trusted_local_app_origins() {
+        let temp = TempDir::new("artifact-http-cors");
+        let app = artifact_test_app(&temp);
+
+        let preflight = |origin: &'static str, authorized: bool| {
+            let uri = if authorized {
+                "/artifacts/lease?widgetToken=artifact-widget-token"
+            } else {
+                "/artifacts/lease"
+            };
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri(uri)
+                    .header(header::ORIGIN, origin)
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        let denied_without_token = preflight("terminal64://widget", false).await.unwrap();
+        assert!(denied_without_token
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+
+        let trusted = preflight("terminal64://widget", true).await.unwrap();
+        assert_eq!(trusted.status(), StatusCode::OK);
+        assert_eq!(
+            trusted
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "terminal64://widget"
+        );
+
+        let untrusted = preflight("https://attacker.example", true).await.unwrap();
+        assert!(
+            untrusted
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "untrusted web origins must not receive CORS permission"
+        );
+    }
+
+    #[test]
+    fn local_app_origin_policy_allows_custom_and_loopback_widget_origins() {
+        for origin in [
+            "t64://widget",
+            "terminal64://widget",
+            "app://localhost",
+            "tauri://localhost",
+            "wry://localhost",
+            "http://127.0.0.1:49173",
+            "http://localhost:49174",
+            "https://[::1]:4443",
+        ] {
+            assert!(
+                is_trusted_local_app_origin(&HeaderValue::from_bytes(origin.as_bytes()).unwrap()),
+                "expected trusted local-app origin: {origin}"
+            );
+        }
+
+        for origin in [
+            "null",
+            "file://",
+            "terminal64://attacker",
+            "app://attacker",
+            "https://attacker.example",
+            "http://127.0.0.2:3000",
+            "http://localhost.attacker.example:3000",
+            "http://user@localhost:3000",
+            "chrome-extension://attacker",
+            "moz-extension://attacker",
+            "terminal64.example",
+        ] {
+            assert!(
+                !is_trusted_local_app_origin(&HeaderValue::from_bytes(origin.as_bytes()).unwrap()),
+                "expected untrusted browser origin: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_widget_origin_requires_the_exact_owner_token() {
+        let origin = HeaderValue::from_static("null");
+        assert!(!is_authorized_widget_browser_request(
+            &origin,
+            &"/hello".parse().unwrap(),
+            true,
+            Some("secret")
+        ));
+        assert!(!is_authorized_widget_browser_request(
+            &origin,
+            &"/hello?widgetToken=wrong".parse().unwrap(),
+            true,
+            Some("secret")
+        ));
+        assert!(is_authorized_widget_browser_request(
+            &origin,
+            &"/hello?widgetToken=secret".parse().unwrap(),
+            true,
+            Some("secret")
+        ));
+    }
+
     #[test]
     fn resolve_accepts_plan_disk_alias() {
         assert!(matches!(
@@ -2335,6 +4230,21 @@ mod tests {
             resolve_conflict_target(&project, "/project/ServerScriptService/Foo.luau"),
             PathBuf::from("/project/ServerScriptService/Foo.luau")
         );
+    }
+
+    #[test]
+    fn missing_nested_parent_preserves_existing_legacy_unicode_prefix() {
+        let d = TempDir::new("resolve-parent-prefix");
+        let workspace = d.path().join("Workspace");
+        let legacy_parent = workspace.join("É");
+        std::fs::create_dir_all(&legacy_parent).unwrap();
+
+        let resolved =
+            resolve_segments_to_dir(d.path(), &["Workspace".into(), "É".into(), "Nested".into()])
+                .unwrap();
+
+        assert_eq!(resolved, legacy_parent.join("Nested"));
+        assert_ne!(resolved, workspace.join(encode_name("É")).join("Nested"));
     }
 
     // Out-of-scope classes are silently skipped: `Part` is not in the four-class
@@ -2394,17 +4304,71 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_applies_changed_script_with_children_source_once() {
-        let d = TempDir::new("bootstrap-changed-script-dir");
+    fn bootstrap_reuses_legacy_literal_unicode_script_and_init_paths() {
+        let d = TempDir::new("bootstrap-legacy-unicode-script-dir");
         let engine = ConflictEngine::new();
         let quiet = push_quiet();
         let ctx = harness(&engine, &quiet);
 
+        let storage = d.path().join("ReplicatedStorage");
+        let controller = storage.join("É");
+        std::fs::create_dir_all(&controller).unwrap();
+        let legacy_init = controller.join("init (É).luau");
+        let child_path = controller.join("Child.luau");
+        std::fs::write(&legacy_init, "return {}\n").unwrap();
+        std::fs::write(&child_path, "return true\n").unwrap();
+
+        let service = serde_json::json!({
+            "name": "ReplicatedStorage",
+            "class": "ReplicatedStorage",
+            "children": [{
+                "name": "É",
+                "class": "ModuleScript",
+                "properties": { "Source": "return {}\n" },
+                "children": [{
+                    "name": "Child",
+                    "class": "ModuleScript",
+                    "properties": { "Source": "return true\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        let applied = apply_service_node(d.path(), &service, &ctx).unwrap();
+        assert_eq!(applied, 0);
+        assert!(legacy_init.is_file());
+        assert!(child_path.is_file());
+        assert!(!storage.join(encode_name("É")).exists());
+        assert!(!controller
+            .join(format!(
+                "init ({}){}",
+                encode_name("É"),
+                ScriptClass::ModuleScript.suffix()
+            ))
+            .exists());
+        let init_count = std::fs::read_dir(&controller)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_str().is_some_and(is_init_file))
+            .count();
+        assert_eq!(init_count, 1);
+    }
+
+    #[test]
+    fn bootstrap_applies_changed_script_with_children_source_once() {
+        let d = TempDir::new("bootstrap-changed-script-dir");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+
         let controller = d.path().join("ReplicatedStorage").join("Controller");
         std::fs::create_dir_all(&controller).unwrap();
         let init_path = controller.join("init (Controller).luau");
+        let child_path = controller.join("Child.luau");
         std::fs::write(&init_path, "print('old')\n").unwrap();
-        std::fs::write(controller.join("Child.luau"), "return {}\n").unwrap();
+        std::fs::write(&child_path, "return {}\n").unwrap();
+        engine.record_sync(&init_path, hash(b"print('old')\n"), 1);
+        engine.record_sync(&child_path, hash(b"return {}\n"), 1);
+        let ctx = harness(&engine, &quiet);
 
         let service = serde_json::json!({
             "name": "ReplicatedStorage",
@@ -2428,6 +4392,290 @@ mod tests {
             std::fs::read_to_string(init_path).unwrap(),
             "print('new')\n"
         );
+    }
+
+    #[test]
+    fn script_with_children_rename_updates_directory_and_init_atomically() {
+        let d = TempDir::new("rename-script-dir-atomic");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("Old");
+        let new_path = parent.join("New");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(old_path.join("init (Old).luau"), "return 42\n").unwrap();
+
+        rename_path_and_init(&old_path, &new_path, "New", true, &ctx).unwrap();
+
+        assert!(!old_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(new_path.join("init (New).luau")).unwrap(),
+            "return 42\n"
+        );
+    }
+
+    #[test]
+    fn studio_rename_rebases_leaf_baseline_for_followup_clean_delete() {
+        let d = TempDir::new("rename-leaf-rebases-baseline");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+        let storage = d.path().join("ServerStorage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let old_path = storage.join("Old.luau");
+        let new_path = storage.join("New.luau");
+        std::fs::write(&old_path, "return 42\n").unwrap();
+        engine.record_sync(&old_path, hash(b"return 42\n"), 1);
+
+        assert_eq!(
+            apply_rename(
+                d.path(),
+                &["ServerStorage".into(), "Old".into()],
+                "New",
+                &ctx
+            )
+            .unwrap(),
+            1
+        );
+        assert!(new_path.is_file());
+        assert!(engine.matches_baseline(&new_path, b"return 42\n"));
+
+        let deleted =
+            apply_delete(d.path(), &["ServerStorage".into(), "New".into()], &ctx).unwrap();
+        assert!(matches!(deleted, ApplyOutcome::Applied(1)));
+        assert!(!new_path.exists());
+        assert!(engine.list().is_empty());
+    }
+
+    #[test]
+    fn script_with_children_rename_rolls_back_after_inner_failure() {
+        let d = TempDir::new("rename-script-dir-rollback");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("Old");
+        let new_path = parent.join("New");
+        let old_init = old_path.join("init (Old).luau");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(&old_init, "return 'preserved'\n").unwrap();
+
+        let mut rename_calls = 0usize;
+        let error =
+            rename_path_and_init_with(&old_path, &new_path, "New", true, &ctx, |from, to| {
+                rename_calls += 1;
+                if rename_calls == 3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected init rename failure",
+                    ));
+                }
+                std::fs::rename(from, to)
+            })
+            .unwrap_err();
+
+        assert!(error.contains("init and outer rename were rolled back"));
+        assert_eq!(rename_calls, 5);
+        assert!(old_path.is_dir());
+        assert!(!new_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&old_init).unwrap(),
+            "return 'preserved'\n"
+        );
+        assert!(std::fs::read_dir(&old_path).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".rosync-init-rename-")));
+    }
+
+    #[test]
+    fn keep_studio_rename_restore_is_atomic_on_success() {
+        let d = TempDir::new("resolve-rename-transaction-success");
+        let parent = d.path().join("ReplicatedStorage");
+        std::fs::create_dir_all(&parent).unwrap();
+        let from = parent.join("Old.luau");
+        let to = parent.join("New.luau");
+        std::fs::write(&to, b"disk edit\n").unwrap();
+
+        restore_fs_rename_transactional(&from, &to, &from, b"studio edit\n").unwrap();
+
+        assert_eq!(std::fs::read(&from).unwrap(), b"studio edit\n");
+        assert!(!to.exists());
+        assert!(std::fs::read_dir(&parent).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".swp")));
+    }
+
+    #[test]
+    fn keep_studio_directory_rename_restores_the_entire_retained_tree() {
+        let d = TempDir::new("resolve-directory-rename-transaction-success");
+        let parent = d.path().join("ReplicatedStorage");
+        let from = parent.join("Old");
+        let to = parent.join("New");
+        let conflict_path = from.join("Nested").join("Diverged.luau");
+        std::fs::create_dir_all(to.join("Nested")).unwrap();
+        std::fs::write(to.join("Nested").join("Diverged.luau"), b"disk edit\n").unwrap();
+        std::fs::write(to.join("Sibling.luau"), b"return 'sibling'\n").unwrap();
+        std::fs::write(to.join("Nested").join("Clean.luau"), b"return 'clean'\n").unwrap();
+
+        restore_fs_rename_transactional(&from, &to, &conflict_path, b"return 'studio edit'\n")
+            .unwrap();
+
+        assert!(!to.exists());
+        assert_eq!(
+            std::fs::read(&conflict_path).unwrap(),
+            b"return 'studio edit'\n"
+        );
+        assert_eq!(
+            std::fs::read(from.join("Sibling.luau")).unwrap(),
+            b"return 'sibling'\n"
+        );
+        assert_eq!(
+            std::fs::read(from.join("Nested").join("Clean.luau")).unwrap(),
+            b"return 'clean'\n"
+        );
+        assert!(std::fs::read_dir(&parent).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".swp")));
+    }
+
+    #[test]
+    fn keep_studio_directory_delete_restore_is_explicitly_fail_closed() {
+        assert_eq!(validate_fs_delete_restore(false), Ok(()));
+        assert_eq!(
+            validate_fs_delete_restore(true),
+            Err(DIRECTORY_DELETE_RESTORE_ERROR)
+        );
+    }
+
+    #[test]
+    fn keep_studio_rename_restore_rolls_back_after_install_failure() {
+        let d = TempDir::new("resolve-rename-transaction-rollback");
+        let parent = d.path().join("ReplicatedStorage");
+        std::fs::create_dir_all(&parent).unwrap();
+        let from = parent.join("Old.luau");
+        let to = parent.join("New.luau");
+        std::fs::write(&to, b"disk edit\n").unwrap();
+
+        let mut calls = 0usize;
+        let error = restore_fs_rename_transactional_with(
+            &from,
+            &to,
+            &from,
+            b"studio edit\n",
+            |source, destination| {
+                calls += 1;
+                if calls == 3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected install failure",
+                    ));
+                }
+                std::fs::rename(source, destination)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("source rollback: ok"), "{error}");
+        assert!(error.contains("directory rollback: ok"), "{error}");
+        assert_eq!(calls, 5);
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"disk edit\n");
+        assert!(std::fs::read_dir(&parent).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".swp")));
+    }
+
+    #[test]
+    fn keep_studio_delete_restore_leaves_no_partial_file_on_install_failure() {
+        let d = TempDir::new("resolve-delete-transaction-rollback");
+        let parent = d.path().join("ServerScriptService");
+        std::fs::create_dir_all(&parent).unwrap();
+        let source = parent.join("Deleted.server.luau");
+
+        let error = restore_fs_deleted_source_with(&source, b"studio edit\n", |_from, _to| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected install failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("injected install failure"), "{error}");
+        assert!(!source.exists());
+        assert!(std::fs::read_dir(&parent).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".swp")));
+    }
+
+    #[test]
+    fn keep_disk_rename_delivery_reports_partial_failure_position() {
+        let rename = json!({ "op": "rename" });
+        let retained = vec![
+            json!({ "op": "update", "path": ["Workspace", "New"] }),
+            json!({ "op": "update", "path": ["Workspace", "New", "Child"] }),
+        ];
+        let mut attempted = Vec::new();
+        let result = deliver_prepared_rename_with(&rename, &retained, |op| {
+            attempted.push(op["op"].as_str().unwrap().to_string());
+            if attempted.len() == 2 {
+                return Err("injected transport failure".to_string());
+            }
+            Ok(())
+        });
+
+        assert_eq!(result, Err(("injected transport failure".to_string(), 1)));
+        assert_eq!(attempted, ["rename", "update"]);
+    }
+
+    #[test]
+    fn partial_keep_disk_rename_queues_source_and_name_compensation() {
+        let d = TempDir::new("resolve-rename-studio-compensation");
+        let workspace = d.path().join("Workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let from = workspace.join("Old.luau");
+        let to = workspace.join("New.luau");
+        std::fs::write(&to, b"disk edit\n").unwrap();
+        let applied = json!({
+            "op": "rename",
+            "from": ["Workspace", "Old"],
+            "to": ["Workspace", "New"],
+        });
+        let (events, mut receiver) = broadcast::channel(4);
+
+        assert!(compensate_studio_rename(
+            &events,
+            d.path(),
+            &applied,
+            &from,
+            &to,
+            &from,
+            b"studio edit\n",
+        ));
+
+        let source_restore: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(source_restore["type"], "plugin-op");
+        assert_eq!(source_restore["op"]["op"], "update");
+        assert_eq!(source_restore["op"]["path"], json!(["Workspace", "New"]));
+        assert_eq!(
+            source_restore["op"]["properties"]["Source"],
+            "studio edit\n"
+        );
+
+        let reverse: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(reverse["op"]["op"], "rename");
+        assert_eq!(reverse["op"]["from"], json!(["Workspace", "New"]));
+        assert_eq!(reverse["op"]["to"], json!(["Workspace", "Old"]));
     }
 
     #[test]
@@ -2460,6 +4708,31 @@ mod tests {
         assert_eq!(
             plugin_op["to"],
             serde_json::json!(["ReplicatedStorage", "Shared", "NewName"])
+        );
+    }
+
+    #[test]
+    fn retained_directory_resolution_emits_the_full_script_tree() {
+        let d = TempDir::new("resolve-retained-tree");
+        let root = d.path().join("Workspace").join("Feature");
+        let nested = root.join("Nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Worker.server.luau"), "print('kept')\n").unwrap();
+
+        let mut ops = Vec::new();
+        collect_tree_update_ops(&root, &mut ops).unwrap();
+
+        let plugin_ops: Vec<Value> = ops
+            .iter()
+            .filter_map(|op| fs_op_to_plugin_op(d.path(), op))
+            .collect();
+        assert_eq!(plugin_ops.len(), 3);
+        assert_eq!(plugin_ops[0]["node"]["name"], "Feature");
+        assert_eq!(plugin_ops[1]["node"]["name"], "Nested");
+        assert_eq!(plugin_ops[2]["node"]["name"], "Worker");
+        assert_eq!(
+            plugin_ops[2]["node"]["properties"]["Source"],
+            "print('kept')\n"
         );
     }
 
@@ -2800,6 +5073,22 @@ mod tests {
             .join("ReplicatedStorage")
             .join("ClientOnly.server.luau")
             .exists());
+        let backup_root = d.path().join(".rosync-backups");
+        let preserved = std::fs::read_dir(&backup_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| {
+                entry
+                    .path()
+                    .join("ReplicatedStorage")
+                    .join("ClientOnly.server.luau")
+            })
+            .find(|path| path.exists())
+            .expect("strict prune must preserve removed source in a backup");
+        assert_eq!(
+            std::fs::read_to_string(preserved).unwrap(),
+            "print('remove me')\n"
+        );
     }
 
     #[test]
@@ -2846,11 +5135,77 @@ mod tests {
         let folder = d.path().join("Workspace").join("StudioOnly").join("Nested");
         std::fs::create_dir_all(&folder).unwrap();
 
-        let applied =
+        let outcome =
             apply_delete(d.path(), &["Workspace".into(), "StudioOnly".into()], &ctx).unwrap();
 
-        assert_eq!(applied, 0);
+        assert!(matches!(outcome, ApplyOutcome::Skipped));
         assert!(d.path().join("Workspace").join("StudioOnly").exists());
+    }
+
+    #[test]
+    fn studio_delete_parks_when_local_script_changed() {
+        let d = TempDir::new("delete-local-edit");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+        let workspace = d.path().join("Workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = workspace.join("Safe.server.luau");
+        std::fs::write(&script, b"local edit\n").unwrap();
+        engine.record_sync(&script, hash(b"agreed source\n"), 1);
+
+        let outcome = apply_delete(d.path(), &["Workspace".into(), "Safe".into()], &ctx).unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Conflict(path) if path == script));
+        assert!(script.exists(), "conflicting local source must be retained");
+        let conflicts = engine.list();
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].studio_deleted);
+        assert_eq!(conflicts[0].local, "local edit\n");
+    }
+
+    #[test]
+    fn studio_delete_applies_when_local_script_matches_baseline() {
+        let d = TempDir::new("delete-clean");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet);
+        let workspace = d.path().join("Workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = workspace.join("Safe.server.luau");
+        std::fs::write(&script, b"agreed source\n").unwrap();
+        engine.record_sync(&script, hash(b"agreed source\n"), 1);
+
+        let outcome = apply_delete(d.path(), &["Workspace".into(), "Safe".into()], &ctx).unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied(1)));
+        assert!(!script.exists());
+    }
+
+    #[test]
+    fn clean_initial_compare_seeds_leaf_and_directory_script_baselines() {
+        let d = TempDir::new("seed-baselines");
+        let replicated = d.path().join("ReplicatedStorage");
+        let controller = replicated.join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        let leaf = replicated.join("Config.luau");
+        let init = controller.join("init (Controller).luau");
+        std::fs::write(&leaf, b"return 1\n").unwrap();
+        std::fs::write(&init, b"return 2\n").unwrap();
+        std::fs::write(controller.join("Child.luau"), b"return 3\n").unwrap();
+        let engine = ConflictEngine::new();
+
+        let seeded = seed_clean_script_baselines(d.path(), &engine).unwrap();
+
+        assert_eq!(seeded, 3);
+        assert_eq!(
+            engine.on_studio_push(&leaf, b"return 10\n", Some((b"return 1\n", 2))),
+            StudioDecision::Apply
+        );
+        assert_eq!(
+            engine.on_studio_push(&init, b"return 20\n", Some((b"return 2\n", 2))),
+            StudioDecision::Apply
+        );
     }
 
     #[test]
@@ -3285,13 +5640,13 @@ mod tests {
         (dir.join("writes.log"), dir.join("writes.log.1"))
     }
 
-    #[tokio::test]
-    async fn writelog_appends_under_fake_home() {
+    #[test]
+    fn writelog_appends_under_fake_home() {
         let _guard = WRITELOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let d = TempDir::new("writelog-append");
         std::env::set_var("ROSYNC_TEST_HOME", d.path());
         let (log, _rot) = writes_log_paths(d.path());
-        let resp = writelog(Json(json!({ "op": "set", "ok": true }))).await;
+        let resp = write_log_entry(Json(json!({ "op": "set", "ok": true })));
         assert_eq!(resp.0["ok"], true, "writelog should succeed");
         let body = std::fs::read_to_string(&log).unwrap();
         // Exactly one JSONL line, and it should carry a `ts` field we merged in.
@@ -3302,8 +5657,8 @@ mod tests {
         assert!(parsed["ts"].is_u64());
     }
 
-    #[tokio::test]
-    async fn writelog_rotates_when_over_10mib() {
+    #[test]
+    fn writelog_rotates_when_over_10mib() {
         let _guard = WRITELOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let d = TempDir::new("writelog-rotate");
         std::env::set_var("ROSYNC_TEST_HOME", d.path());
@@ -3316,7 +5671,7 @@ mod tests {
         let before_len = std::fs::metadata(&log).unwrap().len();
         assert!(before_len >= 10 * 1024 * 1024);
 
-        let resp = writelog(Json(json!({ "op": "set", "ok": true }))).await;
+        let resp = write_log_entry(Json(json!({ "op": "set", "ok": true })));
         assert_eq!(resp.0["ok"], true);
 
         // Old content has been moved aside...
@@ -3330,8 +5685,8 @@ mod tests {
         assert!(fresh.contains("\"op\":\"set\""));
     }
 
-    #[tokio::test]
-    async fn writelog_rotation_overwrites_prior_generation() {
+    #[test]
+    fn writelog_rotation_overwrites_prior_generation() {
         let _guard = WRITELOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let d = TempDir::new("writelog-rotate-overwrite");
         std::env::set_var("ROSYNC_TEST_HOME", d.path());
@@ -3344,7 +5699,7 @@ mod tests {
         marker.extend_from_slice(&vec![b'y'; 10 * 1024 * 1024]);
         std::fs::write(&log, &marker).unwrap();
 
-        let resp = writelog(Json(json!({ "op": "eval", "ok": true }))).await;
+        let resp = write_log_entry(Json(json!({ "op": "eval", "ok": true })));
         assert_eq!(resp.0["ok"], true);
 
         // The .1 file must now start with NEW_ROTATION — old generation gone.

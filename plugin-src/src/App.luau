@@ -5,19 +5,20 @@ local React = require(Packages:WaitForChild("React"))
 local ReactRoblox = require(Packages:WaitForChild("ReactRoblox"))
 
 local MAX_LOG_LINES = 200
+local DEFAULT_LOGO_IMAGE = "rbxassetid://134480165435830"
+local DEFAULT_SETTINGS_IMAGE = "rbxassetid://128477924144442"
 
 local Colors = {
-	Panel = Color3.fromRGB(31, 33, 36),
-	PanelRaised = Color3.fromRGB(42, 45, 49),
-	Field = Color3.fromRGB(22, 24, 27),
-	Stroke = Color3.fromRGB(67, 72, 78),
-	Text = Color3.fromRGB(238, 240, 242),
-	Muted = Color3.fromRGB(164, 170, 176),
-	Subtle = Color3.fromRGB(112, 120, 128),
+	Panel = Color3.fromRGB(25, 26, 31),
+	PanelRaised = Color3.fromRGB(35, 37, 40),
+	Field = Color3.fromRGB(29, 31, 34),
+	Stroke = Color3.fromRGB(255, 255, 255),
+	Text = Color3.fromRGB(244, 245, 247),
+	Muted = Color3.fromRGB(171, 175, 182),
+	Subtle = Color3.fromRGB(119, 125, 134),
 	Accent = Color3.fromRGB(65, 135, 245),
 	AccentDark = Color3.fromRGB(43, 101, 199),
-	Good = Color3.fromRGB(54, 158, 98),
-	Warn = Color3.fromRGB(213, 156, 58),
+	Good = Color3.fromRGB(74, 193, 123),
 	Bad = Color3.fromRGB(207, 72, 72),
 	Overlay = Color3.fromRGB(0, 0, 0),
 }
@@ -47,49 +48,60 @@ end
 
 local function statusView(state, detail)
 	if state == "idle" then
-		return "Idle", Colors.Subtle, "Connect"
+		return "Auto-discover localhost:7878–7890", Colors.Subtle, "Connect"
 	elseif state == "probing" then
-		return "Probing...", Colors.Warn, "Cancel"
+		return "Scanning localhost...", Colors.Accent, "Cancel"
 	elseif state == "connecting" then
-		return "Connecting...", Colors.Warn, "Cancel"
+		return "Connecting...", Colors.Accent, "Cancel"
 	elseif state == "waiting" then
-		return "Waiting for decision...", Colors.Warn, "Cancel"
+		return "Waiting for initial sync...", Colors.Accent, "Cancel"
 	elseif state == "connected" then
-		return string.format("Connected :%s", tostring(detail or "?")), Colors.Good, "Disconnect"
+		return string.format("localhost:%s", tostring(detail or "?")), Colors.Good, "Disconnect"
 	elseif state == "no_daemon" then
 		return string.format("No daemon for GameId %s", tostring(detail or "?")), Colors.Bad, "Connect"
 	elseif state == "wrong_game" then
-		return "Wrong game", Colors.Bad, "Connect"
+		return "Daemon belongs to another game", Colors.Bad, "Connect"
 	elseif state == "error" then
-		return string.format("Error: %s", tostring(detail or "?")), Colors.Bad, "Connect"
+		return tostring(detail or "Connection error"), Colors.Bad, "Connect"
 	end
-	return tostring(state or "Idle"), Colors.Subtle, "Connect"
+	return tostring(state or "Ready"), Colors.Subtle, "Connect"
 end
 
 local function button(props)
 	return React.createElement("TextButton", {
-		Size = props.Size or UDim2.new(0, 112, 0, 32),
+		Size = props.Size or UDim2.new(0, 122, 0, 40),
 		Position = props.Position,
 		AnchorPoint = props.AnchorPoint,
 		LayoutOrder = props.LayoutOrder,
 		BackgroundColor3 = props.Color or Colors.Accent,
+		BackgroundTransparency = props.BackgroundTransparency or 0,
 		AutoButtonColor = true,
 		BorderSizePixel = 0,
 		Text = props.Text or "",
 		TextColor3 = props.TextColor3 or Colors.Text,
 		Font = Enum.Font.SourceSansBold,
-		TextSize = 14,
+		TextSize = 15,
 		ZIndex = props.ZIndex or 1,
 		[React.Event.Activated] = props.OnActivated,
 	}, {
-		Corner = corner(5),
+		Corner = corner(6),
+		Stroke = props.StrokeColor and stroke(props.StrokeColor, 1, props.StrokeTransparency or 0.88) or nil,
+		Icon = props.Image and React.createElement("ImageLabel", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = props.ImageSize or UDim2.fromOffset(32, 32),
+			BackgroundTransparency = 1,
+			Image = props.Image,
+			ImageColor3 = props.ImageColor3 or Colors.Text,
+			ScaleType = Enum.ScaleType.Fit,
+		}) or nil,
 	})
 end
 
 local function textInput(props)
 	return React.createElement("TextBox", {
 		LayoutOrder = props.LayoutOrder,
-		Size = props.Size or UDim2.new(1, 0, 0, 32),
+		Size = props.Size or UDim2.new(1, 0, 0, 40),
 		BackgroundColor3 = Colors.Field,
 		BorderSizePixel = 0,
 		ClearTextOnFocus = false,
@@ -113,9 +125,9 @@ local function textInput(props)
 			end
 		end,
 	}, {
-		Corner = corner(5),
-		Stroke = stroke(Colors.Stroke, 1, 0.15),
-		Pad = padding(0, 8, 0, 8),
+		Corner = corner(6),
+		Stroke = stroke(Colors.Stroke, 1, 0.9),
+		Pad = padding(0, 12, 0, 12),
 	})
 end
 
@@ -138,13 +150,15 @@ local function label(props)
 	})
 end
 
-local function logList(logs)
+local function logList(logs, layoutOrder, size)
 	local children = {
 		Layout = React.createElement("UIListLayout", {
 			SortOrder = Enum.SortOrder.LayoutOrder,
 			Padding = UDim.new(0, 3),
 		}),
 		Pad = padding(8, 10, 8, 10),
+		Corner = corner(6),
+		Stroke = stroke(Colors.Stroke, 1, 0.92),
 	}
 
 	for index, item in ipairs(logs) do
@@ -160,13 +174,14 @@ local function logList(logs)
 	end
 
 	return React.createElement("ScrollingFrame", {
-		LayoutOrder = 7,
-		Size = UDim2.new(1, 0, 1, -184),
+		LayoutOrder = layoutOrder,
+		Size = size or UDim2.new(1, 0, 0, 116),
 		BackgroundColor3 = Colors.Field,
 		BorderSizePixel = 0,
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		CanvasSize = UDim2.fromScale(0, 0),
 		ScrollBarThickness = 6,
+		ScrollBarImageColor3 = Colors.Subtle,
 		ScrollingDirection = Enum.ScrollingDirection.Y,
 	}, children)
 end
@@ -186,17 +201,17 @@ local function modal(props)
 		Card = React.createElement("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.fromScale(0.5, 0.5),
-			Size = UDim2.new(1, -36, 0, 210),
+			Size = UDim2.new(1, -36, 0, 222),
 			BackgroundColor3 = Colors.PanelRaised,
 			BorderSizePixel = 0,
 			ZIndex = 51,
 		}, {
-			Corner = corner(7),
-			Stroke = stroke(Colors.Stroke, 1, 0.05),
-			Pad = padding(14, 14, 14, 14),
+			Corner = corner(8),
+			Stroke = stroke(Colors.Stroke, 1, 0.88),
+			Pad = padding(16, 16, 16, 16),
 			Layout = React.createElement("UIListLayout", {
 				SortOrder = Enum.SortOrder.LayoutOrder,
-				Padding = UDim.new(0, 9),
+				Padding = UDim.new(0, 10),
 			}),
 			Title = label({
 				LayoutOrder = 1,
@@ -224,14 +239,15 @@ local function modal(props)
 			}),
 			Buttons = React.createElement("Frame", {
 				LayoutOrder = 4,
-				Size = UDim2.new(1, 0, 0, 32),
+				Size = UDim2.new(1, 0, 0, 40),
 				BackgroundTransparency = 1,
 				ZIndex = 52,
 			}, {
 				Cancel = button({
 					Size = UDim2.new(0, 90, 1, 0),
-					Position = UDim2.new(1, -202, 0, 0),
-					Color = Color3.fromRGB(77, 82, 88),
+					Position = UDim2.new(1, -204, 0, 0),
+					Color = Colors.PanelRaised,
+					StrokeColor = Colors.Stroke,
 					Text = "Cancel",
 					OnActivated = props.OnCancel,
 					ZIndex = 53,
@@ -254,6 +270,7 @@ function App.mount(target, props)
 	local controller = {}
 	local root = ReactRoblox.createRoot(target)
 	local currentManualUrl = tostring(props.initialUrl or "")
+	local currentPlaceName = tostring(props.placeName or game.Name or "Studio place")
 	local modalResolve = nil
 	local nextLogId = 0
 	local pendingStatus = { state = "idle", detail = nil }
@@ -277,6 +294,10 @@ function App.mount(target, props)
 
 	controller.setManualUrl = function(text)
 		currentManualUrl = tostring(text or "")
+	end
+
+	controller.setProjectName = function(text)
+		currentPlaceName = tostring(text or currentPlaceName)
 	end
 
 	controller.setStatus = function(state, detail)
@@ -314,6 +335,8 @@ function App.mount(target, props)
 		local banner, setBannerState = React.useState(pendingBanner)
 		local logs, setLogs = React.useState(pendingLogs)
 		local modalVisible, setModalVisible = React.useState(pendingModalVisible)
+		local settingsOpen, setSettingsOpen = React.useState(false)
+		local placeName, setPlaceNameState = React.useState(currentPlaceName)
 
 		local function setManualUrl(text)
 			currentManualUrl = tostring(text or "")
@@ -325,6 +348,11 @@ function App.mount(target, props)
 		end
 
 		controller.setManualUrl = setManualUrl
+
+		controller.setProjectName = function(text)
+			currentPlaceName = tostring(text or currentPlaceName)
+			setPlaceNameState(currentPlaceName)
+		end
 
 		controller.setStatus = function(state, detail)
 			pendingStatus = { state = state or "idle", detail = detail }
@@ -370,105 +398,150 @@ function App.mount(target, props)
 			BackgroundColor3 = Colors.Panel,
 			BorderSizePixel = 0,
 		}, {
-			Pad = padding(12, 12, 12, 12),
-			Layout = React.createElement("UIListLayout", {
-				SortOrder = Enum.SortOrder.LayoutOrder,
-				Padding = UDim.new(0, 8),
-			}),
-			Header = React.createElement("Frame", {
-				LayoutOrder = 1,
-				Size = UDim2.new(1, 0, 0, 44),
+			Content = React.createElement("ScrollingFrame", {
+				Size = UDim2.fromScale(1, 1),
 				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				AutomaticCanvasSize = Enum.AutomaticSize.Y,
+				CanvasSize = UDim2.fromScale(0, 0),
+				ScrollBarThickness = 4,
+				ScrollBarImageColor3 = Colors.Subtle,
+				ScrollingDirection = Enum.ScrollingDirection.Y,
 			}, {
-				Title = label({
-					Size = UDim2.new(1, -110, 0, 24),
-					Font = Enum.Font.SourceSansBold,
-					TextSize = 20,
-					Text = "Ro Sync",
+				Pad = padding(18, 16, 18, 16),
+				Layout = React.createElement("UIListLayout", {
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					Padding = UDim.new(0, 12),
 				}),
-				Sub = label({
-					Position = UDim2.new(0, 0, 0, 24),
-					Size = UDim2.new(1, -110, 0, 18),
-					Text = "Studio daemon bridge",
-					Color = Colors.Muted,
-					TextSize = 13,
+				Header = React.createElement("Frame", {
+					LayoutOrder = 1,
+					Size = UDim2.new(1, 0, 0, 20),
+					BackgroundTransparency = 1,
+				}, {
+					Logo = React.createElement("ImageLabel", {
+						Position = UDim2.fromOffset(0, 1),
+						Size = UDim2.fromOffset(113, 18),
+						BackgroundTransparency = 1,
+						Image = props.logoImage or DEFAULT_LOGO_IMAGE,
+						ImageColor3 = Colors.Accent,
+						ScaleType = Enum.ScaleType.Fit,
+					}),
 				}),
-				StateDot = React.createElement("Frame", {
-					AnchorPoint = Vector2.new(1, 0),
-					Position = UDim2.new(1, 0, 0, 6),
-					Size = UDim2.fromOffset(12, 12),
-					BackgroundColor3 = statusColor,
+				Connection = React.createElement("Frame", {
+					LayoutOrder = 2,
+					Size = UDim2.new(1, 0, 0, 70),
+					BackgroundColor3 = Colors.PanelRaised,
 					BorderSizePixel = 0,
 				}, {
-					Corner = React.createElement("UICorner", { CornerRadius = UDim.new(1, 0) }),
+					Corner = corner(7),
+					Stroke = stroke(Colors.Stroke, 1, 0.88),
+					Place = label({
+						Position = UDim2.fromOffset(14, 9),
+						Size = UDim2.new(1, -46, 0, 23),
+						Font = Enum.Font.SourceSansBold,
+						TextSize = 17,
+						Text = placeName,
+						TextTruncate = Enum.TextTruncate.AtEnd,
+					}),
+					Endpoint = label({
+						Position = UDim2.fromOffset(14, 35),
+						Size = UDim2.new(1, -28, 0, 19),
+						Font = Enum.Font.Code,
+						TextSize = 13,
+						Text = statusText,
+						Color = status.state == "connected" and Colors.Muted or statusColor,
+						TextTruncate = Enum.TextTruncate.AtEnd,
+					}),
+					State = React.createElement("Frame", {
+						AnchorPoint = Vector2.new(1, 0),
+						Position = UDim2.new(1, -14, 0, 16),
+						Size = UDim2.fromOffset(8, 8),
+						BackgroundColor3 = statusColor,
+						BorderSizePixel = 0,
+					}, {
+						Corner = React.createElement("UICorner", { CornerRadius = UDim.new(1, 0) }),
+					}),
 				}),
-			}),
-			UrlLabel = label({
-				LayoutOrder = 2,
-				Size = UDim2.new(1, 0, 0, 17),
-				Text = "Manual URL override",
-				Color = Colors.Muted,
-				TextSize = 13,
-			}),
-			Url = textInput({
-				LayoutOrder = 3,
-				Text = manualUrl,
-				PlaceholderText = props.defaultUrl,
-				OnTextChanged = setManualUrl,
-				OnFocusLost = function(enterPressed)
-					if enterPressed and props.onUrlCommit then
-						props.onUrlCommit(currentManualUrl)
-					end
-				end,
-			}),
-			Controls = React.createElement("Frame", {
-				LayoutOrder = 4,
-				Size = UDim2.new(1, 0, 0, 34),
-				BackgroundTransparency = 1,
-			}, {
-				Connect = button({
-					Size = UDim2.new(0, 112, 1, 0),
-					Text = buttonText,
-					Color = status.state == "connected" and Color3.fromRGB(77, 82, 88) or Colors.Accent,
-					OnActivated = props.onConnect,
+				Controls = React.createElement("Frame", {
+					LayoutOrder = 3,
+					Size = UDim2.new(1, 0, 0, 40),
+					BackgroundTransparency = 1,
+				}, {
+					Layout = React.createElement("UIListLayout", {
+						FillDirection = Enum.FillDirection.Horizontal,
+						HorizontalAlignment = Enum.HorizontalAlignment.Right,
+						SortOrder = Enum.SortOrder.LayoutOrder,
+						Padding = UDim.new(0, 10),
+					}),
+					Settings = button({
+						LayoutOrder = 1,
+						Size = UDim2.fromOffset(40, 40),
+						Color = Colors.PanelRaised,
+						Text = "",
+						Image = DEFAULT_SETTINGS_IMAGE,
+						OnActivated = function()
+							setSettingsOpen(not settingsOpen)
+						end,
+					}),
+					Connect = button({
+						LayoutOrder = 2,
+						Size = UDim2.new(0, 122, 1, 0),
+						Text = buttonText,
+						Color = Colors.Accent,
+						OnActivated = props.onConnect,
+					}),
 				}),
-				Pill = React.createElement("TextLabel", {
-					Position = UDim2.new(0, 122, 0, 2),
-					Size = UDim2.new(1, -122, 1, -4),
-					BackgroundColor3 = statusColor,
+				Banner = banner ~= "" and React.createElement("TextLabel", {
+					LayoutOrder = 4,
+					Size = UDim2.new(1, 0, 0, 42),
+					BackgroundColor3 = Colors.AccentDark,
 					BorderSizePixel = 0,
 					Font = Enum.Font.SourceSansBold,
-					Text = statusText,
+					Text = banner,
 					TextColor3 = Colors.Text,
 					TextSize = 13,
-					TextTruncate = Enum.TextTruncate.AtEnd,
+					TextWrapped = true,
 				}, {
-					Corner = React.createElement("UICorner", { CornerRadius = UDim.new(1, 0) }),
+					Corner = corner(6),
 					Pad = padding(0, 12, 0, 12),
-				}),
+				}) or nil,
+				SettingsPanel = settingsOpen and React.createElement("Frame", {
+					LayoutOrder = 5,
+					Size = UDim2.new(1, 0, 0, 216),
+					BackgroundTransparency = 1,
+				}, {
+					Layout = React.createElement("UIListLayout", {
+						SortOrder = Enum.SortOrder.LayoutOrder,
+						Padding = UDim.new(0, 8),
+					}),
+					UrlLabel = label({
+						LayoutOrder = 1,
+						Size = UDim2.new(1, 0, 0, 16),
+						Text = "Manual URL override",
+						Color = Colors.Muted,
+						TextSize = 13,
+					}),
+					Url = textInput({
+						LayoutOrder = 2,
+						Text = manualUrl,
+						PlaceholderText = props.defaultUrl,
+						OnTextChanged = setManualUrl,
+						OnFocusLost = function(enterPressed)
+							if enterPressed and props.onUrlCommit then
+								props.onUrlCommit(currentManualUrl)
+							end
+						end,
+					}),
+					LogLabel = label({
+						LayoutOrder = 3,
+						Size = UDim2.new(1, 0, 0, 18),
+						Text = "Activity",
+						Color = Colors.Muted,
+						TextSize = 13,
+					}),
+					Logs = logList(logs, 4, UDim2.new(1, 0, 0, 118)),
+				}) or nil,
 			}),
-			Banner = banner ~= "" and React.createElement("TextLabel", {
-				LayoutOrder = 5,
-				Size = UDim2.new(1, 0, 0, 34),
-				BackgroundColor3 = Colors.Warn,
-				BorderSizePixel = 0,
-				Font = Enum.Font.SourceSansBold,
-				Text = banner,
-				TextColor3 = Color3.fromRGB(38, 31, 19),
-				TextSize = 13,
-				TextWrapped = true,
-			}, {
-				Corner = corner(5),
-				Pad = padding(0, 10, 0, 10),
-			}) or nil,
-			LogLabel = label({
-				LayoutOrder = 6,
-				Size = UDim2.new(1, 0, 0, 18),
-				Text = "Log",
-				Color = Colors.Muted,
-				TextSize = 13,
-			}),
-			Logs = logList(logs),
 			Modal = modal({
 				Visible = modalVisible,
 				ManualUrl = manualUrl,

@@ -1,19 +1,29 @@
 {
   "name": "lint",
   "title": "rosync lint",
-  "category": "Offline inspection",
-  "description": "Runs `luau-lsp analyze` against a project or one or more paths with a Ro Sync sourcemap, Roblox definitions, and dependency-aware diagnostic filtering.",
-  "usage": "rosync lint [--project <path>] [--path <file-or-dir>]... [--ignore <glob>]... [--scope-only|--owned-only] [--summary] [--luau-lsp <path>] [--no-sourcemap] [--no-vendor-ignores] [-- <luau-lsp args>...]",
+  "category": "Live diagnostics",
+  "description": "Runs `luau-lsp analyze` with named Roblox definitions and selectable live-Studio or filesystem DataModel typing, then optionally compiles bytecode at every optimization level to catch compiler-only failures.",
+  "usage": "rosync lint [--project <path>] [--port <port>] [--path <file-or-dir>]... [--data-model <auto|studio|filesystem|loose>] [--compile <auto|required|off>] [--luau-compile <path>] [--ignore <glob>]... [--scope-only|--owned-only] [--summary] [--raw] [--luau-lsp <path>] [--no-sourcemap] [--no-vendor-ignores] [-- <luau-lsp args>...]",
   "examples": [
     "rosync lint --project .",
+    "rosync lint --project . --data-model studio --port 7878 --raw",
     "rosync lint --project . --path ServerScriptService/Foo.server.luau --path ReplicatedStorage/Shared",
     "rosync lint --project . --path ServerScriptService --owned-only --summary",
-    "rosync lint --project . --no-sourcemap --no-vendor-ignores"
+    "rosync lint --project . --data-model filesystem --raw",
+    "rosync lint --project . --data-model loose --no-vendor-ignores",
+    "rosync lint --project . --compile required --luau-compile /path/to/luau-compile"
   ],
   "notes": [
-    "If `--luau-lsp` is omitted, Ro Sync checks `ROSYNC_LUAU_LSP` and then `PATH`.",
-    "Bundled Roblox definitions are used automatically when present under `tools/luau-lsp/roblox/`.",
-    "Default vendor ignores hide diagnostics under common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.codex`, and `.vscode`; pass `--no-vendor-ignores` to disable them.",
-    "`--scope-only` / `--owned-only` requires at least one `--path` and filters captured diagnostics down to those requested paths while preserving non-diagnostic luau-lsp log lines."
+    "The default `--data-model auto` mode merges the complete live Studio tree into disk script mappings and enables strict DataModel diagnostics when a matching daemon/plugin is connected; otherwise it reports a relaxed filesystem fallback.",
+    "`--data-model studio` requires that live full-DataModel strict check. `filesystem` performs a strict offline audit that may report false unknown children for Studio-only instances, while `loose` keeps filesystem DataModel expressions gradual.",
+    "`--port` selects the daemon used for auto/studio discovery. `--raw` returns JSON diagnostics plus DataModel coverage, strictness, live-node count, analyzer status, and suppressed counts.",
+    "Without `--path`, default vendor ignores hide common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.git`, `.codex`, `.vscode`, and Ro Sync's `.rosync-*` runtime/backup folders. Any explicit `--path` overrides those defaults so the requested target is never silently skipped.",
+    "`--scope-only` / `--owned-only` requires at least one `--path`, shows only diagnostics in those scopes, reports suppressed dependency diagnostics, and does not fail solely for diagnostics outside the requested scopes.",
+    "Ro Sync injects bundled Roblox definitions as the named `@roblox` set. Extra named sets such as `--definitions:@testez=...` coexist; an explicit `--definitions:@roblox=...` after `--` replaces the bundled set.",
+    "Ro Sync recommends luau-lsp 1.68.1 or newer. If `--luau-lsp` is omitted, it checks `ROSYNC_LUAU_LSP`, bundled/Aftman locations, and then `PATH`.",
+    "The default `--compile auto` pass runs every in-scope executable script through `luau-compile --null` at `-O0`, `-O1`, and `-O2` when the compiler is available. It catches bytecode-generation failures such as the 200-local-register limit. Use `required` to fail when the compiler is unavailable or `off` to disable this pass.",
+    "Compiler resolution checks `--luau-compile`, `ROSYNC_LUAU_COMPILE`, `LUAU_COMPILE`, the bundled platform tool, Aftman, and `PATH`. Raw JSON distinguishes analyzer and compiler diagnostics, includes compiler coverage/failure metadata, and preserves unparsed analyzer messages such as configuration errors.",
+    "Structured diagnostics recognize luau-lsp's default and GNU formatters, including adversarial Studio instance names. `--formatter=plain` is rejected because luau-lsp 1.68.1 can emit TypeErrors in that mode while returning a successful process status.",
+    "`--no-sourcemap` disables Ro Sync DataModel coverage. Requiring `studio` or `filesystem` mode while disabling or replacing the generated sourcemap is rejected."
   ]
 }

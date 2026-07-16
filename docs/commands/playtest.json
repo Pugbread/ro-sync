@@ -1,0 +1,25 @@
+{
+  "name": "playtest",
+  "title": "rosync playtest",
+  "category": "Agent Runtime",
+  "description": "Runs asynchronous Studio playtests and controls isolated PlayServer and PlayClient runtime agents for execution, logs, resolved UI inspection, virtual input, and screenshots.",
+  "usage": "rosync playtest start|status|contexts|wait|exec|logs|ui|input|capture|stop|request [options]",
+  "examples": [
+    "rosync playtest start --project . --mode play --wait --raw",
+    "rosync playtest start --project . --mode multiplayer --players 2 --wait --timeout 60 --raw",
+    "rosync playtest contexts --project . --raw",
+    "rosync playtest exec --project . --context server --source 'return #game.Players:GetPlayers()' --identity game --raw",
+    "rosync playtest logs --project . --context client:1 --since-seq 0 --limit 200 --raw",
+    "rosync playtest ui --project . --context client:1 --class TextButton --limit 200 --raw",
+    "rosync playtest input --project . --context client:1 --file ./input-actions.json --raw",
+    "rosync playtest capture --project . --context client:1 --region 0,0,1280,720 --output-size 1024x576 --ui all --output ./captures/client-1.png --raw",
+    "rosync playtest stop --project . --raw"
+  ],
+  "notes": [
+    "`start` returns a job immediately. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N` context arrival; multiplayer supports 1-8 clients.",
+    "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost and their temporary DataModel changes never sync back to edit mode.",
+    "`exec --identity game` uses a temporary Script/LocalScript in the playtest; `--identity plugin` runs with plugin identity. Provide exactly one of `--source` or `--source-file`.",
+    "`ui` defaults to PlayerGui and CoreGui and returns actual GUI paths, visibility, text, absolute position, and absolute size. A supplied `--root` is a full DataModel path. `input` accepts a JSON object/array via `--actions` or `--file`; advanced operations use `request --op <name> --args <json>`.",
+    "Runtime capture uses the same bounded artifact transport as edit-mode capture. Start/stop, execution, and virtual input require explicit user intent."
+  ]
+}

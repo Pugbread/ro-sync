@@ -9,12 +9,14 @@ import {
   checkBinaryCmd, checkCargoCmd, buildDaemonCmd, parseBuildOutput,
   joinShell,
 } from "../platform.js";
-import { copyText, platformLabel } from "./runtime.js";
+import { daemonJson } from "../bridge.js";
+import { copyText, joinProjectFile, platformLabel } from "./runtime.js";
 
 const RELEASES_URL = "https://github.com/Pugbread/ro-sync/releases";
 const RUSTUP_URL   = "https://rustup.rs";
 
 const DEFAULT_PORT = 7878;
+const EXPECTED_PLUGIN_PROTOCOL = 2;
 const PLUGIN_REL = "plugin/Plugin.rbxm";
 const PLUGIN_SOURCE_REL = "plugin/Plugin.luau";
 const SECRETS_STATE_KEY = "secrets";
@@ -43,11 +45,6 @@ async function loadSecrets(api) {
 
 async function saveSecrets(api, secrets) {
   await api.t64("t64:set-state", { key: SECRETS_STATE_KEY, value: secrets });
-}
-
-function joinProjectFile(projectPath, fileName) {
-  const sep = IS_WINDOWS ? "\\" : "/";
-  return String(projectPath || "").replace(/[\\/]+$/, "") + sep + fileName;
 }
 
 export function mountSettings(root, api) {
@@ -112,25 +109,27 @@ export function mountSettings(root, api) {
       <p id="set-plugin-msg" style="color:var(--muted); margin-top:8px"></p>
     </section>
 
-    <section class="section" id="sec-build" hidden>
-      <h3>Build daemon</h3>
+    <section class="section" id="sec-build">
+      <h3>Daemon and lint compiler</h3>
       <p id="build-status" style="color:var(--warn)">Checking…</p>
       <pre id="build-log" class="build-log" hidden
         style="max-height:240px; overflow:auto; padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:4px; font-size:12px; white-space:pre-wrap; word-break:break-all;"></pre>
       <div class="row">
         <button id="build-run" class="primary" hidden>Build now</button>
         <a id="build-releases" href="${RELEASES_URL}" target="_blank" rel="noopener noreferrer">
-          <button type="button">Download from Releases</button>
+          <button type="button">Download release bundle</button>
         </a>
         <a id="build-rustup" href="${RUSTUP_URL}" target="_blank" rel="noopener noreferrer" hidden>
           <button type="button">Install Rust</button>
         </a>
       </div>
       <p style="color:var(--muted); margin-top:8px">
-        The daemon is a tiny Rust program. If it isn't built yet, click
-        <b>Build now</b> (requires the Rust toolchain) or grab a pre-built
-        binary from GitHub Releases and drop it in
-        <code id="build-dir-hint">—</code>.
+        Use <b>Build now</b> when the daemon is missing, or <b>Rebuild now</b>
+        after updating Ro Sync. The build also attempts to install the pinned
+        Luau compiler used by deep lint checks. Alternatively, extract your
+        platform's pre-built release bundle at
+        <code id="build-dir-hint">—</code>; it contains both tools in their
+        expected folders.
       </p>
     </section>
 
@@ -143,6 +142,7 @@ export function mountSettings(root, api) {
         <dt>project</dt><dd id="set-project-path">—</dd>
         <dt>pid</dt><dd id="set-pid">—</dd>
         <dt>base url</dt><dd id="set-base">—</dd>
+        <dt>protocol</dt><dd id="set-protocol">—</dd>
       </dl>
       <div class="row" style="margin-top:8px">
         <button id="set-start">Start</button>
@@ -162,6 +162,7 @@ export function mountSettings(root, api) {
   const $port = root.querySelector("#set-port");
   const $pid = root.querySelector("#set-pid");
   const $base = root.querySelector("#set-base");
+  const $protocol = root.querySelector("#set-protocol");
   const $copy = root.querySelector("#set-copy");
   const $install = root.querySelector("#set-install");
   const $openFolder = root.querySelector("#set-open-folder");
@@ -208,36 +209,71 @@ export function mountSettings(root, api) {
     return (await execStdout(checkCargoCmd())).toLowerCase() === "yes";
   }
 
-  async function refreshBuildBanner() {
-    $buildDirHint.textContent = joinShell(WIDGET_DIR_SHELL, "daemon");
-    const have = await checkBinary();
-    if (have) {
-      $buildSection.hidden = true;
-      return;
+  async function readDaemonHello() {
+    const base = api.getDaemonBase();
+    if (!base) return null;
+    try {
+      return await daemonJson(base, "/hello");
+    } catch {
+      return null;
     }
+  }
+
+  let buildRunning = false;
+  async function refreshBuildBanner() {
+    if (buildRunning) return;
+    $buildDirHint.textContent = WIDGET_DIR_SHELL;
     $buildSection.hidden = false;
     $buildLog.hidden = true;
     $buildLog.textContent = "";
-    const hasCargo = await checkCargo();
-    if (hasCargo) {
+    const [have, hasCargo, hello] = await Promise.all([
+      checkBinary(),
+      checkCargo(),
+      readDaemonHello(),
+    ]);
+    const protocol = hello && hello.pluginProtocol != null
+      ? Number(hello.pluginProtocol)
+      : Number.NaN;
+    $protocol.textContent = Number.isFinite(protocol) ? String(protocol) : (hello ? "legacy / missing" : "—");
+    $buildRun.textContent = have ? "Rebuild now" : "Build now";
+    $buildRun.hidden = !hasCargo;
+    $buildRustup.hidden = hasCargo;
+
+    if (!have && hasCargo) {
       $buildStatus.textContent = "Daemon binary not found. Click “Build now” to compile it (~1-2 minutes).";
-      $buildRun.hidden = false;
-      $buildRustup.hidden = true;
-    } else {
+    } else if (!have) {
       $buildStatus.textContent =
         "Daemon binary not found, and the Rust toolchain (cargo) isn’t on PATH. " +
         "Install Rust first, or download a pre-built binary from Releases.";
-      $buildRun.hidden = true;
-      $buildRustup.hidden = false;
+    } else if (hello && protocol !== EXPECTED_PLUGIN_PROTOCOL) {
+      $buildStatus.textContent =
+        `Running daemon protocol ${Number.isFinite(protocol) ? protocol : "legacy / missing"}; ` +
+        `this plugin requires protocol ${EXPECTED_PLUGIN_PROTOCOL}. Rebuild and restart the daemon.`;
+    } else if (hello) {
+      $buildStatus.textContent =
+        `Daemon protocol ${protocol} is compatible. Rebuild after updating local Ro Sync source.`;
+    } else {
+      $buildStatus.textContent =
+        "Daemon binary found but no running daemon answered. Rebuild after updating local Ro Sync source.";
     }
   }
 
   async function runBuild() {
+    buildRunning = true;
     $buildRun.disabled = true;
-    $buildStatus.textContent = "Building… this usually takes 1-2 minutes. Do not close the widget.";
+    $buildStatus.textContent = "Stopping the daemon and rebuilding… this usually takes 1-2 minutes.";
     $buildLog.hidden = false;
     $buildLog.textContent = "$ " + (IS_WINDOWS ? "daemon\\build.ps1" : "daemon/build.sh") + "\n";
+    let built = false;
     try {
+      // Keep the active project/port target across the rebuild so a daemon
+      // that was assigned a fallback port does not restart on 7878 and strand
+      // the connected Studio plugin.
+      const stopped = await api.killDaemon({ preserveTarget: true });
+      if (!stopped) {
+        $buildStatus.textContent = "Rebuild cancelled because the running daemon could not be stopped safely.";
+        return;
+      }
       // cargo build --release can take 1-2 minutes (cold cache). Override the
       // bridge's default 30s timeout so the promise doesn't reject early.
       const res = await api.t64("t64:exec", {
@@ -252,32 +288,20 @@ export function mountSettings(root, api) {
       if (ok) {
         $buildStatus.textContent = "Build succeeded. Starting daemon…";
         api.toast("Daemon built");
-        setTimeout(async () => {
-          await refreshBuildBanner();
-          await api.ensureDaemon();
-          refresh();
-        }, 500);
+        built = true;
       } else {
         $buildStatus.textContent = `Build failed (exit ${code ?? "?"}). See log below.`;
       }
     } catch (e) {
-      // Host may have its own exec timeout shorter than the build. Re-probe
-      // the binary before reporting failure — the background build often
-      // completes anyway.
-      const present = await checkBinary();
-      if (present) {
-        $buildStatus.textContent = "Build finished (exec stream cut off early, but the binary is now in place). Starting daemon…";
-        api.toast("Daemon built");
-        setTimeout(async () => {
-          await refreshBuildBanner();
-          await api.ensureDaemon();
-          refresh();
-        }, 500);
-      } else {
-        $buildStatus.textContent = `Build failed: ${e.message}`;
-      }
+      $buildStatus.textContent = `Build failed or timed out: ${e.message}`;
     } finally {
+      buildRunning = false;
       $buildRun.disabled = false;
+      if (built) {
+        await api.ensureDaemon();
+        refresh();
+        await refreshBuildBanner();
+      }
     }
   }
 
@@ -465,7 +489,16 @@ export function mountSettings(root, api) {
         throw new Error(res.stderr?.trim() || `exit ${res.code}`);
       }
       api.toast("Installed");
-      $pluginMsg.textContent = `Installed to ${joinShell(PLUGIN_DIR_DISPLAY, "RoSync.rbxm")} — restart Studio`;
+      const hello = await readDaemonHello();
+      const protocol = hello && hello.pluginProtocol != null
+        ? Number(hello.pluginProtocol)
+        : Number.NaN;
+      const daemonHint = hello && protocol !== EXPECTED_PLUGIN_PROTOCOL
+        ? ` Daemon protocol ${Number.isFinite(protocol) ? protocol : "legacy / missing"} is incompatible; rebuild it below.`
+        : "";
+      $pluginMsg.textContent =
+        `Installed to ${joinShell(PLUGIN_DIR_DISPLAY, "RoSync.rbxm")} — restart Studio.${daemonHint}`;
+      await refreshBuildBanner();
     } catch (e) {
       $pluginMsg.textContent = `Install failed: ${e.message}`;
     }
@@ -492,7 +525,8 @@ export function mountSettings(root, api) {
     refresh();
   });
   $restart.addEventListener("click", async () => {
-    await api.killDaemon();
+    const stopped = await api.killDaemon({ preserveTarget: true });
+    if (!stopped) return;
     await api.ensureDaemon();
     refresh();
   });
