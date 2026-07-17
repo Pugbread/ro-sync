@@ -4,6 +4,7 @@ mod project_broker;
 mod resources;
 mod secrets;
 mod storage;
+mod updater;
 
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,7 @@ pub(crate) struct AppState {
     lifecycle_children: daemon::LifecycleChildren,
     managed_daemons: daemon::ManagedDaemonClaims,
     project_broker: project_broker::ProjectInitBroker,
+    update_install_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -29,17 +31,24 @@ impl AppState {
             lifecycle_children: daemon::LifecycleChildren::default(),
             managed_daemons: daemon::ManagedDaemonClaims::default(),
             project_broker,
+            update_install_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let updater_public_key = updater::embedded_public_key().unwrap_or_default();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(updater_public_key)
+                .build(),
+        )
         .setup(|app| {
             let paths = AppPaths::initialize(app.handle()).map_err(std::io::Error::other)?;
             app.manage(AppState::new(paths));
@@ -67,6 +76,8 @@ pub fn run() {
             daemon::daemon_stop,
             project_broker::project_broker_status,
             project_broker::project_init_drain,
+            updater::update_check,
+            updater::update_install,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Ro Sync desktop");

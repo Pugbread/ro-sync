@@ -46,8 +46,10 @@ export function mountConflicts(root, api) {
   function updateBadge(n) {
     const badge = document.getElementById("conflicts-badge");
     if (!badge) return;
-    if (n > 0) { badge.hidden = false; badge.textContent = String(n); }
-    else badge.hidden = true;
+    badge.hidden = false;
+    badge.textContent = String(n);
+    badge.classList.toggle("badge-ok", n === 0);
+    badge.title = n === 0 ? "No conflicts" : `${n} unresolved conflict${n === 1 ? "" : "s"}`;
   }
 
   async function load() {

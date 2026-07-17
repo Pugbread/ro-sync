@@ -292,16 +292,50 @@ jobs:
       - name: Test desktop native host
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
 
-      - name: Build unsigned desktop installers
+      - name: Build desktop installers and signed updater artifacts
         working-directory: desktop
         shell: bash
+        env:
+          ROSYNC_UPDATER_PUBLIC_KEY: ${{ vars.ROSYNC_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          npm run build -- \
-            --target "${{ matrix.target }}" \
-            --ci \
-            --no-sign \
-            --config "{\"version\":\"$ROSYNC_DESKTOP_VERSION\"}"
+          config="$RUNNER_TEMP/ro-sync-release-config.json"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test -n "$ROSYNC_UPDATER_PUBLIC_KEY" || {
+              echo "ROSYNC_UPDATER_PUBLIC_KEY repository variable is required for tagged releases" >&2
+              exit 1
+            }
+            test -n "$TAURI_SIGNING_PRIVATE_KEY" || {
+              echo "TAURI_SIGNING_PRIVATE_KEY repository secret is required for tagged releases" >&2
+              exit 1
+            }
+            node -e '
+              const fs = require("node:fs");
+              fs.writeFileSync(process.argv[1], JSON.stringify({
+                version: process.env.ROSYNC_DESKTOP_VERSION,
+                bundle: { createUpdaterArtifacts: true },
+                plugins: { updater: { pubkey: process.env.ROSYNC_UPDATER_PUBLIC_KEY } },
+              }));
+            ' "$config"
+          else
+            node -e '
+              require("node:fs").writeFileSync(
+                process.argv[1],
+                JSON.stringify({ version: process.env.ROSYNC_DESKTOP_VERSION }),
+              );
+            ' "$config"
+          fi
+          build_args=(
+            --target "${{ matrix.target }}"
+            --ci
+            --config "$config"
+          )
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            build_args+=(--no-sign)
+          fi
+          npm run build -- "${build_args[@]}"
 
       - name: Stage desktop release assets
         shell: bash
@@ -319,13 +353,26 @@ jobs:
             installer="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
             test -n "$installer"
             cp "$installer" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-macos-arm64.dmg"
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              updater="$(find "$bundle_root/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+              test -n "$updater"
+              test -f "$updater.sig"
+              updater_asset="$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-macos-arm64.app.tar.gz"
+              cp "$updater" "$updater_asset"
+              cp "$updater.sig" "$updater_asset.sig"
+            fi
           else
             msi="$(find "$bundle_root/msi" -maxdepth 1 -type f -name '*.msi' -print -quit)"
             setup="$(find "$bundle_root/nsis" -maxdepth 1 -type f -name '*-setup.exe' -print -quit)"
             test -n "$msi"
             test -n "$setup"
             cp "$msi" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64.msi"
-            cp "$setup" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64-setup.exe"
+            setup_asset="$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64-setup.exe"
+            cp "$setup" "$setup_asset"
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              test -f "$setup.sig"
+              cp "$setup.sig" "$setup_asset.sig"
+            fi
           fi
 
           node -e '
@@ -393,13 +440,19 @@ jobs:
           desktop_manifests=(Ro-Sync-*.manifest.json)
           desktop_checksums=(Ro-Sync-*.sha256)
           mac_installers=(Ro-Sync-*-macos-arm64.dmg)
+          mac_updaters=(Ro-Sync-*-macos-arm64.app.tar.gz)
+          mac_updater_signatures=(Ro-Sync-*-macos-arm64.app.tar.gz.sig)
           windows_msis=(Ro-Sync-*-windows-x64.msi)
           windows_setups=(Ro-Sync-*-windows-x64-setup.exe)
+          windows_updater_signatures=(Ro-Sync-*-windows-x64-setup.exe.sig)
           test "${#desktop_manifests[@]}" -eq 2
-          test "${#desktop_checksums[@]}" -eq 5
+          test "${#desktop_checksums[@]}" -eq 8
           test "${#mac_installers[@]}" -eq 1
+          test "${#mac_updaters[@]}" -eq 1
+          test "${#mac_updater_signatures[@]}" -eq 1
           test "${#windows_msis[@]}" -eq 1
           test "${#windows_setups[@]}" -eq 1
+          test "${#windows_updater_signatures[@]}" -eq 1
           sha256sum --check --strict -- Ro-Sync-*.sha256
           for manifest in "${desktop_manifests[@]}"; do
             jq -e --arg commit "$GITHUB_SHA" '
@@ -413,6 +466,54 @@ jobs:
               any(.prepared.resources[]; .path == "tools/luau-lsp/LICENSE.md")
             ' "$manifest"
           done
+      - name: Create signed updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mac_asset="Ro-Sync-$version-macos-arm64.app.tar.gz"
+          windows_asset="Ro-Sync-$version-windows-x64-setup.exe"
+          cd artifacts
+          VERSION="$version" TAG="$GITHUB_REF_NAME" \
+            MAC_ASSET="$mac_asset" WINDOWS_ASSET="$windows_asset" node -e '
+              const fs = require("node:fs");
+              const required = [
+                process.env.MAC_ASSET,
+                `${process.env.MAC_ASSET}.sig`,
+                process.env.WINDOWS_ASSET,
+                `${process.env.WINDOWS_ASSET}.sig`,
+              ];
+              for (const file of required) {
+                if (!fs.statSync(file).isFile()) throw new Error(`missing updater asset: ${file}`);
+              }
+              const signature = (asset) => {
+                const value = fs.readFileSync(`${asset}.sig`, "utf8").trim();
+                if (!value) throw new Error(`empty updater signature: ${asset}.sig`);
+                return value;
+              };
+              const assetUrl = (asset) =>
+                `https://github.com/Pugbread/ro-sync/releases/download/${encodeURIComponent(process.env.TAG)}/${encodeURIComponent(asset)}`;
+              const manifest = {
+                version: process.env.VERSION,
+                notes: `Ro Sync ${process.env.VERSION}`,
+                pub_date: new Date().toISOString(),
+                platforms: {
+                  "darwin-aarch64": {
+                    signature: signature(process.env.MAC_ASSET),
+                    url: assetUrl(process.env.MAC_ASSET),
+                  },
+                  "windows-x86_64": {
+                    signature: signature(process.env.WINDOWS_ASSET),
+                    url: assetUrl(process.env.WINDOWS_ASSET),
+                  },
+                },
+              };
+              fs.writeFileSync("latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+            '
+          jq -e \
+            --arg version "$version" \
+            '.version == $version and (.platforms | keys | sort) == ["darwin-aarch64", "windows-x86_64"]' \
+            latest.json
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*

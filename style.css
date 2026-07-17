@@ -104,25 +104,45 @@ h1, h2, h3 { font-family: var(--display); letter-spacing: -0.018em; }
   border-radius: 999px;
   background: var(--muted);
   opacity: 0.34;
-  box-shadow: 0 0 0 transparent;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(0, 0, 0, 0.38) 12%,
+    #000 26%,
+    #000 74%,
+    rgba(0, 0, 0, 0.38) 88%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(0, 0, 0, 0.38) 12%,
+    #000 26%,
+    #000 74%,
+    rgba(0, 0, 0, 0.38) 88%,
+    transparent 100%
+  );
+  filter: drop-shadow(0 0 0 transparent);
   transition:
     background-color 0.2s var(--ease),
     opacity 0.2s var(--ease),
-    box-shadow 0.2s var(--ease);
+    filter 0.2s var(--ease);
   pointer-events: none;
 }
 .app[data-connection="ok"] .sidebar::after {
   background: var(--accent);
   opacity: 1;
-  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent);
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--accent) 48%, transparent));
 }
 .app[data-connection="warn"] .sidebar::after {
   background: var(--warn);
   opacity: 0.82;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--warn) 34%, transparent));
 }
 .app[data-connection="err"] .sidebar::after {
   background: var(--danger);
   opacity: 0.9;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--danger) 38%, transparent));
 }
 
 .sidebar-brand {
@@ -144,30 +164,34 @@ h1, h2, h3 { font-family: var(--display); letter-spacing: -0.018em; }
 .sidenav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
   flex: 0 0 auto;
 }
 .sidenav-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 7px 10px;
-  min-height: 30px;
+  padding: 8px 11px;
+  min-height: 36px;
   width: 100%;
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   color: var(--muted);
   cursor: pointer;
   font: inherit;
   transition:
     background-color 0.15s var(--ease),
     color 0.15s var(--ease),
-    border-color 0.15s var(--ease);
+    border-color 0.15s var(--ease),
+    box-shadow 0.15s var(--ease);
 }
-.sidenav-item::before { content: none; }
-.sidenav-item:hover { color: var(--fg); background: var(--surface-2); }
+.sidenav-item:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+}
 .sidenav-item:focus-visible {
   outline: none;
   border-color: var(--accent);
@@ -175,9 +199,11 @@ h1, h2, h3 { font-family: var(--display); letter-spacing: -0.018em; }
 }
 .sidenav-item[aria-selected="true"] {
   color: var(--fg);
-  background: var(--surface-2);
-  border-color: var(--border);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+  background: color-mix(in srgb, var(--accent) 13%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--accent) 88%, var(--surface-highlight) 5%),
+    inset 0 1px 0 color-mix(in srgb, var(--surface-highlight) 5%, transparent);
 }
 .sidenav-item[aria-selected="true"] .sidenav-icon { color: var(--accent); }
 .sidenav-icon {
@@ -195,11 +221,56 @@ h1, h2, h3 { font-family: var(--display); letter-spacing: -0.018em; }
   flex: 0 0 auto;
   margin-left: auto;
 }
+.projects-serving-indicator {
+  --serving-tone: var(--ok);
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  border: 2px solid color-mix(in srgb, var(--serving-tone) 72%, white);
+  border-radius: 50%;
+  background: var(--serving-tone);
+  opacity: 0;
+  visibility: hidden;
+  transform: scale(0.65);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--serving-tone) 13%, transparent),
+    0 0 11px color-mix(in srgb, var(--serving-tone) 72%, transparent);
+  transition:
+    opacity 0.18s var(--ease),
+    visibility 0.18s var(--ease),
+    transform 0.18s var(--ease);
+}
+.app[data-projects-serving="ok"] .projects-serving-indicator,
+.app[data-projects-serving="warn"] .projects-serving-indicator,
+.app[data-projects-serving="err"] .projects-serving-indicator {
+  opacity: 1;
+  visibility: visible;
+  transform: scale(1);
+}
+.app[data-projects-serving="warn"] .projects-serving-indicator {
+  --serving-tone: var(--warn);
+  animation: serving-indicator-pulse 0.9s ease-in-out infinite alternate;
+}
+.app[data-projects-serving="err"] .projects-serving-indicator { --serving-tone: var(--danger); }
+
+@keyframes serving-indicator-pulse {
+  to {
+    opacity: 0.58;
+    box-shadow:
+      0 0 0 4px color-mix(in srgb, var(--serving-tone) 9%, transparent),
+      0 0 7px color-mix(in srgb, var(--serving-tone) 48%, transparent);
+  }
+}
 
 .sidebar-foot {
   margin-top: auto;
   padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
+.sidenav-secondary { flex: 0 0 auto; }
 .helpcard {
   display: flex;
   align-items: flex-start;
@@ -289,6 +360,10 @@ h1, h2, h3 { font-family: var(--display); letter-spacing: -0.018em; }
   font-weight: 700;
   text-align: center;
   font-variant-numeric: tabular-nums;
+}
+.badge.badge-ok {
+  background: var(--ok);
+  color: var(--accent-contrast);
 }
 
 .view {
@@ -2333,6 +2408,12 @@ html[data-host="tauri"] body {
     var(--bg);
   overflow: hidden;
 }
+/* The standard dark palette uses opaque view chrome. Keep its canvas flat so
+   the decorative shell glow cannot read as a halo around those surfaces.
+   System-dark resolves to the same data-theme value. */
+html[data-host="tauri"][data-theme="dark"] body {
+  background: var(--bg);
+}
 html[data-host="tauri"] .app {
   --sidebar-w: 208px;
   --pad: 20px;
@@ -2357,7 +2438,10 @@ html[data-host="tauri"] .desktop-titlebar {
 }
 html[data-host="tauri"][data-platform="darwin"] .desktop-titlebar,
 html[data-host="tauri"][data-platform="macos"] .desktop-titlebar {
-  padding-left: 78px;
+  /* Keep the brand one native-control inset beyond the traffic-light group. */
+  padding-left: 86px;
+  /* Match the update control's 10px vertical inset. */
+  padding-right: 10px;
 }
 html[data-host="tauri"] .desktop-titlebar-brand {
   display: flex;
@@ -2380,6 +2464,132 @@ html[data-host="tauri"] .desktop-titlebar-brand img {
 html[data-host="tauri"] .desktop-titlebar-context {
   color: var(--muted);
   font-size: 11px;
+}
+html[data-host="tauri"] .desktop-update {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  min-height: 26px;
+  padding: 3px 10px;
+  border-radius: 8px;
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
+  color: color-mix(in srgb, var(--accent) 68%, var(--fg));
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--surface-highlight) 7%, transparent),
+    0 1px 3px rgba(0, 0, 0, 0.22);
+}
+html[data-host="tauri"] .desktop-update[hidden] { display: none; }
+html[data-host="tauri"] .desktop-update:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 19%, var(--surface-2));
+  color: var(--accent-hover);
+}
+html[data-host="tauri"] .desktop-update[aria-busy="true"] svg {
+  animation: update-pulse 0.9s ease-in-out infinite alternate;
+}
+@keyframes update-pulse {
+  to { opacity: 0.35; translate: 0 1px; }
+}
+
+.desktop-update-confirm {
+  z-index: 320;
+  padding: 24px;
+}
+.desktop-update-confirm-card {
+  max-width: 410px;
+  align-items: center;
+  gap: 12px;
+  padding: 24px;
+  border-color: color-mix(in srgb, var(--warn) 42%, var(--border));
+  text-align: center;
+}
+.desktop-update-warning-icon {
+  display: grid;
+  place-items: center;
+  width: 58px;
+  height: 58px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--warn) 13%, var(--surface-2));
+  color: var(--warn);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--surface-highlight) 6%, transparent);
+}
+.desktop-update-confirm-copy {
+  display: grid;
+  gap: 7px;
+  max-width: 350px;
+}
+.desktop-update-confirm-copy .modal-title { font-size: 17px; }
+.desktop-update-confirm-copy .modal-sub {
+  margin: 0;
+  line-height: 1.55;
+}
+.desktop-update-confirm-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 8px;
+  width: 100%;
+  margin-top: 3px;
+}
+
+.projects-root-prompt {
+  z-index: 300;
+  padding: 24px;
+}
+.projects-root-card {
+  max-width: 390px;
+  align-items: center;
+  gap: 10px;
+  padding: 24px;
+  border: 0;
+  text-align: center;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.06) inset,
+    0 0 0 1px rgba(255, 255, 255, 0.09),
+    0 22px 72px rgba(0, 0, 0, 0.68);
+}
+.projects-root-icon {
+  display: grid;
+  place-items: center;
+  width: 50px;
+  height: 50px;
+  margin-bottom: 2px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+  color: var(--accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.projects-root-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 330px;
+}
+.projects-root-card .modal-title { font-size: 16px; }
+.projects-root-card .modal-sub { line-height: 1.5; }
+.projects-root-card .modal-err { text-align: left; }
+.projects-root-choose {
+  width: 100%;
+  min-height: 38px !important;
+  margin-top: 4px;
+}
+.projects-root-skip {
+  min-height: 26px !important;
+  padding: 3px 8px !important;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+}
+.projects-root-skip:hover {
+  border-color: transparent;
+  background: var(--surface-2);
+  color: var(--fg);
 }
 html[data-host="tauri"] .sidebar {
   padding: 16px 12px 12px;
@@ -2409,17 +2619,22 @@ html[data-host="tauri"]:not([data-platform="darwin"]):not([data-platform="macos"
 html[data-host="tauri"]:not([data-platform="darwin"]):not([data-platform="macos"]) .sidebar-brand {
   display: flex;
 }
-html[data-host="tauri"] .sidenav { gap: 4px; }
+html[data-host="tauri"] .sidenav {
+  width: auto;
+  margin-inline: -4px;
+  gap: 5px;
+}
 html[data-host="tauri"] .sidenav-item {
-  min-height: 40px;
-  padding: 9px 11px;
-  border-radius: 8px;
+  min-height: 44px;
+  padding: 10px 13px;
+  border-radius: 11px;
 }
 html[data-host="tauri"] .sidenav-item[aria-selected="true"] {
-  background: var(--surface-3);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
   box-shadow:
-    var(--shadow-border),
-    inset 3px 0 0 color-mix(in srgb, var(--accent) 86%, var(--surface-highlight) 6%);
+    inset 3px 0 0 color-mix(in srgb, var(--accent) 88%, var(--surface-highlight) 5%),
+    inset 0 1px 0 color-mix(in srgb, var(--surface-highlight) 6%, transparent),
+    0 4px 12px color-mix(in srgb, var(--bg) 26%, transparent);
 }
 html[data-host="tauri"] .helpcard {
   padding: 12px;
@@ -2447,6 +2662,25 @@ html[data-host="tauri"] button {
 }
 html[data-host="tauri"] button:hover {
   box-shadow: var(--shadow-border-hover);
+}
+html[data-host="tauri"] .sidebar .sidenav-item {
+  border-color: transparent;
+  box-shadow: none;
+}
+html[data-host="tauri"] .sidebar .sidenav-item:hover {
+  background: color-mix(in srgb, var(--surface-3) 68%, transparent);
+  box-shadow: none;
+}
+html[data-host="tauri"] .sidebar .sidenav-item[aria-selected="true"] {
+  border-color: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow:
+    inset 3px 0 0 color-mix(in srgb, var(--accent) 88%, var(--surface-highlight) 5%),
+    inset 0 1px 0 color-mix(in srgb, var(--surface-highlight) 6%, transparent),
+    0 4px 12px color-mix(in srgb, var(--bg) 26%, transparent);
+}
+html[data-host="tauri"] .sidebar .sidenav-item:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 html[data-host="tauri"] button.primary {
   box-shadow:
@@ -2575,7 +2809,9 @@ html[data-host="tauri"] .page-sub { font-size: 12px; }
   }
   .sidenav-icon { width: 14px; height: 14px; }
   .sidenav-label { display: none; }
-  .sidebar-foot { display: none; }
+  .sidebar-foot { display: contents; }
+  .sidebar-foot .helpcard { display: none; }
+  .sidenav-secondary { flex: 0 0 auto; }
   .sidenav-badge {
     position: static;
     margin-left: 2px;
