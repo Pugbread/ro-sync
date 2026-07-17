@@ -24,6 +24,14 @@ the current release workflow. Until release signing identities are configured,
 macOS Gatekeeper and Windows SmartScreen may warn about downloaded installers.
 Ro Sync does not ship an auto-updater that bypasses those platform checks.
 
+On macOS, choose project folders with **Projects → Add Project → Browse**.
+macOS may ask once for Files & Folders access when that project lives in
+Documents, Desktop, or Downloads. Unsigned local rebuilds have a different
+ad-hoc code identity, so macOS can ask again after replacing the app; a native
+folder selection reauthorizes the existing project without moving or copying
+it. Production builds should Developer ID-sign and notarize both the bundled
+`rosync` sidecar and the outer app so that approval survives upgrades.
+
 ## Run from source
 
 Prerequisites:
@@ -82,5 +90,12 @@ again at the Rust boundary.
 Credentials use the operating system credential vault where available. Managed
 daemon ownership tokens travel through a private child-process environment,
 are redacted from errors, and are never returned to the renderer.
+Lifecycle sidecars are held by exact native child handles and terminated when
+the app exits or a bounded command times out. On normal exit, the native host
+also sends an authenticated close using the exact in-memory capability of the
+Desktop-managed daemon it launched; CLI-owned, manual, and replaced daemons are
+left untouched. The daemon additionally shuts itself down after a prolonged
+loss of authenticated manager heartbeats, so a crash or interrupted cleanup
+cannot leave a permanent inaccessible background process.
 
 For the component and trust-boundary map, see [ARCHITECTURE.md](ARCHITECTURE.md).

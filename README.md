@@ -173,7 +173,31 @@ the local PNG is written.
 
 ## Playtest automation
 
-Playtests are asynchronous jobs with isolated server and client contexts:
+For agent automation, a playscript-owned run wraps the complete Studio playtest lifecycle
+in one foreground command. The main script can stream structured events, wait
+for clients and cross-context signals, then return its final report; Ro Sync
+prints the result and stops the playtest before returning to the shell:
+
+```sh
+rosync playtest run --project . \
+  --script ./bench.server.luau \
+  --client-script ./join.client.luau \
+  --mode multiplayer --players 2 \
+  --args '{"map":"Lighthouse","laps":3}' \
+  --timeout 600 --raw
+```
+
+Raw mode is live NDJSON. Main return/`playtest.done` exits 0, script failure
+exits 2, timeout exits 3, an externally ended job exits 4 with its final job
+status, and boot failure exits 5. `--keep-open` retains the job for manual
+`exec`, `logs`, or `capture` inspection. Encoded results are capped at 1 MiB;
+large telemetry belongs in `playtest.emit` events.
+
+See the [canonical queue-and-lap benchmark](docs/examples/playtest-run/README.md)
+for complete server/client scripts and the playscript runtime API.
+
+The lower-level asynchronous job commands remain available for interactive or
+custom orchestration:
 
 ```sh
 rosync playtest start --project . --mode multiplayer --players 2 --wait --raw
@@ -186,7 +210,9 @@ rosync playtest stop --project . --raw
 ```
 
 Runtime changes remain inside the temporary PlayServer or PlayClient DataModel
-and never sync back into edit mode.
+and never sync to disk or persist back into edit mode. Game identity is the
+default; plugin identity is an explicit sandbox escape hatch and cannot require
+game modules.
 
 ## Versioned workflows
 

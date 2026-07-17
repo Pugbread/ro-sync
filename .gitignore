@@ -5,6 +5,7 @@ daemon/target/
 plugin-src/Packages/
 plugin-src/src/RoSync.server.luau
 plugin-src/src/Photo.luau
+plugin-src/src/Playscript.luau
 
 # Runtime state & logs (contain absolute paths / project-specific data)
 state.json

@@ -6,6 +6,9 @@
       "$path": "src/RoSync.server.luau",
       "Photo": {
         "$path": "src/Photo.luau"
+      },
+      "Playscript": {
+        "$path": "src/Playscript.luau"
       }
     },
     "App": {

@@ -511,6 +511,25 @@ mod tests {
             ))
             .await
             .unwrap();
+
+            // Keep the peer open until the client has answered the JSON heartbeat.
+            // Dropping immediately after queueing the response races the client's
+            // pong write and makes this transport-tolerance test flaky under load.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let Some(Ok(message)) = ws.next().await else {
+                        panic!("client closed before answering the heartbeat");
+                    };
+                    if let tungstenite::Message::Text(text) = message {
+                        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                        if value.get("type").and_then(Value::as_str) == Some("pong") {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("client should answer the heartbeat within one second");
         });
 
         let mut session = RemoteSession::connect(addr.port()).await.unwrap();

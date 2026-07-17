@@ -30,6 +30,10 @@ await copyFile(
   path.join(repoRoot, "plugin", "Photo.luau"),
   path.join(pluginSrcDir, "src", "Photo.luau"),
 );
+await copyFile(
+  path.join(repoRoot, "plugin", "Playscript.luau"),
+  path.join(pluginSrcDir, "src", "Playscript.luau"),
+);
 
 run("wally", ["install"]);
 run("rojo", ["build", "plugin.project.json", "--output", "../plugin/Plugin.rbxm"]);

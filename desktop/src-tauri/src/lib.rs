@@ -12,6 +12,8 @@ use tauri::Manager;
 pub(crate) struct AppState {
     paths: AppPaths,
     io_lock: Mutex<()>,
+    lifecycle_children: daemon::LifecycleChildren,
+    managed_daemon: daemon::ManagedDaemonClaim,
 }
 
 impl AppState {
@@ -19,13 +21,15 @@ impl AppState {
         Self {
             paths,
             io_lock: Mutex::new(()),
+            lifecycle_children: daemon::LifecycleChildren::default(),
+            managed_daemon: daemon::ManagedDaemonClaim::default(),
         }
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -54,6 +58,14 @@ pub fn run() {
             daemon::daemon_ensure,
             daemon::daemon_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Ro Sync desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Ro Sync desktop");
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            let state = app.state::<AppState>();
+            state.managed_daemon.mark_exiting();
+            state.lifecycle_children.terminate_all();
+            state.managed_daemon.terminate();
+        }
+    });
 }

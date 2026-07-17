@@ -20,6 +20,7 @@ mod initial_sync;
 mod lifecycle;
 mod native_capture;
 mod path_resolver;
+mod playtest_run;
 mod project_config;
 #[cfg(test)]
 mod query;
@@ -504,6 +505,8 @@ pub struct PlaytestArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum PlaytestCommand {
+    /// Run one playscript-owned playtest session to completion.
+    Run(playtest_run::PlaytestRunArgs),
     /// Start Play, Run, or a local multiplayer test as an asynchronous job.
     Start(PlaytestStartArgs),
     /// Print a playtest job and its currently connected contexts.
@@ -2066,6 +2069,10 @@ pub struct DaemonStartArgs {
     /// Seconds to wait for the exact boot-ID handshake.
     #[arg(long, default_value_t = 10.0)]
     pub timeout: f64,
+    /// Keep this short-lived lifecycle process alive only while its parent
+    /// keeps the inherited stdin pipe open.
+    #[arg(long = "parent-stdin-lease", hide = true)]
+    pub parent_stdin_lease: bool,
     #[arg(long)]
     pub raw: bool,
 }
@@ -2076,6 +2083,10 @@ pub struct DaemonStatusArgs {
     pub project: PathBuf,
     #[arg(long = "data-dir")]
     pub data_dir: Option<PathBuf>,
+    /// Keep this short-lived lifecycle process alive only while its parent
+    /// keeps the inherited stdin pipe open.
+    #[arg(long = "parent-stdin-lease", hide = true)]
+    pub parent_stdin_lease: bool,
     #[arg(long)]
     pub raw: bool,
 }
@@ -2483,7 +2494,12 @@ pub struct AppState {
 /// Duration of the per-path quiet window after a `/push` write.
 pub const PUSH_QUIET_MS: u64 = 1500;
 const WIDGET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const WIDGET_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const DESKTOP_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const OWNER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+fn owner_heartbeat_expired(last_seen: Option<Instant>, timeout: Duration) -> bool {
+    last_seen.is_some_and(|last_seen| last_seen.elapsed() > timeout)
+}
 
 fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -2512,6 +2528,10 @@ fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error:
             }
         },
         Command::Playtest(args) => match &mut args.command {
+            // `playtest run` deliberately resolves its daemon only after its
+            // local script/JSON preflight has completed. That keeps malformed
+            // invocations completely offline and unable to launch a playtest.
+            PlaytestCommand::Run(_) => {}
             PlaytestCommand::Start(args) => {
                 resolve_port_field(&mut args.port, args.project.as_deref(), "playtest start")?
             }
@@ -2758,7 +2778,17 @@ fn canonicalize_project_path(path: &std::path::Path) -> PathBuf {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(error) = run_cli().await {
+        if let Some(exit) = error.downcast_ref::<playtest_run::PlaytestRunExit>() {
+            std::process::exit(exit.code());
+        }
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mut command = cli.command;
 
@@ -3239,6 +3269,48 @@ struct DaemonLifecycleStatus {
     externally_managed: bool,
 }
 
+fn arm_parent_stdin_lease() -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("rosync-parent-stdin-lease".to_string())
+        .spawn(|| {
+            let stdin = std::io::stdin();
+            monitor_parent_stdin(stdin.lock(), || -> () {
+                terminate_lifecycle_after_parent_disconnect()
+            });
+        })?;
+    Ok(())
+}
+
+fn monitor_parent_stdin<R, F>(mut reader: R, on_disconnect: F)
+where
+    R: std::io::Read,
+    F: FnOnce(),
+{
+    let mut buffer = [0_u8; 64];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    on_disconnect();
+}
+
+#[cfg(unix)]
+fn terminate_lifecycle_after_parent_disconnect() -> ! {
+    // SAFETY: `_exit` immediately terminates this short-lived lifecycle
+    // process without running locks or cleanup handlers that may be blocked on
+    // another thread. The OS releases its start-lock and pipe handles.
+    unsafe { libc::_exit(1) }
+}
+
+#[cfg(not(unix))]
+fn terminate_lifecycle_after_parent_disconnect() -> ! {
+    std::process::exit(1)
+}
+
 async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         DaemonCommand::Start(args) => {
@@ -3247,6 +3319,9 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> 
             print_daemon_status(&status, raw)?;
         }
         DaemonCommand::Status(args) => {
+            if args.parent_stdin_lease {
+                arm_parent_stdin_lease()?;
+            }
             let canonical_project =
                 lifecycle::canonical_project(&args.project).map_err(|error| {
                     format!(
@@ -3308,6 +3383,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> 
                 place_id: args.place_id,
                 data_dir: args.data_dir,
                 timeout: args.timeout,
+                parent_stdin_lease: false,
                 raw,
             })
             .await?;
@@ -3649,6 +3725,9 @@ fn daemon_status(
 async fn daemon_start(
     args: DaemonStartArgs,
 ) -> Result<DaemonLifecycleStatus, Box<dyn std::error::Error>> {
+    if args.parent_stdin_lease {
+        arm_parent_stdin_lease()?;
+    }
     validate_lifecycle_timeout(args.timeout, "daemon start")?;
     if args.managed_by.trim().is_empty() {
         return Err("daemon start: --managed-by cannot be empty".into());
@@ -3755,6 +3834,7 @@ async fn daemon_start(
         boot_id: &boot_id,
         started_at,
         timeout,
+        owner_token_env: args.owner_token_env.as_deref(),
     })
     .await
 }
@@ -3778,6 +3858,7 @@ struct ManagedDaemonLaunch<'a> {
     boot_id: &'a str,
     started_at: u64,
     timeout: Duration,
+    owner_token_env: Option<&'a str>,
 }
 
 async fn spawn_managed_daemon(
@@ -3792,6 +3873,7 @@ async fn spawn_managed_daemon(
         boot_id,
         started_at,
         timeout,
+        owner_token_env,
     } = launch;
     let executable = std::env::current_exe()?;
     let stdout = lifecycle::open_private_log(&paths.log)?;
@@ -3816,10 +3898,18 @@ async fn spawn_managed_daemon(
         .arg(&paths.log)
         .arg("--started-at")
         .arg(started_at.to_string())
-        .env("ROSYNC_DAEMON_CONTROL_TOKEN", control_token)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    // The short-lived lifecycle process receives the manager secret through
+    // an environment variable, but the long-lived daemon needs only its
+    // dedicated control-token copy. Do not retain or propagate the source
+    // variable into daemon-launched tools.
+    command.env_remove("ROSYNC_OWNER_TOKEN");
+    if let Some(owner_token_env) = owner_token_env {
+        command.env_remove(owner_token_env);
+    }
+    command.env("ROSYNC_DAEMON_CONTROL_TOKEN", control_token);
 
     #[cfg(unix)]
     {
@@ -4183,6 +4273,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         "serve control token",
     )?
     .or_else(|| widget_owner_token.clone());
+    if let Some(control_token_env) = args.control_token_env.as_deref() {
+        // The token has been copied into private process state. Remove the
+        // source variable before this long-lived daemon launches analysis,
+        // capture, or other helper processes that would otherwise inherit it.
+        std::env::remove_var(control_token_env);
+    }
     if managed && manager_owner_token.as_deref().is_none_or(str::is_empty) {
         return Err("serve: a managed daemon requires --control-token or --owner-token".into());
     }
@@ -4231,7 +4327,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         process_id,
         started_at,
         manager_owner_token: Arc::new(manager_owner_token.clone()),
-        manager_last_seen: Arc::new(Mutex::new(args.widget_owned.then(Instant::now))),
+        manager_last_seen: Arc::new(Mutex::new(managed.then(Instant::now))),
         widget_owner_token: Arc::new(widget_owner_token),
         widget_last_seen: Arc::new(Mutex::new(args.widget_owned.then(Instant::now))),
         shutdown_tx,
@@ -4284,6 +4380,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     spawn_config_hot_reload(state.clone());
     if args.widget_owned {
         spawn_widget_owner_watchdog(state.clone());
+    } else if managed_by == "desktop" {
+        spawn_desktop_owner_watchdog(state.clone());
     }
 
     let addr = format!("127.0.0.1:{listen_port}");
@@ -4329,21 +4427,35 @@ async fn serve_shutdown_signal(
 
 fn spawn_widget_owner_watchdog(state: AppState) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(WIDGET_HEARTBEAT_CHECK_INTERVAL);
+        let mut interval = tokio::time::interval(OWNER_HEARTBEAT_CHECK_INTERVAL);
         loop {
             interval.tick().await;
             let last_seen = *state.widget_last_seen.lock().unwrap();
-            if let Some(last_seen) = last_seen {
-                if last_seen.elapsed() > WIDGET_HEARTBEAT_TIMEOUT {
-                    let plugin_connected = state.active_plugin.lock().unwrap().is_some();
-                    if plugin_connected {
-                        continue;
-                    }
-                    let _ = state
-                        .shutdown_tx
-                        .send(Some("widget heartbeat lost".to_string()));
-                    break;
+            if owner_heartbeat_expired(last_seen, WIDGET_HEARTBEAT_TIMEOUT) {
+                let plugin_connected = state.active_plugin.lock().unwrap().is_some();
+                if plugin_connected {
+                    continue;
                 }
+                let _ = state
+                    .shutdown_tx
+                    .send(Some("widget heartbeat lost".to_string()));
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_desktop_owner_watchdog(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(OWNER_HEARTBEAT_CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            let last_seen = *state.manager_last_seen.lock().unwrap();
+            if owner_heartbeat_expired(last_seen, DESKTOP_HEARTBEAT_TIMEOUT) {
+                let _ = state
+                    .shutdown_tx
+                    .send(Some("desktop heartbeat lost".to_string()));
+                break;
             }
         }
     });
@@ -12196,6 +12308,7 @@ async fn run_capture_screen(args: CaptureScreenArgs) -> Result<(), Box<dyn std::
 
 async fn run_playtest(args: PlaytestArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
+        PlaytestCommand::Run(args) => playtest_run::run(args).await,
         PlaytestCommand::Start(args) => run_playtest_start(args).await,
         PlaytestCommand::Status(args) => run_playtest_status(args).await,
         PlaytestCommand::Contexts(args) => run_playtest_contexts(args).await,
@@ -14332,7 +14445,7 @@ fn compact_command_registry(
         if name.is_some_and(|needle| needle != command_name) {
             continue;
         }
-        rows.push(serde_json::json!({
+        let mut row = serde_json::json!({
             "name": command_name,
             "category": command.get("category").and_then(|value| value.as_str()).unwrap_or(""),
             "summary": command.get("description").and_then(|value| value.as_str()).unwrap_or(""),
@@ -14341,7 +14454,11 @@ fn compact_command_registry(
             "requires": command_requirements(command_name),
             "preferBefore": command_prefer_before(command_name),
             "usageLookup": format!("rosync commands {command_name}"),
-        }));
+        });
+        if let Some(subcommands) = command.get("subcommands") {
+            row["subcommands"] = subcommands.clone();
+        }
+        rows.push(row);
     }
     if name.is_some() && rows.is_empty() {
         return Err(format!("commands: unknown command {name:?}").into());
@@ -15743,6 +15860,17 @@ mod tier2_tests {
     }
 
     #[test]
+    fn owner_heartbeat_expiry_requires_a_seen_and_stale_heartbeat() {
+        let timeout = Duration::from_secs(30);
+        assert!(!owner_heartbeat_expired(None, timeout));
+        assert!(!owner_heartbeat_expired(Some(Instant::now()), timeout));
+        assert!(owner_heartbeat_expired(
+            Some(Instant::now() - Duration::from_secs(31)),
+            timeout,
+        ));
+    }
+
+    #[test]
     fn synced_service_root_directory_ops_are_filtered() {
         let root = PathBuf::from("ro-sync-test-project");
         let service_op = Op {
@@ -16178,6 +16306,80 @@ mod tier2_tests {
             Some("ROSYNC_DAEMON_CONTROL_TOKEN")
         );
         assert!(args.control_token.is_none());
+    }
+
+    #[test]
+    fn parent_stdin_lease_is_scoped_to_tauri_lifecycle_commands() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "daemon",
+            "start",
+            "--project",
+            ".",
+            "--parent-stdin-lease",
+        ])
+        .unwrap();
+        let Some(Command::Daemon(DaemonArgs {
+            command: DaemonCommand::Start(start),
+        })) = cli.command
+        else {
+            panic!("expected daemon start command");
+        };
+        assert!(start.parent_stdin_lease);
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "daemon",
+            "status",
+            "--project",
+            ".",
+            "--parent-stdin-lease",
+        ])
+        .unwrap();
+        let Some(Command::Daemon(DaemonArgs {
+            command: DaemonCommand::Status(status),
+        })) = cli.command
+        else {
+            panic!("expected daemon status command");
+        };
+        assert!(status.parent_stdin_lease);
+
+        let cli = Cli::try_parse_from(["rosync", "daemon", "start", "--project", "."]).unwrap();
+        let Some(Command::Daemon(DaemonArgs {
+            command: DaemonCommand::Start(start),
+        })) = cli.command
+        else {
+            panic!("expected daemon start command");
+        };
+        assert!(!start.parent_stdin_lease);
+
+        assert!(Cli::try_parse_from(
+            ["rosync", "serve", "--project", ".", "--parent-stdin-lease",]
+        )
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "rosync",
+            "daemon",
+            "stop",
+            "--project",
+            ".",
+            "--parent-stdin-lease",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parent_stdin_monitor_notifies_promptly_on_eof() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let monitor = std::thread::spawn(move || {
+            monitor_parent_stdin(std::io::Cursor::new(Vec::<u8>::new()), move || {
+                tx.send(()).unwrap();
+            });
+        });
+
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("stdin EOF should release the parent lease promptly");
+        monitor.join().unwrap();
     }
 
     #[test]
@@ -16752,6 +16954,10 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
         let compact = compact_command_registry(&bundle, Some("set")).unwrap();
         assert_eq!(compact["commands"][0]["name"], "set");
         assert_eq!(compact["commands"][0]["safety"], "mutates-studio");
+        let compact_playtest = compact_command_registry(&bundle, Some("playtest")).unwrap();
+        assert!(compact_playtest["commands"][0]["subcommands"]
+            .as_array()
+            .is_some_and(|subcommands| subcommands.iter().any(|command| command == "run")));
 
         let cli = Cli::try_parse_from([
             "rosync",

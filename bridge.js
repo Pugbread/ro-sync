@@ -354,13 +354,13 @@ export function setDaemonAuthToken(token) {
   daemonAuthToken = typeof token === "string" && token.length ? token : null;
 }
 
-export function daemonURL(base, path = "") {
+export function daemonURL(base, path = "", authToken = daemonAuthToken) {
   if (!base) throw new Error("daemon not running");
   const url = new URL(base.replace(/\/+$/, "") + path);
   if (!["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
     throw new Error("daemon URL must use a loopback host");
   }
-  if (daemonAuthToken) url.searchParams.set("widgetToken", daemonAuthToken);
+  if (authToken) url.searchParams.set("widgetToken", authToken);
   return url.toString();
 }
 

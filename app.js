@@ -18,7 +18,13 @@ import { mountConflicts } from "./views/conflicts.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
-import { canStopDesktopDaemon, isDesktopManagedStatus } from "./lifecycle-policy.js";
+import {
+  canStopDesktopDaemon,
+  desktopStartOwnership,
+  desktopStopPlan,
+  desktopTrackedOwnership,
+  isDesktopManagedStatus,
+} from "./lifecycle-policy.js";
 import {
   PLATFORM, IS_WINDOWS,
   BINARY_REL, WIDGET_DIR_SHELL,
@@ -107,6 +113,7 @@ const DAEMON_HEARTBEAT_INTERVAL_MS = 5000;
 let daemonHeartbeatTimer = null;
 let widgetCloseSent = false;
 let lastHeartbeatFailureNoticeAt = 0;
+let pendingDesktopOwnership = null;
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
 // Persisted via t64:get-state/set-state under key "sessions". Shape:
@@ -287,7 +294,7 @@ async function daemonLifecycleRequest(
   token = app.state.daemonOwnerToken,
 ) {
   if (!base || !token) return { sent: false, ok: false, error: "missing daemon owner token" };
-  const url = daemonURL(base, path);
+  const url = daemonURL(base, path, token);
   const body = JSON.stringify({ token, reason });
   try {
     const res = await fetch(url, {
@@ -309,11 +316,11 @@ async function daemonLifecycleRequest(
   }
 }
 
-function daemonLifecyclePost(path, reason, preferBeacon = false) {
-  const base = app.daemonBase;
-  const token = app.state.daemonOwnerToken;
+function daemonLifecyclePost(path, reason, preferBeacon = false, override = null) {
+  const base = override?.base || app.daemonBase;
+  const token = override?.token || app.state.daemonOwnerToken;
   if (!base || !token) return false;
-  const url = daemonURL(base, path);
+  const url = daemonURL(base, path, token);
   const body = JSON.stringify({ token, reason });
   if (preferBeacon && navigator.sendBeacon) {
     try {
@@ -375,7 +382,10 @@ function notifyWidgetClosing() {
   stopDaemonHeartbeat();
   const endpoint = IS_DESKTOP_HOST ? "/manager-close" : "/widget-close";
   const reason = IS_DESKTOP_HOST ? "desktop app closed" : "widget closed";
-  daemonLifecyclePost(endpoint, reason, true);
+  const pending = IS_DESKTOP_HOST && !app.daemonBase && pendingDesktopOwnership?.base
+    ? { base: pendingDesktopOwnership.base, token: pendingDesktopOwnership.token }
+    : null;
+  daemonLifecyclePost(endpoint, reason, true, pending);
 }
 
 function activeProject() {
@@ -582,11 +592,20 @@ function lifecycleValue(value) {
   return value?.status || value || {};
 }
 
-function desktopOwnershipError(message, status = null) {
+function desktopOwnershipError(message, status = null, reason = "external-manager") {
   const error = new Error(message);
   error.code = "EXTERNAL_DAEMON";
   error.status = status;
+  error.reason = reason;
   return error;
+}
+
+function shouldClearDesktopClaim(error) {
+  return !!error && [
+    "incomplete-tracking",
+    "external-manager",
+    "ownership-rejected",
+  ].includes(error.reason);
 }
 
 async function inspectOwnedDesktopDaemon(spec) {
@@ -595,6 +614,8 @@ async function inspectOwnedDesktopDaemon(spec) {
   if (!project || !token) {
     throw desktopOwnershipError(
       "The daemon has no usable Desktop ownership capability; it was left running.",
+      null,
+      "incomplete-tracking",
     );
   }
 
@@ -602,12 +623,20 @@ async function inspectOwnedDesktopDaemon(spec) {
   if (!status.running) return { running: false, status };
   if (!isDesktopManagedStatus(status)) {
     const manager = status.managedBy ? ` by ${status.managedBy}` : " outside Ro Sync Desktop";
-    throw desktopOwnershipError(`The daemon is managed${manager}; it was left running.`, status);
+    throw desktopOwnershipError(
+      `The daemon is managed${manager}; it was left running.`,
+      status,
+      "external-manager",
+    );
   }
 
   const port = Number(status.port || spec.port);
   if (!Number.isFinite(port) || port <= 0) {
-    throw desktopOwnershipError("The managed daemon reported no verifiable port; it was left running.", status);
+    throw desktopOwnershipError(
+      "The managed daemon reported no verifiable port; it was left running.",
+      status,
+      "invalid-status",
+    );
   }
   const base = status.base || status.baseUrl || spec.base || `http://127.0.0.1:${port}`;
 
@@ -621,6 +650,7 @@ async function inspectOwnedDesktopDaemon(spec) {
     throw desktopOwnershipError(
       "Desktop could not authenticate the managed daemon; it was left running.",
       status,
+      "transport",
     );
   }
   const validProjects = new Set([
@@ -635,15 +665,23 @@ async function inspectOwnedDesktopDaemon(spec) {
     "desktop ownership check",
     token,
   );
-  if (!canStopDesktopDaemon({
-    status,
-    hello: info,
-    ownershipAuthenticated: proof.ok,
-    expectedProjects: validProjects,
-  })) {
+  if (!proof.ok) {
     throw desktopOwnershipError(
       `Desktop could not authenticate the exact daemon boot${proof.error ? `: ${proof.error}` : ""}; it was left running.`,
       status,
+      proof.sent ? "ownership-rejected" : "transport",
+    );
+  }
+  if (!canStopDesktopDaemon({
+    status,
+    hello: info,
+    ownershipAuthenticated: true,
+    expectedProjects: validProjects,
+  })) {
+    throw desktopOwnershipError(
+      "Desktop could not match the authenticated daemon to the expected boot; it was left running.",
+      status,
+      "identity-mismatch",
     );
   }
   return { running: true, status, info, base, port, token, bootId: info.bootId };
@@ -696,34 +734,81 @@ function clearDesktopDaemonTracking({ preserveTarget = false } = {}) {
 async function ensureDesktopDaemon(project) {
   const projectInfo = activeProject();
   let ownedCandidate = null;
+  let requestedToken = null;
   let preferredPort =
     app.state.daemonProject === project && app.state.daemonPort
       ? app.state.daemonPort
       : DEFAULT_PORT;
   try {
-    const previousProject = app.state.daemonProject;
-    if (previousProject && previousProject !== project) {
+    if (pendingDesktopOwnership && pendingDesktopOwnership.project !== project) {
       try {
-        await stopOwnedDesktopDaemon({
-          project: previousProject,
-          port: app.state.daemonPort,
-          pid: app.state.daemonPid,
-          bootId: app.state.daemonBootId,
-          ownerToken: app.state.daemonOwnerToken,
-        }, "desktop switched projects");
-        clearDesktopDaemonTracking();
+        await stopOwnedDesktopDaemon(
+          {
+            project: pendingDesktopOwnership.project,
+            ownerToken: pendingDesktopOwnership.token,
+          },
+          "desktop switched away from a pending startup",
+        );
+        pendingDesktopOwnership = null;
       } catch (error) {
-        if (error?.code !== "EXTERNAL_DAEMON") throw error;
-        // The tracked boot was replaced or adopted elsewhere. Forget only our
-        // stale local claim, leave that listener untouched, and let lifecycle
-        // discovery choose a different free port for the new project.
-        toast(error.message);
-        clearDesktopDaemonTracking();
-        preferredPort = null;
+        if (error?.code !== "EXTERNAL_DAEMON" || !shouldClearDesktopClaim(error)) {
+          throw error;
+        }
+        pendingDesktopOwnership = null;
       }
     }
 
-    const requestedToken = ensureOwnerToken();
+    const previousProject = app.state.daemonProject;
+    if (previousProject && previousProject !== project) {
+      const previousClaim = desktopTrackedOwnership(app.state);
+      if (!previousClaim) {
+        clearDesktopDaemonTracking();
+        preferredPort = null;
+      } else {
+        try {
+          await stopOwnedDesktopDaemon(previousClaim, "desktop switched projects");
+          clearDesktopDaemonTracking();
+        } catch (error) {
+          if (error?.code !== "EXTERNAL_DAEMON") throw error;
+          toast(error.message);
+          if (!shouldClearDesktopClaim(error)) throw error;
+          // The tracked boot was definitively replaced/adopted elsewhere. Forget
+          // only our stale claim and let discovery choose a different free port.
+          clearDesktopDaemonTracking();
+          preferredPort = null;
+        }
+      }
+    }
+
+    const startOwnership = desktopStartOwnership(
+      app.state,
+      project,
+      makeOwnerToken(),
+      pendingDesktopOwnership,
+    );
+    if (!startOwnership.reusedClaim && !startOwnership.reusedPending) {
+      // Remove migration/failed-start fragments before using a fresh capability.
+      // The new token stays memory-only until exact ownership is authenticated.
+      clearDesktopDaemonTracking();
+      pendingDesktopOwnership = {
+        project,
+        token: startOwnership.token,
+        base: preferredPort ? `http://127.0.0.1:${preferredPort}` : null,
+      };
+    } else if (startOwnership.reusedClaim && !pendingDesktopOwnership) {
+      // A complete persisted claim is safe to use, but app.daemonBase is not
+      // restored until the async sidecar handshake finishes. Keep a temporary
+      // close target so quitting during that window cannot orphan the exact
+      // Desktop-managed boot from the previous renderer session.
+      pendingDesktopOwnership = {
+        project,
+        token: startOwnership.token,
+        base: preferredPort ? `http://127.0.0.1:${preferredPort}` : null,
+        port: preferredPort || null,
+      };
+    }
+    requestedToken = startOwnership.token;
+    setDaemonAuthToken(requestedToken);
     let result = await host.daemonEnsure({
       project,
       preferredPort,
@@ -742,6 +827,7 @@ async function ensureDesktopDaemon(project) {
       throw desktopOwnershipError(
         `A daemon for this project is already externally managed${manager}; Desktop left it running.`,
         result,
+        "external-manager",
       );
     }
 
@@ -749,6 +835,10 @@ async function ensureDesktopDaemon(project) {
     if (!Number.isFinite(port) || port <= 0) throw new Error("managed daemon returned an invalid port");
     const token = requestedToken;
     const base = result.base || `http://127.0.0.1:${port}`;
+    // The lifecycle command may have fallen back from a stale/occupied
+    // preferred port. Replace the provisional close target with the exact
+    // reported listener before ownership verification.
+    pendingDesktopOwnership = { project, token, base, port };
     ownedCandidate = await inspectOwnedDesktopDaemon({
       project,
       canonicalProject: result.canonicalProject,
@@ -759,6 +849,27 @@ async function ensureDesktopDaemon(project) {
     if (!ownedCandidate.running) throw new Error("managed daemon stopped during startup");
     const info = ownedCandidate.info;
 
+    // Serve/Stop and project switches can race the async sidecar handshake. A
+    // superseded start must never commit a now-unwanted daemon after the UI
+    // has moved on; authenticate it first, then stop that exact boot safely.
+    if (activeProjectPath() !== project) {
+      await stopOwnedDesktopDaemon(
+        {
+          project,
+          port: ownedCandidate.port,
+          pid: ownedCandidate.status.pid,
+          bootId: ownedCandidate.bootId,
+          ownerToken: requestedToken,
+        },
+        "desktop startup was superseded",
+      );
+      pendingDesktopOwnership = null;
+      clearDesktopDaemonTracking();
+      setDaemonDot("idle", "daemon stopped");
+      emit("daemon:down", { host: HOST_KIND });
+      return;
+    }
+
     app.daemonBase = ownedCandidate.base;
     app.daemonOk = true;
     setState({
@@ -768,11 +879,13 @@ async function ensureDesktopDaemon(project) {
       daemonBootId: ownedCandidate.bootId,
       daemonOwnerToken: token,
     });
+    pendingDesktopOwnership = null;
     setDaemonDot("ok", `:${ownedCandidate.port}`);
     emit("daemon:up", { base: ownedCandidate.base, info, project, host: HOST_KIND });
   } catch (error) {
     // Cleanup is allowed only after an authenticated ownership proof. A CLI,
     // manual, or other Desktop manager remains untouched on every failure.
+    let retainedOwnedCandidate = false;
     if (ownedCandidate?.running) {
       try {
         const stopped = await stopOwnedDesktopDaemon(
@@ -784,14 +897,45 @@ async function ensureDesktopDaemon(project) {
           },
           "desktop startup did not complete",
         );
-        if (stopped.stopped) clearDesktopDaemonTracking();
+        if (stopped.stopped) {
+          pendingDesktopOwnership = null;
+          clearDesktopDaemonTracking();
+        }
       } catch (cleanupError) {
         console.warn("owned daemon cleanup failed", cleanupError);
+        // Ownership was already proven. Retain the complete capability if a
+        // transient close failed so a later health tick/restart can retry the
+        // exact boot instead of orphaning it.
+        setState({
+          daemonPid: ownedCandidate.status.pid || null,
+          daemonPort: ownedCandidate.port,
+          daemonProject: project,
+          daemonBootId: ownedCandidate.bootId,
+          daemonOwnerToken: ownedCandidate.token,
+        });
+        pendingDesktopOwnership = {
+          project,
+          token: ownedCandidate.token,
+          base: ownedCandidate.base,
+          port: ownedCandidate.port,
+        };
+        retainedOwnedCandidate = true;
       }
+    }
+    if (!retainedOwnedCandidate && shouldClearDesktopClaim(error)) {
+      if (!requestedToken || pendingDesktopOwnership?.token === requestedToken) {
+        pendingDesktopOwnership = null;
+      }
+      clearDesktopDaemonTracking();
     }
     setDaemonAuthToken(null);
     app.daemonOk = false;
     app.daemonBase = null;
+    if (activeProjectPath() !== project && !retainedOwnedCandidate) {
+      setDaemonDot("idle", "no active project");
+      emit("daemon:down", { host: HOST_KIND });
+      return;
+    }
     setDaemonDot("err", "daemon down");
     setStatus(`managed daemon failed: ${error.message}`, "err");
     emit("daemon:down", { error: error.message, host: HOST_KIND });
@@ -908,20 +1052,43 @@ async function killDaemon({ preserveTarget = false } = {}) {
   const pid = app.state.daemonPid;
   const port = app.state.daemonPort;
   if (IS_DESKTOP_HOST) {
+    if (pendingDesktopOwnership) {
+      try {
+        await stopOwnedDesktopDaemon(
+          {
+            project: pendingDesktopOwnership.project,
+            ownerToken: pendingDesktopOwnership.token,
+          },
+          "desktop cancelled a pending startup",
+        );
+        pendingDesktopOwnership = null;
+      } catch (error) {
+        if (shouldClearDesktopClaim(error)) {
+          pendingDesktopOwnership = null;
+        } else {
+          toast(`Could not stop pending daemon safely: ${error.message}`);
+          return false;
+        }
+      }
+    }
+    const plan = desktopStopPlan(app.state);
+    if (plan.kind === "clear-local") {
+      clearDesktopDaemonTracking({ preserveTarget });
+      setDaemonDot("idle", "daemon stopped");
+      emit("daemon:down", { host: HOST_KIND });
+      return true;
+    }
     try {
-      const result = await stopOwnedDesktopDaemon({
-        project: app.state.daemonProject,
-        port,
-        pid,
-        bootId: app.state.daemonBootId,
-        ownerToken: app.state.daemonOwnerToken,
-      }, "desktop daemon stopped");
+      const result = await stopOwnedDesktopDaemon(plan.spec, "desktop daemon stopped");
       if (!result.stopped) throw new Error("managed daemon did not stop");
       clearDesktopDaemonTracking({ preserveTarget });
       setDaemonDot("idle", "daemon stopped");
       emit("daemon:down", { host: HOST_KIND });
       return true;
     } catch (error) {
+      if (shouldClearDesktopClaim(error)) {
+        clearDesktopDaemonTracking({ preserveTarget });
+      }
       toast(`Could not stop managed daemon: ${error.message}`);
       return false;
     }
@@ -984,7 +1151,46 @@ async function killDaemon({ preserveTarget = false } = {}) {
 
 // ---------- Health loop ----------
 async function healthTick() {
-  if (!app.daemonBase) return;
+  if (!app.daemonBase) {
+    if (!IS_DESKTOP_HOST) return;
+    const project = activeProject();
+    if (!project) {
+      if (pendingDesktopOwnership) {
+        try {
+          await stopOwnedDesktopDaemon(
+            {
+              project: pendingDesktopOwnership.project,
+              ownerToken: pendingDesktopOwnership.token,
+            },
+            "desktop cleaned up a cancelled pending startup",
+          );
+          pendingDesktopOwnership = null;
+        } catch (error) {
+          if (shouldClearDesktopClaim(error)) {
+            pendingDesktopOwnership = null;
+          } else {
+            return;
+          }
+        }
+      }
+      if (desktopTrackedOwnership(app.state)) {
+        await killDaemon();
+      }
+      return;
+    }
+    // `preserveTarget` marks controlled Desktop pauses (restart/plugin build)
+    // with the desired project but no authenticated boot. Do not race those
+    // workflows; an external-start failure clears daemonProject and may retry.
+    if (
+      app.state.daemonProject === project.path &&
+      !desktopTrackedOwnership(app.state)
+    ) return;
+    const cfg = project.settings || {};
+    if (cfg.AutoReconnect === "off") return;
+    setDaemonDot("warn", "reconnecting…");
+    await ensureDaemon();
+    return;
+  }
   try {
     await daemonJson(app.daemonBase, "/hello");
     if (!app.daemonOk) {

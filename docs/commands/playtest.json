@@ -2,9 +2,26 @@
   "name": "playtest",
   "title": "rosync playtest",
   "category": "Agent Runtime",
-  "description": "Runs asynchronous Studio playtests and controls isolated PlayServer and PlayClient runtime agents for execution, logs, resolved UI inspection, virtual input, and screenshots.",
-  "usage": "rosync playtest start|status|contexts|wait|exec|logs|ui|input|capture|stop|request [options]",
+  "description": "Runs playscript-owned foreground sessions or controls lower-level asynchronous Studio playtests and isolated PlayServer and PlayClient runtime agents.",
+  "usage": "rosync playtest run|start|status|contexts|wait|exec|logs|ui|input|capture|stop|request [options]",
+  "subcommands": [
+    "run",
+    "start",
+    "status",
+    "contexts",
+    "wait",
+    "exec",
+    "logs",
+    "ui",
+    "input",
+    "capture",
+    "stop",
+    "request"
+  ],
   "examples": [
+    "rosync playtest run --project . --script ./check.server.luau --raw",
+    "rosync playtest run --project . --script ./bench.server.luau --client-script ./join.client.luau --mode multiplayer --players 2 --args '{\"map\":\"Lighthouse\",\"laps\":3}' --timeout 600 --raw",
+    "rosync playtest run --project . --script ./repro.server.luau --keep-open --logs warn",
     "rosync playtest start --project . --mode play --wait --raw",
     "rosync playtest start --project . --mode multiplayer --players 2 --wait --timeout 60 --raw",
     "rosync playtest contexts --project . --raw",
@@ -16,10 +33,17 @@
     "rosync playtest stop --project . --raw"
   ],
   "notes": [
-    "`start` returns a job immediately. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N` context arrival; multiplayer supports 1-8 clients.",
-    "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost and their temporary DataModel changes never sync back to edit mode.",
-    "`exec --identity game` uses a temporary Script/LocalScript in the playtest; `--identity plugin` runs with plugin identity. Provide exactly one of `--source` or `--source-file`.",
-    "`ui` defaults to PlayerGui and CoreGui and returns actual GUI paths, visibility, text, absolute position, and absolute size. A supplied `--root` is a full DataModel path. `input` accepts a JSON object/array via `--actions` or `--file`; advanced operations use `request --op <name> --args <json>`.",
-    "Runtime capture uses the same bounded artifact transport as edit-mode capture. Start/stop, execution, and virtual input require explicit user intent."
+    "`run --script <file>` owns the complete foreground lifecycle: it starts a Studio playtest, waits for the selected `--context` (`server` by default), injects the playscript, streams progress, prints the return value, and stops the playtest without another Ro Sync invocation.",
+    "Run flags are `--script`, `--context server|client:N`, optional `--client-script`, `--mode play|run|multiplayer`, `--players`, JSON `--args`, `--timeout` (600 seconds by default, maximum 3600), `--identity game|plugin`, `--logs off|info|warn|error`, `--keep-open`, `--quiet`, and `--raw`. Invalid JSON is rejected before a job starts.",
+    "The injected API exposes `playtest.args`, `mode`, `context`, and `jobId`; `emit(data)` and `log(msg)` stream progress; `done(value)` and `fail(msg)` complete from any task; and generation-scoped `signal`, `await`, and server-only `awaitClients` coordinate contexts.",
+    "The first completion wins. Main return or `done` exits 0; a main-script error or `fail` exits 2; hard timeout exits 3; an externally ended job exits 4 with its fetched `jobStatus`; and boot or required-context failure exits 5. Runs stop automatically except with `--keep-open`, which prints the job ID for later `exec`, `logs`, `capture`, and `stop` use.",
+    "`--client-script` runs once in every client as it becomes ready. Each return is a `clientResult`; a client error is an event and never ends the main session. The main script decides whether missing or failed client work matters.",
+    "`--raw` is live NDJSON with `started`, `ready`, `event`, `log`, `clientResult`, `dropped`, `aborted`, and `result` records. Each physical line is independently valid JSON. Events are not deduplicated or sampled by the CLI; source rate limiting is visible through accurate `dropped` counts.",
+    "Runtime heartbeats distinguish quiet scripts from vanished jobs. Missing heartbeats cause a status confirmation before `aborted` is emitted, and every failure reports the final observed job status instead of an empty exec-style value.",
+    "Encoded main/client results are capped at 1 MiB. An oversized value is replaced by `{\"truncated\":true,\"bytes\":N}` with its original byte count; stream bulk telemetry through `emit` instead.",
+    "`--identity game` is the default and runs through a temporary Script/LocalScript in the disposable playtest clone. Plugin identity is an explicit escape hatch in the plugin sandbox and cannot require game modules.",
+    "All runtime changes are temporary and never sync to disk or persist to edit mode. Run coordination is authenticated with the private job generation token. The start audit record includes script paths and SHA-256 hashes; the completion record includes the outcome and exit code.",
+    "`start` returns a lower-level asynchronous job. Use `--wait`, `playtest wait`, `status`, and `contexts` to synchronize with `server` and `client:N`; the existing low-level commands remain supported and unchanged.",
+    "Runtime copies communicate only with the edit-mode plugin through PluginConnectionService. They do not connect to localhost. Runtime capture uses the same bounded artifact transport as edit-mode capture."
   ]
 }

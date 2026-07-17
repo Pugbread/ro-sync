@@ -17,4 +17,13 @@ npm run dev
 
 Application state lives below the OS application-data directory. Credentials use the native credential vault when available; a deliberately isolated fallback uses a mode-`0600` JSON file inside that private application-data directory. The Roblox Open Cloud credential is additionally synchronized, through a private child environment variable, into the CLI's canonical mode-`0600` credential store so `rosync upload` and monetization commands can use the Settings value without receiving it in argv or output. Daemon ownership tokens use the same no-argv environment boundary, are redacted from errors, and are never returned to the renderer by lifecycle results.
 
+On normal app exit, the native host uses the exact in-memory ownership capability to close the daemon it launched and waits a bounded three seconds for the listener to disappear. A CLI-owned, manually started, or replaced daemon cannot authenticate with that capability and is left untouched. The daemon heartbeat watchdog remains the fallback for crashes, interrupted startup, or a bounded close failure.
+
 The app bundles `Plugin.rbxm`, generated command documentation, and the Luau analysis/compiler toolchain. Studio plugin installation copies the bundle to Roblox's per-user plugin directory and reports that Studio must be restarted.
+
+On macOS, project folders must be selected through the native **Browse** picker.
+That selection is both Ro Sync's project-root authorization and the operating
+system's Files & Folders consent for protected locations such as Documents.
+Local unsigned rebuilds change their ad-hoc code identity and can require the
+folder to be selected again. Distributable builds need a stable Developer ID
+signature on the nested sidecar and the final app bundle.

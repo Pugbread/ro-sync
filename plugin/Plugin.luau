@@ -265,6 +265,33 @@ local function runPlaytestRuntimeAgent()
 		return tostring(value)
 	end
 
+	local playscriptRuntime = nil
+	do
+		local moduleScript = script:FindFirstChild("Playscript")
+		if moduleScript and moduleScript:IsA("ModuleScript") then
+			local okModule, module = pcall(require, moduleScript)
+			if okModule and type(module) == "table" and type(module.newRuntime) == "function" then
+				local okRuntime, runtime = pcall(module.newRuntime, {
+					httpService = HttpService,
+					encodingService = EncodingService,
+					scriptEditorService = ScriptEditorService,
+					sha256Hex = sha256Hex,
+					runtimeId = runtimeId,
+					jobId = runtimePlaytestJobId,
+					sessionToken = runtimeSessionToken,
+					role = role,
+				})
+				if okRuntime then
+					playscriptRuntime = runtime
+				else
+					warn("[Ro Sync runtime] playscript initialization failed: " .. tostring(runtime))
+				end
+			else
+				warn("[Ro Sync runtime] packaged playscript module is unavailable: " .. tostring(module))
+			end
+		end
+	end
+
 	local function send(connection, message): (boolean, string?)
 		local ok, encoded = pcall(function()
 			return HttpService:JSONEncode(message)
@@ -330,6 +357,9 @@ local function runPlaytestRuntimeAgent()
 			runtimeLogSeq += 1
 			if #runtimeLogs > 500 then
 				table.remove(runtimeLogs, 1)
+			end
+			if playscriptRuntime then
+				playscriptRuntime:onStudioLog(level, text)
 			end
 		end)
 	end)
@@ -948,6 +978,9 @@ local function runPlaytestRuntimeAgent()
 	end
 
 	local handlers = {}
+	if playscriptRuntime then
+		playscriptRuntime:registerHandlers(handlers)
+	end
 	function handlers.ping(_args)
 		return runtimeContext()
 	end
@@ -1022,6 +1055,12 @@ local function runPlaytestRuntimeAgent()
 				if not decodeOk or type(message) ~= "table" then
 					return
 				end
+				if message.kind == "rosync-playscript-frame" then
+					if playscriptRuntime then
+						playscriptRuntime:handleFrame(connection, message)
+					end
+					return
+				end
 				if message.kind == "rosync-runtime-discover" then
 					local context = runtimeContext()
 					context.kind = "rosync-runtime-hello"
@@ -1091,6 +1130,9 @@ local function runPlaytestRuntimeAgent()
 			end)
 		end)
 		if okBound then
+			if playscriptRuntime then
+				playscriptRuntime:attachConnection(connection)
+			end
 			local context = runtimeContext()
 			context.kind = "rosync-runtime-hello"
 			context.protocolVersion = PLUGIN_PROTOCOL_VERSION
@@ -4089,7 +4131,35 @@ do
 	local nextRuntimeClientIndex = 1
 	local runtimeRequestCounter = 0
 	local playtestJobs = {}
+	local playscriptRunsByClientId = {}
+	local playscriptRunTombstones = {}
 	local latestPlaytestJobId = nil
+	local requestRuntimeContext
+	local fetchPlayscriptResult
+	local playscriptCoordinator = nil
+	do
+		local moduleScript = script:FindFirstChild("Playscript")
+		if moduleScript and moduleScript:IsA("ModuleScript") then
+			local okModule, module = pcall(require, moduleScript)
+			if okModule and type(module) == "table" and type(module.newCoordinator) == "function" then
+				local okCoordinator, coordinator = pcall(module.newCoordinator, {
+					httpService = HttpService,
+					sha256Hex = sha256Hex,
+					onTerminalRequested = function(job, terminal, external)
+						local callback = remoteState.onPlayscriptTerminalRequested
+						if callback then
+							callback(job, terminal, external)
+						end
+					end,
+				})
+				if okCoordinator then
+					playscriptCoordinator = coordinator
+				else
+					warn("[Ro Sync] playscript coordinator initialization failed: " .. tostring(coordinator))
+				end
+			end
+		end
+	end
 
 	local function coordinatorAuth(sessionToken: string, purpose: string): string
 		return sha256Hex(sessionToken .. "|" .. purpose)
@@ -4114,11 +4184,22 @@ do
 	end
 
 	local function pruneRuntimeContexts()
+		local changedJobs = {}
 		for runtimeId, context in pairs(runtimeContextsById) do
 			if not context.connection.Connected then
+				changedJobs[context.playtestJobId] = true
 				runtimeContextsById[runtimeId] = nil
 				if runtimeContextsByName[context.name] == context then
 					runtimeContextsByName[context.name] = nil
+				end
+			end
+		end
+		if playscriptCoordinator then
+			for jobId in pairs(changedJobs) do
+				local job = playtestJobs[jobId]
+				if job and job.run then
+					playscriptCoordinator:setContexts(job, runtimeContextsByName)
+					playscriptCoordinator:onContextsChanged(job, runtimeContextsByName)
 				end
 			end
 		end
@@ -4170,6 +4251,10 @@ do
 		}
 		runtimeContextsById[runtimeId] = context
 		runtimeContextsByName[name] = context
+		if playscriptCoordinator and job.run then
+			playscriptCoordinator:setContexts(job, runtimeContextsByName)
+			playscriptCoordinator:onContext(job, context, runtimeContextsByName)
+		end
 	end
 
 	local function bindRuntimeConnection(connection)
@@ -4186,6 +4271,26 @@ do
 			end
 			if message.kind == "rosync-runtime-hello" then
 				registerRuntimeHello(connection, message)
+				return
+			end
+			if message.kind == "rosync-playscript-frame" then
+				local runtimeId = tostring(message.runtimeId or "")
+				local context = runtimeContextsById[runtimeId]
+				if context and context.connection == connection then
+					local job = playtestJobs[context.playtestJobId]
+					if job and job.run and playscriptCoordinator then
+						local action = playscriptCoordinator:handleFrame(job, context, message)
+						if action then
+							task.spawn(function()
+								if fetchPlayscriptResult then
+									fetchPlayscriptResult(action)
+								else
+									playscriptCoordinator:resolveResult(action, nil, "result transport unavailable")
+								end
+							end)
+						end
+					end
+				end
 				return
 			end
 			if message.kind == "rosync-runtime-response" then
@@ -4224,7 +4329,7 @@ do
 		end
 	end
 
-	local function requestRuntimeContext(context, operation: string, args: any, timeoutSeconds: number)
+	requestRuntimeContext = function(context, operation: string, args: any, timeoutSeconds: number)
 		if not context or not context.connection.Connected then
 			error("playtest context is not connected")
 		end
@@ -4279,12 +4384,74 @@ do
 		return pending.response.value
 	end
 
+	fetchPlayscriptResult = function(action)
+		local context = action.context
+		local result = action.result
+		local resultId = tostring(result.id or "")
+		local byteLength = math.floor(tonumber(result.bytes) or -1)
+		if resultId == "" or byteLength < 2 or byteLength > 2 * 1024 * 1024 then
+			playscriptCoordinator:resolveResult(action, nil, "runtime returned invalid playscript result metadata")
+			return
+		end
+		local deadline = os.clock() + 20
+		local pieces = {}
+		local offset = 0
+		local transferOk, transferError = pcall(function()
+			while offset < byteLength do
+				local remaining = deadline - os.clock()
+				if remaining <= 0 then
+					error("playscript result transfer timed out")
+				end
+				local chunk = requestRuntimeContext(context, "playscript_result_read", {
+					id = resultId,
+					offset = offset,
+					maxBytes = 96 * 1024,
+				}, math.max(0.1, math.min(remaining, 5)))
+				local chunkOffset = math.floor(tonumber(chunk.offset) or -1)
+				local nextOffset = math.floor(tonumber(chunk.nextOffset) or -1)
+				if chunkOffset ~= offset or nextOffset <= offset or nextOffset > byteLength then
+					error("playscript result returned an invalid chunk offset")
+				end
+				local decoded = EncodingService:Base64Decode(buffer.fromstring(tostring(chunk.bytesBase64 or "")))
+				if typeof(decoded) == "buffer" then
+					decoded = buffer.tostring(decoded)
+				end
+				if type(decoded) ~= "string" or #decoded ~= nextOffset - offset then
+					error("playscript result returned an invalid chunk length")
+				end
+				table.insert(pieces, decoded)
+				offset = nextOffset
+			end
+			local encoded = table.concat(pieces)
+			if #encoded ~= byteLength then
+				error("playscript result length mismatch")
+			end
+			if tostring(result.sha256 or "") ~= sha256Hex(encoded) then
+				error("playscript result SHA-256 mismatch")
+			end
+			local decodeOk, envelope = pcall(function()
+				return HttpService:JSONDecode(encoded)
+			end)
+			if not decodeOk or type(envelope) ~= "table" then
+				error("playscript result is not a valid JSON envelope")
+			end
+			playscriptCoordinator:resolveResult(action, envelope, nil)
+		end)
+		pcall(function()
+			requestRuntimeContext(context, "playscript_result_close", { id = resultId }, 1)
+		end)
+		if not transferOk then
+			playscriptCoordinator:resolveResult(action, nil, tostring(transferError))
+		end
+	end
+
 	local function playtestJobSnapshot(job)
 		if not job then
 			return nil
 		end
 		return {
 			id = job.id,
+			clientRunId = job.clientRunId,
 			mode = job.mode,
 			players = job.players,
 			status = job.status,
@@ -4296,7 +4463,131 @@ do
 		}
 	end
 
-	remoteHandlers.playtest_start = function(args)
+	local function playscriptFingerprint(args)
+		local main = if type(args.script) == "table" then args.script else {}
+		local client = if type(args.clientScript) == "table" then args.clientScript else nil
+		local mainSource = tostring(main.source or args.source or "")
+		local clientSource = if client then tostring(client.source or "") else ""
+		local argsJson = tostring(args.scriptArgsJson or "")
+		if argsJson == "" then
+			local argsOk, encodedArgs = pcall(function()
+				return HttpService:JSONEncode(if args.scriptArgs == nil then {} else args.scriptArgs)
+			end)
+			if not argsOk then
+				error("playtest run args could not be fingerprinted: " .. tostring(encodedArgs))
+			end
+			argsJson = encodedArgs
+		end
+		local testArgsOk, testArgsJson = pcall(function()
+			return HttpService:JSONEncode(if type(args.testArgs) == "table" then args.testArgs else {})
+		end)
+		if not testArgsOk then
+			error("playtest run test args could not be fingerprinted: " .. tostring(testArgsJson))
+		end
+		local fields = {
+			tostring(args.mode or "play"):lower(),
+			tostring(math.clamp(math.floor(tonumber(args.players) or 1), 1, 8)),
+			tostring(args.context or "server"),
+			tostring(args.identity or "game"):lower(),
+			tostring(math.clamp(tonumber(args.timeout) or 600, 0.1, 3600)),
+			tostring(args.logs or "off"):lower(),
+			if args.keepOpen == true then "true" else "false",
+			tostring(main.path or ""),
+			sha256Hex(mainSource),
+			if clientSource == "" then "" else tostring(client.path or ""),
+			if clientSource == "" then "" else sha256Hex(clientSource),
+			argsJson,
+			testArgsJson,
+		}
+		local framed = {}
+		for _, field in ipairs(fields) do
+			table.insert(framed, tostring(#field) .. ":" .. field)
+		end
+		return sha256Hex(table.concat(framed, "|"))
+	end
+
+	local function prunePlayscriptRunKeys()
+		local now = os.clock()
+		for clientRunId, entry in pairs(playscriptRunsByClientId) do
+			local status = tostring(entry.job.status)
+			local active = status == "starting" or status == "running" or status == "stopping"
+			if not active and now - entry.lastUsed > 600 then
+				playscriptRunsByClientId[clientRunId] = nil
+			end
+		end
+		for clientRunId, tombstone in pairs(playscriptRunTombstones) do
+			if now - tombstone.createdAt > 120 then
+				playscriptRunTombstones[clientRunId] = nil
+			end
+		end
+		while true do
+			local count = 0
+			local oldestId = nil
+			local oldestClock = math.huge
+			for clientRunId, entry in pairs(playscriptRunsByClientId) do
+				count += 1
+				local status = tostring(entry.job.status)
+				local active = status == "starting" or status == "running" or status == "stopping"
+				if not active and entry.lastUsed < oldestClock then
+					oldestClock = entry.lastUsed
+					oldestId = clientRunId
+				end
+			end
+			if count <= 64 or not oldestId then
+				break
+			end
+			playscriptRunsByClientId[oldestId] = nil
+		end
+		while true do
+			local count = 0
+			local oldestId = nil
+			local oldestClock = math.huge
+			for clientRunId, tombstone in pairs(playscriptRunTombstones) do
+				count += 1
+				if tombstone.createdAt < oldestClock then
+					oldestClock = tombstone.createdAt
+					oldestId = clientRunId
+				end
+			end
+			if count <= 64 or not oldestId then
+				break
+			end
+			playscriptRunTombstones[oldestId] = nil
+		end
+	end
+
+	local function playscriptJobForArgs(args)
+		local explicitJobId = tostring(args.jobId or "")
+		local clientRunId = tostring(args.clientRunId or "")
+		if clientRunId ~= "" and (#clientRunId > 128 or string.find(clientRunId, "%c")) then
+			error("playtest run clientRunId must be at most 128 bytes without control characters")
+		end
+		if explicitJobId ~= "" then
+			if clientRunId ~= "" then
+				prunePlayscriptRunKeys()
+				local entry = playscriptRunsByClientId[clientRunId]
+				if not entry or entry.job.id ~= explicitJobId then
+					error("playtest jobId does not match clientRunId")
+				end
+				entry.lastUsed = os.clock()
+				return explicitJobId, entry.job, clientRunId
+			end
+			return explicitJobId, playtestJobs[explicitJobId], clientRunId
+		end
+		if clientRunId ~= "" then
+			prunePlayscriptRunKeys()
+			local entry = playscriptRunsByClientId[clientRunId]
+			if entry then
+				entry.lastUsed = os.clock()
+				return entry.job.id, entry.job, clientRunId
+			end
+			return "", nil, clientRunId
+		end
+		local jobId = tostring(latestPlaytestJobId or "")
+		return jobId, playtestJobs[jobId], ""
+	end
+
+	local function startPlaytestJob(args, runConfiguration)
 		for _, job in pairs(playtestJobs) do
 			if job.status == "starting" or job.status == "running" or job.status == "stopping" then
 				error("a playtest job is already active: " .. job.id)
@@ -4310,8 +4601,10 @@ do
 		local players = math.clamp(math.floor(tonumber(args.players) or 1), 1, 8)
 		local jobId = HttpService:GenerateGUID(false)
 		local sessionToken = HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
+		local previousLatestJobId = latestPlaytestJobId
 		local job = {
 			id = jobId,
+			clientRunId = if runConfiguration then tostring(runConfiguration.clientRunId or "") else nil,
 			mode = mode,
 			players = players,
 			status = "starting",
@@ -4324,6 +4617,21 @@ do
 		runtimeContextsById = {}
 		runtimeContextsByName = {}
 		nextRuntimeClientIndex = 1
+		if runConfiguration ~= nil then
+			if not playscriptCoordinator then
+				playtestJobs[jobId] = nil
+				latestPlaytestJobId = previousLatestJobId
+				error("packaged playscript coordinator is unavailable; reinstall the Studio plugin")
+			end
+			local configured, configureResult = pcall(function()
+				return playscriptCoordinator:createRun(job, runConfiguration)
+			end)
+			if not configured then
+				playtestJobs[jobId] = nil
+				latestPlaytestJobId = previousLatestJobId
+				error(tostring(configureResult))
+			end
+		end
 		local historicalJobs = {}
 		for id, candidate in pairs(playtestJobs) do
 			if
@@ -4353,6 +4661,14 @@ do
 				if mode == "run" then
 					return service:ExecuteRunModeAsync(testArgs)
 				elseif mode == "multiplayer" then
+					-- Studio's one-player multiplayer launcher creates only a
+					-- PlayClient DataModel, so there is no server context in which
+					-- to install the main playscript. Play mode provides the same
+					-- one-server/one-client topology while preserving the requested
+					-- mode in the run configuration exposed to playscripts.
+					if players == 1 then
+						return service:ExecutePlayModeAsync(testArgs)
+					end
 					return service:ExecuteMultiplayerTestAsync(players, testArgs)
 				else
 					return service:ExecutePlayModeAsync(testArgs)
@@ -4385,8 +4701,116 @@ do
 				job.error = tostring(result)
 			end
 			pruneRuntimeContexts()
+			if playscriptCoordinator and job.run then
+				playscriptCoordinator:onJobEnded(job)
+			end
 		end)
-		return playtestJobSnapshot(job)
+		return job
+	end
+
+	remoteHandlers.playtest_start = function(args)
+		return playtestJobSnapshot(startPlaytestJob(args, nil))
+	end
+
+	remoteHandlers.playtest_run_start = function(args)
+		local clientRunId = tostring(args.clientRunId or "")
+		if clientRunId == "" or #clientRunId > 128 or string.find(clientRunId, "%c") then
+			error("playtest run clientRunId must be 1-128 bytes without control characters")
+		end
+		prunePlayscriptRunKeys()
+		if playscriptRunTombstones[clientRunId] then
+			if remoteState.preAuditedWrites then
+				remoteState.preAuditedWrites[args] = true
+			end
+			error("playtest run was cancelled before launch: " .. clientRunId)
+		end
+		local fingerprint = playscriptFingerprint(args)
+		local existing = playscriptRunsByClientId[clientRunId]
+		if existing then
+			if existing.fingerprint ~= fingerprint then
+				error("playtest run clientRunId was already used with different content")
+			end
+			existing.lastUsed = os.clock()
+			if remoteState.preAuditedWrites then
+				remoteState.preAuditedWrites[args] = true
+			end
+			return {
+				job = playtestJobSnapshot(existing.job),
+				run = playscriptCoordinator:snapshot(existing.job),
+				reused = true,
+				replayed = true,
+				clientRunId = clientRunId,
+			}
+		end
+		local job = startPlaytestJob(args, args)
+		playscriptRunsByClientId[clientRunId] = {
+			job = job,
+			fingerprint = fingerprint,
+			createdAt = os.clock(),
+			lastUsed = os.clock(),
+		}
+		prunePlayscriptRunKeys()
+		args.__rosyncAuditJobId = job.id
+		local response = {
+			job = playtestJobSnapshot(job),
+			run = playscriptCoordinator:snapshot(job),
+			reused = false,
+			replayed = false,
+			clientRunId = clientRunId,
+		}
+		local postAudit = remoteState.postRemoteWriteLogSync
+		local preAuditedWrites = remoteState.preAuditedWrites
+		if postAudit and preAuditedWrites then
+			preAuditedWrites[args] = true
+			local auditOk = postAudit({
+				ts = os.time(),
+				op = "playtest_run_start",
+				args = playscriptCoordinator:auditStart(job),
+				ok = true,
+				result = response,
+			})
+			if auditOk then
+				preAuditedWrites[args] = true
+			else
+				preAuditedWrites[args] = nil
+			end
+		end
+		return response
+	end
+
+	remoteState.auditArgsForOp = function(op, args)
+		if op ~= "playtest_run_start" then
+			return args
+		end
+		local main = if type(args.script) == "table" then args.script else {}
+		local client = if type(args.clientScript) == "table" then args.clientScript else nil
+		local mainSource = tostring(main.source or args.source or "")
+		local clientSource = if client then tostring(client.source or "") else ""
+		return {
+			subcommand = "playtest run",
+			jobId = args.__rosyncAuditJobId,
+			clientRunId = tostring(args.clientRunId or ""),
+			mode = tostring(args.mode or "play"),
+			players = math.floor(tonumber(args.players) or 1),
+			context = tostring(args.context or "server"),
+			identity = tostring(args.identity or "game"),
+			timeout = tonumber(args.timeout) or 600,
+			keepOpen = args.keepOpen == true,
+			args = args.scriptArgs,
+			argsJson = tostring(args.scriptArgsJson or ""),
+			script = {
+				path = tostring(main.path or ""),
+				sha256 = sha256Hex(mainSource),
+				bytes = #mainSource,
+			},
+			clientScript = if client
+				then {
+					path = tostring(client.path or ""),
+					sha256 = sha256Hex(clientSource),
+					bytes = #clientSource,
+				}
+				else nil,
+		}
 	end
 
 	local function runtimeContextsForJob(playtestJobId: string)
@@ -4404,11 +4828,10 @@ do
 	end
 
 	remoteHandlers.playtest_status = function(args)
-		local jobId = tostring(args.jobId or latestPlaytestJobId or "")
+		local jobId, job, clientRunId = playscriptJobForArgs(args)
 		if jobId == "" then
-			return { active = false, contexts = {} }
+			return { active = false, contexts = {}, clientRunId = clientRunId }
 		end
-		local job = playtestJobs[jobId]
 		if not job then
 			error("playtest job not found: " .. jobId)
 		end
@@ -4417,7 +4840,19 @@ do
 			active = job.status == "starting" or job.status == "running" or job.status == "stopping",
 			job = playtestJobSnapshot(job),
 			contexts = contexts,
+			run = if playscriptCoordinator and job.run then playscriptCoordinator:snapshot(job) else nil,
 		}
+	end
+
+	remoteHandlers.playtest_run_poll = function(args)
+		local jobId, job = playscriptJobForArgs(args)
+		if jobId == "" or not job or not job.run or not playscriptCoordinator then
+			error("playtest run not found: " .. jobId)
+		end
+		playscriptCoordinator:setContexts(job, runtimeContextsByName)
+		local result = playscriptCoordinator:poll(job, args)
+		result.job = playtestJobSnapshot(job)
+		return result
 	end
 
 	remoteHandlers.playtest_contexts = function(args)
@@ -4557,8 +4992,232 @@ do
 		}
 	end
 
-	remoteHandlers.playtest_stop = function(args)
+	local function stopPlaytestJob(job, args, forceStop)
 		local service = game:GetService("StudioTestService")
+		local jobId = job.id
+		if tostring(job.status) == "stopping" then
+			error("playtest stop is already in progress")
+		end
+		if tostring(job.status) ~= "starting" and tostring(job.status) ~= "running" then
+			return { stopped = true, alreadyEnded = true, job = playtestJobSnapshot(job) }
+		end
+		local retryableStatus = job.status
+		local function restoreRetryableState()
+			job.stopRequested = false
+			if tostring(job.status) == "stopping" then
+				job.status = retryableStatus
+			end
+		end
+		job.stopRequested = true
+		job.status = "stopping"
+		if playscriptCoordinator and job.run then
+			playscriptCoordinator:cancelRunners(job, runtimeContextsByName, args.reason or "playtest stopped")
+		end
+		local serverContext = nil
+		for _, context in pairs(runtimeContextsByName) do
+			if context.playtestJobId == jobId and context.role == "server" and context.connection.Connected then
+				serverContext = context
+				break
+			end
+		end
+		local function leaveFromEdit()
+			local canLeave, allowed = pcall(function()
+				return service:CanLeaveTest()
+			end)
+			if not canLeave or allowed ~= true then
+				return false, "Studio cannot leave this playtest"
+			end
+			local ok, result = pcall(function()
+				return service:LeaveTest()
+			end)
+			if not ok then
+				return false, tostring(result)
+			end
+			return true, nil
+		end
+		local function waitForEnd(seconds)
+			local deadline = os.clock() + seconds
+			while tostring(job.status) == "stopping" and os.clock() < deadline do
+				task.wait(0.05)
+			end
+			return tostring(job.status) ~= "stopping"
+		end
+
+		if forceStop then
+			local left, leaveError = leaveFromEdit()
+			if left then
+				if waitForEnd(3) then
+					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.LeaveTest" }
+				end
+				leaveError = "Studio accepted LeaveTest but the playtest remained active"
+			end
+			if not serverContext then
+				restoreRetryableState()
+				error("unable to force-stop playtest: " .. tostring(leaveError))
+			end
+		end
+
+		if serverContext then
+			local requested, requestError = pcall(function()
+				requestRuntimeContext(serverContext, "end_test", { result = args.result }, if forceStop then 1 else 5)
+			end)
+			if requested then
+				waitForEnd(if forceStop then 3 else 10)
+				if tostring(job.status) == "stopped" then
+					return { stopped = true, job = playtestJobSnapshot(job), via = "PlayServer.EndTest" }
+				end
+				if tostring(job.status) ~= "stopping" then
+					return { stopped = true, job = playtestJobSnapshot(job), via = "PlayServer.EndTest" }
+				end
+			end
+			local left, leaveError = leaveFromEdit()
+			if left then
+				if waitForEnd(3) then
+					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.LeaveTest" }
+				end
+				leaveError = "Studio accepted LeaveTest but the playtest remained active"
+			end
+			restoreRetryableState()
+			error(
+				"unable to stop playtest through PlayServer ("
+					.. tostring(requestError)
+					.. ") or edit mode ("
+					.. tostring(leaveError)
+					.. ")"
+			)
+		end
+
+		local left, leaveError = leaveFromEdit()
+		if not left then
+			restoreRetryableState()
+			error("unable to stop playtest: " .. tostring(leaveError))
+		end
+		if not waitForEnd(3) then
+			restoreRetryableState()
+			error("Studio accepted LeaveTest but the playtest remained active")
+		end
+		return { stopped = true, job = playtestJobSnapshot(job) }
+	end
+
+	local function completionExitCode(outcome)
+		if outcome == "success" then
+			return 0
+		elseif outcome == "failure" then
+			return 2
+		elseif outcome == "timeout" then
+			return 3
+		elseif outcome == "aborted" then
+			return 4
+		end
+		return 5
+	end
+
+	local function auditPlayscriptCompletion(job, terminal)
+		local postAudit = remoteState.postRemoteWriteLogSync
+		if not postAudit then
+			return false, "synchronous writelog transport is unavailable"
+		end
+		local run = job.run
+		return postAudit({
+			ts = os.time(),
+			op = "playtest_run_complete",
+			ok = terminal.outcome == "success",
+			jobId = job.id,
+			clientRunId = job.clientRunId,
+			outcome = terminal.outcome,
+			exitCode = completionExitCode(terminal.outcome),
+			jobStatus = terminal.jobStatus,
+			elapsed = terminal.elapsed,
+			script = if run and run._main
+				then { path = run._main.path, sha256 = run._main.sha256, bytes = #run._main.source }
+				else nil,
+			clientScript = if run and run._client
+				then { path = run._client.path, sha256 = run._client.sha256, bytes = #run._client.source }
+				else nil,
+		})
+	end
+
+	local function cancelOpenPlayscriptRunners(job, reason)
+		playscriptCoordinator:cancelRunners(job, runtimeContextsByName, reason)
+		local failures = {}
+		for _, context in pairs(runtimeContextsByName) do
+			if context.playtestJobId == job.id and context.connection.Connected then
+				local ok, result = pcall(function()
+					return requestRuntimeContext(context, "playscript_cancel", { reason = reason }, 2)
+				end)
+				if not ok or type(result) ~= "table" or result.cancelled ~= true then
+					local failure = if ok then "runtime did not confirm cancellation" else tostring(result)
+					table.insert(failures, context.name .. ": " .. failure)
+				end
+			end
+		end
+		return if #failures > 0 then table.concat(failures, "; ") else nil
+	end
+
+	remoteState.onPlayscriptTerminalRequested = function(job, terminal, external)
+		if external then
+			terminal.jobStatus = job.status
+			local auditOk, auditError = auditPlayscriptCompletion(job, terminal)
+			if not auditOk then
+				terminal.auditError = tostring(auditError)
+			end
+			playscriptCoordinator:finalizeTerminal(job, terminal)
+			return
+		end
+		local run = job.run
+		if not run or run.terminal then
+			return
+		end
+		if run.keepOpen and terminal.outcome ~= "aborted" and terminal.force ~= true then
+			local cancelError = cancelOpenPlayscriptRunners(job, terminal.outcome)
+			local finalTerminal = terminal
+			if cancelError then
+				finalTerminal = table.clone(terminal)
+				finalTerminal.originalOutcome = terminal.outcome
+				finalTerminal.outcome = "aborted"
+				finalTerminal.kind = "aborted"
+				finalTerminal.ok = false
+				finalTerminal.error = "playscript cleanup could not be confirmed: " .. cancelError
+				finalTerminal.reason = finalTerminal.error
+			end
+			finalTerminal.jobStatus = job.status
+			local auditOk, auditError = auditPlayscriptCompletion(job, finalTerminal)
+			if not auditOk then
+				finalTerminal.auditError = tostring(auditError)
+			end
+			playscriptCoordinator:finalizeTerminal(job, finalTerminal, cancelError)
+			return
+		end
+		local forceStop = terminal.force == true or terminal.outcome == "timeout" or terminal.outcome == "bootFailure"
+		local stopped, stopResult = pcall(function()
+			return stopPlaytestJob(
+				job,
+				{ reason = terminal.outcome, result = "Ro Sync playscript completed" },
+				forceStop
+			)
+		end)
+		local stopConfirmed = stopped and type(stopResult) == "table" and stopResult.stopped == true
+		local finalTerminal = terminal
+		local stopError = nil
+		if not stopConfirmed then
+			stopError = if stopped then "playtest stop returned without confirmation" else tostring(stopResult)
+			finalTerminal = table.clone(terminal)
+			finalTerminal.originalOutcome = terminal.outcome
+			finalTerminal.outcome = "aborted"
+			finalTerminal.kind = "aborted"
+			finalTerminal.ok = false
+			finalTerminal.error = "playtest teardown could not be confirmed: " .. stopError
+			finalTerminal.reason = finalTerminal.error
+		end
+		finalTerminal.jobStatus = job.status
+		local auditOk, auditError = auditPlayscriptCompletion(job, finalTerminal)
+		if not auditOk then
+			finalTerminal.auditError = tostring(auditError)
+		end
+		playscriptCoordinator:finalizeTerminal(job, finalTerminal, stopError)
+	end
+
+	remoteHandlers.playtest_stop = function(args)
 		local jobId = tostring(args.jobId or latestPlaytestJobId or "")
 		if jobId == "" then
 			error("no playtest job is active")
@@ -4573,54 +5232,96 @@ do
 		if tostring(job.status) ~= "starting" and tostring(job.status) ~= "running" then
 			error("playtest job is not active: " .. tostring(job.status))
 		end
-		job.stopRequested = true
-		job.status = "stopping"
-		local serverContext = nil
-		for _, context in pairs(runtimeContextsByName) do
-			if context.playtestJobId == jobId and context.role == "server" and context.connection.Connected then
-				serverContext = context
-				break
-			end
-		end
-		if serverContext then
-			local requested, requestError = pcall(function()
-				requestRuntimeContext(serverContext, "end_test", { result = args.result }, 5)
-			end)
-			if requested then
-				local deadline = os.clock() + 10
-				while tostring(job.status) == "stopping" and os.clock() < deadline do
-					task.wait(0.05)
-				end
-				if tostring(job.status) == "stopped" then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "PlayServer.EndTest" }
-				end
-				if tostring(job.status) ~= "stopping" then
-					error("playtest ended with unexpected status: " .. tostring(job.status))
-				end
-				error("PlayServer accepted the stop request but Studio did not finish within 10 seconds")
-			end
-			job.stopRequested = false
-			job.status = "running"
-			error("unable to stop playtest through PlayServer: " .. tostring(requestError))
-		end
+		return stopPlaytestJob(job, args, args.force == true)
+	end
 
-		local canLeave, allowed = pcall(function()
-			return service:CanLeaveTest()
-		end)
-		if not canLeave or allowed ~= true then
-			job.stopRequested = false
-			job.status = "running"
-			error("Studio cannot leave this playtest and no PlayServer context is connected")
+	remoteHandlers.playtest_run_cancel = function(args)
+		local jobId, job, clientRunId = playscriptJobForArgs(args)
+		if jobId == "" and not job and clientRunId ~= "" then
+			prunePlayscriptRunKeys()
+			playscriptRunTombstones[clientRunId] = playscriptRunTombstones[clientRunId] or { createdAt = os.clock() }
+			prunePlayscriptRunKeys()
+			local terminal = {
+				outcome = "aborted",
+				kind = "aborted",
+				ok = false,
+				error = tostring(args.reason or "playtest run cancelled before launch"),
+				reason = tostring(args.reason or "playtest run cancelled before launch"),
+				jobStatus = "not-started",
+				elapsed = 0,
+			}
+			return {
+				cancelled = true,
+				cleanupConfirmed = true,
+				pendingStart = true,
+				clientRunId = clientRunId,
+				outcome = terminal,
+			}
 		end
-		local ok, result = pcall(function()
-			return service:LeaveTest()
-		end)
-		if not ok then
-			job.stopRequested = false
-			job.status = "running"
-			error("unable to stop playtest: " .. tostring(result))
+		if jobId == "" or not job or not job.run or not playscriptCoordinator then
+			error("playtest run not found: " .. jobId)
 		end
-		return { stopped = true, job = playtestJobSnapshot(job) }
+		local cancelOutcome = job.run.terminal
+		local forcedCleanupConfirmed = nil
+		if cancelOutcome and args.force == true then
+			local active = job.status == "starting" or job.status == "running" or job.status == "stopping"
+			if active then
+				local stopped, stopResult = pcall(function()
+					return stopPlaytestJob(job, { reason = args.reason or "playtest run cleanup" }, true)
+				end)
+				forcedCleanupConfirmed = stopped and type(stopResult) == "table" and stopResult.stopped == true
+				cancelOutcome = table.clone(cancelOutcome)
+				cancelOutcome.jobStatus = job.status
+				if forcedCleanupConfirmed then
+					cancelOutcome.stopError = nil
+				else
+					local stopError = if stopped
+						then "playtest stop returned without confirmation"
+						else tostring(stopResult)
+					cancelOutcome.originalOutcome = cancelOutcome.outcome
+					cancelOutcome.outcome = "aborted"
+					cancelOutcome.kind = "aborted"
+					cancelOutcome.ok = false
+					cancelOutcome.error = "playtest teardown could not be confirmed: " .. stopError
+					cancelOutcome.reason = cancelOutcome.error
+					cancelOutcome.stopError = stopError
+				end
+			end
+		end
+		if not job.run.terminal and not job.run._pendingTerminal then
+			local reason = tostring(args.reason or "playtest run cancelled")
+			local requestedOutcome = tostring(args.outcome or ""):lower()
+			local outcome = if requestedOutcome == "timeout" or reason:lower():find("timeout", 1, true)
+				then "timeout"
+				else "aborted"
+			playscriptCoordinator:requestTerminal(job, {
+				outcome = outcome,
+				kind = outcome,
+				error = reason,
+				reason = reason,
+				jobStatus = job.status,
+				force = args.force == true,
+			})
+		end
+		local deadline = os.clock() + 20
+		while not job.run.terminal and os.clock() < deadline do
+			task.wait(0.05)
+		end
+		if not job.run.terminal then
+			error("playtest run cancellation did not finish within 20 seconds")
+		end
+		cancelOutcome = cancelOutcome or job.run.terminal
+		local cleanupConfirmed = if forcedCleanupConfirmed ~= nil
+			then forcedCleanupConfirmed
+			else cancelOutcome.stopError == nil
+		return {
+			cancelled = cleanupConfirmed,
+			cleanupConfirmed = cleanupConfirmed,
+			job = playtestJobSnapshot(job),
+			run = playscriptCoordinator:snapshot(job),
+			outcome = cancelOutcome,
+			clientRunId = job.clientRunId,
+		}
 	end
 end
 
@@ -6568,6 +7269,8 @@ do
 		local captureService = getStudioCaptureService()
 		local photoChild = script:FindFirstChild("Photo")
 		local photoAvailable = photoChild ~= nil and photoChild:IsA("ModuleScript")
+		local playscriptChild = script:FindFirstChild("Playscript")
+		local playscriptAvailable = playscriptChild ~= nil and playscriptChild:IsA("ModuleScript")
 		local hostType = hostDataModelTypeName()
 		local pluginConnectionOk, pluginConnection = pcall(function()
 			local service = game:GetService("PluginConnectionService")
@@ -6612,6 +7315,7 @@ do
 				studioTest = studioTest,
 				virtualInput = virtualInput,
 				playtest = studioTest and pluginConnection,
+				playtestRun = studioTest and pluginConnection and playscriptAvailable,
 				runtimeExec = pluginConnection,
 				uiInspect = pluginConnection,
 				playtestLogs = pluginConnection,
@@ -6631,6 +7335,13 @@ do
 				photoAxis = 4096,
 				photoPixels = 16 * 1024 * 1024,
 				photoChunkBytes = 512 * 1024,
+				playscriptEventBytes = 64 * 1024,
+				playscriptResultBytes = 1024 * 1024,
+				playscriptResultChunkBytes = 96 * 1024,
+				playscriptEventsPerSecond = 20,
+				playscriptEventBurst = 40,
+				playscriptPollEvents = 64,
+				playscriptPollBytes = 512 * 1024,
 			},
 		}
 	end
@@ -7737,6 +8448,8 @@ do
 		capture_export = true,
 		photo_prepare = true,
 		playtest_start = true,
+		playtest_run_start = true,
+		playtest_run_cancel = true,
 		playtest_stop = true,
 		playtest_request = true,
 		playtest_capture = true,
@@ -7762,6 +8475,7 @@ do
 	-- unrelated server/client execs to exhaust the queue while a peer yields.
 	local REMOTE_CONCURRENT_WRITE_OPS = {
 		playtest_request = true,
+		playtest_run_cancel = true,
 	}
 
 	local function redactRemoteAuditValue(value: any, depth: number?, seen: any?): any
@@ -7809,14 +8523,39 @@ do
 		return out
 	end
 
-	local function postRemoteWriteLog(entry)
+	local function postRemoteWriteLogSync(entry)
 		local redacted = redactRemoteAuditValue(entry)
+		local ok, response = httpJson("/writelog", "POST", redacted)
+		if ok and (type(response) ~= "table" or response.ok ~= true) then
+			ok = false
+			response = if type(response) == "table"
+				then tostring(response.error or "writelog rejected the audit entry")
+				else "invalid writelog response"
+		end
+		if not ok then
+			warn("[Ro Sync] writelog POST failed: " .. tostring(response))
+		end
+		return ok, response
+	end
+
+	local function postRemoteWriteLog(entry)
 		task.spawn(function()
-			local ok, err = httpRequest("/writelog", "POST", redacted)
-			if not ok then
-				warn("[Ro Sync] writelog POST failed: " .. tostring(err))
-			end
+			postRemoteWriteLogSync(entry)
 		end)
+	end
+	remoteState.postRemoteWriteLog = postRemoteWriteLog
+	remoteState.postRemoteWriteLogSync = postRemoteWriteLogSync
+	remoteState.preAuditedWrites = setmetatable({}, { __mode = "k" })
+
+	local function remoteAuditArgs(op, args)
+		local transform = remoteState.auditArgsForOp
+		if transform then
+			local ok, transformed = pcall(transform, op, args)
+			if ok and type(transformed) == "table" then
+				return transformed
+			end
+		end
+		return args
 	end
 
 	-- Every remote write enters one cooperative lane. Roblox event callbacks can
@@ -7910,15 +8649,20 @@ do
 			error = remoteError,
 			meta = remoteRequestMeta(item),
 		})
-		if item.isWrite then
+		local preAudited = remoteState.preAuditedWrites and remoteState.preAuditedWrites[item.args] == true
+		if preAudited then
+			remoteState.preAuditedWrites[item.args] = nil
+		end
+		if item.isWrite and not preAudited and not item.auditHandled then
 			postRemoteWriteLog({
 				ts = os.time(),
 				op = item.op,
-				args = item.args,
+				args = remoteAuditArgs(item.op, item.args),
 				ok = false,
 				synthetic = true,
 				error = remoteError,
 			})
+			item.auditHandled = true
 		end
 	end
 
@@ -7945,11 +8689,16 @@ do
 				})
 			end
 		end
-		if item.isWrite then
+		local preAudited = remoteState.preAuditedWrites and remoteState.preAuditedWrites[item.args] == true
+		if preAudited then
+			remoteState.preAuditedWrites[item.args] = nil
+			item.auditHandled = true
+		end
+		if item.isWrite and not item.auditHandled then
 			local audit = {
 				ts = os.time(),
 				op = item.op,
-				args = item.args,
+				args = remoteAuditArgs(item.op, item.args),
 				ok = ok,
 				late = late,
 			}
@@ -7959,6 +8708,7 @@ do
 				audit.error = classifyRemoteHandlerError(item.op, result)
 			end
 			postRemoteWriteLog(audit)
+			item.auditHandled = true
 		end
 	end
 

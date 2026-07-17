@@ -500,6 +500,183 @@ edit plugin through PluginConnectionService and appear as `server` and
 job uses a private generation token, and stale contexts cannot satisfy a later
 job's wait or receive its runtime requests.
 
+### Playscript-owned runs
+
+`rosync playtest run` is the one-command path for agent automation. It starts a
+playtest, injects a main Luau playscript when its runtime context is ready,
+streams progress while that script runs, prints its return value, and stops the
+playtest before the command exits. No external `start` / `wait` / `exec` / poll /
+`stop` choreography is required.
+
+```
+rosync playtest run --project . --script ./bench.server.luau
+
+rosync playtest run --project . \
+  --script ./bench.server.luau \
+  --client-script ./join.client.luau \
+  --mode multiplayer --players 2 \
+  --args '{"map":"Lighthouse","laps":3}' \
+  --timeout 600 --raw
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--script <file>` | required | Main playscript. Its first successful completion ends the run. |
+| `--context server\|client:N` | `server` | Runtime context in which to run the main playscript. |
+| `--client-script <file>` | none | Companion script injected once into every client as it becomes ready. Its return is side data and its errors do not end the run. |
+| `--mode play\|run\|multiplayer` | `play` | Studio test mode. `--mode run` is Studio's server-only Run mode and is unrelated to the subcommand name. |
+| `--players N` | `1` | Client count for multiplayer mode; valid range is 1-8. |
+| `--args <json>` | `{}` | JSON decoded and exposed as `playtest.args` in every playscript. Invalid JSON is rejected before a playtest starts. |
+| `--timeout <seconds>` | `600` | Hard wall-clock budget for boot, execution, and teardown; maximum 3600. |
+| `--identity game\|plugin` | `game` | Execution identity. Plugin identity is an opt-in escape hatch. |
+| `--logs off\|info\|warn\|error` | `off` | Interleave Studio output from all runtime contexts at or above the selected level. |
+| `--keep-open` | off | Print the result and job ID without stopping the playtest, for subsequent `exec`, `logs`, or `capture` autopsy. |
+| `--quiet` | off | Suppress progress/event lines and print only the terminal result. |
+| `--raw` | off | Emit newline-delimited JSON (NDJSON), one complete object per physical line. |
+
+Playscripts are ordinary Luau sources executed through the same temporary
+Script/LocalScript mechanism and value codec as `playtest exec`. The following
+job-scoped namespace is injected:
+
+| API | Meaning |
+| --- | --- |
+| `playtest.args` | Value decoded from `--args`. |
+| `playtest.mode` | `"play"`, `"run"`, or `"multiplayer"`. |
+| `playtest.context` | Current `server` or `client:N` context name. |
+| `playtest.jobId` | Current playtest job ID. |
+| `playtest.emit(data)` | Stream one JSON-encodable progress value. |
+| `playtest.log(msg)` | Sugar for `playtest.emit({ log = tostring(msg) })`. |
+| `playtest.done(value)` | Successfully complete the run from any task or callback. |
+| `playtest.fail(msg)` | Fail the run with exit code 2. |
+| `playtest.signal(name, payload)` | Broadcast a generation-scoped signal to all live runtime contexts, including the sender. |
+| `playtest.await(name, timeoutSec)` | Yield for a matching signal, returning `nil` on timeout. |
+| `playtest.awaitClients(n, timeoutSec)` | Server-only wait for `n` ready client contexts. |
+
+The first completion wins; later returns or calls are ignored:
+
+1. The main script returns: its value is the result and the command exits 0.
+2. Any task calls `playtest.done(value)`: that value is the result and the command exits 0.
+3. The main script throws or any task calls `playtest.fail(msg)`: the error and Luau traceback are reported and the command exits 2.
+4. The wall-clock deadline expires: partial events remain visible, the playtest is stopped, and the command exits 3.
+5. Studio stops the job, closes, or disconnects: an `aborted` record includes the fetched final `jobStatus` and the command exits 4.
+6. The playtest or required contexts never become ready: the command exits 5.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Main return or `playtest.done`; result printed. |
+| `2` | Main-script error or `playtest.fail`; traceback printed. |
+| `3` | Hard session deadline expired; partial events retained. |
+| `4` | Job ended externally; final observed `jobStatus` reported. |
+| `5` | Playtest or required runtime contexts failed to boot. |
+
+Completion paths 1-4 automatically stop the playtest unless `--keep-open` was
+passed. With `--keep-open`, the result and job ID are printed while the job
+remains available to the existing `playtest exec`, `logs`, `capture`, and `stop`
+commands. A playscript waiting on callbacks can end with
+`return playtest.await("finished")`; `done` or `fail` may still finish it from a
+spawned task.
+
+In `--raw` mode stdout is a live NDJSON stream. Each line parses independently;
+the CLI does not deduplicate, sample, or suppress `event` records. Representative
+records are:
+
+```json
+{"type":"started","jobId":"...","mode":"multiplayer","timeout":600}
+{"type":"ready","context":"server","t":2.1}
+{"type":"ready","context":"client:1","t":4.2}
+{"type":"event","t":12.4,"context":"server","data":{"phase":"Racing"}}
+{"type":"log","t":13.0,"context":"client:1","level":"warn","message":"..."}
+{"type":"clientResult","context":"client:1","ok":true,"value":"ok"}
+{"type":"dropped","context":"server","count":17}
+{"type":"aborted","reason":"job ended externally","jobStatus":"completed"}
+{"type":"result","ok":true,"elapsed":214.6,"value":{"laps":[71.2,68.9,70.3]}}
+```
+
+Runtime agents send internal heartbeats about every two seconds, so a quiet
+script is distinguishable from a vanished job. Missing heartbeats trigger a job
+status check before an abort is reported. Every failure record includes the
+final observed job status rather than presenting an empty exec-style value.
+`emit` is source-rate-limited to roughly 20 records/second with a small burst
+allowance and a 64 KiB encoded payload cap. Over-budget events produce explicit
+`dropped` records whose counts account for the loss; they are never silently
+discarded.
+
+Main and client result values use the `playtest exec` codec and bounded-chunk
+transport. An encoded result larger than 1 MiB is replaced in its result
+envelope by `{"truncated":true,"bytes":N}`, where `N` is the original encoded
+byte count. Stream bulk telemetry with `playtest.emit` instead.
+
+`--identity game` is the safe default and can require modules from the temporary
+playtest DataModel. `--identity plugin` runs in the plugin sandbox and cannot `require` game modules;
+use it only as an explicit escape hatch.
+Every coordination message is authenticated with the job's private generation
+token. Stale contexts cannot emit into a later run, complete it, or satisfy its
+waits.
+
+Like every Studio playtest, a playscript runs only inside the disposable runtime
+DataModel clone. Its instance, property, and source changes never sync to disk or persist back into edit mode.
+`playtest run` is user-intent-gated. Its start audit entry records the script
+paths and SHA-256 hashes; its completion entry records the outcome and exit
+code in `writes.log`.
+
+### Canonical playscript example
+
+The client joins a queue and votes like a player; the server waits for that
+signal, streams lap progress, and returns the final bot report:
+
+```lua
+-- join.client.luau
+local Net = require(game:GetService("ReplicatedStorage"):WaitForChild("Packages"):WaitForChild("net"))
+local queue = workspace:WaitForChild("Ques"):WaitForChild("1")
+Net:RemoteFunction("JoinQueue"):InvokeServer(queue)
+Net:RemoteFunction("VoteMap"):InvokeServer(playtest.args.map)
+playtest.signal("voted")
+return "ok"
+```
+
+```lua
+-- bench.server.luau
+local MatchService = require(game:GetService("ServerScriptService").Server.MatchService)
+local Players = game:GetService("Players")
+
+playtest.awaitClients(1, 60)
+playtest.await("voted", 30)
+local match = MatchService:GetPlayerMatch(Players:GetPlayers()[1])
+
+repeat task.wait(0.25) until match.State == "Racing" or match.IsDestroyed
+playtest.emit({ phase = match.State })
+
+local bots, startedAt = {}, os.clock()
+while match.State == "Racing" and not match.IsDestroyed do
+	for name, ai in pairs(match.AICars) do
+		local bot = bots[name] or { lap = 0, lapT = {} }
+		bots[name] = bot
+		local lap = ai.car:GetAttribute("Lap") or 0
+		if lap > bot.lap then
+			bot.lap = lap
+			table.insert(bot.lapT, os.clock() - startedAt)
+			playtest.emit({ lap = lap, bot = name, t = os.clock() - startedAt })
+		end
+	end
+	local allDone = next(bots) ~= nil
+	for _, bot in pairs(bots) do
+		if bot.lap < playtest.args.laps then allDone = false end
+	end
+	if allDone then break end
+	task.wait(0.3)
+end
+return bots
+```
+
+```
+rosync playtest run --project . \
+  --script ./bench.server.luau --client-script ./join.client.luau \
+  --mode multiplayer --players 1 \
+  --args '{"map":"Lighthouse","laps":3}' --timeout 600 --raw
+```
+
+The low-level playtest commands remain available and unchanged:
+
 ```
 rosync playtest start --project . --mode play --wait --raw
 rosync playtest start --project . --mode multiplayer --players 2 --wait --raw

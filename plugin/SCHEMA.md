@@ -241,6 +241,8 @@ or response metadata. The edit plugin exposes runtime operations externally thro
 - `playtest_request` with `{context, op, args, timeout}` for a named `server`
   or `client:N` runtime.
 - `playtest_capture` for artifact-backed runtime screenshots.
+- `playtest_run_start`, `playtest_run_poll`, and `playtest_run_cancel` for a
+  foreground, playscript-owned job lifecycle.
 
 Supported runtime operations include `exec`, `logs`, `ui_tree`, `input`,
 `capture_prepare`, `capture_read`, and `capture_close`. Runtime hello metadata
@@ -252,6 +254,122 @@ sync pipeline. Input sequences, capture dimensions/bytes/session counts, and
 runtime serialization breadth are bounded. Plugin-identity timeouts cancel the
 cooperating execution thread, but tasks deliberately spawned by user code are
 outside that cooperative cancellation boundary.
+
+### Playscript-owned playtest sessions
+
+`playtest_run_start` composes job creation and boot-time source injection. Its
+request is:
+
+```json
+{
+  "clientRunId":"8b1f...128-bit-client-token...",
+  "mode":"multiplayer",
+  "players":2,
+  "context":"server",
+  "identity":"game",
+  "script":{"path":"bench.server.luau","source":"..."},
+  "clientScript":{"path":"join.client.luau","source":"..."},
+  "scriptArgsJson":"{\"laps\":3}",
+  "timeout":600,
+  "logs":"warn",
+  "keepOpen":false
+}
+```
+
+The plugin hashes the received sources itself for the audit record and never
+puts source text in that record. `scriptArgsJson` preserves the exact validated
+JSON value, including top-level `null`; `scriptArgs` is accepted as the decoded
+fallback. `clientRunId` is a required caller-generated token of at most 128
+bytes. A session-local, content-fingerprinted mapping makes start idempotent:
+the first call returns `{job,run,reused:false,clientRunId}`, while an equivalent
+replay returns the same job with `reused:true` and does not launch or audit a
+second session. Reusing a key with different source hashes, args, paths, mode,
+context, identity, timeout, logs, players, keep-open state, or test args is an
+error. The mapping is limited to 64 entries; inactive entries expire after ten
+minutes and active entries are never evicted.
+
+`playtest_run_poll` accepts
+`{jobId,afterSeq,waitSeconds,maxEvents,maxBytes}` and returns
+`{frames,nextSeq,lastSeq,hasMore,heartbeats,heartbeatStale,run,job}`. The cursor
+is the last sequence actually delivered, so the caller can pass `nextSeq`
+unchanged. `playtest_run_cancel` accepts `{jobId,reason,outcome,force}` and does
+not return until the cleanup attempt settles. Its `cancelled` and
+`cleanupConfirmed` fields are false when runner cleanup or, unless a non-forced
+keep-open run is being retained, playtest teardown cannot be confirmed; the
+returned terminal is then the canonical `aborted` outcome.
+Status, poll, and cancel also accept `clientRunId` when `jobId` is unavailable;
+a supplied unknown key never falls back to the latest job. Canceling an unknown
+key records a 120-second cancellation tombstone (also capped at 64), so a start
+that was still queued when cleanup arrived is rejected before launching.
+A forced cancel by key also tears down an already-terminal keep-open job, which
+prevents a fast completion plus lost start response from leaving an ownerless
+Studio session.
+
+Edit/runtime coordination uses `kind: "rosync-playscript-frame"`. Each frame
+carries `playtestJobId`, `runtimeId`, a monotonic per-direction `seq`, an encoded
+`bodyJson`, and an authenticator derived from the private generation token,
+direction, runtime ID, sequence, and SHA-256 of the body. Stale generations,
+replayed sequences, mismatched runtime IDs, and invalid authenticators are
+ignored. Edit-to-runtime frame types are `boot`, `signal`, `clients`, and
+`cancel`; runtime-to-edit types are `booted`, `bootFailure`, `heartbeat`,
+`event`, `log`, `signal`, `dropped`, `clientResult`, and `complete`. Result
+payloads are fetched separately with the internal `playscript_result_read` and
+`playscript_result_close` bounded-chunk operations; `playscript_cancel`
+provides confirmed runner cancellation.
+Boot sends are retried until an authenticated `booted` or `bootFailure` frame.
+The runtime distinguishes installing, installed, and failed runners: duplicate
+boot frames re-ack only a fully installed runner (including one that already
+finished), never execute source twice, and replay a retained installation
+failure. A companion boot failure is terminal for that companion attempt and
+produces one `clientResult` instead of a retry flood.
+
+The injected source receives this runtime surface:
+
+```lua
+playtest.args
+playtest.mode
+playtest.context
+playtest.jobId
+playtest.emit(value)
+playtest.log(message)
+playtest.done(value)
+playtest.fail(message)
+playtest.signal(name, payload)
+playtest.await(name, timeoutSeconds)
+playtest.awaitClients(count, timeoutSeconds)
+```
+
+The first main return/error, explicit `done`/`fail`, timeout, boot failure, or
+external end claims completion. A companion client's ordinary return/error is
+only a `clientResult`; explicit `done`/`fail` is global. Ordinary completion is
+not exposed to polling until owned teardown finishes. If teardown or keep-open
+runner cancellation cannot be confirmed, the terminal outcome is `aborted`
+with the observed job status and cleanup error instead of a false success.
+`keepOpen` retains the Studio job only after every connected runtime confirms
+its playscript runner was cancelled.
+
+Source events and signals use a 20/s token bucket with burst 40 and a 64 KiB
+encoded-value ceiling. Loss is reported with counted `dropped` frames. Pending
+signals are limited to 100 total values per runner (not 100 per signal name),
+and the generation backlog is also limited to 100 values and 30 seconds.
+Heartbeats run every two seconds. A missing/disconnected selected context
+aborts the run; a connected but stale heartbeat is reported without overriding
+the hard timeout while the Studio job is still active. Polls return at most 64
+frames / 512 KiB, the coordinator queue is bounded, and encoded final values
+are capped at 1 MiB with an explicit `{truncated:true,bytes:N}` marker. Result
+sessions are length- and SHA-checked, chunked at 96 KiB, limited to 16, and
+expire after 120 seconds.
+
+Start and completion each produce a write audit record. Completion records the
+outcome, mapped exit code, final job status, and elapsed time. Playscripts run
+only in the disposable playtest DataModel and never enter edit mode or disk
+sync.
+The first launch audit is attempted synchronously before its start response;
+if the audit endpoint rejects it, the generic write lane retries without
+abandoning an already-started playtest. Idempotent start replays suppress an
+extra generic write audit. Completion audit is likewise attempted before the
+terminal becomes visible to poll/cancel, so the healthy path cannot race the
+required completion record.
 
 ## Workflow support operations
 

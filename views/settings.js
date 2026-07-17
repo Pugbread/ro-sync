@@ -486,11 +486,26 @@ export function mountSettings(root, api) {
   });
 
   $start.addEventListener("click", async () => {
+    const s = api.getState();
+    if (!s.activeProjectId) {
+      const target = (s.projects || []).find((p) => p.path === s.daemonProject);
+      if (!target) {
+        api.toast("Select a project in Projects before starting the daemon");
+        return;
+      }
+      api.setState({ activeProjectId: target.id });
+    }
     await api.ensureDaemon();
     refresh();
   });
   $stop.addEventListener("click", async () => {
-    await api.killDaemon();
+    const s = api.getState();
+    const active = (s.projects || []).find((p) => p.id === s.activeProjectId);
+    api.setState({
+      activeProjectId: null,
+      daemonProject: active?.path || s.daemonProject || null,
+    });
+    await api.killDaemon({ preserveTarget: true });
     refresh();
   });
   $restart.addEventListener("click", async () => {

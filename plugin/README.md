@@ -25,6 +25,11 @@ render; `capture photo` scene-background and include-world captures remain
 framed, while the isolated transparent `capture scene` alias inherits the
 default crop.
 
+`Playscript.luau` is the isolated runtime coordinator for playscript-owned
+playtests. The builder packages it as `RoSync.Playscript`; `Plugin.luau`
+requires that child module for authenticated boot, event streaming,
+cross-context signals, completion, and bounded result transport.
+
 ## Build
 
 ```sh
