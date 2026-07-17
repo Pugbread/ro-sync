@@ -1,5 +1,9 @@
 {
   "commands": [
+    "init",
+    "plugin",
+    "auth",
+    "daemon",
     "commands",
     "context",
     "capabilities",

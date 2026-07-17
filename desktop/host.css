@@ -1,0 +1,14 @@
+/* Tauri's titleBarStyle=Overlay applies to macOS. Other platforms retain
+   their native titlebar and therefore hide the renderer's overlay row. */
+html[data-host="tauri"][data-platform="windows"] .desktop-titlebar,
+html[data-host="tauri"][data-platform="linux"] .desktop-titlebar {
+  display: none;
+}
+
+html[data-host="tauri"][data-platform="windows"] .app,
+html[data-host="tauri"][data-platform="linux"] .app {
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "side view"
+    "side status";
+}

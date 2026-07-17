@@ -2,6 +2,115 @@
 
 Each command entry is sourced from one JSON file under `docs/commands/`.
 
+### `rosync init`
+
+Initializes a directory as a Ro Sync project and writes the config, agent context, and local Luau tooling files without starting a daemon.
+
+**Category:** Project setup
+
+**Usage**
+
+```sh
+rosync init --project <path> [--name <name>] [--game-id <id>] [--group-id <id>] [--place-id <id>...] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync init --project .
+rosync init --project ./game --game-id 123 --group-id 456 --place-id 789 --raw
+```
+
+**Notes**
+
+- Existing custom project files are preserved or merged by the same guarded writers used by rosync refresh.
+- This command never starts a background process.
+
+---
+### `rosync plugin`
+
+Atomically installs the bundled Roblox Studio Plugin.rbxm or compares the installed copy with the bundle by SHA-256.
+
+**Category:** Project setup
+
+**Usage**
+
+```sh
+rosync plugin <install|status> [--source <Plugin.rbxm>] [--plugin-dir <path>] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync plugin install
+rosync plugin status --raw
+rosync plugin install --source ./plugin/Plugin.rbxm --plugin-dir ./scratch-plugins --raw
+```
+
+**Notes**
+
+- The default destination is ~/Documents/Roblox/Plugins on macOS and LocalAppData/Roblox/Plugins on Windows.
+- Installation removes stale RoSync.lua and RoSync.luau copies and reports that Studio must be restarted.
+
+---
+### `rosync auth`
+
+Stores, inspects, or clears the CLI Roblox Open Cloud credential without accepting or printing the secret as a command-line value.
+
+**Category:** Project setup
+
+**Usage**
+
+```sh
+rosync auth <set|status|clear> [--data-dir <path>] [--raw]
+```
+
+**Examples**
+
+```sh
+printf '%s' "$ROBLOX_API_KEY" | rosync auth set --from-stdin --raw
+rosync auth set --from-env ROBLOX_API_KEY --raw
+rosync auth status --raw
+rosync auth clear --raw
+```
+
+**Notes**
+
+- auth set requires exactly one of --from-stdin, --file, or --from-env; the credential itself is never accepted in argv.
+- The CLI fallback store uses a private per-user data directory and mode 0600 on Unix. It is filesystem-permission protected, not an OS keychain.
+- upload and monetization discover this store before falling back to legacy widget settings or environment variables.
+
+---
+### `rosync daemon`
+
+Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.
+
+**Category:** Daemon
+
+**Usage**
+
+```sh
+rosync daemon <start|status|stop|restart|logs> --project <path> [options]
+```
+
+**Examples**
+
+```sh
+rosync daemon start --project . --raw
+rosync daemon status --project . --raw
+rosync daemon stop --project . --timeout 10 --raw
+rosync daemon restart --project . --game-id 123 --place-id 456 --raw
+rosync daemon logs --project . --lines 100
+```
+
+**Notes**
+
+- start and restart accept --port, --managed-by, --data-dir, --timeout, --game-id, --group-id, and repeated --place-id. status, stop, and logs use the same canonical project identity and optional --data-dir.
+- A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error.
+- Stop authenticates an exact project and boot ID before graceful shutdown. Ro Sync never kills a PID read from a stale runtime record.
+- Desktop managers should supply their browser capability through --owner-token-env <ENV>; secrets are never returned by lifecycle JSON.
+
+---
 ### `rosync commands`
 
 Prints generated command docs as JSON, either as a compact LLM index, one command entry, or the full registry.
@@ -1453,7 +1562,7 @@ rosync serve --project . --port 7878 --game-id 1234567890
 
 **Notes**
 
-- This is the normal CLI-only entrypoint; the widget can also launch it for an active project.
-- Run it manually when using Ro Sync without opening the widget interface.
+- serve stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.
+- For an ordinary CLI-managed background process, use rosync daemon start instead.
 
 ---

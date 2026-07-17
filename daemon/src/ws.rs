@@ -193,8 +193,8 @@ pub async fn ws_upgrade(
         if !is_authorized_widget_browser_request(
             origin,
             &uri,
-            state.widget_owned,
-            state.widget_owner_token.as_ref().as_deref(),
+            state.managed,
+            state.manager_owner_token.as_ref().as_deref(),
         ) {
             return (
                 StatusCode::FORBIDDEN,
@@ -722,6 +722,18 @@ mod tests {
             pending_routes: Arc::new(Mutex::new(HashMap::new())),
             active_plugin: Arc::new(Mutex::new(None)),
             widget_owned,
+            managed: widget_owned,
+            managed_by: Arc::new(if widget_owned {
+                "test-widget".to_string()
+            } else {
+                "test-manual".to_string()
+            }),
+            boot_id: Arc::new("test-boot".to_string()),
+            listen_port: 0,
+            process_id: std::process::id(),
+            started_at: 1,
+            manager_owner_token: Arc::new(widget_owned.then(|| "test-widget-token".to_string())),
+            manager_last_seen: Arc::new(Mutex::new(None)),
             widget_owner_token: Arc::new(widget_owned.then(|| "test-widget-token".to_string())),
             widget_last_seen: Arc::new(Mutex::new(None)),
             shutdown_tx,

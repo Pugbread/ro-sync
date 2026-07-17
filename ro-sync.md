@@ -250,8 +250,9 @@ ambiguous `.rbxm`/`.rbxmx` model or animation files.
 When the daemon is running (the user has Ro Sync connected to Studio), these
 subcommands speak to the plugin over WebSocket and inspect or mutate live
 instances. They work across the entire DataModel — not just the four
-filesystem-synced classes. Every call that mutates state is appended to the
-widget audit log at `~/.terminal64/widgets/ro-sync/writes.log`.
+filesystem-synced classes. Every call that mutates state is appended to
+`writes.log` in the platform-native Ro Sync state directory
+(`ROSYNC_STATE_DIR` overrides it).
 
 Treat these live explorer commands as authoritative when deciding what exists in
 Studio. The filesystem view is intentionally narrower and can omit empty
@@ -339,8 +340,8 @@ rosync redo --project .
 
 ## 6c. Structured writes — construct, destroy, reparent, attrs, tags, call, select
 
-Live-DataModel ops beyond `set`/`eval`. Each write is appended to the widget
-audit log at `~/.terminal64/widgets/ro-sync/writes.log`. `mv` requires
+Live-DataModel ops beyond `set`/`eval`. Each write is appended to `writes.log`
+in the platform-native Ro Sync state directory. `mv` requires
 `--force` to cross a top-level service boundary.
 
 ```
@@ -697,8 +698,8 @@ Two write-path flags every agent should know:
   reparenting. If you genuinely need the raw write, pass `--force-parent`
   explicitly.
 
-The widget audit log auto-rotates once it passes 10 MiB: `writes.log` is
-renamed to `writes.log.1` in the same widget directory (overwriting any prior
+The audit log auto-rotates once it passes 10 MiB: `writes.log` is renamed to
+`writes.log.1` in the same state directory (overwriting any prior
 generation), and a fresh `writes.log` takes its place. Only one prior
 generation is preserved.
 
@@ -713,8 +714,8 @@ The filesystem → Studio sync covers only `Folder`/`Script`/`LocalScript`/
 `tag add|rm`, and `call` are **user-initiated escape hatches**, not automated
 tools — never invoke them from a plugin or a script, and prefer asking the
 user before running them even at the CLI. Every successful write is appended
-to the widget audit log at `~/.terminal64/widgets/ro-sync/writes.log` so the
-user can audit or replay anything an agent ran on their behalf.
+to `writes.log` in the platform-native Ro Sync state directory so the user can
+audit or replay anything an agent ran on their behalf.
 
 This build deliberately skips Roblox property sync through the filesystem;
 attempts to push property changes by editing files are silently ignored. Use

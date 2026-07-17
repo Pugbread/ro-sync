@@ -8,25 +8,31 @@
   </head>
   <body>
     <div id="root" class="app" data-view="projects">
+      <header class="desktop-titlebar" data-tauri-drag-region>
+        <div class="desktop-titlebar-brand" data-tauri-drag-region>
+          <img src="assets/rosynclogo.png" alt="Ro Sync" data-tauri-drag-region />
+        </div>
+        <span class="desktop-titlebar-context" data-tauri-drag-region>Studio bridge</span>
+      </header>
       <aside class="sidebar">
         <div class="sidebar-brand">
           <span id="daemon-dot" class="dot dot-idle" title="Daemon status"></span>
           <img class="brand-logo" src="assets/rosynclogo.png" alt="Ro Sync" />
         </div>
         <nav class="sidenav tabs" role="tablist">
-          <button class="tab sidenav-item" role="tab" data-route="projects" aria-label="Projects">
+          <button id="nav-projects" class="tab sidenav-item" role="tab" data-route="projects" aria-label="Projects" aria-controls="view" tabindex="0">
             <svg class="sidenav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">
               <path d="M1.75 4.25a1 1 0 0 1 1-1h3.5l1.5 1.5h6.5a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H2.75a1 1 0 0 1-1-1v-7z"/>
             </svg>
             <span class="sidenav-label">Projects</span>
           </button>
-          <button class="tab sidenav-item" role="tab" data-route="active" aria-label="Activity">
+          <button id="nav-active" class="tab sidenav-item" role="tab" data-route="active" aria-label="Activity" aria-controls="view" tabindex="-1">
             <svg class="sidenav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M1.5 8.5h3l1.5-4 3 8 1.5-4h4"/>
             </svg>
             <span class="sidenav-label">Activity</span>
           </button>
-          <button class="tab sidenav-item" role="tab" data-route="conflicts" aria-label="Conflicts">
+          <button id="nav-conflicts" class="tab sidenav-item" role="tab" data-route="conflicts" aria-label="Conflicts" aria-controls="view" tabindex="-1">
             <svg class="sidenav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true">
               <path d="M8 1.75 1.5 13.25h13L8 1.75z"/>
               <path d="M8 6.5v3M8 11v.6" stroke-linecap="round"/>
@@ -34,7 +40,7 @@
             <span class="sidenav-label">Conflicts</span>
             <span id="conflicts-badge" class="badge sidenav-badge" hidden>0</span>
           </button>
-          <button class="tab sidenav-item" role="tab" data-route="docs" aria-label="Docs">
+          <button id="nav-docs" class="tab sidenav-item" role="tab" data-route="docs" aria-label="Docs" aria-controls="view" tabindex="-1">
             <svg class="sidenav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M4.25 2.25h5.5l2 2v9.5h-7.5a1 1 0 0 1-1-1V3.25a1 1 0 0 1 1-1z"/>
               <path d="M9.75 2.25v2h2"/>
@@ -42,7 +48,7 @@
             </svg>
             <span class="sidenav-label">Docs</span>
           </button>
-          <button class="tab sidenav-item" role="tab" data-route="settings" aria-label="Settings">
+          <button id="nav-settings" class="tab sidenav-item" role="tab" data-route="settings" aria-label="Settings" aria-controls="view" tabindex="-1">
             <svg class="sidenav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="8" cy="8" r="2.2"/>
               <path d="M8 1.25v1.8M8 12.95v1.8M14.75 8h-1.8M3.05 8h-1.8M12.78 3.22l-1.27 1.27M4.49 11.51l-1.27 1.27M12.78 12.78l-1.27-1.27M4.49 4.49 3.22 3.22"/>
@@ -66,7 +72,7 @@
           </div>
         </div>
       </aside>
-      <main id="view" class="view" aria-live="polite"></main>
+      <main id="view" class="view" role="tabpanel" aria-labelledby="nav-projects" aria-live="polite" tabindex="0"></main>
       <footer class="statusbar">
         <span id="status-left" class="status-left">—</span>
         <span id="status-right" class="status-right">—</span>

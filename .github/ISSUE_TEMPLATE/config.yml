@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/Pugbread/ro-sync/security/advisories/new
+    about: Report vulnerabilities privately through GitHub Security Advisories.
+  - name: Command reference
+    url: https://github.com/Pugbread/ro-sync/blob/main/docs/client-commands.md
+    about: Browse the complete generated CLI reference before opening a usage question.

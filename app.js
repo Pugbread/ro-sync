@@ -2,6 +2,9 @@
 import {
   t64,
   onT64,
+  host,
+  HOST_KIND,
+  IS_DESKTOP_HOST,
   daemonJson,
   daemonWS,
   daemonURL,
@@ -15,6 +18,7 @@ import { mountConflicts } from "./views/conflicts.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
+import { canStopDesktopDaemon, isDesktopManagedStatus } from "./lifecycle-policy.js";
 import {
   PLATFORM, IS_WINDOWS,
   BINARY_REL, WIDGET_DIR_SHELL,
@@ -31,7 +35,7 @@ import {
 //   {
 //     projects: [{ id, name, path, addedAt, gameId, groupId, placeIds }],
 //     activeProjectId,
-//     daemonPid, daemonPort, daemonProject, daemonOwnerToken,
+//     daemonPid, daemonPort, daemonProject, daemonBootId, daemonOwnerToken,
 //     lastView,
 //   }
 const DEFAULT_STATE = {
@@ -40,6 +44,7 @@ const DEFAULT_STATE = {
   daemonPid: null,
   daemonPort: null,
   daemonProject: null,
+  daemonBootId: null,
   daemonOwnerToken: null,
   lastView: "projects",
 };
@@ -62,8 +67,8 @@ function saveState() {
   // order; a failed write is logged without breaking later saves.
   const value = { ...app.state };
   stateSaveChain = stateSaveChain.then(
-    () => t64("t64:set-state", { key: "state", value }),
-    () => t64("t64:set-state", { key: "state", value }),
+    () => host.stateSet("state", value),
+    () => host.stateSet("state", value),
   ).catch((e) => {
     console.warn("t64:set-state failed", e);
   });
@@ -72,8 +77,7 @@ function saveState() {
 
 async function loadState() {
   try {
-    const res = await t64("t64:get-state", { key: "state" });
-    const value = res && typeof res === "object" ? res.value : null;
+    const value = await host.stateGet("state");
     if (value && typeof value === "object") {
       app.state = { ...DEFAULT_STATE, ...value };
     }
@@ -111,15 +115,14 @@ let lastHeartbeatFailureNoticeAt = 0;
 // ensureDaemon() runs so we never try to reuse a stale record.
 async function loadSessions() {
   try {
-    const res = await t64("t64:get-state", { key: "sessions" });
-    const v = res && typeof res === "object" ? res.value : null;
+    const v = await host.stateGet("sessions");
     return Array.isArray(v) ? v : [];
   } catch { return []; }
 }
 
 async function saveSessions(list) {
   try {
-    await t64("t64:set-state", { key: "sessions", value: list });
+    await host.stateSet("sessions", list);
   } catch (e) { console.warn("t64:set-state sessions failed", e); }
 }
 
@@ -277,8 +280,12 @@ function ensureOwnerToken() {
   return token;
 }
 
-async function daemonLifecycleRequest(base, path, reason) {
-  const token = app.state.daemonOwnerToken;
+async function daemonLifecycleRequest(
+  base,
+  path,
+  reason,
+  token = app.state.daemonOwnerToken,
+) {
   if (!base || !token) return { sent: false, ok: false, error: "missing daemon owner token" };
   const url = daemonURL(base, path);
   const body = JSON.stringify({ token, reason });
@@ -324,7 +331,9 @@ function daemonLifecyclePost(path, reason, preferBeacon = false) {
 }
 
 async function verifyDaemonOwnership(base) {
-  const result = await daemonLifecycleRequest(base, "/widget-heartbeat", "widget heartbeat");
+  const endpoint = IS_DESKTOP_HOST ? "/manager-heartbeat" : "/widget-heartbeat";
+  const reason = IS_DESKTOP_HOST ? "desktop heartbeat" : "widget heartbeat";
+  const result = await daemonLifecycleRequest(base, endpoint, reason);
   if (!result.ok) {
     console.warn("daemon heartbeat rejected", result);
   }
@@ -341,7 +350,9 @@ function stopDaemonHeartbeat() {
 function sendDaemonHeartbeat() {
   const base = app.daemonBase;
   if (!base || !app.state.daemonOwnerToken) return;
-  daemonLifecycleRequest(base, "/widget-heartbeat", "widget heartbeat").then((result) => {
+  const endpoint = IS_DESKTOP_HOST ? "/manager-heartbeat" : "/widget-heartbeat";
+  const reason = IS_DESKTOP_HOST ? "desktop heartbeat" : "widget heartbeat";
+  daemonLifecycleRequest(base, endpoint, reason).then((result) => {
     if (result.ok) return;
     const now = Date.now();
     if (now - lastHeartbeatFailureNoticeAt > 30_000) {
@@ -362,7 +373,9 @@ function notifyWidgetClosing() {
   if (widgetCloseSent) return;
   widgetCloseSent = true;
   stopDaemonHeartbeat();
-  daemonLifecyclePost("/widget-close", "widget closed", true);
+  const endpoint = IS_DESKTOP_HOST ? "/manager-close" : "/widget-close";
+  const reason = IS_DESKTOP_HOST ? "desktop app closed" : "widget closed";
+  daemonLifecyclePost(endpoint, reason, true);
 }
 
 function activeProject() {
@@ -380,13 +393,18 @@ async function launchDaemon(projectPath, port) {
   // Shell-level path — host expands $HOME / %USERPROFILE% at command time.
   const binaryPath = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
 
+  // Persist the widget capability before launch. The daemon reads this one
+  // narrow key from Terminal 64's ignored state file, so the secret never
+  // appears in the t64:exec command string or in the daemon's argv.
+  ensureOwnerToken();
+  await saveState();
+
   // Raw (unquoted) args — launchDaemonCmd applies platform-native quoting.
   const args = [
     "serve",
     "--project", projectPath,
     "--port",    String(port),
     "--widget-owned",
-    "--owner-token", ensureOwnerToken(),
   ];
   if (proj && proj.gameId) {
     args.push("--game-id", String(proj.gameId));
@@ -403,7 +421,13 @@ async function launchDaemon(projectPath, port) {
   }
 
   const logPath = tmpLogPath(`rosync-${port}.log`);
-  const command = launchDaemonCmd({ binaryPath, args, logPath, port });
+  const command = launchDaemonCmd({
+    binaryPath,
+    args,
+    logPath,
+    port,
+    ownerTokenStatePath: joinShell(WIDGET_DIR_SHELL, "state.json"),
+  });
 
   try {
     const res = await t64("t64:exec", { command });
@@ -530,19 +554,248 @@ async function launchAndWait(project, port) {
   // created; manually managed daemons are never touched here.
   await stopTrackedSession({ pid: launchedPid, port, project });
   if (app.state.daemonPid === launchedPid) {
-    setState({ daemonPid: null, daemonProject: null });
+    setState({ daemonPid: null, daemonProject: null, daemonBootId: null });
   }
   return null;
 }
 
 let ensureDaemonPromise = null;
+let ensureDaemonQueued = false;
 
 async function ensureDaemon() {
-  if (ensureDaemonPromise) return ensureDaemonPromise;
-  ensureDaemonPromise = ensureDaemonInner().finally(() => {
+  if (ensureDaemonPromise) {
+    ensureDaemonQueued = true;
+    return ensureDaemonPromise;
+  }
+  ensureDaemonPromise = (async () => {
+    do {
+      ensureDaemonQueued = false;
+      await ensureDaemonInner();
+    } while (ensureDaemonQueued);
+  })().finally(() => {
     ensureDaemonPromise = null;
   });
   return ensureDaemonPromise;
+}
+
+function lifecycleValue(value) {
+  return value?.status || value || {};
+}
+
+function desktopOwnershipError(message, status = null) {
+  const error = new Error(message);
+  error.code = "EXTERNAL_DAEMON";
+  error.status = status;
+  return error;
+}
+
+async function inspectOwnedDesktopDaemon(spec) {
+  const project = spec?.project;
+  const token = spec?.ownerToken;
+  if (!project || !token) {
+    throw desktopOwnershipError(
+      "The daemon has no usable Desktop ownership capability; it was left running.",
+    );
+  }
+
+  const status = lifecycleValue(await host.daemonStatus(project));
+  if (!status.running) return { running: false, status };
+  if (!isDesktopManagedStatus(status)) {
+    const manager = status.managedBy ? ` by ${status.managedBy}` : " outside Ro Sync Desktop";
+    throw desktopOwnershipError(`The daemon is managed${manager}; it was left running.`, status);
+  }
+
+  const port = Number(status.port || spec.port);
+  if (!Number.isFinite(port) || port <= 0) {
+    throw desktopOwnershipError("The managed daemon reported no verifiable port; it was left running.", status);
+  }
+  const base = status.base || status.baseUrl || spec.base || `http://127.0.0.1:${port}`;
+
+  // CORS and the lifecycle endpoint both require the exact manager token. A
+  // manager label or a persisted PID is never treated as proof of ownership.
+  setDaemonAuthToken(token);
+  let info;
+  try {
+    info = await daemonJson(base, "/hello");
+  } catch {
+    throw desktopOwnershipError(
+      "Desktop could not authenticate the managed daemon; it was left running.",
+      status,
+    );
+  }
+  const validProjects = new Set([
+    project,
+    status.project,
+    status.canonicalProject,
+    spec.canonicalProject,
+  ].filter(Boolean));
+  const proof = await daemonLifecycleRequest(
+    base,
+    "/manager-heartbeat",
+    "desktop ownership check",
+    token,
+  );
+  if (!canStopDesktopDaemon({
+    status,
+    hello: info,
+    ownershipAuthenticated: proof.ok,
+    expectedProjects: validProjects,
+  })) {
+    throw desktopOwnershipError(
+      `Desktop could not authenticate the exact daemon boot${proof.error ? `: ${proof.error}` : ""}; it was left running.`,
+      status,
+    );
+  }
+  return { running: true, status, info, base, port, token, bootId: info.bootId };
+}
+
+async function stopOwnedDesktopDaemon(spec, reason) {
+  const owned = await inspectOwnedDesktopDaemon(spec);
+  if (!owned.running) return { stopped: true, alreadyStopped: true, status: owned.status };
+
+  const response = await daemonLifecycleRequest(
+    owned.base,
+    "/manager-close",
+    reason || "desktop daemon stop requested",
+    owned.token,
+  );
+  if (!response.ok) {
+    throw new Error(response.error || "the authenticated daemon stop was rejected");
+  }
+
+  // The HTTP acknowledgement means the exact owned process accepted shutdown;
+  // only clear persisted tracking once the lifecycle record confirms that boot
+  // is gone. A replacement external/CLI daemon is reported but never stopped.
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline) {
+    await sleep(100);
+    const status = lifecycleValue(await host.daemonStatus(spec.project));
+    if (!status.running || status.bootId !== owned.bootId) {
+      return {
+        stopped: true,
+        status,
+        replacementRunning: !!status.running,
+      };
+    }
+  }
+  throw new Error(`owned daemon boot ${owned.bootId} did not stop before the timeout`);
+}
+
+function clearDesktopDaemonTracking({ preserveTarget = false } = {}) {
+  setDaemonAuthToken(null);
+  app.daemonBase = null;
+  app.daemonOk = false;
+  setState({
+    daemonPid: null,
+    daemonProject: preserveTarget ? app.state.daemonProject : null,
+    daemonBootId: null,
+    daemonOwnerToken: null,
+  });
+}
+
+async function ensureDesktopDaemon(project) {
+  const projectInfo = activeProject();
+  let ownedCandidate = null;
+  let preferredPort =
+    app.state.daemonProject === project && app.state.daemonPort
+      ? app.state.daemonPort
+      : DEFAULT_PORT;
+  try {
+    const previousProject = app.state.daemonProject;
+    if (previousProject && previousProject !== project) {
+      try {
+        await stopOwnedDesktopDaemon({
+          project: previousProject,
+          port: app.state.daemonPort,
+          pid: app.state.daemonPid,
+          bootId: app.state.daemonBootId,
+          ownerToken: app.state.daemonOwnerToken,
+        }, "desktop switched projects");
+        clearDesktopDaemonTracking();
+      } catch (error) {
+        if (error?.code !== "EXTERNAL_DAEMON") throw error;
+        // The tracked boot was replaced or adopted elsewhere. Forget only our
+        // stale local claim, leave that listener untouched, and let lifecycle
+        // discovery choose a different free port for the new project.
+        toast(error.message);
+        clearDesktopDaemonTracking();
+        preferredPort = null;
+      }
+    }
+
+    const requestedToken = ensureOwnerToken();
+    let result = await host.daemonEnsure({
+      project,
+      preferredPort,
+      gameId: projectInfo?.gameId || null,
+      groupId: projectInfo?.groupId || null,
+      placeIds: projectInfo?.placeIds || [],
+      ownerToken: requestedToken,
+    });
+    result = lifecycleValue(result);
+    if (result.ok === false || result.running === false) {
+      throw new Error(result.error || "managed daemon did not start");
+    }
+
+    if (result.externallyManaged || result.managedBy !== "desktop") {
+      const manager = result.managedBy ? ` (${result.managedBy})` : "";
+      throw desktopOwnershipError(
+        `A daemon for this project is already externally managed${manager}; Desktop left it running.`,
+        result,
+      );
+    }
+
+    const port = Number(result.port || app.state.daemonPort || DEFAULT_PORT);
+    if (!Number.isFinite(port) || port <= 0) throw new Error("managed daemon returned an invalid port");
+    const token = requestedToken;
+    const base = result.base || `http://127.0.0.1:${port}`;
+    ownedCandidate = await inspectOwnedDesktopDaemon({
+      project,
+      canonicalProject: result.canonicalProject,
+      port,
+      base,
+      ownerToken: token,
+    });
+    if (!ownedCandidate.running) throw new Error("managed daemon stopped during startup");
+    const info = ownedCandidate.info;
+
+    app.daemonBase = ownedCandidate.base;
+    app.daemonOk = true;
+    setState({
+      daemonPid: ownedCandidate.status.pid || null,
+      daemonPort: ownedCandidate.port,
+      daemonProject: project,
+      daemonBootId: ownedCandidate.bootId,
+      daemonOwnerToken: token,
+    });
+    setDaemonDot("ok", `:${ownedCandidate.port}`);
+    emit("daemon:up", { base: ownedCandidate.base, info, project, host: HOST_KIND });
+  } catch (error) {
+    // Cleanup is allowed only after an authenticated ownership proof. A CLI,
+    // manual, or other Desktop manager remains untouched on every failure.
+    if (ownedCandidate?.running) {
+      try {
+        const stopped = await stopOwnedDesktopDaemon(
+          {
+            project,
+            port: ownedCandidate.port,
+            bootId: ownedCandidate.bootId,
+            ownerToken: ownedCandidate.token,
+          },
+          "desktop startup did not complete",
+        );
+        if (stopped.stopped) clearDesktopDaemonTracking();
+      } catch (cleanupError) {
+        console.warn("owned daemon cleanup failed", cleanupError);
+      }
+    }
+    setDaemonAuthToken(null);
+    app.daemonOk = false;
+    app.daemonBase = null;
+    setDaemonDot("err", "daemon down");
+    setStatus(`managed daemon failed: ${error.message}`, "err");
+    emit("daemon:down", { error: error.message, host: HOST_KIND });
+  }
 }
 
 async function ensureDaemonInner() {
@@ -557,6 +810,11 @@ async function ensureDaemonInner() {
     app.daemonBase = null;
     setDaemonDot("idle", "no active project");
     emit("daemon:down", {});
+    return;
+  }
+
+  if (IS_DESKTOP_HOST) {
+    await ensureDesktopDaemon(project);
     return;
   }
 
@@ -605,6 +863,9 @@ async function ensureDaemonInner() {
     setDaemonDot("ok", `:${hit.port}`);
     if (app.state.daemonPort !== hit.port) setState({ daemonPort: hit.port });
     if (app.state.daemonProject !== project) setState({ daemonProject: project });
+    if (hit.info?.bootId && app.state.daemonBootId !== hit.info.bootId) {
+      setState({ daemonBootId: hit.info.bootId });
+    }
 
     // A matching /hello response only proves that this is a Ro Sync daemon;
     // it does not give the widget lifecycle ownership. Claim and persist its
@@ -631,7 +892,7 @@ async function ensureDaemonInner() {
       // would make killDaemon()/heartbeat treat an external process as ours.
       await removeSession({ port: hit.port });
       if (app.state.daemonPid || app.state.daemonOwnerToken) {
-        setState({ daemonPid: null, daemonOwnerToken: null });
+        setState({ daemonPid: null, daemonBootId: null, daemonOwnerToken: null });
       }
     }
     emit("daemon:up", { base: app.daemonBase, info: hit.info, project });
@@ -646,6 +907,25 @@ async function ensureDaemonInner() {
 async function killDaemon({ preserveTarget = false } = {}) {
   const pid = app.state.daemonPid;
   const port = app.state.daemonPort;
+  if (IS_DESKTOP_HOST) {
+    try {
+      const result = await stopOwnedDesktopDaemon({
+        project: app.state.daemonProject,
+        port,
+        pid,
+        bootId: app.state.daemonBootId,
+        ownerToken: app.state.daemonOwnerToken,
+      }, "desktop daemon stopped");
+      if (!result.stopped) throw new Error("managed daemon did not stop");
+      clearDesktopDaemonTracking({ preserveTarget });
+      setDaemonDot("idle", "daemon stopped");
+      emit("daemon:down", { host: HOST_KIND });
+      return true;
+    } catch (error) {
+      toast(`Could not stop managed daemon: ${error.message}`);
+      return false;
+    }
+  }
   if (!pid) {
     // No tracked PID means the process may have been started manually. Only
     // the authenticated lifecycle endpoint is safe to use in this case.
@@ -670,6 +950,7 @@ async function killDaemon({ preserveTarget = false } = {}) {
     setState({
       daemonPid: null,
       daemonProject: preserveTarget ? app.state.daemonProject : null,
+      daemonBootId: null,
       daemonOwnerToken: null,
     });
     app.daemonOk = false;
@@ -691,6 +972,7 @@ async function killDaemon({ preserveTarget = false } = {}) {
   setState({
     daemonPid: null,
     daemonProject: preserveTarget ? app.state.daemonProject : null,
+    daemonBootId: null,
     daemonOwnerToken: null,
   });
   app.daemonOk = false;
@@ -757,6 +1039,23 @@ const $tabs = document.querySelectorAll(".tab");
 const $daemonDot = document.getElementById("daemon-dot");
 const $statusLeft = document.getElementById("status-left");
 const $statusRight = document.getElementById("status-right");
+document.documentElement.dataset.host = HOST_KIND;
+document.body.dataset.host = HOST_KIND;
+document.documentElement.dataset.platform = PLATFORM;
+document.body.dataset.platform = PLATFORM;
+
+async function hydrateHostPresentation() {
+  try {
+    const info = await host.appInfo();
+    const platform = info?.platform || PLATFORM;
+    document.documentElement.dataset.platform = platform;
+    document.body.dataset.platform = platform;
+    const context = document.querySelector(".desktop-titlebar-context");
+    if (context && info?.version) context.textContent = `Studio bridge · v${info.version}`;
+  } catch {
+    document.documentElement.dataset.platform = PLATFORM;
+  }
+}
 
 const ROUTES = {
   projects: mountProjects,
@@ -770,6 +1069,7 @@ function setDaemonDot(kind, label) {
   $daemonDot.className = "dot dot-" + kind;
   $daemonDot.title = `Daemon: ${label}`;
   $statusRight.textContent = `daemon: ${label}`;
+  document.getElementById("root").dataset.connection = kind;
 }
 
 function setStatus(msg, kind) {
@@ -786,7 +1086,10 @@ function navigate(route) {
   app.currentView = route;
   $view.innerHTML = "";
   for (const t of $tabs) {
-    t.setAttribute("aria-selected", t.dataset.route === route ? "true" : "false");
+    const selected = t.dataset.route === route;
+    t.setAttribute("aria-selected", selected ? "true" : "false");
+    t.tabIndex = selected ? 0 : -1;
+    if (selected) $view.setAttribute("aria-labelledby", t.id);
   }
   document.getElementById("root").dataset.view = route;
   const api = {
@@ -799,14 +1102,25 @@ function navigate(route) {
     toast,
     onBus: on,
     emitBus: emit,
-    t64,
+    host,
   };
   app.unmountCurrent = ROUTES[route]($view, api) || null;
   setState({ lastView: route });
 }
 
-for (const t of $tabs) {
+for (const [index, t] of [...$tabs].entries()) {
   t.addEventListener("click", () => navigate(t.dataset.route));
+  t.addEventListener("keydown", (event) => {
+    let next = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % $tabs.length;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index - 1 + $tabs.length) % $tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = $tabs.length - 1;
+    if (next == null) return;
+    event.preventDefault();
+    $tabs[next].focus();
+    navigate($tabs[next].dataset.route);
+  });
 }
 
 window.addEventListener("pagehide", (event) => {
@@ -838,6 +1152,9 @@ function toast(msg) {
   if (!el) {
     el = document.createElement("div");
     el.className = "toast";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.setAttribute("aria-atomic", "true");
     document.body.appendChild(el);
   }
   el.textContent = msg;
@@ -949,11 +1266,12 @@ on("daemon:down", () => {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 (async function boot() {
+  void hydrateHostPresentation();
   await loadState();
   // Reap dead-PID sessions before we try to reuse any recorded port.
-  await pruneDeadSessions();
+  if (!IS_DESKTOP_HOST) await pruneDeadSessions();
   // Signal readiness so host can send t64:init.
-  t64("t64:ready", { app: "ro-sync", version: 1 }).catch(() => {});
+  host.ready().catch(() => {});
   navigate(app.state.lastView || "projects");
   // Mount the blocking overwrite-choice modal at app-level.
   mountOverwriteModal({

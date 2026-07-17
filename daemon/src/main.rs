@@ -17,6 +17,7 @@ mod fs_map;
 mod http;
 mod img_upload;
 mod initial_sync;
+mod lifecycle;
 mod native_capture;
 mod path_resolver;
 mod project_config;
@@ -84,8 +85,16 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Initialize a directory as a Ro Sync project without starting a daemon.
+    Init(InitArgs),
+    /// Install or inspect the bundled Roblox Studio plugin.
+    Plugin(PluginArgs),
+    /// Manage the CLI's Roblox Open Cloud credential.
+    Auth(AuthArgs),
     /// Run the HTTP/WebSocket sync daemon.
     Serve(ServeArgs),
+    /// Start, inspect, stop, restart, or read logs from a managed background daemon.
+    Daemon(DaemonArgs),
     /// Print machine-readable command docs from the generated command registry.
     Commands(CommandsArgs),
     /// Print an LLM-oriented project context snapshot as JSON.
@@ -1955,8 +1964,277 @@ pub struct ServeArgs {
     pub widget_owned: bool,
 
     /// Token required for widget lifecycle heartbeat and close requests.
-    #[arg(long = "owner-token", hide = true)]
+    #[arg(
+        long = "owner-token",
+        hide = true,
+        conflicts_with = "owner_token_state_file"
+    )]
     pub owner_token: Option<String>,
+
+    /// Read the widget owner token from state.daemonOwnerToken in a Terminal 64
+    /// widget state file. This keeps the capability out of both shell command
+    /// strings and child-process argv.
+    #[arg(long = "owner-token-state-file", hide = true)]
+    pub owner_token_state_file: Option<PathBuf>,
+
+    /// Mark this daemon as lifecycle-managed without tying it to the legacy widget heartbeat.
+    #[arg(long, hide = true)]
+    pub managed: bool,
+
+    /// Name of the lifecycle manager that launched this process.
+    #[arg(long = "managed-by", hide = true)]
+    pub managed_by: Option<String>,
+
+    /// Token required for generic lifecycle heartbeat and stop requests.
+    #[arg(
+        long = "control-token",
+        hide = true,
+        conflicts_with = "control_token_env"
+    )]
+    pub control_token: Option<String>,
+
+    /// Environment variable containing the generic lifecycle control token.
+    #[arg(long = "control-token-env", hide = true)]
+    pub control_token_env: Option<String>,
+
+    /// Per-process identity returned by /hello and recorded by the lifecycle manager.
+    #[arg(long = "boot-id", hide = true)]
+    pub boot_id: Option<String>,
+
+    /// Runtime record written atomically after the listener binds.
+    #[arg(long = "runtime-record", hide = true)]
+    pub runtime_record: Option<PathBuf>,
+
+    /// Log file associated with the runtime record.
+    #[arg(long = "log-path", hide = true)]
+    pub log_path: Option<PathBuf>,
+
+    /// Unix timestamp supplied by the lifecycle manager.
+    #[arg(long = "started-at", hide = true)]
+    pub started_at: Option<u64>,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub command: DaemonCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Start a detached daemon for one project, or return the matching running daemon.
+    Start(DaemonStartArgs),
+    /// Report the managed daemon recorded for one project.
+    Status(DaemonStatusArgs),
+    /// Gracefully stop the exact managed daemon recorded for one project.
+    Stop(DaemonStopArgs),
+    /// Gracefully stop and then start the managed daemon for one project.
+    Restart(DaemonRestartArgs),
+    /// Print or follow the managed daemon's log file.
+    Logs(DaemonLogsArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct DaemonStartArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    /// Exact port to use. Without this flag, ports 7878-7890 are tried in order.
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Lifecycle manager label recorded for diagnostics (for example cli or desktop).
+    #[arg(long = "managed-by", default_value = "cli")]
+    pub managed_by: String,
+    /// Browser/control capability supplied by a trusted desktop manager.
+    /// Hidden because it is a secret and never appears in lifecycle JSON.
+    #[arg(long = "owner-token", hide = true, conflicts_with = "owner_token_env")]
+    pub owner_token: Option<String>,
+    /// Read the trusted desktop/browser capability from this environment variable.
+    #[arg(long = "owner-token-env")]
+    pub owner_token_env: Option<String>,
+    /// Roblox GameId override persisted to ro-sync.json before launch.
+    #[arg(long = "game-id")]
+    pub game_id: Option<String>,
+    /// Roblox GroupId override persisted to ro-sync.json before launch.
+    #[arg(long = "group-id")]
+    pub group_id: Option<String>,
+    /// Roblox PlaceId override; repeat for multiple place IDs.
+    #[arg(long = "place-id")]
+    pub place_id: Vec<String>,
+    /// Override the platform-native Ro Sync state directory.
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    /// Seconds to wait for the exact boot-ID handshake.
+    #[arg(long, default_value_t = 10.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct DaemonStatusArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct DaemonStopArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    /// Seconds to wait for graceful shutdown. Ro Sync never kills a PID from a stale record.
+    #[arg(long, default_value_t = 10.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct DaemonRestartArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    /// Exact replacement port. Without this flag, the previous port is reused when possible.
+    #[arg(long)]
+    pub port: Option<u16>,
+    #[arg(long = "managed-by", default_value = "cli")]
+    pub managed_by: String,
+    #[arg(long = "owner-token", hide = true, conflicts_with = "owner_token_env")]
+    pub owner_token: Option<String>,
+    /// Read the trusted manager/browser capability from this environment variable.
+    #[arg(long = "owner-token-env")]
+    pub owner_token_env: Option<String>,
+    #[arg(long = "game-id")]
+    pub game_id: Option<String>,
+    #[arg(long = "group-id")]
+    pub group_id: Option<String>,
+    #[arg(long = "place-id")]
+    pub place_id: Vec<String>,
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 10.0)]
+    pub timeout: f64,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct DaemonLogsArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 100)]
+    pub lines: usize,
+    #[arg(long)]
+    pub follow: bool,
+    #[arg(long, conflicts_with = "follow")]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct InitArgs {
+    #[arg(long)]
+    pub project: PathBuf,
+    /// Project display name written to ro-sync.json.
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long = "game-id")]
+    pub game_id: Option<String>,
+    #[arg(long = "group-id")]
+    pub group_id: Option<String>,
+    #[arg(long = "place-id")]
+    pub place_id: Vec<String>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub command: PluginCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginCommand {
+    /// Atomically install the bundled Plugin.rbxm into Roblox Studio.
+    Install(PluginInstallArgs),
+    /// Compare the installed plugin with the bundled Plugin.rbxm.
+    Status(PluginStatusArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PluginInstallArgs {
+    /// Override the bundled Plugin.rbxm source (primarily for packagers/tests).
+    #[arg(long)]
+    pub source: Option<PathBuf>,
+    /// Override Roblox Studio's per-user Plugins directory.
+    #[arg(long = "plugin-dir")]
+    pub plugin_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PluginStatusArgs {
+    #[arg(long)]
+    pub source: Option<PathBuf>,
+    #[arg(long = "plugin-dir")]
+    pub plugin_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Store a Roblox Open Cloud credential from stdin, a file, or an environment variable.
+    Set(AuthSetArgs),
+    /// Report whether a CLI credential is stored (never prints the credential).
+    Status(AuthStatusArgs),
+    /// Remove the stored CLI credential.
+    Clear(AuthClearArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct AuthSetArgs {
+    /// Read the credential from stdin. The credential itself is never accepted as an argument.
+    #[arg(long = "from-stdin", conflicts_with_all = ["file", "from_env"])]
+    pub from_stdin: bool,
+    /// Read the credential from a file.
+    #[arg(long, conflicts_with_all = ["from_stdin", "from_env"])]
+    pub file: Option<PathBuf>,
+    /// Read the credential from an environment variable.
+    #[arg(long = "from-env", conflicts_with_all = ["from_stdin", "file"])]
+    pub from_env: Option<String>,
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct AuthStatusArgs {
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct AuthClearArgs {
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -2182,9 +2460,21 @@ pub struct AppState {
     /// Whether this daemon was launched by the Terminal 64 widget and should
     /// exit with that widget instead of lingering as a background service.
     pub widget_owned: bool,
-    /// Shared secret for widget lifecycle endpoints.
+    /// Whether a lifecycle manager owns this process.
+    pub managed: bool,
+    /// Human-readable manager label (for example cli, desktop, or terminal64-widget).
+    pub managed_by: Arc<String>,
+    /// Per-process identity used to reject stale runtime records.
+    pub boot_id: Arc<String>,
+    pub listen_port: u16,
+    pub process_id: u32,
+    pub started_at: u64,
+    /// Shared secret for generic lifecycle control endpoints.
+    pub manager_owner_token: Arc<Option<String>>,
+    /// Last heartbeat received from a heartbeat-driven manager.
+    pub manager_last_seen: Arc<Mutex<Option<Instant>>>,
+    /// Backward-compatible aliases used only by legacy widget tests/routes.
     pub widget_owner_token: Arc<Option<String>>,
-    /// Last heartbeat received from the owning widget.
     pub widget_last_seen: Arc<Mutex<Option<Instant>>>,
     /// Graceful shutdown trigger used by local lifecycle endpoints.
     pub shutdown_tx: tokio_watch::Sender<Option<String>>,
@@ -2370,8 +2660,12 @@ fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error:
             resolve_port_field(&mut args.port, args.project.as_deref(), "find-attr")?
         }
         Command::Lint(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "lint")?,
-        Command::Commands(_)
+        Command::Auth(_)
+        | Command::Commands(_)
+        | Command::Daemon(_)
+        | Command::Init(_)
         | Command::Plan(_)
+        | Command::Plugin(_)
         | Command::Serve(_)
         | Command::Upload(_)
         | Command::Monetization(_)
@@ -2389,24 +2683,38 @@ fn resolve_port_field(
     context: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project = project_or_cwd(project, context)?;
-    if let Some(resolved) = discover_project_daemon_port(&project, *port) {
+    if let Some(resolved) = discover_project_daemon_port(&project, *port)? {
         *port = resolved;
     }
     Ok(())
 }
 
-fn discover_project_daemon_port(project: &std::path::Path, requested_port: u16) -> Option<u16> {
-    let canonical_project = canonicalize_project_path(project);
+fn discover_project_daemon_port(
+    project: &std::path::Path,
+    requested_port: u16,
+) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+    discover_project_daemon_port_in_range(
+        project,
+        requested_port,
+        DEFAULT_DAEMON_PORT..=DAEMON_PORT_SCAN_MAX,
+    )
+}
 
-    if fetch_daemon_hello(requested_port)
-        .ok()
+fn discover_project_daemon_port_in_range(
+    project: &std::path::Path,
+    requested_port: u16,
+    ports: std::ops::RangeInclusive<u16>,
+) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+    let canonical_project = canonicalize_project_path(project);
+    let requested_hello = fetch_daemon_hello(requested_port).ok();
+    if requested_hello
         .as_ref()
         .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
     {
-        return Some(requested_port);
+        return Ok(Some(requested_port));
     }
 
-    for port in DEFAULT_DAEMON_PORT..=DAEMON_PORT_SCAN_MAX {
+    for port in ports {
         if port == requested_port {
             continue;
         }
@@ -2416,11 +2724,23 @@ fn discover_project_daemon_port(project: &std::path::Path, requested_port: u16) 
             .as_ref()
             .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
         {
-            return Some(port);
+            return Ok(Some(port));
         }
     }
 
-    None
+    if let Some(hello) = requested_hello {
+        let daemon_project = hello
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown project");
+        return Err(format!(
+            "daemon routing refused: port {requested_port} serves {daemon_project}, not {}",
+            canonical_project.display()
+        )
+        .into());
+    }
+
+    Ok(None)
 }
 
 fn daemon_hello_matches_project(
@@ -2447,6 +2767,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match command {
+        Some(Command::Init(args)) => run_init(args),
+        Some(Command::Plugin(args)) => run_plugin(args),
+        Some(Command::Auth(args)) => run_auth(args),
         Some(Command::Commands(args)) => run_commands(args),
         Some(Command::Context(args)) => run_context(args),
         Some(Command::Run(args)) => run_workflow(args).await,
@@ -2457,6 +2780,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Query(args)) => run_query(args).await,
         Some(Command::Path(args)) => run_path(args).await,
         Some(Command::Serve(args)) => run_serve(args).await,
+        Some(Command::Daemon(args)) => run_daemon(args).await,
         Some(Command::Get(args)) => run_get(args).await,
         Some(Command::Set(args)) => run_set(args).await,
         Some(Command::Ls(args)) => run_ls(args).await,
@@ -2519,38 +2843,1314 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 place_id: cli.place_id,
                 widget_owned: false,
                 owner_token: None,
+                owner_token_state_file: None,
+                managed: false,
+                managed_by: None,
+                control_token: None,
+                control_token_env: None,
+                boot_id: None,
+                runtime_record: None,
+                log_path: None,
+                started_at: None,
             })
             .await
         }
     }
 }
 
-async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.project.exists() {
-        std::fs::create_dir_all(&args.project)?;
+fn run_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(&args.project).map_err(|error| {
+        format!(
+            "init: create project directory {}: {error}",
+            args.project.display()
+        )
+    })?;
+    let project = lifecycle::canonical_project(&args.project)
+        .map_err(|error| format!("init: canonicalize {}: {error}", args.project.display()))?;
+    let mut config = project_config::load_or_create(&project)
+        .map_err(|error| format!("init: load ro-sync.json: {error}"))?;
+    let mut config_changed = false;
+    if let Some(name) = args.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("init: --name cannot be empty".into());
+        }
+        if config.name != name {
+            config.name = name.to_string();
+            config_changed = true;
+        }
+    }
+    config_changed |= project_config::apply_overrides(
+        &mut config,
+        args.game_id,
+        args.group_id,
+        (!args.place_id.is_empty()).then_some(args.place_id),
+    );
+    if config_changed {
+        project_config::write(&project, &config)
+            .map_err(|error| format!("init: write ro-sync.json: {error}"))?;
     }
 
-    if let Err(e) = snapshot::write_ro_sync_md_if_missing(&args.project) {
+    let ro_sync_md = snapshot::write_ro_sync_md_if_missing(&project)?;
+    let claude_md = snapshot::write_claude_md_if_missing_or_merge(&project)?;
+    let codex_context = snapshot::write_codex_context_if_missing_or_merge(&project)?;
+    let tooling = snapshot::write_project_tooling_if_missing_or_merge(&project)?;
+    let value = serde_json::json!({
+        "ok": true,
+        "project": project.display().to_string(),
+        "config": project.join(project_config::CONFIG_FILE).display().to_string(),
+        "changed": {
+            "config": config_changed,
+            "roSyncMd": ro_sync_md,
+            "claudeMd": claude_md,
+            "codexContext": codex_context,
+            "tooling": tooling,
+        },
+    });
+    if args.raw {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("Initialized Ro Sync project at {}.", project.display());
+    }
+    Ok(())
+}
+
+fn run_plugin(args: PluginArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        PluginCommand::Install(args) => plugin_install(args),
+        PluginCommand::Status(args) => plugin_status(args),
+    }
+}
+
+fn bundled_plugin_path(
+    explicit: Option<&std::path::Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut candidates = Vec::new();
+    if let Some(path) = explicit {
+        candidates.push(path.to_path_buf());
+    } else {
+        if let Some(path) = std::env::var_os("ROSYNC_PLUGIN_PATH") {
+            if !path.is_empty() {
+                candidates.push(PathBuf::from(path));
+            }
+        }
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                candidates.push(parent.join("plugin").join("Plugin.rbxm"));
+                if let Some(grandparent) = parent.parent() {
+                    candidates.push(grandparent.join("plugin").join("Plugin.rbxm"));
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("plugin").join("Plugin.rbxm"));
+            candidates.push(cwd.join("..").join("plugin").join("Plugin.rbxm"));
+        }
+    }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return std::fs::canonicalize(candidate).map_err(|error| {
+                format!("plugin: resolve {}: {error}", candidate.display()).into()
+            });
+        }
+    }
+    let searched = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "plugin: bundled Plugin.rbxm was not found{}",
+        if searched.is_empty() {
+            String::new()
+        } else {
+            format!(" (searched {searched})")
+        }
+    )
+    .into())
+}
+
+fn roblox_plugin_dir(
+    explicit: Option<&std::path::Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = explicit {
+        return if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir()
+            .map(|home| home.join("Documents").join("Roblox").join("Plugins"))
+            .ok_or_else(|| "plugin: home directory not found".into())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs::data_local_dir()
+            .map(|local| local.join("Roblox").join("Plugins"))
+            .ok_or_else(|| "plugin: local app-data directory not found".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("plugin: automatic Roblox Studio plugin installation is supported on macOS and Windows; pass --plugin-dir to override".into())
+    }
+}
+
+fn file_sha256(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    use sha2::{Digest as _, Sha256};
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read {} for SHA-256: {error}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn atomic_replace_bytes(
+    path: &std::path::Path,
+    bytes: &[u8],
+    #[allow(unused_variables)] unix_mode: u32,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid filename"))?;
+    let temporary = parent.join(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        unix_nanos()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(unix_mode);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn plugin_install(args: PluginInstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let source = bundled_plugin_path(args.source.as_deref())?;
+    let directory = roblox_plugin_dir(args.plugin_dir.as_deref())?;
+    let destination = directory.join("RoSync.rbxm");
+    let bytes = std::fs::read(&source)
+        .map_err(|error| format!("plugin install: read {}: {error}", source.display()))?;
+    atomic_replace_bytes(&destination, &bytes, 0o644)
+        .map_err(|error| format!("plugin install: write {}: {error}", destination.display()))?;
+    for stale_name in ["RoSync.lua", "RoSync.luau"] {
+        let stale = directory.join(stale_name);
+        if stale.is_file() {
+            std::fs::remove_file(&stale).map_err(|error| {
+                format!("plugin install: remove stale {}: {error}", stale.display())
+            })?;
+        }
+    }
+    let sha256 = file_sha256(&destination)?;
+    let value = serde_json::json!({
+        "ok": true,
+        "installed": true,
+        "current": true,
+        "source": source.display().to_string(),
+        "path": destination.display().to_string(),
+        "sha256": sha256,
+        "restartRequired": true,
+    });
+    if args.raw {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!(
+            "Installed Ro Sync Studio plugin at {}. Restart Roblox Studio to load it.",
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
+fn plugin_status(args: PluginStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let source = bundled_plugin_path(args.source.as_deref())?;
+    let directory = roblox_plugin_dir(args.plugin_dir.as_deref())?;
+    let destination = directory.join("RoSync.rbxm");
+    let expected_sha256 = file_sha256(&source)?;
+    let installed_sha256 = destination
+        .is_file()
+        .then(|| file_sha256(&destination))
+        .transpose()?;
+    let installed = installed_sha256.is_some();
+    let current = installed_sha256.as_deref() == Some(expected_sha256.as_str());
+    let value = serde_json::json!({
+        "ok": true,
+        "installed": installed,
+        "current": current,
+        "source": source.display().to_string(),
+        "path": destination.display().to_string(),
+        "expectedSha256": expected_sha256,
+        "installedSha256": installed_sha256,
+        "restartRequired": installed && !current,
+    });
+    if args.raw {
+        println!("{}", serde_json::to_string(&value)?);
+    } else if current {
+        println!(
+            "Ro Sync Studio plugin is installed and current at {}.",
+            destination.display()
+        );
+    } else if installed {
+        println!(
+            "Ro Sync Studio plugin is installed but outdated at {}.",
+            destination.display()
+        );
+    } else {
+        println!(
+            "Ro Sync Studio plugin is not installed at {}.",
+            destination.display()
+        );
+    }
+    Ok(())
+}
+
+const OPEN_CLOUD_CREDENTIAL_KEY: &str = "robloxCloudApiKey";
+
+fn run_auth(args: AuthArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        AuthCommand::Set(args) => auth_set(args),
+        AuthCommand::Status(args) => auth_status(args),
+        AuthCommand::Clear(args) => auth_clear(args),
+    }
+}
+
+fn auth_store_path(
+    data_dir: Option<&std::path::Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let state_dir = lifecycle::state_dir(data_dir)
+        .map_err(|error| format!("auth: resolve Ro Sync state directory: {error}"))?;
+    Ok(lifecycle::credentials_path(&state_dir))
+}
+
+fn auth_set(args: AuthSetArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let sources = usize::from(args.from_stdin)
+        + usize::from(args.file.is_some())
+        + usize::from(args.from_env.is_some());
+    if sources != 1 {
+        return Err("auth set: choose exactly one of --from-stdin, --file, or --from-env".into());
+    }
+    let mut credential = if args.from_stdin {
+        use std::io::Read as _;
+        let mut value = String::new();
+        std::io::stdin()
+            .take(64 * 1024 + 1)
+            .read_to_string(&mut value)?;
+        value
+    } else if let Some(path) = args.file.as_ref() {
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("auth set: inspect {}: {error}", path.display()))?;
+        if metadata.len() > 64 * 1024 {
+            return Err("auth set: credential file exceeds 64 KiB".into());
+        }
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("auth set: read {}: {error}", path.display()))?
+    } else {
+        read_named_secret_env(args.from_env.as_deref().unwrap_or_default(), "auth set")?
+    };
+    credential = credential.trim().to_string();
+    if credential.is_empty() {
+        return Err("auth set: credential is empty".into());
+    }
+    if credential.len() > 64 * 1024 {
+        return Err("auth set: credential exceeds 64 KiB".into());
+    }
+    let path = auth_store_path(args.data_dir.as_deref())?;
+    lifecycle::write_credential(&path, OPEN_CLOUD_CREDENTIAL_KEY, &credential)?;
+    drop(credential);
+    print_auth_result(&path, true, args.raw)
+}
+
+fn auth_status(args: AuthStatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let path = auth_store_path(args.data_dir.as_deref())?;
+    let configured = lifecycle::read_credential(&path, OPEN_CLOUD_CREDENTIAL_KEY)?.is_some();
+    print_auth_result(&path, configured, args.raw)
+}
+
+fn auth_clear(args: AuthClearArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let path = auth_store_path(args.data_dir.as_deref())?;
+    lifecycle::remove_credential(&path, OPEN_CLOUD_CREDENTIAL_KEY)?;
+    print_auth_result(&path, false, args.raw)
+}
+
+fn print_auth_result(
+    path: &std::path::Path,
+    configured: bool,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = serde_json::json!({
+        "ok": true,
+        "configured": configured,
+        "path": path.display().to_string(),
+        "protection": "filesystem-permissions",
+        "warning": "The CLI fallback store is protected by per-user filesystem permissions (0600 on Unix), not an OS keychain.",
+    });
+    if raw {
+        println!("{}", serde_json::to_string(&value)?);
+    } else if configured {
+        println!(
+            "Roblox Open Cloud credential is configured in {} (filesystem-permission protected; not an OS keychain).",
+            path.display()
+        );
+    } else {
+        println!("No CLI Roblox Open Cloud credential is configured.");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonLifecycleStatus {
+    ok: bool,
+    running: bool,
+    managed: bool,
+    managed_by: Option<String>,
+    project: String,
+    canonical_project: String,
+    pid: Option<u32>,
+    port: Option<u16>,
+    base_url: Option<String>,
+    boot_id: Option<String>,
+    log_path: Option<String>,
+    started_at: Option<u64>,
+    plugin_connected: Option<bool>,
+    stale: bool,
+    externally_managed: bool,
+}
+
+async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        DaemonCommand::Start(args) => {
+            let raw = args.raw;
+            let status = daemon_start(args).await?;
+            print_daemon_status(&status, raw)?;
+        }
+        DaemonCommand::Status(args) => {
+            let canonical_project =
+                lifecycle::canonical_project(&args.project).map_err(|error| {
+                    format!(
+                        "daemon status: canonicalize {}: {error}",
+                        args.project.display()
+                    )
+                })?;
+            let paths = daemon_runtime_paths(args.data_dir.as_deref(), &canonical_project)?;
+            let status = daemon_status(&canonical_project, &paths, true)?;
+            print_daemon_status(&status, args.raw)?;
+        }
+        DaemonCommand::Stop(args) => {
+            validate_lifecycle_timeout(args.timeout, "daemon stop")?;
+            let canonical_project =
+                lifecycle::canonical_project(&args.project).map_err(|error| {
+                    format!(
+                        "daemon stop: canonicalize {}: {error}",
+                        args.project.display()
+                    )
+                })?;
+            let paths = daemon_runtime_paths(args.data_dir.as_deref(), &canonical_project)?;
+            let status = daemon_stop(
+                &canonical_project,
+                &paths,
+                Duration::from_secs_f64(args.timeout),
+            )
+            .await?;
+            print_daemon_status(&status, args.raw)?;
+        }
+        DaemonCommand::Restart(args) => {
+            validate_lifecycle_timeout(args.timeout, "daemon restart")?;
+            let canonical_project =
+                lifecycle::canonical_project(&args.project).map_err(|error| {
+                    format!(
+                        "daemon restart: canonicalize {}: {error}",
+                        args.project.display()
+                    )
+                })?;
+            let paths = daemon_runtime_paths(args.data_dir.as_deref(), &canonical_project)?;
+            let previous_port = lifecycle::read_record(&paths.record)?.map(|record| record.port);
+            let existing = daemon_status(&canonical_project, &paths, false)?;
+            if existing.running || existing.stale {
+                daemon_stop(
+                    &canonical_project,
+                    &paths,
+                    Duration::from_secs_f64(args.timeout),
+                )
+                .await?;
+            }
+            let raw = args.raw;
+            let status = daemon_start(DaemonStartArgs {
+                project: canonical_project,
+                port: args.port.or(previous_port),
+                managed_by: args.managed_by,
+                owner_token: args.owner_token,
+                owner_token_env: args.owner_token_env,
+                game_id: args.game_id,
+                group_id: args.group_id,
+                place_id: args.place_id,
+                data_dir: args.data_dir,
+                timeout: args.timeout,
+                raw,
+            })
+            .await?;
+            print_daemon_status(&status, raw)?;
+        }
+        DaemonCommand::Logs(args) => daemon_logs(args).await?,
+    }
+    Ok(())
+}
+
+fn daemon_runtime_paths(
+    data_dir: Option<&std::path::Path>,
+    canonical_project: &std::path::Path,
+) -> Result<lifecycle::RuntimePaths, Box<dyn std::error::Error>> {
+    let state_dir = lifecycle::state_dir(data_dir)
+        .map_err(|error| format!("resolve Ro Sync state directory: {error}"))?;
+    Ok(lifecycle::runtime_paths(state_dir, canonical_project))
+}
+
+fn validate_lifecycle_timeout(
+    timeout: f64,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !timeout.is_finite() || !(0.1..=300.0).contains(&timeout) {
+        return Err(format!("{context}: --timeout must be between 0.1 and 300 seconds").into());
+    }
+    Ok(())
+}
+
+fn read_named_secret_env(name: &str, context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(format!("{context}: invalid environment variable name").into());
+    }
+    let value = std::env::var(name)
+        .map_err(|_| format!("{context}: environment variable {name} is missing or not UTF-8"))?;
+    if value.is_empty() {
+        return Err(format!("{context}: environment variable {name} is empty").into());
+    }
+    Ok(value)
+}
+
+fn resolve_optional_secret(
+    direct: Option<String>,
+    env_name: Option<&str>,
+    context: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match (direct, env_name) {
+        (Some(value), None) if !value.is_empty() => Ok(Some(value)),
+        (Some(_), None) => Err(format!("{context}: secret cannot be empty").into()),
+        (None, Some(name)) => Ok(Some(read_named_secret_env(name, context)?)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(format!("{context}: choose one secret source").into()),
+    }
+}
+
+fn read_widget_owner_token_state_file(
+    path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    const MAX_WIDGET_STATE_BYTES: u64 = 4 * 1024 * 1024;
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        format!(
+            "serve widget owner token: inspect Terminal 64 state file {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.len() > MAX_WIDGET_STATE_BYTES {
+        return Err(format!(
+            "serve widget owner token: Terminal 64 state file {} exceeds the 4 MiB limit",
+            path.display()
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "serve widget owner token: Terminal 64 state file {} must have mode 0600",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "serve widget owner token: read Terminal 64 state file {}: {error}",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "serve widget owner token: parse Terminal 64 state file {}: {error}",
+            path.display()
+        )
+    })?;
+    let token = value
+        .get("state")
+        .and_then(|state| state.get("daemonOwnerToken"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| {
+            (16..=512).contains(&token.len())
+                && token.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+                })
+        })
+        .ok_or_else(|| {
+            format!(
+                "serve widget owner token: {} has no valid state.daemonOwnerToken",
+                path.display()
+            )
+        })?;
+    Ok(token.to_owned())
+}
+
+fn resolve_widget_owner_token(
+    direct: Option<String>,
+    state_file: Option<&std::path::Path>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match (direct, state_file) {
+        (Some(value), None) if !value.is_empty() => Ok(Some(value)),
+        (Some(_), None) => Err("serve widget owner token cannot be empty".into()),
+        (None, Some(path)) => read_widget_owner_token_state_file(path).map(Some),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err("serve widget owner token: choose one secret source".into()),
+    }
+}
+
+fn normalize_optional_metadata(
+    value: Option<&str>,
+    flag: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(format!("{flag} cannot be empty").into()),
+        Some(value) => Ok(Some(value.trim().to_string())),
+        None => Ok(None),
+    }
+}
+
+fn daemon_record_matches_hello(
+    record: &lifecycle::RuntimeRecord,
+    hello: &serde_json::Value,
+    canonical_project: &std::path::Path,
+) -> bool {
+    daemon_hello_matches_project(hello, canonical_project)
+        && hello.get("bootId").and_then(serde_json::Value::as_str) == Some(record.boot_id.as_str())
+        && hello.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(record.pid))
+        && hello.get("port").and_then(serde_json::Value::as_u64) == Some(u64::from(record.port))
+}
+
+fn daemon_status_from_record(
+    record: &lifecycle::RuntimeRecord,
+    hello: Option<&serde_json::Value>,
+    running: bool,
+    stale: bool,
+) -> DaemonLifecycleStatus {
+    DaemonLifecycleStatus {
+        ok: true,
+        running,
+        managed: true,
+        managed_by: Some(record.managed_by.clone()),
+        project: record.project.clone(),
+        canonical_project: record.canonical_project.clone(),
+        pid: Some(record.pid),
+        port: Some(record.port),
+        base_url: Some(format!("http://127.0.0.1:{}", record.port)),
+        boot_id: Some(record.boot_id.clone()),
+        log_path: Some(record.log_path.clone()),
+        started_at: Some(record.started_at),
+        plugin_connected: hello.and_then(|value| {
+            value
+                .get("pluginConnected")
+                .and_then(serde_json::Value::as_bool)
+        }),
+        stale,
+        externally_managed: false,
+    }
+}
+
+fn external_daemon_status(
+    canonical_project: &std::path::Path,
+    port: u16,
+    hello: &serde_json::Value,
+) -> DaemonLifecycleStatus {
+    let managed = hello
+        .get("managed")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            hello
+                .get("widgetOwned")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+    DaemonLifecycleStatus {
+        ok: true,
+        running: true,
+        managed,
+        managed_by: hello
+            .get("managedBy")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        project: hello
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| canonical_project.to_str().unwrap_or(""))
+            .to_string(),
+        canonical_project: canonical_project.display().to_string(),
+        pid: hello
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
+        port: Some(port),
+        base_url: Some(format!("http://127.0.0.1:{port}")),
+        boot_id: hello
+            .get("bootId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        log_path: None,
+        started_at: hello.get("startedAt").and_then(serde_json::Value::as_u64),
+        plugin_connected: hello
+            .get("pluginConnected")
+            .and_then(serde_json::Value::as_bool),
+        stale: false,
+        externally_managed: true,
+    }
+}
+
+fn matching_external_daemon_status(
+    canonical_project: &std::path::Path,
+    port: u16,
+    hello: &serde_json::Value,
+) -> Option<DaemonLifecycleStatus> {
+    daemon_hello_matches_project(hello, canonical_project)
+        .then(|| external_daemon_status(canonical_project, port, hello))
+}
+
+fn stopped_daemon_status(canonical_project: &std::path::Path) -> DaemonLifecycleStatus {
+    DaemonLifecycleStatus {
+        ok: true,
+        running: false,
+        managed: false,
+        managed_by: None,
+        project: canonical_project.display().to_string(),
+        canonical_project: canonical_project.display().to_string(),
+        pid: None,
+        port: None,
+        base_url: None,
+        boot_id: None,
+        log_path: None,
+        started_at: None,
+        plugin_connected: None,
+        stale: false,
+        externally_managed: false,
+    }
+}
+
+fn find_daemon_for_project_in_range(
+    canonical_project: &std::path::Path,
+    ports: std::ops::RangeInclusive<u16>,
+) -> Option<(u16, serde_json::Value)> {
+    ports.into_iter().find_map(|port| {
+        let hello = fetch_daemon_hello(port).ok()?;
+        daemon_hello_matches_project(&hello, canonical_project).then_some((port, hello))
+    })
+}
+
+fn find_daemon_for_project(
+    canonical_project: &std::path::Path,
+) -> Option<(u16, serde_json::Value)> {
+    find_daemon_for_project_in_range(
+        canonical_project,
+        DEFAULT_DAEMON_PORT..=DAEMON_PORT_SCAN_MAX,
+    )
+}
+
+fn daemon_status(
+    canonical_project: &std::path::Path,
+    paths: &lifecycle::RuntimePaths,
+    clean_stale: bool,
+) -> Result<DaemonLifecycleStatus, Box<dyn std::error::Error>> {
+    if let Some(record) = lifecycle::read_record(&paths.record)? {
+        if canonicalize_project_path(std::path::Path::new(&record.canonical_project))
+            != canonical_project
+        {
+            return Err(format!(
+                "daemon runtime record {} belongs to {}, not {}",
+                paths.record.display(),
+                record.canonical_project,
+                canonical_project.display()
+            )
+            .into());
+        }
+        let hello = fetch_daemon_hello(record.port).ok();
+        if hello
+            .as_ref()
+            .is_some_and(|hello| daemon_record_matches_hello(&record, hello, canonical_project))
+        {
+            return Ok(daemon_status_from_record(
+                &record,
+                hello.as_ref(),
+                true,
+                false,
+            ));
+        }
+        if clean_stale {
+            lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
+        }
+
+        // A stale record only proves that its exact boot is gone. A manual
+        // daemon or a daemon adopted by another host may still be serving the
+        // same project, either on the recorded port or elsewhere in the
+        // discovery range. Prefer that live identity so `daemon start` stays
+        // idempotent instead of launching a duplicate.
+        if let Some(status) = hello.as_ref().and_then(|hello| {
+            matching_external_daemon_status(canonical_project, record.port, hello)
+        }) {
+            return Ok(status);
+        }
+        if let Some((port, hello)) = find_daemon_for_project(canonical_project) {
+            return Ok(external_daemon_status(canonical_project, port, &hello));
+        }
+        return Ok(daemon_status_from_record(
+            &record,
+            hello.as_ref(),
+            false,
+            true,
+        ));
+    }
+
+    if let Some((port, hello)) = find_daemon_for_project(canonical_project) {
+        return Ok(external_daemon_status(canonical_project, port, &hello));
+    }
+    Ok(stopped_daemon_status(canonical_project))
+}
+
+async fn daemon_start(
+    args: DaemonStartArgs,
+) -> Result<DaemonLifecycleStatus, Box<dyn std::error::Error>> {
+    validate_lifecycle_timeout(args.timeout, "daemon start")?;
+    if args.managed_by.trim().is_empty() {
+        return Err("daemon start: --managed-by cannot be empty".into());
+    }
+    let supplied_owner_token = resolve_optional_secret(
+        args.owner_token.clone(),
+        args.owner_token_env.as_deref(),
+        "daemon start owner token",
+    )?;
+    let canonical_project = lifecycle::canonical_project(&args.project).map_err(|error| {
+        format!(
+            "daemon start: canonicalize {}: {error}",
+            args.project.display()
+        )
+    })?;
+    let paths = daemon_runtime_paths(args.data_dir.as_deref(), &canonical_project)?;
+    let _lock = lifecycle::StartLock::acquire(&paths.start_lock)?;
+
+    let game_id = normalize_optional_metadata(args.game_id.as_deref(), "--game-id")?;
+    let group_id = normalize_optional_metadata(args.group_id.as_deref(), "--group-id")?;
+    let place_ids = if args.place_id.is_empty() {
+        None
+    } else {
+        Some(
+            args.place_id
+                .iter()
+                .map(|value| {
+                    normalize_optional_metadata(Some(value), "--place-id")?
+                        .ok_or_else(|| "--place-id cannot be empty".into())
+                })
+                .collect::<Result<Vec<String>, Box<dyn std::error::Error>>>()?,
+        )
+    };
+    if game_id.is_some() || group_id.is_some() || place_ids.is_some() {
+        let mut config = project_config::load_or_create(&canonical_project)
+            .map_err(|error| format!("daemon start: load ro-sync.json: {error}"))?;
+        if project_config::apply_overrides(&mut config, game_id, group_id, place_ids) {
+            project_config::write(&canonical_project, &config)
+                .map_err(|error| format!("daemon start: write ro-sync.json: {error}"))?;
+        }
+    }
+
+    let current = daemon_status(&canonical_project, &paths, true)?;
+    if current.running {
+        if let Some(requested_port) = args.port {
+            if current.port != Some(requested_port) {
+                if let Ok(hello) = fetch_daemon_hello(requested_port) {
+                    let daemon_project = hello
+                        .get("project")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown project");
+                    return Err(format!(
+                        "daemon start: requested port {requested_port} serves {daemon_project}; matching project already runs on port {}",
+                        current.port.unwrap_or_default()
+                    )
+                    .into());
+                }
+            }
+        }
+        return Ok(current);
+    }
+
+    if let Some(requested_port) = args.port {
+        if let Ok(hello) = fetch_daemon_hello(requested_port) {
+            if let Some(status) =
+                matching_external_daemon_status(&canonical_project, requested_port, &hello)
+            {
+                return Ok(status);
+            }
+            let daemon_project = hello
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown project");
+            return Err(format!(
+                "daemon start: port {requested_port} is already serving {daemon_project}, not {}",
+                canonical_project.display()
+            )
+            .into());
+        }
+    }
+
+    let port = match args.port {
+        Some(0) => reserve_ephemeral_port()?,
+        Some(port) => port,
+        None => find_available_daemon_port().ok_or_else(|| {
+            format!(
+                "daemon start: no available port in {DEFAULT_DAEMON_PORT}-{DAEMON_PORT_SCAN_MAX}"
+            )
+        })?,
+    };
+    let control_token = match supplied_owner_token {
+        Some(token) => token,
+        None => artifact::random_hex(32)?,
+    };
+    let boot_id = artifact::random_hex(32)?;
+    let started_at = unix_secs();
+    let timeout = Duration::from_secs_f64(args.timeout);
+    spawn_managed_daemon(ManagedDaemonLaunch {
+        canonical_project: &canonical_project,
+        paths: &paths,
+        port,
+        managed_by: &args.managed_by,
+        control_token: &control_token,
+        boot_id: &boot_id,
+        started_at,
+        timeout,
+    })
+    .await
+}
+
+fn reserve_ephemeral_port() -> Result<u16, Box<dyn std::error::Error>> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn find_available_daemon_port() -> Option<u16> {
+    (DEFAULT_DAEMON_PORT..=DAEMON_PORT_SCAN_MAX)
+        .find(|port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port)).is_ok())
+}
+
+struct ManagedDaemonLaunch<'a> {
+    canonical_project: &'a std::path::Path,
+    paths: &'a lifecycle::RuntimePaths,
+    port: u16,
+    managed_by: &'a str,
+    control_token: &'a str,
+    boot_id: &'a str,
+    started_at: u64,
+    timeout: Duration,
+}
+
+async fn spawn_managed_daemon(
+    launch: ManagedDaemonLaunch<'_>,
+) -> Result<DaemonLifecycleStatus, Box<dyn std::error::Error>> {
+    let ManagedDaemonLaunch {
+        canonical_project,
+        paths,
+        port,
+        managed_by,
+        control_token,
+        boot_id,
+        started_at,
+        timeout,
+    } = launch;
+    let executable = std::env::current_exe()?;
+    let stdout = lifecycle::open_private_log(&paths.log)?;
+    let stderr = stdout.try_clone()?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("serve")
+        .arg("--project")
+        .arg(canonical_project)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--managed")
+        .arg("--managed-by")
+        .arg(managed_by)
+        .arg("--control-token-env")
+        .arg("ROSYNC_DAEMON_CONTROL_TOKEN")
+        .arg("--boot-id")
+        .arg(boot_id)
+        .arg("--runtime-record")
+        .arg(&paths.record)
+        .arg("--log-path")
+        .arg(&paths.log)
+        .arg("--started-at")
+        .arg(started_at.to_string())
+        .env("ROSYNC_DAEMON_CONTROL_TOKEN", control_token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: `setsid` is async-signal-safe and the closure performs no
+        // allocation or shared-memory access between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "daemon start: launch managed daemon for {}: {error}",
+            canonical_project.display()
+        )
+    })?;
+    let child_pid = child.id();
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("daemon start: timeout overflow")?;
+    loop {
+        if let Ok(hello) = fetch_daemon_hello(port) {
+            let expected = lifecycle::RuntimeRecord {
+                version: lifecycle::RUNTIME_RECORD_VERSION,
+                project: canonical_project.display().to_string(),
+                canonical_project: canonical_project.display().to_string(),
+                pid: child_pid,
+                port,
+                boot_id: boot_id.to_string(),
+                control_token: control_token.to_string(),
+                managed_by: managed_by.to_string(),
+                log_path: paths.log.display().to_string(),
+                started_at,
+            };
+            if daemon_record_matches_hello(&expected, &hello, canonical_project) {
+                let record = lifecycle::read_record(&paths.record)?.ok_or_else(|| {
+                    format!(
+                        "daemon start: exact daemon answered but runtime record {} is missing",
+                        paths.record.display()
+                    )
+                })?;
+                if record.boot_id != boot_id || record.pid != child_pid || record.port != port {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(
+                        "daemon start: runtime record did not match the spawned process".into(),
+                    );
+                }
+                return Ok(daemon_status_from_record(
+                    &record,
+                    Some(&hello),
+                    true,
+                    false,
+                ));
+            }
+        }
+        if let Some(exit) = child.try_wait()? {
+            lifecycle::remove_record_if_boot(&paths.record, boot_id)?;
+            let tail = read_log_tail(&paths.log, 20).unwrap_or_default();
+            return Err(format!(
+                "daemon start: child {child_pid} exited with {exit} before the exact handshake{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{tail}")
+                }
+            )
+            .into());
+        }
+        if Instant::now() >= deadline {
+            // This is the exact child handle created above, never a PID read
+            // from disk. It is therefore safe to terminate on failed startup.
+            let _ = child.kill();
+            let _ = child.wait();
+            lifecycle::remove_record_if_boot(&paths.record, boot_id)?;
+            let tail = read_log_tail(&paths.log, 20).unwrap_or_default();
+            return Err(format!(
+                "daemon start: timed out waiting for project/boot handshake on port {port}{}",
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{tail}")
+                }
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn daemon_stop(
+    canonical_project: &std::path::Path,
+    paths: &lifecycle::RuntimePaths,
+    timeout: Duration,
+) -> Result<DaemonLifecycleStatus, Box<dyn std::error::Error>> {
+    let Some(record) = lifecycle::read_record(&paths.record)? else {
+        if let Some((port, _)) = find_daemon_for_project(canonical_project) {
+            return Err(format!(
+                "daemon stop: project is running on port {port}, but no matching managed runtime record exists; refusing PID-only or unauthenticated shutdown"
+            )
+            .into());
+        }
+        return Ok(stopped_daemon_status(canonical_project));
+    };
+    if canonicalize_project_path(std::path::Path::new(&record.canonical_project))
+        != canonical_project
+    {
+        return Err(format!(
+            "daemon stop: runtime record belongs to {}, not {}",
+            record.canonical_project,
+            canonical_project.display()
+        )
+        .into());
+    }
+    let hello = fetch_daemon_hello(record.port).ok();
+    if !hello
+        .as_ref()
+        .is_some_and(|hello| daemon_record_matches_hello(&record, hello, canonical_project))
+    {
+        lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
+        return Ok(daemon_status_from_record(
+            &record,
+            hello.as_ref(),
+            false,
+            true,
+        ));
+    }
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("daemon stop: timeout overflow")?;
+    let response = http_post_json_until(
+        record.port,
+        "/manager-close",
+        &serde_json::json!({
+            "token": record.control_token,
+            "reason": "managed daemon stop requested",
+        }),
+        deadline,
+    )
+    .await
+    .map_err(|error| format!("daemon stop: authenticated shutdown request: {error}"))?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("daemon stop: daemon rejected shutdown: {response}").into());
+    }
+
+    loop {
+        let exact_still_running = fetch_daemon_hello(record.port)
+            .ok()
+            .is_some_and(|hello| daemon_record_matches_hello(&record, &hello, canonical_project));
+        if !exact_still_running {
+            lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
+            let mut status = daemon_status_from_record(&record, None, false, false);
+            status.plugin_connected = response
+                .get("pluginConnected")
+                .and_then(serde_json::Value::as_bool);
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "daemon stop: timed out waiting for boot {} on port {} to stop; no PID signal was sent",
+                record.boot_id, record.port
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn print_daemon_status(
+    status: &DaemonLifecycleStatus,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if raw {
+        println!("{}", serde_json::to_string(status)?);
+        return Ok(());
+    }
+    if status.running {
+        let ownership = if status.externally_managed {
+            "external"
+        } else if status.managed {
+            "managed"
+        } else {
+            "manual"
+        };
+        println!(
+            "Ro Sync is running for {} on {} ({ownership}).",
+            status.canonical_project,
+            status.base_url.as_deref().unwrap_or("unknown address")
+        );
+    } else if status.stale {
+        println!(
+            "Ro Sync is not running for {} (removed stale runtime state).",
+            status.canonical_project
+        );
+    } else {
+        println!("Ro Sync is not running for {}.", status.canonical_project);
+    }
+    Ok(())
+}
+
+fn read_log_tail(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    if lines == 0 {
+        return Ok(String::new());
+    }
+    let mut selected = text.lines().rev().take(lines).collect::<Vec<_>>();
+    selected.reverse();
+    Ok(selected.join("\n"))
+}
+
+async fn daemon_logs(args: DaemonLogsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let canonical_project = lifecycle::canonical_project(&args.project).map_err(|error| {
+        format!(
+            "daemon logs: canonicalize {}: {error}",
+            args.project.display()
+        )
+    })?;
+    let paths = daemon_runtime_paths(args.data_dir.as_deref(), &canonical_project)?;
+    let path = lifecycle::read_record(&paths.record)?
+        .map(|record| PathBuf::from(record.log_path))
+        .unwrap_or(paths.log);
+    let content = match read_log_tail(&path, args.lines) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("daemon logs: read {}: {error}", path.display()).into()),
+    };
+    if args.raw {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "path": path.display().to_string(),
+                "lines": args.lines,
+                "content": content,
+            }))?
+        );
+        return Ok(());
+    }
+    if !content.is_empty() {
+        println!("{content}");
+    }
+    if !args.follow {
+        return Ok(());
+    }
+
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(|error| format!("daemon logs: follow {}: {error}", path.display()))?;
+    let mut offset = file.metadata()?.len();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                let length = file.metadata()?.len();
+                if length < offset {
+                    offset = 0;
+                }
+                if length > offset {
+                    file.seek(SeekFrom::Start(offset))?;
+                    let mut appended = String::new();
+                    file.read_to_string(&mut appended)?;
+                    offset = length;
+                    print!("{appended}");
+                    std::io::stdout().flush()?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.project.is_dir() {
+        return Err(format!(
+            "serve: project directory does not exist: {}",
+            args.project.display()
+        )
+        .into());
+    }
+    let canonical_project = lifecycle::canonical_project(&args.project)
+        .map_err(|error| format!("serve: canonicalize {}: {error}", args.project.display()))?;
+    let widget_owner_token = resolve_widget_owner_token(
+        args.owner_token.clone(),
+        args.owner_token_state_file.as_deref(),
+    )?;
+
+    // Bind before generating project docs or starting the watcher. A port
+    // collision must fail without mutating the project or leaving background
+    // work behind.
+    let requested_addr = format!("127.0.0.1:{}", args.port);
+    let listener = tokio::net::TcpListener::bind(&requested_addr)
+        .await
+        .map_err(|error| format!("serve: bind {requested_addr}: {error}"))?;
+    let listen_port = listener.local_addr()?.port();
+
+    if let Err(e) = snapshot::write_ro_sync_md_if_missing(&canonical_project) {
         eprintln!("rosync: failed to write ro-sync.md: {e}");
     }
-    if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&args.project) {
+    if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&canonical_project) {
         eprintln!("rosync: failed to write CLAUDE.md: {e}");
     }
-    if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&args.project) {
+    if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&canonical_project) {
         eprintln!("rosync: failed to write Codex context: {e}");
     }
-    if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&args.project) {
+    if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&canonical_project) {
         eprintln!("rosync: failed to write project tooling files: {e}");
     }
 
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
-    let mut cfg = match project_config::load_or_create(&args.project) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("rosync: failed to load ro-sync.json: {e}");
-            project_config::ProjectConfig::default_for(&args.project)
-        }
-    };
+    let mut cfg = project_config::load_or_create(&canonical_project).map_err(|error| {
+        format!(
+            "serve: load {}: {error}",
+            canonical_project.join("ro-sync.json").display()
+        )
+    })?;
     let place_ids_override = if args.place_id.is_empty() {
         None
     } else {
@@ -2563,22 +4163,47 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         place_ids_override,
     );
     if changed {
-        if let Err(e) = project_config::write(&args.project, &cfg) {
-            eprintln!("rosync: failed to write ro-sync.json: {e}");
-        }
+        project_config::write(&canonical_project, &cfg)
+            .map_err(|error| format!("serve: write ro-sync.json: {error}"))?;
     }
 
     let (tx, _rx) = broadcast::channel::<String>(1024);
 
-    let watcher = Watch::new(args.project.clone())?;
+    let watcher = Watch::new(canonical_project.clone())?;
     let canonical_project = watcher.root().to_path_buf();
     let conflict_engine = Arc::new(ConflictEngine::new());
     let push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let (request_tx, _) = broadcast::channel::<RequestEnvelope>(256);
     let (shutdown_tx, shutdown_rx) = tokio_watch::channel::<Option<String>>(None);
 
+    let managed = args.managed || args.widget_owned;
+    let manager_owner_token = resolve_optional_secret(
+        args.control_token.clone(),
+        args.control_token_env.as_deref(),
+        "serve control token",
+    )?
+    .or_else(|| widget_owner_token.clone());
+    if managed && manager_owner_token.as_deref().is_none_or(str::is_empty) {
+        return Err("serve: a managed daemon requires --control-token or --owner-token".into());
+    }
+    let managed_by = args.managed_by.clone().unwrap_or_else(|| {
+        if args.widget_owned {
+            "terminal64-widget".to_string()
+        } else if managed {
+            "unknown".to_string()
+        } else {
+            "manual".to_string()
+        }
+    });
+    let boot_id = match args.boot_id.clone() {
+        Some(boot_id) => boot_id,
+        None => artifact::random_hex(32)?,
+    };
+    let started_at = args.started_at.unwrap_or_else(unix_secs);
+    let process_id = std::process::id();
+
     let state = AppState {
-        project: Arc::new(args.project.clone()),
+        project: Arc::new(canonical_project.clone()),
         canonical_project: Arc::new(canonical_project.clone()),
         events: tx.clone(),
         conflict: conflict_engine.clone(),
@@ -2599,9 +4224,54 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         pending_routes: Arc::new(Mutex::new(HashMap::new())),
         active_plugin: Arc::new(Mutex::new(None)),
         widget_owned: args.widget_owned,
-        widget_owner_token: Arc::new(args.owner_token.clone()),
+        managed,
+        managed_by: Arc::new(managed_by.clone()),
+        boot_id: Arc::new(boot_id.clone()),
+        listen_port,
+        process_id,
+        started_at,
+        manager_owner_token: Arc::new(manager_owner_token.clone()),
+        manager_last_seen: Arc::new(Mutex::new(args.widget_owned.then(Instant::now))),
+        widget_owner_token: Arc::new(widget_owner_token),
         widget_last_seen: Arc::new(Mutex::new(args.widget_owned.then(Instant::now))),
         shutdown_tx,
+    };
+
+    let runtime_guard = if let Some(record_path) = args.runtime_record.as_ref() {
+        if !managed {
+            return Err("serve: --runtime-record requires a managed daemon".into());
+        }
+        let control_token = manager_owner_token
+            .clone()
+            .ok_or("serve: managed runtime record requires a control token")?;
+        let log_path = args
+            .log_path
+            .clone()
+            .unwrap_or_else(|| record_path.with_extension("log"));
+        let record = lifecycle::RuntimeRecord {
+            version: lifecycle::RUNTIME_RECORD_VERSION,
+            project: canonical_project.display().to_string(),
+            canonical_project: canonical_project.display().to_string(),
+            pid: process_id,
+            port: listen_port,
+            boot_id: boot_id.clone(),
+            control_token,
+            managed_by: managed_by.clone(),
+            log_path: log_path.display().to_string(),
+            started_at,
+        };
+        lifecycle::write_record(record_path, &record).map_err(|error| {
+            format!(
+                "serve: write runtime record {}: {error}",
+                record_path.display()
+            )
+        })?;
+        Some(lifecycle::RuntimeRecordGuard::new(
+            record_path.clone(),
+            boot_id.clone(),
+        ))
+    } else {
+        None
     };
 
     spawn_watch_bridge(
@@ -2616,18 +4286,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         spawn_widget_owner_watchdog(state.clone());
     }
 
-    let addr = format!("127.0.0.1:{}", args.port);
+    let addr = format!("127.0.0.1:{listen_port}");
     eprintln!(
         "rosync listening on http://{} (project: {})",
         addr,
-        args.project.display()
+        canonical_project.display()
     );
 
     let app = http::router(state);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(serve_shutdown_signal(tx.clone(), shutdown_rx))
         .await?;
+    drop(runtime_guard);
     Ok(())
 }
 
@@ -5213,7 +6883,7 @@ fn monetization_credential_sources(project: Option<&std::path::Path>) -> Vec<Str
         }
     }
     if find_widget_secret("robloxCloudApiKey").is_some() {
-        sources.push("widget-secret:robloxCloudApiKey".to_string());
+        sources.push("rosync-secret:robloxCloudApiKey".to_string());
     }
     sources
 }
@@ -7646,6 +9316,15 @@ fn group_id_from_widget_state(value: &serde_json::Value) -> Option<String> {
 }
 
 fn find_widget_secret(key: &str) -> Option<String> {
+    if let Ok(state_dir) = lifecycle::state_dir(None) {
+        let path = lifecycle::credentials_path(&state_dir);
+        if let Ok(Some(secret)) = lifecycle::read_credential(&path, key) {
+            let secret = secret.trim();
+            if !secret.is_empty() {
+                return Some(secret.to_string());
+            }
+        }
+    }
     for state_file in widget_state_file_candidates() {
         let Ok(text) = std::fs::read_to_string(&state_file) else {
             continue;
@@ -12362,26 +14041,30 @@ fn check_luaurc(project: &std::path::Path) -> DoctorCheck {
 }
 
 fn check_writes_log_path() -> DoctorCheck {
-    let Some(home) = dirs::home_dir() else {
-        return doctor_check("writes.log", DoctorStatus::Warn, "home directory not found");
-    };
-    let dir = home.join(".terminal64").join("widgets").join("ro-sync");
-    let log = dir.join("writes.log");
-    if log.exists() {
-        return doctor_check("writes.log", DoctorStatus::Ok, log.display().to_string());
+    if let Ok(dir) = lifecycle::state_dir(None) {
+        let log = dir.join("writes.log");
+        if log.exists() {
+            return doctor_check("writes.log", DoctorStatus::Ok, log.display().to_string());
+        }
+        if dir.is_dir() {
+            return doctor_check(
+                "writes.log",
+                DoctorStatus::Warn,
+                format!("not created yet: {}", log.display()),
+            );
+        }
     }
-    if dir.is_dir() {
-        return doctor_check(
-            "writes.log",
-            DoctorStatus::Warn,
-            format!("not created yet: {}", log.display()),
-        );
+    if let Some(dir) = lifecycle::legacy_widget_dir() {
+        let legacy = dir.join("writes.log");
+        if legacy.exists() {
+            return doctor_check(
+                "writes.log",
+                DoctorStatus::Warn,
+                format!("legacy location: {}", legacy.display()),
+            );
+        }
     }
-    doctor_check(
-        "writes.log",
-        DoctorStatus::Warn,
-        format!("directory missing: {}", dir.display()),
-    )
+    doctor_check("writes.log", DoctorStatus::Warn, "not created yet")
 }
 
 fn fetch_daemon_hello(port: u16) -> Result<serde_json::Value, String> {
@@ -12681,10 +14364,12 @@ fn command_output_cost(name: &str) -> &'static str {
         "commands" => "high-full-or-low-single",
         "context" | "capabilities" | "plan" | "query" | "path" | "meta" | "services" | "where"
         | "open" | "classinfo" | "enums" | "enum" | "ping" | "version" => "low",
-        "status" | "doctor" | "ls" | "tree" | "props" | "find" | "find-attr" | "logs"
-        | "resolve" | "decision" | "lint" | "upload" | "monetization" | "set" | "new" | "rm"
-        | "mv" | "attr" | "tag" | "select" | "save" | "waypoint" | "undo" | "redo" | "refresh"
-        | "repair" | "capture" | "playtest" | "run" => "medium",
+        "init" | "plugin" | "auth" | "daemon" | "status" | "doctor" | "ls" | "tree" | "props"
+        | "find" | "find-attr" | "logs" | "resolve" | "decision" | "lint" | "upload"
+        | "monetization" | "set" | "new" | "rm" | "mv" | "attr" | "tag" | "select" | "save"
+        | "waypoint" | "undo" | "redo" | "refresh" | "repair" | "capture" | "playtest" | "run" => {
+            "medium"
+        }
         "source" | "conflicts" => "medium-special-case",
         "diff" | "changes" | "snapshot" | "get" | "eval" | "transmit" | "call" | "tail"
         | "watch" | "serve" => "high-or-streaming",
@@ -12704,7 +14389,9 @@ fn command_safety_class(name: &str) -> &'static str {
         "capture" => "captures-screen-and-writes-local-artifacts",
         "select" | "open" => "mutates-studio-selection",
         "upload" | "monetization" => "open-cloud-mutating",
-        "refresh" | "snapshot" | "repair" => "writes-local-files",
+        "init" | "plugin" | "refresh" | "snapshot" | "repair" => "writes-local-files",
+        "auth" => "writes-local-credentials",
+        "daemon" => "controls-local-service",
         "tail" | "watch" => "streaming-read",
         "serve" => "starts-local-service",
         "commands" | "context" | "capabilities" | "plan" | "query" | "path" | "lint" | "get"
@@ -12725,7 +14412,9 @@ fn command_requirements(name: &str) -> Vec<&'static str> {
         "lint" => vec!["project"],
         "upload" | "monetization" => vec!["project", "roblox-open-cloud-credential"],
         "commands" | "context" | "plan" | "snapshot" | "diff" | "changes" | "status" | "doctor"
-        | "refresh" => vec!["project"],
+        | "refresh" | "init" | "daemon" => vec!["project"],
+        "plugin" => vec!["bundled-plugin", "roblox-plugin-directory"],
+        "auth" => vec!["credential-input-for-set"],
         _ => vec!["daemon", "studio-plugin"],
     }
 }
@@ -14235,6 +15924,84 @@ mod tier2_tests {
         assert_eq!(args.project, PathBuf::from("."));
         assert!(args.widget_owned);
         assert_eq!(args.owner_token.as_deref(), Some("secret"));
+        assert!(args.owner_token_state_file.is_none());
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "serve",
+            "--project",
+            ".",
+            "--widget-owned",
+            "--owner-token-state-file",
+            "/private/widget/state.json",
+        ])
+        .unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert!(args.owner_token.is_none());
+        assert_eq!(
+            args.owner_token_state_file.as_deref(),
+            Some(std::path::Path::new("/private/widget/state.json"))
+        );
+
+        assert!(Cli::try_parse_from([
+            "rosync",
+            "serve",
+            "--project",
+            ".",
+            "--owner-token",
+            "secret",
+            "--owner-token-state-file",
+            "/private/widget/state.json",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn widget_owner_state_file_reads_only_the_narrow_token_key() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.json");
+        let unrelated_secret = "must-not-appear-in-errors";
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "secrets": { "robloxCloudApiKey": unrelated_secret },
+                "state": { "daemonOwnerToken": "0123456789abcdef0123456789abcdef" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let error = read_widget_owner_token_state_file(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("mode 0600"));
+            assert!(!error.contains(unrelated_secret));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            read_widget_owner_token_state_file(&path).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "secrets": { "robloxCloudApiKey": unrelated_secret },
+                "state": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = read_widget_owner_token_state_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(unrelated_secret));
+        assert!(error.contains("state.daemonOwnerToken"));
     }
 
     #[test]
@@ -14287,6 +16054,130 @@ mod tier2_tests {
         std::fs::create_dir_all(&other).unwrap();
         let other_canonical = std::fs::canonicalize(other).unwrap();
         assert!(!daemon_hello_matches_project(&hello, &other_canonical));
+    }
+
+    #[test]
+    fn lifecycle_matching_external_daemon_status_requires_the_same_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Project");
+        let other = dir.path().join("Other");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        let other = std::fs::canonicalize(other).unwrap();
+        let hello = serde_json::json!({
+            "project": project.display().to_string(),
+            "pid": 1234,
+            "port": 8123,
+            "bootId": "external-boot",
+            "managed": false,
+            "pluginConnected": true,
+        });
+
+        let status = matching_external_daemon_status(&project, 8123, &hello).unwrap();
+        assert!(status.running);
+        assert!(status.externally_managed);
+        assert!(!status.managed);
+        assert_eq!(status.port, Some(8123));
+        assert_eq!(status.boot_id.as_deref(), Some("external-boot"));
+        assert!(matching_external_daemon_status(&other, 8123, &hello).is_none());
+    }
+
+    #[test]
+    fn lifecycle_secret_sources_and_metadata_are_validated() {
+        assert_eq!(
+            resolve_optional_secret(Some("secret".into()), None, "test").unwrap(),
+            Some("secret".into())
+        );
+        assert!(resolve_optional_secret(Some(String::new()), None, "test").is_err());
+        assert!(resolve_optional_secret(Some("secret".into()), Some("TOKEN"), "test").is_err());
+        assert_eq!(
+            normalize_optional_metadata(Some("  123  "), "--game-id").unwrap(),
+            Some("123".into())
+        );
+        assert!(normalize_optional_metadata(Some("  "), "--game-id").is_err());
+    }
+
+    #[test]
+    fn lifecycle_json_does_not_expose_the_control_token() {
+        let status = DaemonLifecycleStatus {
+            ok: true,
+            running: true,
+            managed: true,
+            managed_by: Some("desktop".into()),
+            project: "/tmp/project".into(),
+            canonical_project: "/tmp/project".into(),
+            pid: Some(1234),
+            port: Some(8123),
+            base_url: Some("http://127.0.0.1:8123".into()),
+            boot_id: Some("boot".into()),
+            log_path: Some("/tmp/daemon.log".into()),
+            started_at: Some(1),
+            plugin_connected: Some(false),
+            stale: false,
+            externally_managed: false,
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert!(value.get("controlToken").is_none());
+        assert!(value.get("ownerToken").is_none());
+    }
+
+    #[test]
+    fn lifecycle_cli_accepts_env_tokens_and_rejects_duplicate_sources() {
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "daemon",
+            "start",
+            "--project",
+            ".",
+            "--owner-token-env",
+            "ROSYNC_DESKTOP_TOKEN",
+        ])
+        .unwrap();
+        let Some(Command::Daemon(DaemonArgs {
+            command: DaemonCommand::Start(args),
+        })) = cli.command
+        else {
+            panic!("expected daemon start command");
+        };
+        assert_eq!(
+            args.owner_token_env.as_deref(),
+            Some("ROSYNC_DESKTOP_TOKEN")
+        );
+        assert!(args.owner_token.is_none());
+
+        assert!(Cli::try_parse_from([
+            "rosync",
+            "daemon",
+            "start",
+            "--project",
+            ".",
+            "--owner-token",
+            "secret",
+            "--owner-token-env",
+            "ROSYNC_DESKTOP_TOKEN",
+        ])
+        .is_err());
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "serve",
+            "--project",
+            ".",
+            "--managed",
+            "--control-token-env",
+            "ROSYNC_DAEMON_CONTROL_TOKEN",
+        ])
+        .unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert!(args.managed);
+        assert_eq!(
+            args.control_token_env.as_deref(),
+            Some("ROSYNC_DAEMON_CONTROL_TOKEN")
+        );
+        assert!(args.control_token.is_none());
     }
 
     #[test]

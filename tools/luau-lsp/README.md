@@ -25,4 +25,5 @@ this update. Their SHA-256 is
 `08fbcafcf6d17643886d8fe0ec297fc9bfab33d3bf8d96d88b6eefe29f6d5490`
 after normalizing the generated file to one trailing newline.
 Ro Sync still accepts `--luau-lsp` / `ROSYNC_LUAU_LSP` overrides. luau-lsp is
-distributed under its upstream MIT license: <https://github.com/JohnnyMorganz/luau-lsp>.
+distributed under its upstream MIT license; the required notice is bundled as
+[`LICENSE.md`](LICENSE.md). Upstream: <https://github.com/JohnnyMorganz/luau-lsp>.

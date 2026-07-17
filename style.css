@@ -1,21 +1,24 @@
 :root {
-  --bg: #111;
-  --fg: #eee;
-  --muted: #888;
-  --accent: #6cf;
-  --border: #2a2a2a;
-  --surface: #1a1a1a;
-  --surface-2: #222;
-  --danger: #f66;
-  --ok: #6c6;
-  --warn: #fc6;
+  --bg: #0e1116;
+  --fg: #f3f6fb;
+  --muted: #929cab;
+  --accent: #4f8ef7;
+  --accent-hover: #71a6fa;
+  --border: #292f3a;
+  --surface: #151922;
+  --surface-2: #1c222d;
+  --surface-3: #242b37;
+  --danger: #ef6872;
+  --ok: #4bc58a;
+  --warn: #dda64f;
   --radius-xs: 4px;
   --radius-sm: 6px;
   --radius: 10px;
   --radius-lg: 14px;
   --pad: 12px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --display: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
   --ease: cubic-bezier(0.2, 0, 0, 1);
   --shadow-1: 0 1px 1px rgba(0, 0, 0, 0.25), 0 1px 2px rgba(0, 0, 0, 0.15);
   --shadow-2: 0 2px 4px rgba(0, 0, 0, 0.3), 0 4px 12px rgba(0, 0, 0, 0.25);
@@ -23,6 +26,8 @@
     0 1px 0 rgba(255, 255, 255, 0.03) inset,
     0 2px 6px rgba(0, 0, 0, 0.35),
     0 20px 56px rgba(0, 0, 0, 0.6);
+  --shadow-border: 0 0 0 1px rgba(255, 255, 255, 0.075);
+  --shadow-border-hover: 0 0 0 1px rgba(255, 255, 255, 0.13);
 }
 
 * { box-sizing: border-box; }
@@ -41,6 +46,7 @@ body {
 
 p { text-wrap: pretty; }
 h1, h2, h3, h4, h5, h6 { text-wrap: balance; }
+h1, h2, h3 { font-family: var(--display); letter-spacing: -0.018em; }
 
 .app {
   --sidebar-w: 184px;
@@ -54,6 +60,8 @@ h1, h2, h3, h4, h5, h6 { text-wrap: balance; }
   min-height: 0;
 }
 
+.desktop-titlebar { display: none; }
+
 /* -------- Sidebar -------- */
 .sidebar {
   grid-area: side;
@@ -66,6 +74,40 @@ h1, h2, h3, h4, h5, h6 { text-wrap: balance; }
   box-shadow: inset -1px 0 0 var(--border);
   position: relative;
   z-index: 1;
+}
+
+/* The connection rail is Ro Sync's persistent status signature. It makes the
+   Studio link legible in peripheral vision without turning the UI into a
+   dashboard of badges. */
+.sidebar::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  right: -1px;
+  bottom: 10px;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--muted);
+  opacity: 0.34;
+  box-shadow: 0 0 0 transparent;
+  transition:
+    background-color 0.2s var(--ease),
+    opacity 0.2s var(--ease),
+    box-shadow 0.2s var(--ease);
+  pointer-events: none;
+}
+.app[data-connection="ok"] .sidebar::after {
+  background: var(--accent);
+  opacity: 1;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.app[data-connection="warn"] .sidebar::after {
+  background: var(--warn);
+  opacity: 0.82;
+}
+.app[data-connection="err"] .sidebar::after {
+  background: var(--danger);
+  opacity: 0.9;
 }
 
 .sidebar-brand {
@@ -113,13 +155,13 @@ h1, h2, h3, h4, h5, h6 { text-wrap: balance; }
 .sidenav-item:focus-visible {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(102, 204, 255, 0.2);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 .sidenav-item[aria-selected="true"] {
   color: var(--fg);
   background: var(--surface-2);
   border-color: var(--border);
-  box-shadow: inset 0 0 0 1px rgba(102, 204, 255, 0.12);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .sidenav-item[aria-selected="true"] .sidenav-icon { color: var(--accent); }
 .sidenav-icon {
@@ -289,19 +331,19 @@ button:active:not(:disabled) { scale: 0.96; }
 button:focus-visible {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(102, 204, 255, 0.2);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.primary {
   background: var(--accent);
-  color: #001;
+  color: #07111f;
   border-color: var(--accent);
   font-weight: 600;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.25),
     0 1px 2px rgba(0, 0, 0, 0.3);
 }
-button.primary:hover { background: #8df; border-color: #8df; }
+button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 button.danger { color: var(--danger); border-color: var(--danger); }
 button.danger:hover { background: rgba(255, 102, 102, 0.1); }
 
@@ -318,13 +360,13 @@ input[type="text"], input[type="search"], input[type="password"] {
 input:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(102, 204, 255, 0.15);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 input.is-drop-target {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, var(--bg));
   box-shadow:
-    0 0 0 3px rgba(102, 204, 255, 0.18),
+    0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent),
     inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
@@ -660,7 +702,7 @@ input.is-drop-target {
   border-color: var(--accent);
   box-shadow:
     var(--shadow-1),
-    inset 0 0 0 1px rgba(102, 204, 255, 0.15);
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 .project .meta {
   display: flex;
@@ -814,7 +856,7 @@ input.is-drop-target {
 .project-edit textarea:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(102, 204, 255, 0.15);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 .project-wally-block {
   display: flex;
@@ -924,7 +966,7 @@ input.is-drop-target {
   border-color: var(--accent);
   box-shadow:
     var(--shadow-1),
-    inset 0 0 0 1px rgba(102, 204, 255, 0.18);
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 .thumb {
   width: 32px;
@@ -1849,6 +1891,150 @@ input.is-drop-target {
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
+
+/* -------- Packaged desktop host --------
+   The widget keeps its deliberately compact density. The desktop shell gains
+   breathing room, native-size hit targets, and a quiet draggable titlebar
+   without forking the UI or its information architecture. */
+html[data-host="tauri"] body {
+  background:
+    radial-gradient(circle at 78% -20%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 42%),
+    var(--bg);
+  overflow: hidden;
+}
+html[data-host="tauri"] .app {
+  --sidebar-w: 208px;
+  --pad: 20px;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-rows: 46px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "title title"
+    "side  view"
+    "side  status";
+}
+html[data-host="tauri"] .desktop-titlebar {
+  grid-area: title;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 16px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.065);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-app-region: drag;
+}
+html[data-host="tauri"][data-platform="darwin"] .desktop-titlebar,
+html[data-host="tauri"][data-platform="macos"] .desktop-titlebar {
+  padding-left: 78px;
+}
+html[data-host="tauri"] .desktop-titlebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--fg);
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+html[data-host="tauri"] .desktop-titlebar-brand img {
+  width: auto;
+  height: 15px;
+  object-fit: contain;
+  -webkit-user-drag: none;
+}
+html[data-host="tauri"] .desktop-titlebar-context {
+  color: var(--muted);
+  font-size: 11px;
+}
+html[data-host="tauri"] .sidebar {
+  padding: 16px 12px 12px;
+  gap: 14px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+}
+html[data-host="tauri"] .sidebar::after {
+  top: 16px;
+  bottom: 16px;
+  width: 3px;
+}
+html[data-host="tauri"] .sidebar-brand {
+  display: none;
+}
+/* Tauri's overlay titlebar is macOS-only. Windows and Linux retain their
+   native decorated titlebar and keep the Ro Sync identity inside the sidebar,
+   avoiding a duplicate draggable header. */
+html[data-host="tauri"]:not([data-platform="darwin"]):not([data-platform="macos"]) .app {
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "side  view"
+    "side  status";
+}
+html[data-host="tauri"]:not([data-platform="darwin"]):not([data-platform="macos"]) .desktop-titlebar {
+  display: none;
+}
+html[data-host="tauri"]:not([data-platform="darwin"]):not([data-platform="macos"]) .sidebar-brand {
+  display: flex;
+}
+html[data-host="tauri"] .sidenav { gap: 4px; }
+html[data-host="tauri"] .sidenav-item {
+  min-height: 40px;
+  padding: 9px 11px;
+  border-radius: 8px;
+}
+html[data-host="tauri"] .sidenav-item[aria-selected="true"] {
+  background: var(--surface-3);
+  box-shadow:
+    var(--shadow-border),
+    inset 3px 0 0 color-mix(in srgb, var(--accent) 86%, white 6%);
+}
+html[data-host="tauri"] .helpcard {
+  padding: 12px;
+  border: 0;
+  border-radius: 12px;
+  box-shadow: var(--shadow-border);
+}
+html[data-host="tauri"] .view { padding: var(--pad); }
+html[data-host="tauri"] .statusbar {
+  min-height: 32px;
+  padding: 7px var(--pad);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+}
+html[data-host="tauri"] button,
+html[data-host="tauri"] input[type="text"],
+html[data-host="tauri"] input[type="search"],
+html[data-host="tauri"] input[type="password"],
+html[data-host="tauri"] select {
+  min-height: 40px;
+}
+html[data-host="tauri"] button {
+  padding-inline: 13px;
+  border-color: transparent;
+  box-shadow: var(--shadow-border);
+}
+html[data-host="tauri"] button:hover {
+  box-shadow: var(--shadow-border-hover);
+}
+html[data-host="tauri"] button.primary {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 5px 16px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+html[data-host="tauri"] .section,
+html[data-host="tauri"] .project-card,
+html[data-host="tauri"] .ws-detail {
+  border-color: transparent;
+  box-shadow: var(--shadow-border), var(--shadow-1);
+}
+html[data-host="tauri"] .project-card:hover {
+  border-color: transparent;
+  box-shadow: var(--shadow-border-hover), var(--shadow-2);
+}
+html[data-host="tauri"] .page-title { font-size: 20px; }
+html[data-host="tauri"] .page-sub { font-size: 12px; }
+
 .pp-grid select {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1863,7 +2049,7 @@ input.is-drop-target {
 .pp-grid select:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(102, 204, 255, 0.15);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 /* -------- Scrollbars (webkit) -------- */
@@ -1883,6 +2069,7 @@ input.is-drop-target {
     animation-delay: 0ms !important;
     transition-duration: 0.001ms !important;
   }
+  button:active:not(:disabled) { scale: 1; }
 }
 
 /* -------- Responsive: medium (sidebar shrinks, workspace stacks) -------- */

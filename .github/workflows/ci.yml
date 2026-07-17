@@ -28,6 +28,9 @@ jobs:
         working-directory: daemon
         run: cargo fmt --check
 
+      - name: Check desktop Rust formatting
+        run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check
+
       - name: Check Rust lints
         working-directory: daemon
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -137,9 +140,14 @@ jobs:
         run: |
           node --check app.js
           node --check bridge.js
+          node --check lifecycle-policy.js
           node --check platform.js
           node --check scripts/install-luau-compiler.mjs
           for file in views/*.js; do node --check "$file"; done
+          node scripts/check-host-adapter.mjs
+          node scripts/check-lifecycle-policy.mjs
+          node scripts/check-platform-commands.mjs
+          node scripts/check-project-path-policy.mjs
 
       - name: Install plugin build tools
         run: |
@@ -161,7 +169,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -188,3 +196,118 @@ jobs:
       - name: Test daemon
         working-directory: daemon
         run: cargo test --locked --target ${{ matrix.target }}
+
+  desktop:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            sidecar: rosync-darwin-arm64
+            daemon_binary: rosync
+            lsp_asset: luau-lsp-macos.zip
+            lsp_binary: luau-lsp
+            lsp_sha256: e32a71823ee47471d931a03e4186ced2b4c43bb785c8fe05de901fe54c6ebe21
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            sidecar: rosync-windows-x86_64.exe
+            daemon_binary: rosync.exe
+            lsp_asset: luau-lsp-win64.zip
+            lsp_binary: luau-lsp.exe
+            lsp_sha256: 15f2add7c70191c5cd636b047968760f0056893b63be10294453c75430bcb339
+
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      LUAU_LSP_VERSION: "1.68.1"
+      LUAU_LSP_LICENSE_SHA256: 5bf374ce7ab54c8d75f14e21f04932cae10708189afaec95321aed1a47701935
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            daemon -> target
+            desktop/src-tauri -> target
+
+      - name: Build same-commit daemon sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --release \
+            --locked \
+            --manifest-path daemon/Cargo.toml \
+            --target "${{ matrix.target }}"
+          cp \
+            "daemon/target/${{ matrix.target }}/release/${{ matrix.daemon_binary }}" \
+            "daemon/${{ matrix.sidecar }}"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            chmod +x "daemon/${{ matrix.sidecar }}"
+          fi
+
+      - name: Install checksum-pinned Luau compiler
+        run: node scripts/install-luau-compiler.mjs --target ${{ matrix.platform }}
+
+      - name: Install checksum-pinned luau-lsp
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/${{ matrix.lsp_asset }}"
+          extract_dir="$RUNNER_TEMP/luau-lsp"
+          destination="tools/luau-lsp/${{ matrix.platform }}/${{ matrix.lsp_binary }}"
+          license="tools/luau-lsp/LICENSE.md"
+          curl --fail --location --retry 3 \
+            "https://github.com/JohnnyMorganz/luau-lsp/releases/download/$LUAU_LSP_VERSION/${{ matrix.lsp_asset }}" \
+            --output "$archive"
+          curl --fail --location --retry 3 \
+            "https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/$LUAU_LSP_VERSION/LICENSE.md" \
+            --output "$license"
+          LSP_ARCHIVE="$archive" LSP_SHA256="${{ matrix.lsp_sha256 }}" \
+            LSP_LICENSE="$license" node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            function verify(file, expected, label) {
+              const actual = crypto.createHash("sha256")
+                .update(fs.readFileSync(file)).digest("hex");
+              if (actual !== expected) throw new Error(`${label} SHA-256 mismatch: ${actual}`);
+            }
+            verify(process.env.LSP_ARCHIVE, process.env.LSP_SHA256, "luau-lsp archive");
+            verify(process.env.LSP_LICENSE, process.env.LUAU_LSP_LICENSE_SHA256, "luau-lsp license");
+          '
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir" "$(dirname "$destination")"
+          unzip -q "$archive" -d "$extract_dir"
+          executable="$(find "$extract_dir" -type f -name '${{ matrix.lsp_binary }}' -print -quit)"
+          test -n "$executable"
+          cp "$executable" "$destination"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then chmod +x "$destination"; fi
+          "$destination" --version | grep -F "$LUAU_LSP_VERSION"
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Test desktop native host
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Prepare and compile desktop application
+        working-directory: desktop
+        run: npm run build -- --target ${{ matrix.target }} --no-bundle --ci --no-sign

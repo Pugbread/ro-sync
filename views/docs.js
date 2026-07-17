@@ -160,8 +160,7 @@ async function loadDocs(api) {
     if (res.ok) return await res.json();
   } catch {}
 
-  const res = await api.t64("t64:read-file", { path: "{widgetDir}/" + DOCS_BUNDLE_REL });
-  const text = (res && (res.content || res.text || res.data)) ?? (typeof res === "string" ? res : null);
+  const text = await api.host.readResourceText(DOCS_BUNDLE_REL);
   if (!text) throw new Error("empty docs bundle");
   return JSON.parse(text);
 }

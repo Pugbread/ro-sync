@@ -3,10 +3,8 @@
 import {
   PLATFORM, IS_WINDOWS,
   BINARY_REL, WIDGET_DIR_SHELL,
-  PLUGIN_DIR_DISPLAY, PLUGIN_DIR_SHELL,
-  pluginInstallCmd, openFolderEnsuredCmd,
-  writeFileFromB64Cmd, readFileCmd,
-  checkBinaryCmd, checkCargoCmd, buildDaemonCmd, parseBuildOutput,
+  PLUGIN_DIR_DISPLAY,
+  parseBuildOutput,
   joinShell,
 } from "../platform.js";
 import { daemonJson } from "../bridge.js";
@@ -17,41 +15,24 @@ const RUSTUP_URL   = "https://rustup.rs";
 
 const DEFAULT_PORT = 7878;
 const EXPECTED_PLUGIN_PROTOCOL = 2;
-const PLUGIN_REL = "plugin/Plugin.rbxm";
 const PLUGIN_SOURCE_REL = "plugin/Plugin.luau";
-const SECRETS_STATE_KEY = "secrets";
 
-// Write arbitrary text to a path via base64 round-trip. Avoids quoting
-// headaches for JSON payloads containing newlines/quotes/unicode.
 async function writeFileViaExec(api, absPath, text) {
-  const b64 = btoa(unescape(encodeURIComponent(text)));
-  return api.t64("t64:exec", { command: writeFileFromB64Cmd(absPath, b64) });
+  return api.host.writeTextFile(absPath, text);
 }
 
 async function readFileViaExec(api, absPath) {
-  const res = await api.t64("t64:exec", { command: readFileCmd(absPath) });
-  return (res && typeof res.stdout === "string") ? res.stdout : "";
-}
-
-async function loadSecrets(api) {
-  try {
-    const res = await api.t64("t64:get-state", { key: SECRETS_STATE_KEY });
-    const value = res && typeof res === "object" ? res.value : null;
-    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  } catch {
-    return {};
-  }
-}
-
-async function saveSecrets(api, secrets) {
-  await api.t64("t64:set-state", { key: SECRETS_STATE_KEY, value: secrets });
+  return api.host.readTextFile(absPath);
 }
 
 export function mountSettings(root, api) {
+  const desktop = api.host.isDesktop;
   root.innerHTML = `
     <section class="section">
       <h3>Secrets</h3>
-      <p style="color:var(--muted)">Stored in Terminal 64 widget state, not in <code>ro-sync.json</code>. Use this for upload/API credentials.</p>
+      <p id="secret-storage-hint" style="color:var(--muted)">${desktop
+        ? "Stored in the system credential vault when available, with a private mode-0600 Ro Sync credential file for CLI access or fallback; never in <code>ro-sync.json</code>."
+        : "Stored in Terminal 64 widget state, not in <code>ro-sync.json</code>."} Use this for upload/API credentials.</p>
       <div class="secret-grid">
         <label>Roblox Open Cloud API key
           <div class="secret-input-row">
@@ -110,26 +91,28 @@ export function mountSettings(root, api) {
     </section>
 
     <section class="section" id="sec-build">
-      <h3>Daemon and lint compiler</h3>
+      <h3>${desktop ? "Managed runtime" : "Daemon and lint compiler"}</h3>
       <p id="build-status" style="color:var(--warn)">Checking…</p>
       <pre id="build-log" class="build-log" hidden
         style="max-height:240px; overflow:auto; padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:4px; font-size:12px; white-space:pre-wrap; word-break:break-all;"></pre>
       <div class="row">
         <button id="build-run" class="primary" hidden>Build now</button>
         <a id="build-releases" href="${RELEASES_URL}" target="_blank" rel="noopener noreferrer">
-          <button type="button">Download release bundle</button>
+          <button type="button">${desktop ? "View releases" : "Download release bundle"}</button>
         </a>
         <a id="build-rustup" href="${RUSTUP_URL}" target="_blank" rel="noopener noreferrer" hidden>
           <button type="button">Install Rust</button>
         </a>
       </div>
       <p style="color:var(--muted); margin-top:8px">
-        Use <b>Build now</b> when the daemon is missing, or <b>Rebuild now</b>
-        after updating Ro Sync. The build also attempts to install the pinned
-        Luau compiler used by deep lint checks. Alternatively, extract your
-        platform's pre-built release bundle at
-        <code id="build-dir-hint">—</code>; it contains both tools in their
-        expected folders.
+        ${desktop
+          ? `The desktop app keeps its daemon, lint compiler, and Studio plugin on the same release. Runtime files live under <code id="build-dir-hint">—</code>.`
+          : `Use <b>Build now</b> when the daemon is missing, or <b>Rebuild now</b>
+            after updating Ro Sync. The build also attempts to install the pinned
+            Luau compiler used by deep lint checks. Alternatively, extract your
+            platform's pre-built release bundle at
+            <code id="build-dir-hint">—</code>; it contains both tools in their
+            expected folders.`}
       </p>
     </section>
 
@@ -154,6 +137,7 @@ export function mountSettings(root, api) {
     <section class="section">
       <h3>About</h3>
       <p>Ro Sync — zero-config two-way sync between Roblox Studio and your filesystem.</p>
+      <p style="color:var(--muted)">Host: <span id="set-host">${desktop ? "Desktop app" : "Terminal 64 widget"}</span></p>
       <p style="color:var(--muted)">Platform: <span id="set-platform">—</span></p>
     </section>
   `;
@@ -181,6 +165,7 @@ export function mountSettings(root, api) {
   const $buildStatus  = root.querySelector("#build-status");
   const $buildLog     = root.querySelector("#build-log");
   const $buildRun     = root.querySelector("#build-run");
+  const $buildReleases = root.querySelector("#build-releases");
   const $buildRustup  = root.querySelector("#build-rustup");
   const $buildDirHint = root.querySelector("#build-dir-hint");
 
@@ -192,21 +177,18 @@ export function mountSettings(root, api) {
   const $ppSave = root.querySelector("#pp-save");
   const $ppReset = root.querySelector("#pp-reset");
   const $ppMsg = root.querySelector("#pp-msg");
+  if (desktop) $buildReleases.hidden = true;
 
   // --- Binary / build management ---
-  async function execStdout(cmd) {
+  let runtimeInfo = null;
+
+  async function loadRuntimeInfo() {
     try {
-      const res = await api.t64("t64:exec", { command: cmd });
-      return (res && typeof res.stdout === "string") ? res.stdout.trim() : "";
-    } catch { return ""; }
-  }
-
-  async function checkBinary() {
-    return (await execStdout(checkBinaryCmd())).toLowerCase() === "yes";
-  }
-
-  async function checkCargo() {
-    return (await execStdout(checkCargoCmd())).toLowerCase() === "yes";
+      runtimeInfo = await api.host.appInfo();
+    } catch {
+      runtimeInfo = null;
+    }
+    return runtimeInfo;
   }
 
   async function readDaemonHello() {
@@ -222,24 +204,36 @@ export function mountSettings(root, api) {
   let buildRunning = false;
   async function refreshBuildBanner() {
     if (buildRunning) return;
-    $buildDirHint.textContent = WIDGET_DIR_SHELL;
+    await loadRuntimeInfo();
+    $buildDirHint.textContent = desktop
+      ? (runtimeInfo?.resourceDir || runtimeInfo?.dataDir || "the Ro Sync app bundle")
+      : WIDGET_DIR_SHELL;
     $buildSection.hidden = false;
     $buildLog.hidden = true;
     $buildLog.textContent = "";
-    const [have, hasCargo, hello] = await Promise.all([
-      checkBinary(),
-      checkCargo(),
+    const [binary, hello] = await Promise.all([
+      api.host.binaryStatus().catch(() => ({ present: false, cargo: false })),
       readDaemonHello(),
     ]);
+    const have = !!binary.present;
+    const hasCargo = !!binary.cargo;
     const protocol = hello && hello.pluginProtocol != null
       ? Number(hello.pluginProtocol)
       : Number.NaN;
     $protocol.textContent = Number.isFinite(protocol) ? String(protocol) : (hello ? "legacy / missing" : "—");
     $buildRun.textContent = have ? "Rebuild now" : "Build now";
-    $buildRun.hidden = !hasCargo;
-    $buildRustup.hidden = hasCargo;
+    $buildRun.hidden = desktop || !hasCargo;
+    $buildRustup.hidden = desktop || hasCargo;
 
-    if (!have && hasCargo) {
+    if (desktop && hello && protocol !== EXPECTED_PLUGIN_PROTOCOL) {
+      $buildStatus.textContent =
+        `The managed runtime is ready, but Studio is using protocol ${Number.isFinite(protocol) ? protocol : "legacy / missing"}. ` +
+        `Reinstall the Studio plugin below and restart Studio.`;
+    } else if (desktop && hello) {
+      $buildStatus.textContent = `Managed runtime connected · protocol ${protocol}`;
+    } else if (desktop) {
+      $buildStatus.textContent = "Managed runtime is bundled with Ro Sync and starts when a project is served.";
+    } else if (!have && hasCargo) {
       $buildStatus.textContent = "Daemon binary not found. Click “Build now” to compile it (~1-2 minutes).";
     } else if (!have) {
       $buildStatus.textContent =
@@ -276,10 +270,7 @@ export function mountSettings(root, api) {
       }
       // cargo build --release can take 1-2 minutes (cold cache). Override the
       // bridge's default 30s timeout so the promise doesn't reject early.
-      const res = await api.t64("t64:exec", {
-        command: buildDaemonCmd(),
-        timeoutMs: 5 * 60_000,
-      });
+      const res = await api.host.buildDaemon({ timeoutMs: 5 * 60_000 });
       const out = (res && typeof res.stdout === "string" ? res.stdout : "")
         + (res && typeof res.stderr === "string" && res.stderr ? "\n" + res.stderr : "");
       const { ok, code, log } = parseBuildOutput(out);
@@ -307,17 +298,19 @@ export function mountSettings(root, api) {
 
   $buildRun.addEventListener("click", runBuild);
 
-  let secrets = {};
+  let savedRobloxKey = "";
   let secretInputDirty = false;
   $secretSave.disabled = true;
   $secretClear.disabled = true;
 
   async function hydrateSecrets() {
-    secrets = await loadSecrets(api);
-    if (!secretInputDirty) {
-      $secretRobloxKey.value = secrets.robloxCloudApiKey || "";
+    try {
+      savedRobloxKey = String(await api.host.secretGet("robloxCloudApiKey") || "");
+    } catch {
+      savedRobloxKey = "";
     }
-    $secretMsg.textContent = secrets.robloxCloudApiKey ? "Roblox key saved." : "No Roblox key saved.";
+    if (!secretInputDirty) $secretRobloxKey.value = savedRobloxKey;
+    $secretMsg.textContent = savedRobloxKey ? "Roblox key saved." : "No Roblox key saved.";
     $secretSave.disabled = false;
     $secretClear.disabled = false;
   }
@@ -326,12 +319,9 @@ export function mountSettings(root, api) {
     $secretSave.disabled = true;
     try {
       const value = $secretRobloxKey.value.trim();
-      secrets = {
-        ...secrets,
-        robloxCloudApiKey: value,
-        robloxCloudApiKeyUpdatedAt: value ? Date.now() : null,
-      };
-      await saveSecrets(api, secrets);
+      if (value) await api.host.secretSet("robloxCloudApiKey", value);
+      else await api.host.secretDelete("robloxCloudApiKey");
+      savedRobloxKey = value;
       secretInputDirty = false;
       $secretMsg.textContent = value ? "Roblox key saved." : "Roblox key cleared.";
       api.toast(value ? "Secrets saved" : "Secret cleared");
@@ -371,9 +361,11 @@ export function mountSettings(root, api) {
   function refresh() {
     const s = api.getState();
     const base = api.getDaemonBase();
-    $bin.textContent = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
+    $bin.textContent = desktop
+      ? (runtimeInfo?.daemonPath || "Bundled with desktop app")
+      : joinShell(WIDGET_DIR_SHELL, BINARY_REL);
     const $plat = root.querySelector("#set-platform");
-    if ($plat) $plat.textContent = platformLabel(PLATFORM);
+    if ($plat) $plat.textContent = platformLabel(runtimeInfo?.platform || PLATFORM);
     $port.textContent = s.daemonPort ?? DEFAULT_PORT;
     $pid.textContent = s.daemonPid ?? "—";
     $base.textContent = base || "—";
@@ -443,19 +435,9 @@ export function mountSettings(root, api) {
   $ppReset.addEventListener("click", resetProjectSettings);
 
   async function readPluginFile() {
-    try {
-      const res = await api.t64("t64:read-file", { path: "{widgetDir}/" + PLUGIN_SOURCE_REL });
-      const text = (res && (res.content || res.text || res.data)) ?? (typeof res === "string" ? res : null);
-      if (!text) throw new Error("empty");
-      return text;
-    } catch (e) {
-      // Fallback: fetch relative to the widget's own origin.
-      try {
-        const r = await fetch(PLUGIN_SOURCE_REL);
-        if (r.ok) return await r.text();
-      } catch {}
-      throw e;
-    }
+    const text = await api.host.readResourceText(PLUGIN_SOURCE_REL);
+    if (!text) throw new Error("empty plugin source");
+    return text;
   }
 
   $copy.addEventListener("click", async () => {
@@ -465,39 +447,26 @@ export function mountSettings(root, api) {
       $pluginMsg.textContent = `Copied ${text.length} chars to clipboard.`;
       api.toast("Plugin.luau copied");
     } catch (e) {
-      // Fallback via host.
-      try {
-        await api.t64("t64:clipboard-write", { path: "{widgetDir}/" + PLUGIN_SOURCE_REL });
-        api.toast("Plugin.luau copied");
-        $pluginMsg.textContent = "Copied via host.";
-      } catch (e2) {
-        $pluginMsg.textContent = `Copy failed: ${e.message}`;
-      }
+      $pluginMsg.textContent = `Copy failed: ${e.message}`;
     }
   });
 
   $install.addEventListener("click", async () => {
-    const command = pluginInstallCmd({
-      srcFile:   joinShell(WIDGET_DIR_SHELL, PLUGIN_REL),
-      destDir:   PLUGIN_DIR_SHELL,
-      destName:  "RoSync.rbxm",
-      staleNames: ["RoSync.lua", "RoSync.luau"],
-    });
     try {
-      const res = await api.t64("t64:exec", { command });
-      if (res && res.code !== 0 && res.code != null) {
-        throw new Error(res.stderr?.trim() || `exit ${res.code}`);
-      }
+      const result = await api.host.pluginInstall();
       api.toast("Installed");
       const hello = await readDaemonHello();
       const protocol = hello && hello.pluginProtocol != null
         ? Number(hello.pluginProtocol)
         : Number.NaN;
       const daemonHint = hello && protocol !== EXPECTED_PLUGIN_PROTOCOL
-        ? ` Daemon protocol ${Number.isFinite(protocol) ? protocol : "legacy / missing"} is incompatible; rebuild it below.`
+        ? (desktop
+          ? ` Studio protocol ${Number.isFinite(protocol) ? protocol : "legacy / missing"} is incompatible; restart Studio after installing.`
+          : ` Daemon protocol ${Number.isFinite(protocol) ? protocol : "legacy / missing"} is incompatible; rebuild it below.`)
         : "";
+      const installPath = result?.path || joinShell(PLUGIN_DIR_DISPLAY, "RoSync.rbxm");
       $pluginMsg.textContent =
-        `Installed to ${joinShell(PLUGIN_DIR_DISPLAY, "RoSync.rbxm")} — restart Studio.${daemonHint}`;
+        `Installed to ${installPath} — restart Studio.${daemonHint}`;
       await refreshBuildBanner();
     } catch (e) {
       $pluginMsg.textContent = `Install failed: ${e.message}`;
@@ -505,12 +474,12 @@ export function mountSettings(root, api) {
   });
 
   $openFolder.addEventListener("click", async () => {
-    const command = openFolderEnsuredCmd(PLUGIN_DIR_SHELL);
     try {
-      const res = await api.t64("t64:exec", { command });
-      if (res && res.code !== 0 && res.code != null) {
-        throw new Error(res.stderr?.trim() || `exit ${res.code}`);
-      }
+      await loadRuntimeInfo();
+      const pluginDir = runtimeInfo?.pluginDir
+        || parentPath(runtimeInfo?.pluginPath)
+        || PLUGIN_DIR_DISPLAY;
+      await api.host.openPath(pluginDir);
     } catch (e) {
       api.toast(`open failed: ${e.message}`);
     }
@@ -536,8 +505,14 @@ export function mountSettings(root, api) {
   const offDown = api.onBus("daemon:down", () => { refresh(); refreshBuildBanner(); });
 
   refresh();
-  refreshBuildBanner();
+  refreshBuildBanner().then(refresh);
   hydrateSecrets();
 
   return () => { offState(); offUp(); offDown(); };
+}
+
+function parentPath(path) {
+  const value = String(path || "").replace(/[\\/]+$/, "");
+  const index = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+  return index > 0 ? value.slice(0, index) : "";
 }

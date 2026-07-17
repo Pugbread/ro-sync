@@ -1,0 +1,15 @@
+{
+  "name": "init",
+  "title": "rosync init",
+  "category": "Project setup",
+  "description": "Initializes a directory as a Ro Sync project and writes the config, agent context, and local Luau tooling files without starting a daemon.",
+  "usage": "rosync init --project <path> [--name <name>] [--game-id <id>] [--group-id <id>] [--place-id <id>...] [--raw]",
+  "examples": [
+    "rosync init --project .",
+    "rosync init --project ./game --game-id 123 --group-id 456 --place-id 789 --raw"
+  ],
+  "notes": [
+    "Existing custom project files are preserved or merged by the same guarded writers used by rosync refresh.",
+    "This command never starts a background process."
+  ]
+}

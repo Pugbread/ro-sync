@@ -1350,6 +1350,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "png",

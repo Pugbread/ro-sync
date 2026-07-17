@@ -1,6 +1,33 @@
-// bridge.js — minimal postMessage + SSE helpers for the Ro Sync widget.
+// bridge.js — shared host adapter plus daemon transport helpers.
+//
+// The same renderer runs in two hosts:
+//   - Terminal 64, via the existing postMessage RPC protocol
+//   - the packaged Tauri app, via a deliberately narrow invoke surface
+//
+// Keep host-specific privileges in this file. Views consume `host` methods and
+// never receive a raw shell primitive.
+
+import {
+  PLATFORM,
+  BINARY_REL,
+  WIDGET_DIR_SHELL,
+  PLUGIN_DIR_DISPLAY,
+  PLUGIN_DIR_SHELL,
+  buildDaemonCmd,
+  checkBinaryCmd,
+  checkCargoCmd,
+  openFolderEnsuredCmd,
+  pickFolderCmd,
+  pluginInstallCmd,
+  readFileCmd,
+  secureWidgetStateCmd,
+  wallyInstallCmd,
+  writeFileFromB64Cmd,
+  joinShell,
+} from "./platform.js";
 //
 // Exports:
+//   host                         narrow cross-host native capability adapter
 //   t64(type, payload) -> Promise<any>     postMessage RPC to the T64 host
 //   onT64(type, fn)    -> unsubscribe      subscribe to host-pushed events
 //   daemonFetch(base, path, init) -> Promise<Response>
@@ -14,6 +41,47 @@
 const pending = new Map();          // id -> {resolve, reject, timer}
 const listeners = new Map();        // t64 event type -> Set<fn>
 let daemonAuthToken = null;
+
+function findTauriInvoke() {
+  const globalApi = globalThis.__TAURI__;
+  if (globalApi && globalApi.core && typeof globalApi.core.invoke === "function") {
+    return globalApi.core.invoke.bind(globalApi.core);
+  }
+  return null;
+}
+
+const tauriInvoke = findTauriInvoke();
+export const HOST_KIND = tauriInvoke ? "tauri" : "terminal64";
+export const IS_DESKTOP_HOST = HOST_KIND === "tauri";
+
+async function invokeDesktop(command, args = {}) {
+  if (!tauriInvoke) throw new Error(`${command} is only available in the desktop app`);
+  try {
+    return await tauriInvoke(command, args);
+  } catch (error) {
+    const message = typeof error === "string"
+      ? error
+      : (error && error.message) || String(error);
+    throw new Error(message);
+  }
+}
+
+function unwrapValue(value) {
+  if (value && typeof value === "object" && Object.hasOwn(value, "value")) {
+    return value.value;
+  }
+  return value;
+}
+
+function unwrapText(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  return value.content ?? value.text ?? value.data ?? value.stdout ?? "";
+}
+
+function encodeTextBase64(value) {
+  return btoa(unescape(encodeURIComponent(String(value))));
+}
 
 function nextId() {
   return "r" + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -56,6 +124,197 @@ export function t64(type, payload = {}) {
   setStateQueue = result.catch(() => {});
   return result;
 }
+
+async function widgetExec(command, options = {}) {
+  if (IS_DESKTOP_HOST) throw new Error("raw shell execution is unavailable in the desktop app");
+  return t64("t64:exec", { command, ...options });
+}
+
+/**
+ * Privileged host operations used by the shared renderer.
+ *
+ * Terminal 64 implementations preserve the established RPC/command behavior.
+ * Tauri implementations map one-to-one to allowlisted native commands; there
+ * is intentionally no `exec` method on this public object.
+ */
+export const host = Object.freeze({
+  kind: HOST_KIND,
+  isDesktop: IS_DESKTOP_HOST,
+  supports: Object.freeze({
+    buildDaemon: !IS_DESKTOP_HOST,
+    spawnSession: !IS_DESKTOP_HOST,
+    hostTheme: !IS_DESKTOP_HOST,
+  }),
+
+  async appInfo() {
+    if (IS_DESKTOP_HOST) {
+      return (await invokeDesktop("app_info")) || { kind: "tauri", platform: PLATFORM };
+    }
+    return {
+      kind: "terminal64",
+      platform: PLATFORM,
+      widgetDir: WIDGET_DIR_SHELL,
+      daemonPath: joinShell(WIDGET_DIR_SHELL, BINARY_REL),
+      pluginDir: PLUGIN_DIR_DISPLAY,
+    };
+  },
+
+  async stateGet(key) {
+    if (IS_DESKTOP_HOST) return unwrapValue(await invokeDesktop("state_get", { key }));
+    return unwrapValue(await t64("t64:get-state", { key }));
+  },
+
+  async stateSet(key, value) {
+    if (IS_DESKTOP_HOST) return invokeDesktop("state_set", { key, value });
+    const result = await t64("t64:set-state", { key, value });
+    if (PLATFORM !== "windows") {
+      const secured = await widgetExec(secureWidgetStateCmd());
+      if (secured && secured.code != null && secured.code !== 0) {
+        throw new Error("Terminal 64 state was saved but could not be restricted to mode 0600");
+      }
+    }
+    return result;
+  },
+
+  async secretGet(key) {
+    if (IS_DESKTOP_HOST) return unwrapValue(await invokeDesktop("secret_get", { key }));
+    const secrets = await this.stateGet("secrets");
+    return secrets && typeof secrets === "object" ? (secrets[key] ?? null) : null;
+  },
+
+  async secretSet(key, value) {
+    if (IS_DESKTOP_HOST) return invokeDesktop("secret_set", { key, value });
+    const current = await this.stateGet("secrets");
+    const secrets = current && typeof current === "object" && !Array.isArray(current)
+      ? { ...current }
+      : {};
+    secrets[key] = value;
+    return this.stateSet("secrets", secrets);
+  },
+
+  async secretDelete(key) {
+    if (IS_DESKTOP_HOST) return invokeDesktop("secret_delete", { key });
+    const current = await this.stateGet("secrets");
+    const secrets = current && typeof current === "object" && !Array.isArray(current)
+      ? { ...current }
+      : {};
+    delete secrets[key];
+    return this.stateSet("secrets", secrets);
+  },
+
+  async readTextFile(path) {
+    if (IS_DESKTOP_HOST) return unwrapText(await invokeDesktop("read_project_file", { path }));
+    return unwrapText(await widgetExec(readFileCmd(path)));
+  },
+
+  async writeTextFile(path, text) {
+    if (IS_DESKTOP_HOST) {
+      return invokeDesktop("write_project_file", { path, content: String(text) });
+    }
+    return widgetExec(writeFileFromB64Cmd(path, encodeTextBase64(text)));
+  },
+
+  async readResourceText(path) {
+    try {
+      const response = await fetch(path);
+      if (response.ok) return await response.text();
+    } catch {}
+    if (IS_DESKTOP_HOST) {
+      return unwrapText(await invokeDesktop("read_resource_file", { path }));
+    }
+    return unwrapText(await t64("t64:read-file", { path: `{widgetDir}/${path}` }));
+  },
+
+  async pickFolder(prompt = "Pick a folder") {
+    if (IS_DESKTOP_HOST) return unwrapValue(await invokeDesktop("pick_folder", { prompt }));
+    const result = await widgetExec(pickFolderCmd(prompt));
+    return unwrapText(result).replace(/^﻿/, "").trim() || null;
+  },
+
+  async openPath(path) {
+    if (IS_DESKTOP_HOST) return invokeDesktop("open_path", { path });
+    return widgetExec(openFolderEnsuredCmd(path));
+  },
+
+  async clipboardWrite(text) {
+    if (IS_DESKTOP_HOST) return invokeDesktop("clipboard_write", { text: String(text) });
+    return t64("t64:clipboard-write", { text: String(text), timeoutMs: 5000 });
+  },
+
+  async pluginInstall() {
+    if (IS_DESKTOP_HOST) return invokeDesktop("plugin_install");
+    const command = pluginInstallCmd({
+      srcFile: joinShell(WIDGET_DIR_SHELL, "plugin/Plugin.rbxm"),
+      destDir: PLUGIN_DIR_SHELL,
+      destName: "RoSync.rbxm",
+      staleNames: ["RoSync.lua", "RoSync.luau"],
+    });
+    const result = await widgetExec(command);
+    if (result && result.code != null && result.code !== 0) {
+      throw new Error(result.stderr?.trim() || `plugin install exited ${result.code}`);
+    }
+    return { ok: true, path: joinShell(PLUGIN_DIR_DISPLAY, "RoSync.rbxm"), restartRequired: true };
+  },
+
+  async binaryStatus() {
+    if (IS_DESKTOP_HOST) {
+      const info = await this.appInfo();
+      return { present: !!info.daemonPath, cargo: false, bundled: true, path: info.daemonPath || null };
+    }
+    const [binary, cargo] = await Promise.all([
+      widgetExec(checkBinaryCmd()),
+      widgetExec(checkCargoCmd()),
+    ]);
+    return {
+      present: unwrapText(binary).trim().toLowerCase() === "yes",
+      cargo: unwrapText(cargo).trim().toLowerCase() === "yes",
+      bundled: false,
+      path: joinShell(WIDGET_DIR_SHELL, BINARY_REL),
+    };
+  },
+
+  async buildDaemon(options = {}) {
+    if (IS_DESKTOP_HOST) throw new Error("The desktop app ships with a managed daemon");
+    return widgetExec(buildDaemonCmd(), { timeoutMs: options.timeoutMs ?? 5 * 60_000 });
+  },
+
+  async wallyInstall(cwd) {
+    if (IS_DESKTOP_HOST) return invokeDesktop("wally_install", { cwd });
+    return widgetExec(wallyInstallCmd(cwd), { timeoutMs: 2 * 60_000 });
+  },
+
+  async windowBounds() {
+    if (IS_DESKTOP_HOST) return null;
+    return t64("t64:get-bounds", { timeoutMs: 1000 });
+  },
+
+  async createSession(payload) {
+    if (IS_DESKTOP_HOST) return { supported: false };
+    return t64("t64:create-session", { ...payload, timeoutMs: 10_000 });
+  },
+
+  async daemonEnsure(spec) {
+    return invokeDesktop("daemon_ensure", {
+      spec: {
+        project: spec.project,
+        preferredPort: spec.preferredPort,
+        gameId: spec.gameId ?? null,
+        groupId: spec.groupId ?? null,
+        placeIds: Array.isArray(spec.placeIds) ? spec.placeIds : [],
+        ownerToken: spec.ownerToken ?? null,
+      },
+    });
+  },
+
+  async daemonStatus(project = null) {
+    return invokeDesktop("daemon_status", { project });
+  },
+
+  ready() {
+    if (IS_DESKTOP_HOST) return Promise.resolve({ ok: true });
+    return t64("t64:ready", { app: "ro-sync", version: 1 });
+  },
+});
 
 export function onT64(type, fn) {
   let set = listeners.get(type);

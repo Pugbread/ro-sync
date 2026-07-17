@@ -2,16 +2,6 @@
 // per-project controls, and a throttled activity tail for the served project.
 import { daemonJson, daemonWS } from "../bridge.js";
 import { copyText, joinProjectFile, pathFromDrop } from "./runtime.js";
-import {
-  pickFolderCmd,
-  openFolderEnsuredCmd,
-  writeFileFromB64Cmd,
-  readFileCmd,
-  shQuote,
-  psEncodedCmd,
-  psQuote,
-  IS_WINDOWS,
-} from "../platform.js";
 
 const MAX_PROJECT_LOG_LINES = 100;
 const MAX_PROJECT_PARSED_OPS_PER_SECOND = 20;
@@ -67,6 +57,9 @@ export function mountProjects(root, api) {
           <input id="proj-path" class="path-input" type="text" placeholder="/absolute/path/to/project" spellcheck="false" />
           <button id="proj-pick" type="button" title="Pick folder">Browse…</button>
         </div>
+        <div id="proj-path-hint" class="project-hint" hidden>
+          Desktop projects must be chosen with Browse so Ro Sync can authorize that folder.
+        </div>
         <div class="row">
           <input id="proj-game-id" type="text" placeholder="Game ID (optional)" spellcheck="false" inputmode="numeric" />
           <input id="proj-group-id" type="text" placeholder="Group ID (optional)" spellcheck="false" inputmode="numeric" />
@@ -117,6 +110,7 @@ export function mountProjects(root, api) {
   const $toggleAdd = root.querySelector("#proj-toggle-add");
   const $cancelAdd = root.querySelector("#proj-cancel-add");
   const $path = root.querySelector("#proj-path");
+  const $pathHint = root.querySelector("#proj-path-hint");
   const $pick = root.querySelector("#proj-pick");
   const $add = root.querySelector("#proj-add");
   const $gameId = root.querySelector("#proj-game-id");
@@ -149,7 +143,15 @@ export function mountProjects(root, api) {
   let activityErrorCount = 0;
   let lastActivityErrorAt = 0;
   let disposed = false;
+  let authorizedDesktopPath = "";
   const activityFrames = [];
+
+  if (api.host.isDesktop) {
+    $path.readOnly = true;
+    $path.placeholder = "Choose a project folder with Browse…";
+    $path.title = "Desktop project folders must be authorized with Browse";
+    $pathHint.hidden = false;
+  }
 
   function parsePlaceIds(raw) {
     if (!raw) return [];
@@ -305,7 +307,7 @@ export function mountProjects(root, api) {
             ${lastSyncLabel ? `<span class="muted-sm">${escapeHTML(lastSyncLabel)}</span>` : ""}
           </div>
         </div>
-        <button class="detail-icon-btn" data-act="spawn-session" type="button" title="Spawn Session" aria-label="Spawn Session">${sessionSVG()}<span>Spawn Session</span></button>
+        ${api.host.supports.spawnSession ? `<button class="detail-icon-btn" data-act="spawn-session" type="button" title="Spawn Session" aria-label="Spawn Session">${sessionSVG()}<span>Spawn Session</span></button>` : ""}
         <button class="detail-icon-btn" data-act="edit" type="button" title="Edit project" aria-label="Edit project">${editSVG()}<span>Edit</span></button>
       </div>
       <div class="project-log-shell">
@@ -322,7 +324,7 @@ export function mountProjects(root, api) {
     $detail.querySelector('[data-act="back"]').addEventListener("click", () => {
       $workspace.dataset.mode = "list";
     });
-    $detail.querySelector('[data-act="spawn-session"]').addEventListener("click", () => {
+    $detail.querySelector('[data-act="spawn-session"]')?.addEventListener("click", () => {
       spawnSession(p);
     });
     $detail.querySelector('[data-act="edit"]').addEventListener("click", () => {
@@ -344,7 +346,7 @@ export function mountProjects(root, api) {
     const wallyEnabled = !!p.wallyEnabled;
     const wallyFolder = p.wallyFolder || (wallyEnabled ? DEFAULT_WALLY_FOLDER : "");
     const wallyFile = p.wallyFile || DEFAULT_WALLY_FILE;
-    const wallyTomlPath = wallyTomlPathForFolder(p.path, wallyFolder || DEFAULT_WALLY_FOLDER);
+    const wallyTargetLabel = wallyTomlPathPreview(p.path, wallyFolder || DEFAULT_WALLY_FOLDER);
 
     $detail.innerHTML = `
       <div class="detail-head">
@@ -395,7 +397,7 @@ export function mountProjects(root, api) {
                 <label>Wally File
                   <textarea data-field="wallyFile" spellcheck="false" rows="16"></textarea>
                 </label>
-                <div class="project-hint" data-wally-target>Writes to ${escapeHTML(wallyTomlPath)}</div>
+                <div class="project-hint" data-wally-target>${escapeHTML(wallyTargetLabel)}</div>
                 <div class="project-wally-actions">
                   <button data-act="wally-install" type="button">Wally Install</button>
                   <span class="project-hint" data-wally-install-status></span>
@@ -444,8 +446,10 @@ export function mountProjects(root, api) {
     function refreshWallySettings() {
       const enabled = $wallyEnabled.checked;
       $wallySettings.hidden = !enabled;
-      const folder = normalizeStudioPath($wallyFolder.value || DEFAULT_WALLY_FOLDER);
-      $wallyTarget.textContent = `Writes to ${wallyTomlPathForFolder(p.path, folder)}`;
+      $wallyTarget.textContent = wallyTomlPathPreview(
+        p.path,
+        $wallyFolder.value,
+      );
     }
     $wallyEnabled.addEventListener("change", refreshWallySettings);
     $wallyFolder.addEventListener("input", refreshWallySettings);
@@ -469,14 +473,14 @@ export function mountProjects(root, api) {
         groupId: $group.value.trim(),
         placeIds: parsePlaceIds($pl.value),
         wallyEnabled: $wallyEnabled.checked,
-        wallyFolder: normalizeStudioPath($wallyFolder.value),
+        wallyFolder: $wallyFolder.value,
         wallyFile: $wallyFile.value,
       });
     });
     $wallyInstall.addEventListener("click", () => {
       installWallyFromEdit(p, {
         enabled: $wallyEnabled.checked,
-        folder: normalizeStudioPath($wallyFolder.value),
+        folder: $wallyFolder.value,
         file: $wallyFile.value,
         button: $wallyInstall,
         statusEl: $wallyInstallStatus,
@@ -548,7 +552,15 @@ export function mountProjects(root, api) {
     const nextGroupId = form.groupId || null;
     const nextPlaceIdsStr = placeIds.join(",");
     const nextWallyEnabled = !!form.wallyEnabled;
-    const nextWallyFolder = normalizeStudioPath(form.wallyFolder);
+    let nextWallyFolder = "";
+    try {
+      if (nextWallyEnabled) nextWallyFolder = validateWallyFolder(form.wallyFolder);
+    } catch (error) {
+      api.toast(error.message);
+      const input = $detail.querySelector('[data-field="wallyFolder"]');
+      if (input) input.focus();
+      return;
+    }
     const nextWallyFile = String(form.wallyFile || "").trimEnd() + "\n";
 
     if (nextWallyEnabled && !nextWallyFolder) {
@@ -607,8 +619,18 @@ export function mountProjects(root, api) {
   }
 
   async function add() {
-    const path = $path.value.trim();
-    if (!path) return;
+    const decision = assessProjectPath({
+      isDesktop: api.host.isDesktop,
+      source: "manual",
+      path: $path.value,
+      authorizedPath: authorizedDesktopPath,
+    });
+    if (!decision.ok) {
+      api.toast(decision.message);
+      (api.host.isDesktop ? $pick : $path).focus();
+      return;
+    }
+    const path = decision.path;
     const s = api.getState();
     if ((s.projects || []).some((p) => p.path === path)) {
       api.toast("Project already added");
@@ -630,6 +652,7 @@ export function mountProjects(root, api) {
     api.setState({ projects: next });
     selectedId = proj.id;
     $path.value = "";
+    authorizedDesktopPath = "";
     $gameId.value = "";
     $groupId.value = "";
     $placeIds.value = "";
@@ -676,20 +699,20 @@ export function mountProjects(root, api) {
 
   async function pickFolder() {
     try {
-      const res = await api.t64("t64:exec", {
-        command: pickFolderCmd("Pick Ro Sync project folder"),
-      });
-      const raw = (res?.stdout || "").replace(/^﻿/, "").trim();
-      const out = raw.replace(/[\\/]+$/, "");
+      const raw = String(await api.host.pickFolder("Pick Ro Sync project folder") || "")
+        .replace(/^﻿/, "")
+        .trim();
+      const out = trimProjectPath(raw);
       const looksLikePath =
         out && !/\r?\n/.test(out) && /^(?:[A-Za-z]:[\\/]|[\\/]|~)/.test(out);
       if (looksLikePath) {
         $path.value = out;
+        if (api.host.isDesktop) authorizedDesktopPath = out;
       } else if (!out) {
         // user cancelled — silent
       } else {
         api.toast("Folder picker failed");
-        console.warn("pickFolder: ignoring non-path stdout", { raw, stderr: res?.stderr });
+        console.warn("pickFolder: ignoring non-path result", { raw });
       }
     } catch (e) {
       api.toast("Folder picker unavailable");
@@ -698,7 +721,7 @@ export function mountProjects(root, api) {
 
   async function openFolder(p) {
     try {
-      await api.t64("t64:exec", { command: openFolderEnsuredCmd(p) });
+      await api.host.openPath(p);
     } catch (e) {
       api.toast("Open folder failed");
     }
@@ -718,11 +741,18 @@ export function mountProjects(root, api) {
     }
 
     const wallyEnabled = Boolean(cfg.wallyEnabled ?? proj.wallyEnabled);
-    const wallyFolder = normalizeStudioPath(cfg.wallyFolder ?? proj.wallyFolder ?? "");
+    const wallyFolder = String(cfg.wallyFolder ?? proj.wallyFolder ?? "");
+    let validatedWallyFolder = "";
+    try {
+      validatedWallyFolder = validateWallyFolder(wallyFolder || DEFAULT_WALLY_FOLDER);
+    } catch {
+      // Preserve invalid persisted input for correction, but never turn it
+      // into a filesystem path or Wally working directory.
+    }
     let wallyFile = typeof cfg.wallyFile === "string" ? cfg.wallyFile : (proj.wallyFile || "");
-    if (wallyEnabled && !wallyFile) {
+    if (wallyEnabled && validatedWallyFolder && !wallyFile) {
       try {
-        wallyFile = await readTextFile(api, wallyTomlPathForFolder(proj.path, wallyFolder || DEFAULT_WALLY_FOLDER));
+        wallyFile = await readTextFile(api, wallyTomlPathForFolder(proj.path, validatedWallyFolder));
       } catch {
         wallyFile = "";
       }
@@ -766,7 +796,7 @@ export function mountProjects(root, api) {
     };
 
     if (proj.wallyEnabled) {
-      merged.wallyFolder = normalizeStudioPath(proj.wallyFolder || DEFAULT_WALLY_FOLDER);
+      merged.wallyFolder = validateWallyFolder(proj.wallyFolder || DEFAULT_WALLY_FOLDER);
       merged.wallyFile = String(proj.wallyFile || DEFAULT_WALLY_FILE).trimEnd() + "\n";
       const tomlPath = wallyTomlPathForFolder(proj.path, merged.wallyFolder);
       await writeTextFile(api, tomlPath, merged.wallyFile);
@@ -784,7 +814,15 @@ export function mountProjects(root, api) {
       return;
     }
 
-    const folder = normalizeStudioPath(form.folder);
+    let folder = "";
+    try {
+      folder = validateWallyFolder(form.folder);
+    } catch (error) {
+      api.toast(error.message);
+      const input = $detail.querySelector('[data-field="wallyFolder"]');
+      if (input) input.focus();
+      return;
+    }
     const file = String(form.file || "").trimEnd() + "\n";
     if (!folder) {
       api.toast("Wally folder is required");
@@ -815,10 +853,7 @@ export function mountProjects(root, api) {
       });
       await saveProjectConfig(nextProj);
       if (statusEl) statusEl.textContent = "Running wally install...";
-      const res = await api.t64("t64:exec", {
-        command: wallyInstallCmd(cwd),
-        timeoutMs: 2 * 60_000,
-      });
+      const res = await api.host.wallyInstall(cwd);
       if (res && res.code !== 0 && res.code != null) {
         throw new Error((res.stderr || res.stdout || `exit ${res.code}`).trim());
       }
@@ -855,7 +890,7 @@ export function mountProjects(root, api) {
     };
 
     try {
-      const bounds = await api.t64("t64:get-bounds", { timeoutMs: 1000 });
+      const bounds = await api.host.windowBounds();
       const x = Number(bounds && bounds.x);
       const y = Number(bounds && bounds.y);
       const width = Number(bounds && bounds.width);
@@ -868,7 +903,11 @@ export function mountProjects(root, api) {
     }
 
     try {
-      const res = await api.t64("t64:create-session", { ...payload, timeoutMs: 10000 });
+      const res = await api.host.createSession(payload);
+      if (res && res.supported === false) {
+        api.toast("Terminal sessions are available in the Terminal 64 widget");
+        return;
+      }
       if (res && res.error) throw new Error(res.error);
       api.toast("Session spawned");
     } catch (e) {
@@ -1067,7 +1106,7 @@ export function mountProjects(root, api) {
   function openAddPanel() {
     $addPanel.hidden = false;
     $toggleAdd.setAttribute("aria-expanded", "true");
-    requestAnimationFrame(() => $path.focus());
+    requestAnimationFrame(() => (api.host.isDesktop ? $pick : $path).focus());
   }
   function closeAddPanel() {
     $addPanel.hidden = true;
@@ -1079,11 +1118,18 @@ export function mountProjects(root, api) {
     event.preventDefault();
     $path.classList.remove("is-drop-target");
     const path = pathFromDrop(event);
-    if (path) {
-      $path.value = path;
+    const decision = assessProjectPath({
+      isDesktop: api.host.isDesktop,
+      source: "drop",
+      path,
+      authorizedPath: authorizedDesktopPath,
+    });
+    if (decision.ok) {
+      $path.value = decision.path;
       $path.focus();
     } else {
-      api.toast("Drop a folder path");
+      api.toast(decision.message);
+      if (api.host.isDesktop) $pick.focus();
     }
   }
 
@@ -1097,11 +1143,11 @@ export function mountProjects(root, api) {
   $addTile.addEventListener("click", openAddPanel);
   $path.addEventListener("dragenter", (e) => {
     e.preventDefault();
-    $path.classList.add("is-drop-target");
+    if (!api.host.isDesktop) $path.classList.add("is-drop-target");
   });
   $path.addEventListener("dragover", (e) => {
     e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    if (e.dataTransfer) e.dataTransfer.dropEffect = api.host.isDesktop ? "none" : "copy";
   });
   $path.addEventListener("dragleave", () => {
     $path.classList.remove("is-drop-target");
@@ -1155,6 +1201,36 @@ export function mountProjects(root, api) {
 }
 
 // ---- helpers ----
+export function assessProjectPath({ isDesktop, source, path, authorizedPath = "" }) {
+  const cleaned = trimProjectPath(path);
+  if (isDesktop && source === "drop") {
+    return {
+      ok: false,
+      message: "Use Browse… to authorize project folders in the desktop app",
+    };
+  }
+  if (!cleaned) {
+    return {
+      ok: false,
+      message: source === "drop" ? "Drop a folder path" : "Choose a project folder",
+    };
+  }
+  if (isDesktop && cleaned !== trimProjectPath(authorizedPath)) {
+    return {
+      ok: false,
+      message: "Use Browse… to authorize this project folder first",
+    };
+  }
+  return { ok: true, path: cleaned };
+}
+
+function trimProjectPath(path) {
+  const value = String(path ?? "").replace(/^﻿/, "").trim();
+  if (/^\/+$/u.test(value)) return "/";
+  if (/^[A-Za-z]:[\\/]+$/u.test(value)) return `${value.slice(0, 2)}\\`;
+  return value.replace(/[\\/]+$/u, "");
+}
+
 function basename(p) {
   if (!p) return "";
   const s = p.replace(/[\\/]+$/, "");
@@ -1173,56 +1249,66 @@ function escapeHTML(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 }
-function b64EncodeUnicode(text) {
-  return btoa(unescape(encodeURIComponent(String(text))));
-}
 async function writeTextFile(api, absPath, text) {
-  return api.t64("t64:exec", {
-    command: writeFileFromB64Cmd(absPath, b64EncodeUnicode(text)),
-  });
+  return api.host.writeTextFile(absPath, text);
 }
 async function readTextFile(api, absPath) {
-  const res = await api.t64("t64:exec", { command: readFileCmd(absPath) });
-  return (res && typeof res.stdout === "string") ? res.stdout : "";
+  return api.host.readTextFile(absPath);
 }
-function normalizeStudioPath(path) {
+function normalizeStudioPathForDisplay(path) {
   return String(path || "")
     .trim()
     .replace(/\\/g, "/")
     .replace(/^\/+|\/+$/g, "")
     .replace(/\/{2,}/g, "/");
 }
-function wallyTomlPathForFolder(projectPath, studioFolder) {
-  const normalized = normalizeStudioPath(studioFolder || DEFAULT_WALLY_FOLDER);
-  const parts = normalized.split("/").filter(Boolean);
+
+/**
+ * Validate the Studio-style folder used to locate wally.toml.
+ *
+ * This is deliberately stricter than display normalization: every component
+ * must survive exactly as entered so `..`, `.`, doubled separators, and
+ * control characters can never be turned into a path outside the project.
+ */
+export function validateWallyFolder(path) {
+  const raw = String(path ?? "");
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(raw)) {
+    throw new Error("Wally folder cannot contain control characters");
+  }
+
+  const value = raw.trim().replace(/\\/g, "/");
+  if (!value) throw new Error("Wally folder is required");
+  if (value.startsWith("/") || /^[A-Za-z]:(?:\/|$)/.test(value)) {
+    throw new Error("Wally folder must be relative to the project");
+  }
+
+  const components = value.split("/");
+  if (components.some((component) => !component || !component.trim())) {
+    throw new Error("Wally folder cannot contain empty path components");
+  }
+  if (components.some((component) => component === "." || component === "..")) {
+    throw new Error("Wally folder cannot contain . or .. path components");
+  }
+  return components.join("/");
+}
+
+export function wallyTomlPathForFolder(projectPath, studioFolder) {
+  const normalized = validateWallyFolder(studioFolder);
+  const parts = normalized.split("/");
   const parent = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
   return joinProjectFile(projectPath, parent ? `${parent}/wally.toml` : "wally.toml");
+}
+function wallyTomlPathPreview(projectPath, studioFolder) {
+  try {
+    return `Writes to ${wallyTomlPathForFolder(projectPath, studioFolder)}`;
+  } catch (error) {
+    return `Invalid Wally folder: ${error.message}`;
+  }
 }
 function dirnamePath(path) {
   const s = String(path || "").replace(/[\\/]+$/, "");
   const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
   return i >= 0 ? s.slice(0, i) : ".";
-}
-function wallyInstallCmd(cwd) {
-  if (IS_WINDOWS) {
-    return psEncodedCmd(
-      `$aftmanBin = Join-Path $env:USERPROFILE '.aftman\\bin'; ` +
-      `$env:PATH = "$aftmanBin;$env:LOCALAPPDATA\\aftman\\bin;$env:PATH"; ` +
-      `Set-Location -LiteralPath ${psQuote(cwd)}; ` +
-      `$wally = Get-Command wally -ErrorAction SilentlyContinue; ` +
-      `if ($wally) { & $wally.Source install; exit $LASTEXITCODE }; ` +
-      `$aftman = Get-Command aftman -ErrorAction SilentlyContinue; ` +
-      `if ($aftman) { & $aftman.Source run wally install; exit $LASTEXITCODE }; ` +
-      `Write-Error 'wally not found on PATH and aftman is not available'; exit 127`
-    );
-  }
-  const script =
-    `export PATH="$HOME/.aftman/bin:$HOME/.local/share/aftman/bin:$HOME/.wally/bin:$PATH"; ` +
-    `cd ${shQuote(cwd)} && ` +
-    `if command -v wally >/dev/null 2>&1; then wally install; ` +
-    `elif command -v aftman >/dev/null 2>&1; then aftman run wally install; ` +
-    `else echo "wally not found on PATH and aftman is not available" >&2; exit 127; fi`;
-  return `if [ -x /bin/zsh ]; then /bin/zsh -lc ${shQuote(script)}; elif [ -x /bin/bash ]; then /bin/bash -lc ${shQuote(script)}; else /bin/sh -c ${shQuote(script)}; fi`;
 }
 function summarizeWallyInstall(res) {
   const out = `${res?.stdout || ""}\n${res?.stderr || ""}`.trim();
@@ -1234,7 +1320,7 @@ function summarizeWallyInstall(res) {
   return "Wally install complete";
 }
 function shortStudioPath(path) {
-  const normalized = normalizeStudioPath(path);
+  const normalized = normalizeStudioPathForDisplay(path);
   if (!normalized) return "enabled";
   const parts = normalized.split("/");
   if (parts.length <= 2) return normalized;

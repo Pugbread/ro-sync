@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="480" viewBox="0 0 1440 480" role="img" aria-labelledby="title desc">
+  <title id="title">Ro Sync</title>
+  <desc id="desc">Desktop, Terminal 64, and CLI connect through one Ro Sync engine to Roblox Studio.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#171b22"/>
+      <stop offset="1" stop-color="#0f1218"/>
+    </linearGradient>
+    <linearGradient id="rail" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#438af5" stop-opacity="0.18"/>
+      <stop offset="0.5" stop-color="#438af5"/>
+      <stop offset="1" stop-color="#69b8ff" stop-opacity="0.25"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1440" height="480" rx="28" fill="url(#background)"/>
+  <path d="M0 1h1440" stroke="#ffffff" stroke-opacity="0.08"/>
+  <path d="M0 479h1440" stroke="#000000" stroke-opacity="0.4"/>
+
+  <g transform="translate(92 76)">
+    <circle cx="10" cy="14" r="7" fill="#438af5" filter="url(#glow)"/>
+    <text x="34" y="27" fill="#f5f7fb" font-family="Avenir Next, Segoe UI, sans-serif" font-size="54" font-weight="700" letter-spacing="8">RO SYNC</text>
+    <text x="2" y="86" fill="#aab4c3" font-family="Avenir Next, Segoe UI, sans-serif" font-size="23" font-weight="500">Roblox Studio, exposed as a precise local tool</text>
+    <text x="2" y="118" fill="#aab4c3" font-family="Avenir Next, Segoe UI, sans-serif" font-size="23" font-weight="500">for humans and agents.</text>
+  </g>
+
+  <g transform="translate(92 288)" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15">
+    <path d="M116 34H1196" stroke="url(#rail)" stroke-width="2"/>
+
+    <g transform="translate(0)">
+      <rect width="206" height="68" rx="14" fill="#202630" stroke="#ffffff" stroke-opacity="0.08"/>
+      <circle cx="30" cy="34" r="6" fill="#438af5"/>
+      <text x="50" y="39" fill="#e8edf5">DESKTOP · T64 · CLI</text>
+    </g>
+
+    <g transform="translate(494)">
+      <rect width="220" height="68" rx="14" fill="#26364f" stroke="#438af5" stroke-opacity="0.55"/>
+      <circle cx="32" cy="34" r="7" fill="#69b8ff" filter="url(#glow)"/>
+      <text x="54" y="39" fill="#f5f7fb">ROSYNC ENGINE</text>
+    </g>
+
+    <g transform="translate(1050)">
+      <rect width="206" height="68" rx="14" fill="#202630" stroke="#ffffff" stroke-opacity="0.08"/>
+      <circle cx="30" cy="34" r="6" fill="#67d6a3"/>
+      <text x="50" y="39" fill="#e8edf5">ROBLOX STUDIO</text>
+    </g>
+  </g>
+
+  <text x="92" y="424" fill="#6f7b8d" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="13" letter-spacing="1.5">ONE ENGINE · THREE SURFACES · LOCAL-FIRST</text>
+</svg>

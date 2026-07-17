@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a focused improvement to Ro Sync or its agent workflow.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Shared engine / protocol
+        - Desktop app
+        - Terminal 64 widget
+        - CLI
+        - Roblox Studio plugin
+        - Capture / playtest automation
+        - Documentation / developer experience
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the interface or outcome you would expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: agent_use
+    attributes:
+      label: Agent workflow
+      description: If this is for an LLM or automation, show the ideal command sequence or structured result.
+      render: shell
+
+  - type: checkboxes
+    id: compatibility
+    attributes:
+      label: Compatibility
+      options:
+        - label: This can preserve existing CLI and plugin protocol behavior, or I described the required migration.
+          required: true

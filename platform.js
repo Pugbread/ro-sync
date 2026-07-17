@@ -127,6 +127,17 @@ export function tmpLogPath(name) {
   return IS_WINDOWS ? `%TEMP%\\${name}` : `/tmp/${name}`;
 }
 
+// Terminal 64 keeps state and secrets together in this ignored JSON file.
+// Unix umasks are not guaranteed to be private, so harden it after every host
+// state write and again immediately before a daemon reads its owner token.
+export function secureWidgetStateCmd(
+  path = joinShell(WIDGET_DIR_SHELL, "state.json"),
+) {
+  if (IS_WINDOWS) return "echo secured";
+  const expanded = posixExpandQuote(path);
+  return `if [ -f ${expanded} ]; then chmod 600 ${expanded}; else exit 1; fi`;
+}
+
 // ---------- Command generators ----------
 
 // Check whether a PID is alive. Stdout will contain "alive" or "dead".
@@ -189,13 +200,19 @@ export function portOwnerCmd(port) {
 // %USERPROFILE% on Windows) — the outer shell expands them before the command
 // runs. On Windows, cmd.exe performs %VAR% expansion inside the double-quoted
 // PowerShell -Command argument before PowerShell parses it.
-export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
+export function launchDaemonCmd({ binaryPath, args, logPath, port, ownerTokenStatePath = null }) {
   if (IS_WINDOWS) {
     // Wrap Start-Process in try/catch so we ALWAYS emit a structured response
     // on stdout: `---\n<pid>` on success, `---\nERROR: <message>` on failure.
     // This stops PowerShell's default CLIXML error-serialization from leaking
     // into the hint the widget displays.
     const psArgs = args.map(psArgQuote).join(",");
+    const ownerStateSetup = ownerTokenStatePath
+      ? `$ownerState = & $xp ${psQuote(ownerTokenStatePath)}; ` +
+        `if (-not (Test-Path -LiteralPath $ownerState)) { throw ('widget state file not found: ' + $ownerState) }; ` +
+        `$launchArgs = @(${psArgs}); ` +
+        `$launchArgs += @(${psArgQuote("--owner-token-state-file")}, ('"' + $ownerState + '"')); `
+      : `$launchArgs = @(${psArgs}); `;
     const ps =
       `$ErrorActionPreference = 'Stop'; ` +
       `$ProgressPreference = 'SilentlyContinue'; ` +
@@ -205,8 +222,9 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
       `  if (-not (Test-Path -LiteralPath $bin)) { throw ('binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ' + $bin) }; ` +
       `  $log = & $xp ${psQuote(logPath)}; ` +
       `  $err = & $xp ${psQuote(logPath + ".err")}; ` +
+      ownerStateSetup +
       `  $proc = Start-Process -FilePath $bin ` +
-      `    -ArgumentList @(${psArgs}) ` +
+      `    -ArgumentList $launchArgs ` +
       `    -PassThru -WindowStyle Hidden ` +
       `    -RedirectStandardOutput $log ` +
       `    -RedirectStandardError $err; ` +
@@ -224,13 +242,21 @@ export function launchDaemonCmd({ binaryPath, args, logPath, port }) {
   // approach matched by `--port`, which could report a stale daemon from a
   // different project as the process we just launched.
   const quotedArgs = args.map(posixQuote).join(" ");
+  const ownerStateArg = ownerTokenStatePath
+    ? ` --owner-token-state-file ${posixExpandQuote(ownerTokenStatePath)}`
+    : "";
+  const ownerStatePreflight = ownerTokenStatePath
+    ? `if [ ! -f ${posixExpandQuote(ownerTokenStatePath)} ] || ! chmod 600 ${posixExpandQuote(ownerTokenStatePath)} ; then ` +
+      `  echo "---" ; echo "ERROR: widget state file is missing or could not be secured" ; exit 0 ; fi ; `
+    : "";
   return (
     `if [ ! -x "${binaryPath}" ] ; then ` +
     `  echo "---" ; ` +
     `  echo "ERROR: binary not found — open Settings -> Build daemon to build it, or download from GitHub Releases. Missing: ${binaryPath}" ; ` +
     `  exit 0 ; ` +
     `fi ; ` +
-    `nohup "${binaryPath}" ${quotedArgs} ` +
+    ownerStatePreflight +
+    `nohup "${binaryPath}" ${quotedArgs}${ownerStateArg} ` +
     `</dev/null >${posixQuote(logPath)} 2>&1 & ` +
     `PID=$! ; ` +
     `echo "---" ; echo "$PID"`
@@ -457,6 +483,31 @@ export function parseBuildOutput(stdout) {
   const code = m ? parseInt(m[1], 10) : NaN;
   const log = m ? s.slice(0, m.index).trimEnd() : s.trimEnd();
   return { ok: code === 0, code: Number.isFinite(code) ? code : null, log };
+}
+
+// Install the Wally package graph rooted at `cwd`. This remains a Terminal 64
+// implementation detail; packaged desktop builds expose a narrow native
+// `wally_install` command instead of forwarding a shell string from the UI.
+export function wallyInstallCmd(cwd) {
+  if (IS_WINDOWS) {
+    return psEncodedCmd(
+      `$aftmanBin = Join-Path $env:USERPROFILE '.aftman\\bin'; ` +
+      `$env:PATH = "$aftmanBin;$env:LOCALAPPDATA\\aftman\\bin;$env:PATH"; ` +
+      `Set-Location -LiteralPath ${psQuote(cwd)}; ` +
+      `$wally = Get-Command wally -ErrorAction SilentlyContinue; ` +
+      `if ($wally) { & $wally.Source install; exit $LASTEXITCODE }; ` +
+      `$aftman = Get-Command aftman -ErrorAction SilentlyContinue; ` +
+      `if ($aftman) { & $aftman.Source run wally install; exit $LASTEXITCODE }; ` +
+      `Write-Error 'wally not found on PATH and aftman is not available'; exit 127`
+    );
+  }
+  const script =
+    `export PATH="$HOME/.aftman/bin:$HOME/.local/share/aftman/bin:$HOME/.wally/bin:$PATH"; ` +
+    `cd ${shQuote(cwd)} && ` +
+    `if command -v wally >/dev/null 2>&1; then wally install; ` +
+    `elif command -v aftman >/dev/null 2>&1; then aftman run wally install; ` +
+    `else echo "wally not found on PATH and aftman is not available" >&2; exit 127; fi`;
+  return `if [ -x /bin/zsh ]; then /bin/zsh -lc ${shQuote(script)}; elif [ -x /bin/bash ]; then /bin/bash -lc ${shQuote(script)}; else /bin/sh -c ${shQuote(script)}; fi`;
 }
 
 // ---------- Path joining for shell-level concatenation ----------

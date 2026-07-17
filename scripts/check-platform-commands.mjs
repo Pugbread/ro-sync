@@ -40,15 +40,20 @@ assert(installPs.includes("Copy-Item -LiteralPath"), "install must copy literal 
 assert(installPs.includes("Remove-Item -LiteralPath"), "install must remove literal paths");
 assert(installPs.includes("RoSync.rbxm"), "install must target rbxm");
 
+const forbiddenOwnerToken = "owner-token-must-never-enter-command-or-argv";
 const launchPs = decodePowerShell(win.launchDaemonCmd({
   binaryPath: win.joinShell(win.WIDGET_DIR_SHELL, win.BINARY_REL),
   args: ["--project", "C:\\Users\\Test User\\Game [Dev]", "--port", "7878"],
   logPath: win.tmpLogPath("rosync-7878.log"),
   port: 7878,
+  ownerTokenStatePath: win.joinShell(win.WIDGET_DIR_SHELL, "state.json"),
+  ownerToken: forbiddenOwnerToken,
 }));
 assert(launchPs.includes("Test-Path -LiteralPath $bin"), "launch must probe literal binary path");
 assert(launchPs.includes("-RedirectStandardError $err"), "launch must capture stderr");
 assert(launchPs.includes("'\"C:\\Users\\Test User\\Game [Dev]\"'"), "launch must preserve spaced/bracketed project path");
+assert(launchPs.includes("--owner-token-state-file"), "Windows launch must use the private widget state source");
+assert(!launchPs.includes(forbiddenOwnerToken), "Windows launch must never embed the owner token");
 
 const tailPs = decodePowerShell(win.tailLogCmd("%TEMP%\\rosync-7878.log"));
 assert(tailPs.includes("[Environment]::ExpandEnvironmentVariables"), "tail must expand env vars");
@@ -87,5 +92,22 @@ assert(macPick.includes("base64 -D"), "macOS folder picker must support BSD base
 const macBuild = mac.buildDaemonCmd();
 assert(macBuild.includes("bash ./build.sh"), "POSIX build must run build.sh");
 assert(!macBuild.includes('CARGO="$HOME/.cargo/bin/cargo"'), "POSIX build must not force home cargo");
+
+const macLaunch = mac.launchDaemonCmd({
+  binaryPath: mac.joinShell(mac.WIDGET_DIR_SHELL, mac.BINARY_REL),
+  args: ["serve", "--project", "/tmp/Game", "--port", "7878", "--widget-owned"],
+  logPath: mac.tmpLogPath("rosync-7878.log"),
+  port: 7878,
+  ownerTokenStatePath: mac.joinShell(mac.WIDGET_DIR_SHELL, "state.json"),
+  ownerToken: forbiddenOwnerToken,
+});
+assert(macLaunch.includes("--owner-token-state-file"), "POSIX launch must use the private widget state source");
+assert(macLaunch.includes('"$HOME/.terminal64/widgets/ro-sync/state.json"'), "POSIX state path must expand HOME");
+assert(macLaunch.includes("chmod 600"), "POSIX launch must harden widget state before reading its token");
+assert(!macLaunch.includes(forbiddenOwnerToken), "POSIX launch must never embed the owner token");
+
+const secureState = mac.secureWidgetStateCmd();
+assert(secureState.includes("chmod 600"), "POSIX state writes must restore mode 0600");
+assert(secureState.includes('"$HOME/.terminal64/widgets/ro-sync/state.json"'), "state hardening must expand HOME");
 
 console.log("platform command checks passed");

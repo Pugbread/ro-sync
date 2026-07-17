@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible problem in Ro Sync Desktop, the Terminal 64 widget, the CLI, or the Studio plugin.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      description: Where did the problem occur?
+      options:
+        - Desktop app
+        - Terminal 64 widget
+        - CLI / daemon
+        - Roblox Studio plugin
+        - Capture / playtest automation
+        - Linting / generated project files
+        - Release or installation
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Include the Ro Sync, Studio, and operating-system versions when known.
+      placeholder: "Ro Sync 0.1.0, Studio 0.730, macOS 15.5"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Start Ro Sync for …
+        2. Connect Studio …
+        3. Run …
+        4. Observe …
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste relevant `rosync doctor --raw`, `rosync status --raw`, or Studio output. Remove API keys, tokens, usernames, and private project source.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials and private game source from this report.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

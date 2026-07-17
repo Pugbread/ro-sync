@@ -13,9 +13,9 @@ export async function copyText(api, text) {
     }
   }
 
-  if (api && typeof api.t64 === "function") {
+  if (api && api.host && typeof api.host.clipboardWrite === "function") {
     try {
-      await api.t64("t64:clipboard-write", { text: value, timeoutMs: 5000 });
+      await api.host.clipboardWrite(value);
       return;
     } catch {}
   }
@@ -24,7 +24,7 @@ export async function copyText(api, text) {
 }
 
 export function platformLabel(platform) {
-  if (platform === "darwin") return "macOS";
+  if (platform === "darwin" || platform === "macos") return "macOS";
   if (platform === "windows") return "Windows";
   if (platform === "linux") return "Linux";
   return String(platform || "Unknown");

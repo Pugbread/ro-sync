@@ -54,15 +54,15 @@ pub fn router(state: AppState) -> Router {
     // origins need both an allowlisted app origin (or file-webview `null`) and
     // the owning widget's capability; native Studio/CLI requests carry no
     // Origin header and bypass this browser-only CORS gate.
-    let cors_widget_owned = state.widget_owned;
-    let cors_owner_token = state.widget_owner_token.clone();
+    let cors_managed = state.managed;
+    let cors_owner_token = state.manager_owner_token.clone();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, request: &Parts| {
                 is_authorized_widget_browser_request(
                     origin,
                     &request.uri,
-                    cors_widget_owned,
+                    cors_managed,
                     cors_owner_token.as_ref().as_deref(),
                 )
             },
@@ -116,6 +116,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/widget-heartbeat", post(widget_heartbeat))
         .route("/widget-close", post(widget_close))
+        .route("/manager-heartbeat", post(manager_heartbeat))
+        .route("/manager-close", post(manager_close))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
         .layer(cors)
@@ -325,6 +327,7 @@ pub(crate) fn is_trusted_local_app_origin(origin: &HeaderValue) -> bool {
             | "terminal64://widget"
             | "app://localhost"
             | "tauri://localhost"
+            | "http://tauri.localhost"
             | "wry://localhost"
     ) {
         return true;
@@ -394,7 +397,7 @@ fn constant_time_text_eq(left: &str, right: &str) -> bool {
 // read through `rosync tree` / `rosync ls` rather than a project cache file.
 // ---------------------------------------------------------------------------
 
-/// Append one JSONL line to `~/.terminal64/widgets/ro-sync/writes.log`.
+/// Append one JSONL line to the platform-native Ro Sync `writes.log`.
 /// Creates the directory and file if they don't exist. The body is written
 /// verbatim (after a timestamp is merged in) — callers should post a JSON
 /// object describing the write they just performed.
@@ -403,16 +406,10 @@ async fn writelog(body: Json<Value>) -> Json<Value> {
 }
 
 pub(crate) fn write_log_entry(body: Json<Value>) -> Json<Value> {
-    let home = match rosync_home_dir() {
-        Some(h) => h,
-        None => {
-            return Json(json!({ "ok": false, "error": "home directory not found" }));
-        }
+    let dir = match writes_log_dir() {
+        Ok(dir) => dir,
+        Err(error) => return Json(json!({ "ok": false, "error": error })),
     };
-    let dir = home.join(".terminal64").join("widgets").join("ro-sync");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return Json(json!({ "ok": false, "error": format!("mkdir {}: {e}", dir.display()) }));
-    }
     let log_path = dir.join("writes.log");
     // Rotate when writes.log grows past 10 MiB. Preserve exactly one prior
     // generation: writes.log → writes.log.1, overwriting any previous .1. We
@@ -449,11 +446,14 @@ pub(crate) fn write_log_entry(body: Json<Value>) -> Json<Value> {
         }
     };
     use std::io::Write;
-    let mut f = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut f = match options.open(&log_path) {
         Ok(f) => f,
         Err(e) => {
             return Json(
@@ -467,13 +467,29 @@ pub(crate) fn write_log_entry(body: Json<Value>) -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-fn rosync_home_dir() -> Option<PathBuf> {
+fn writes_log_dir() -> Result<PathBuf, String> {
     #[cfg(test)]
     if let Some(home) = std::env::var_os("ROSYNC_TEST_HOME") {
-        return Some(PathBuf::from(home));
+        let dir = PathBuf::from(home)
+            .join(".terminal64")
+            .join("widgets")
+            .join("ro-sync");
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("mkdir {}: {error}", dir.display()))?;
+        return Ok(dir);
     }
 
-    dirs::home_dir()
+    if let Ok(dir) = crate::lifecycle::state_dir(None) {
+        if crate::lifecycle::create_private_dir(&dir).is_ok() {
+            return Ok(dir);
+        }
+    }
+    if let Some(dir) = crate::lifecycle::legacy_widget_dir() {
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("mkdir {}: {error}", dir.display()))?;
+        return Ok(dir);
+    }
+    Err("Ro Sync data directory not found".to_string())
 }
 
 #[derive(Default, Deserialize)]
@@ -502,12 +518,53 @@ fn authorize_widget_control(state: &AppState, token: Option<&str>) -> Result<(),
     Ok(())
 }
 
+fn authorize_manager_control(state: &AppState, token: Option<&str>) -> Result<(), &'static str> {
+    if !state.managed {
+        return Err("daemon is not lifecycle-managed");
+    }
+    let Some(expected) = state.manager_owner_token.as_ref().as_deref() else {
+        return Err("missing daemon control token");
+    };
+    if token != Some(expected) {
+        return Err("invalid daemon control token");
+    }
+    Ok(())
+}
+
+async fn manager_heartbeat(State(state): State<AppState>, body: Bytes) -> Json<Value> {
+    let body = parse_widget_control_body(&body);
+    if let Err(error) = authorize_manager_control(&state, body.token.as_deref()) {
+        return Json(json!({ "ok": false, "error": error }));
+    }
+    *state.manager_last_seen.lock().unwrap() = Some(Instant::now());
+    Json(json!({ "ok": true }))
+}
+
+async fn manager_close(State(state): State<AppState>, body: Bytes) -> Json<Value> {
+    let body = parse_widget_control_body(&body);
+    if let Err(error) = authorize_manager_control(&state, body.token.as_deref()) {
+        return Json(json!({ "ok": false, "error": error }));
+    }
+    let reason = body
+        .reason
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| "lifecycle manager requested shutdown".to_string());
+    let plugin_connected = state.active_plugin.lock().unwrap().is_some();
+    let _ = state.shutdown_tx.send(Some(reason.clone()));
+    Json(json!({
+        "ok": true,
+        "reason": reason,
+        "pluginConnected": plugin_connected,
+    }))
+}
+
 async fn widget_heartbeat(State(state): State<AppState>, body: Bytes) -> Json<Value> {
     let body = parse_widget_control_body(&body);
     if let Err(error) = authorize_widget_control(&state, body.token.as_deref()) {
         return Json(json!({ "ok": false, "error": error }));
     }
     *state.widget_last_seen.lock().unwrap() = Some(Instant::now());
+    *state.manager_last_seen.lock().unwrap() = Some(Instant::now());
     Json(json!({ "ok": true }))
 }
 
@@ -572,6 +629,15 @@ struct Hello {
     wally_folder: Option<String>,
     #[serde(rename = "widgetOwned")]
     widget_owned: bool,
+    managed: bool,
+    #[serde(rename = "managedBy")]
+    managed_by: String,
+    #[serde(rename = "bootId")]
+    boot_id: String,
+    pid: u32,
+    port: u16,
+    #[serde(rename = "startedAt")]
+    started_at: u64,
     #[serde(rename = "pluginConnected")]
     plugin_connected: bool,
     #[serde(rename = "pluginProtocol")]
@@ -592,6 +658,12 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         wally_enabled: *state.wally_enabled.read().unwrap(),
         wally_folder: state.wally_folder.read().unwrap().clone(),
         widget_owned: state.widget_owned,
+        managed: state.managed,
+        managed_by: state.managed_by.as_ref().clone(),
+        boot_id: state.boot_id.as_ref().clone(),
+        pid: state.process_id,
+        port: state.listen_port,
+        started_at: state.started_at,
         plugin_connected,
         plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
         plugin_capability: crate::ws::plugin_capability(),
@@ -3852,6 +3924,14 @@ mod tests {
             pending_routes: Arc::new(Mutex::new(HashMap::new())),
             active_plugin: Arc::new(Mutex::new(None)),
             widget_owned: true,
+            managed: true,
+            managed_by: Arc::new("test-widget".into()),
+            boot_id: Arc::new("test-boot".into()),
+            listen_port: 0,
+            process_id: std::process::id(),
+            started_at: 1,
+            manager_owner_token: Arc::new(Some("artifact-widget-token".into())),
+            manager_last_seen: Arc::new(Mutex::new(None)),
             widget_owner_token: Arc::new(Some("artifact-widget-token".into())),
             widget_last_seen: Arc::new(Mutex::new(None)),
             shutdown_tx,
@@ -4149,6 +4229,7 @@ mod tests {
             "terminal64://widget",
             "app://localhost",
             "tauri://localhost",
+            "http://tauri.localhost",
             "wry://localhost",
             "http://127.0.0.1:49173",
             "http://localhost:49174",
@@ -4168,6 +4249,7 @@ mod tests {
             "https://attacker.example",
             "http://127.0.0.2:3000",
             "http://localhost.attacker.example:3000",
+            "http://tauri.localhost.attacker.example",
             "http://user@localhost:3000",
             "chrome-extension://attacker",
             "moz-extension://attacker",

@@ -9,7 +9,7 @@
     "rosync serve --project . --port 7878 --game-id 1234567890"
   ],
   "notes": [
-    "This is the normal CLI-only entrypoint; the widget can also launch it for an active project.",
-    "Run it manually when using Ro Sync without opening the widget interface."
+    "serve stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.",
+    "For an ordinary CLI-managed background process, use rosync daemon start instead."
   ]
 }

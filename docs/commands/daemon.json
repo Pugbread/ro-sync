@@ -1,0 +1,20 @@
+{
+  "name": "daemon",
+  "title": "rosync daemon",
+  "category": "Daemon",
+  "description": "Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.",
+  "usage": "rosync daemon <start|status|stop|restart|logs> --project <path> [options]",
+  "examples": [
+    "rosync daemon start --project . --raw",
+    "rosync daemon status --project . --raw",
+    "rosync daemon stop --project . --timeout 10 --raw",
+    "rosync daemon restart --project . --game-id 123 --place-id 456 --raw",
+    "rosync daemon logs --project . --lines 100"
+  ],
+  "notes": [
+    "start and restart accept --port, --managed-by, --data-dir, --timeout, --game-id, --group-id, and repeated --place-id. status, stop, and logs use the same canonical project identity and optional --data-dir.",
+    "A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error.",
+    "Stop authenticates an exact project and boot ID before graceful shutdown. Ro Sync never kills a PID read from a stale runtime record.",
+    "Desktop managers should supply their browser capability through --owner-token-env <ENV>; secrets are never returned by lifecycle JSON."
+  ]
+}
