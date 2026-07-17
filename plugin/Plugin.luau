@@ -41,7 +41,7 @@ local RO_SYNC_SETTINGS_IMAGE = "rbxassetid://128477924144442"
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "2.0.0"
+local PLUGIN_VERSION_STRING = "2.1.0"
 local PLUGIN_PROTOCOL_VERSION = 2
 
 --------------------------------------------------------------------------------
@@ -1318,7 +1318,8 @@ end)
 local startConnect: (() -> ())? = nil
 
 local function trimUiUrl(s)
-	return (tostring(s or ""):gsub("/+$", ""))
+	local trimmed = tostring(s or ""):match("^%s*(.-)%s*$") or ""
+	return (trimmed:gsub("/+$", ""))
 end
 
 local function mountFallbackUi(reason)
@@ -1601,10 +1602,10 @@ local function mountFallbackUi(reason)
 		settingsFrame.Visible = not settingsFrame.Visible
 	end)
 
-	urlBox.FocusLost:Connect(function(enter)
-		if enter then
-			plugin:SetSetting(SETTING_MANUAL_URL, trimUiUrl(urlBox.Text))
-		end
+	urlBox.FocusLost:Connect(function()
+		local normalized = trimUiUrl(urlBox.Text)
+		urlBox.Text = normalized
+		plugin:SetSetting(SETTING_MANUAL_URL, normalized)
 	end)
 
 	local controller = {}
@@ -1639,6 +1640,21 @@ local function mountFallbackUi(reason)
 			connectBtn.Text = "Cancel"
 		elseif state == "waiting" then
 			status.Text = "Waiting for initial sync..."
+			status.TextColor3 = Color3.fromRGB(65, 135, 245)
+			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			connectBtn.Text = "Cancel"
+		elseif state == "project_init" then
+			status.Text = "New Studio project · ready to create"
+			status.TextColor3 = Color3.fromRGB(65, 135, 245)
+			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			connectBtn.Text = "Create Project"
+		elseif state == "project_creating" then
+			status.Text = "Creating Ro Sync project..."
+			status.TextColor3 = Color3.fromRGB(65, 135, 245)
+			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			connectBtn.Text = "Cancel"
+		elseif state == "project_waiting" then
+			status.Text = "Project ready · waiting for Desktop..."
 			status.TextColor3 = Color3.fromRGB(65, 135, 245)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
@@ -2883,7 +2899,6 @@ local ws: any = nil
 -- Short-lived daemon-issued proof that this Studio plugin completed the local
 -- HTTP hello. Never persist or log it; a fresh daemon process issues a new one.
 local pluginCapability: string? = nil
-
 -- Forward-declared so wsLoop (below) can re-enter the initial-sync handshake
 -- after a `lagged` message. The real function assignment happens further down.
 local runInitialCompare: () -> ()
@@ -4118,6 +4133,34 @@ local remoteHandlers = {}
 local remoteState: any = {}
 
 do
+	-- Keep the native instance clipboard in a packaged ModuleScript so this
+	-- already-large top-level chunk stays below Luau's 200-register ceiling.
+	remoteState.clipboardAvailable = false
+	local moduleScript = script:FindFirstChild("Clipboard")
+	if moduleScript and moduleScript:IsA("ModuleScript") then
+		local okModule, module = pcall(require, moduleScript)
+		if okModule and type(module) == "table" and type(module.install) == "function" then
+			local okInstall, controller = pcall(module.install, {
+				resolvePath = resolveRemotePath,
+				pathOf = instancePathString,
+				httpJson = httpJson,
+				readScriptSource = readScriptSource,
+			})
+			if okInstall and type(controller) == "table" and type(controller.handlers) == "table" then
+				remoteState.clipboardAvailable = controller.available == true
+				for name, handler in pairs(controller.handlers) do
+					remoteHandlers[name] = handler
+				end
+			else
+				warn("[Ro Sync] native clipboard unavailable: " .. tostring(controller))
+			end
+		else
+			warn("[Ro Sync] packaged Clipboard module failed to load: " .. tostring(module))
+		end
+	end
+end
+
+do
 	-- ---------------------------------------------------------------------------
 	-- Edit-mode playtest coordinator. Runtime copies of this plugin advertise
 	-- themselves over PluginConnectionService; this registry assigns friendly
@@ -4779,7 +4822,20 @@ do
 	end
 
 	remoteState.auditArgsForOp = function(op, args)
-		if op ~= "playtest_run_start" then
+		if op == "clipboard_copy" then
+			return {
+				selection = type(args.paths) ~= "table" or #args.paths == 0,
+				paths = if type(args.paths) == "table" then args.paths else nil,
+				pathCount = if type(args.paths) == "table" then #args.paths else 0,
+			}
+		elseif op == "clipboard_paste" then
+			return {
+				parent = tostring(args.parent or ""),
+				rootCount = if type(args.roots) == "table" then #args.roots else 0,
+				select = args.select ~= false,
+				byteLength = math.floor(tonumber(args.byteLength) or 0),
+			}
+		elseif op ~= "playtest_run_start" then
 			return args
 		end
 		local main = if type(args.script) == "table" then args.script else {}
@@ -4811,6 +4867,22 @@ do
 				}
 				else nil,
 		}
+	end
+	remoteState.auditResultForOp = function(op, result)
+		if op == "clipboard_copy" then
+			return {
+				rootCount = if type(result.roots) == "table" then #result.roots else 0,
+				byteLength = math.floor(tonumber(result.byteLength) or 0),
+			}
+		elseif op == "clipboard_paste" then
+			return {
+				count = math.floor(tonumber(result.count) or 0),
+				paths = result.paths,
+				parent = result.parent,
+				selected = result.selected == true,
+			}
+		end
+		return result
 	end
 
 	local function runtimeContextsForJob(playtestJobId: string)
@@ -7311,6 +7383,8 @@ do
 				photoUiTarget = photoAvailable,
 				photoInstanceTightCrop = photoAvailable,
 				artifactChunks = true,
+				instanceClipboard = remoteState.clipboardAvailable == true,
+				copyPaste = remoteState.clipboardAvailable == true,
 				pluginConnection = pluginConnection,
 				studioTest = studioTest,
 				virtualInput = virtualInput,
@@ -7335,6 +7409,8 @@ do
 				photoAxis = 4096,
 				photoPixels = 16 * 1024 * 1024,
 				photoChunkBytes = 512 * 1024,
+				clipboardBytes = 128 * 1024 * 1024,
+				clipboardRoots = 256,
 				playscriptEventBytes = 64 * 1024,
 				playscriptResultBytes = 1024 * 1024,
 				playscriptResultChunkBytes = 96 * 1024,
@@ -8468,6 +8544,8 @@ do
 		rm_tag = true,
 		call = true,
 		select_set = true,
+		clipboard_copy = true,
+		clipboard_paste = true,
 	}
 	-- Runtime requests are still audited as writes, but they mutate temporary,
 	-- generation-scoped playtest DataModels and have their own correlated
@@ -8589,6 +8667,8 @@ do
 			-- The privacy prompt is user-driven, but it must not retain the write lane
 			-- forever if Studio never completes the authorization request.
 			return 120
+		elseif item.op == "clipboard_copy" or item.op == "clipboard_paste" then
+			return math.clamp(tonumber(item.args.timeoutSeconds) or 120, 1, 300) + 5
 		end
 		return REMOTE_WRITE_HANDLER_RESPONSE_SECONDS
 	end
@@ -8703,7 +8783,13 @@ do
 				late = late,
 			}
 			if ok then
-				audit.result = result
+				local transformResult = remoteState.auditResultForOp
+				if transformResult then
+					local transformedOk, transformed = pcall(transformResult, item.op, result)
+					audit.result = if transformedOk then transformed else "<result-redacted>"
+				else
+					audit.result = result
+				end
 			else
 				audit.error = classifyRemoteHandlerError(item.op, result)
 			end
@@ -8880,13 +8966,19 @@ do
 			})
 			return
 		end
+		local receivedAt = os.clock()
+		if op == "clipboard_copy" or op == "clipboard_paste" then
+			-- Clipboard deadlines are end-to-end. The handler deducts time spent
+			-- waiting behind another serialized write before it can mutate Studio.
+			args.__rosyncReceivedAt = receivedAt
+		end
 		local item = {
 			client = client,
 			reqId = reqId,
 			op = op,
 			args = args,
 			handler = handler,
-			receivedAt = os.clock(),
+			receivedAt = receivedAt,
 			responded = false,
 			started = false,
 			finished = false,
@@ -9196,6 +9288,12 @@ local function doPullPath(strictDisk: boolean?)
 	return true
 end
 
+-- A daemon or Desktop broker may advertise the authorized project initializer.
+-- Keep this state near the connection UI that consumes it so the plugin's very
+-- large top-level chunk can reuse earlier compiler registers.
+local projectInitCandidate: any = nil
+local connectionAttempt = 0
+
 local function disconnect(reason)
 	connected = false
 	busy = false
@@ -9214,6 +9312,8 @@ local function disconnect(reason)
 	setBanner(nil)
 	connectedPort = nil
 	pluginCapability = nil
+	projectInitCandidate = nil
+	connectionAttempt += 1
 	if reason then
 		log("disconnected: " .. reason)
 	end
@@ -9371,7 +9471,8 @@ end
 --------------------------------------------------------------------------------
 
 local function trimTrailingSlash(s)
-	return (s:gsub("/+$", ""))
+	local trimmed = tostring(s or ""):match("^%s*(.-)%s*$") or ""
+	return (trimmed:gsub("/+$", ""))
 end
 
 local function probePort(port, gameId)
@@ -9451,40 +9552,346 @@ local function validateDaemonProtocol(url)
 	return true, nil, capability
 end
 
-local function discoverDaemon(gameId)
-	-- Spawn a coroutine per port, first-match-wins via a shared result slot.
-	setPill("probing")
-	log(string.format("probing ports %d..%d for GameId %s", PORT_RANGE_START, PORT_RANGE_END, gameId))
-	local result = { found = false, url = nil, port = nil, sawWrongGame = false }
-	local remaining = PORT_RANGE_END - PORT_RANGE_START + 1
-	local done = false
+-- Project-bootstrap constants live in this late connection scope instead of at
+-- the top of the already-large plugin chunk, preserving Luau's 200-register
+-- compiler budget for the earlier capture and playtest function declarations.
+local BROKER_PORT_START = 7867
+local BROKER_PORT_END = 7870
+local PROJECT_DAEMON_WAIT_SECONDS = 120
+
+local function projectInitOffer(url, port, hello)
+	if type(hello) ~= "table" or tonumber(hello.pluginProtocol) ~= PLUGIN_PROTOCOL_VERSION then
+		return nil
+	end
+	local capability = hello.pluginCapability
+	if type(capability) ~= "string" or #capability ~= 64 or not capability:match("^[0-9a-fA-F]+$") then
+		return nil
+	end
+	local init = hello.projectInit
+	if type(init) ~= "table" or init.available ~= true then
+		return nil
+	end
+	local projectsRoot = init.projectsRoot
+	local endpoint = init.endpoint
+	if type(projectsRoot) ~= "string" or projectsRoot == "" then
+		return nil
+	end
+	if
+		type(endpoint) ~= "string"
+		or #endpoint > 128
+		or not endpoint:match("^/[A-Za-z0-9_%%/%.%-]+$")
+		or endpoint:sub(1, 2) == "//"
+		or endpoint:find("..", 1, true) ~= nil
+	then
+		return nil
+	end
+	return {
+		url = url,
+		port = port,
+		endpoint = endpoint,
+		projectsRoot = projectsRoot,
+		pluginCapability = capability,
+	}
+end
+
+local function projectInitUnavailableMessage(hello)
+	if type(hello) ~= "table" then
+		return nil
+	end
+	local init = hello.projectInit
+	if type(init) ~= "table" or init.broker ~= true or init.available == true then
+		return nil
+	end
+	if type(init.error) == "string" and init.error ~= "" then
+		return init.error
+	end
+	return "Set a Projects folder in Ro Sync Desktop Settings before creating this project."
+end
+
+local function discoverDaemon(gameId, quiet, includeInitializer)
+	-- Probe concurrently, but choose the lowest-port exact match and initializer
+	-- deterministically after all completed probes have been collected.
+	if not quiet then
+		setPill("probing")
+		log(string.format("probing ports %d..%d for GameId %s", PORT_RANGE_START, PORT_RANGE_END, gameId))
+	end
+	local result = {
+		found = false,
+		url = nil,
+		port = nil,
+		sawWrongGame = false,
+		initializer = nil,
+		initializerError = nil,
+	}
+	local function probeRange(firstPort, lastPort)
+		local probes = {}
+		local remaining = lastPort - firstPort + 1
+		local closed = false
+		for port = firstPort, lastPort do
+			task.spawn(function()
+				local matched, url, hello = probePort(port, gameId)
+				if not closed then
+					probes[port] = { matched = matched, url = url, hello = hello }
+				end
+				remaining -= 1
+			end)
+		end
+		local started = os.clock()
+		while remaining > 0 and (os.clock() - started) < PROBE_TIMEOUT_SECONDS do
+			task.wait(0.05)
+		end
+		closed = true
+		return probes
+	end
+
+	local probes = probeRange(PORT_RANGE_START, PORT_RANGE_END)
+	local daemonInitializer = nil
 
 	for port = PORT_RANGE_START, PORT_RANGE_END do
-		task.spawn(function()
-			local matched, url, hello = probePort(port, gameId)
-			if done then
-				remaining -= 1
-				return
-			end
-			if matched then
+		local probe = probes[port]
+		if probe then
+			if probe.matched and not result.found then
 				result.found = true
-				result.url = url
+				result.url = probe.url
 				result.port = port
-				done = true
-			elseif hello ~= nil then
+			elseif probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
-			remaining -= 1
-		end)
+			if daemonInitializer == nil and probe.hello ~= nil then
+				daemonInitializer = projectInitOffer(probe.url, port, probe.hello)
+			end
+		end
 	end
 
-	-- Wait up to PROBE_TIMEOUT_SECONDS, or until a match or all done.
-	local start = os.clock()
-	while not done and remaining > 0 and (os.clock() - start) < PROBE_TIMEOUT_SECONDS do
-		task.wait(0.05)
+	-- The Desktop broker is deliberately outside the project-daemon range. It
+	-- exists even when there are no projects yet, so inspect it only after no
+	-- matching GameId daemon was found. Prefer it over a wrong-game daemon's
+	-- initializer because Desktop owns the configured projects root and daemon
+	-- lifecycle handoff.
+	if not result.found and includeInitializer ~= false then
+		if not quiet then
+			log(string.format("probing Desktop broker ports %d..%d", BROKER_PORT_START, BROKER_PORT_END))
+		end
+		local brokerProbes = probeRange(BROKER_PORT_START, BROKER_PORT_END)
+		for port = BROKER_PORT_START, BROKER_PORT_END do
+			local probe = brokerProbes[port]
+			if probe and probe.hello ~= nil then
+				local offer = projectInitOffer(probe.url, port, probe.hello)
+				if offer ~= nil then
+					result.initializer = offer
+					break
+				elseif result.initializerError == nil then
+					result.initializerError = projectInitUnavailableMessage(probe.hello)
+				end
+			end
+		end
 	end
-	done = true
+	if result.initializer == nil then
+		result.initializer = daemonInitializer
+	end
 	return result
+end
+
+local function positiveIdString(value)
+	local text = tostring(value or ""):match("^%s*(.-)%s*$") or ""
+	if text == "" or not text:match("^%d+$") or text:match("^0+$") then
+		return nil
+	end
+	return (text:gsub("^0+", ""))
+end
+
+local function normalizeCreatorType(value)
+	local text = tostring(value or "")
+	if text == "Group" or text:match("%.Group$") then
+		return "Group"
+	elseif text == "User" or text:match("%.User$") then
+		return "User"
+	end
+	return nil
+end
+
+local function collectProjectInitMetadata()
+	local gameName = tostring(game.Name or "")
+	local loweredGameName = gameName:lower()
+	local genericGameName = gameName == ""
+		or gameName:match("^Place%d*$") ~= nil
+		or loweredGameName == "game"
+		or loweredGameName == "untitled experience"
+	if gameName == "" then
+		gameName = "Untitled Experience"
+	end
+	local placeName = gameName
+	local creatorType = nil
+	local creatorId = nil
+
+	pcall(function()
+		creatorType = normalizeCreatorType(game.CreatorType)
+		creatorId = positiveIdString(game.CreatorId)
+	end)
+
+	-- Product info gives Studio a better place label and fills creator metadata
+	-- on channels where DataModel.CreatorType/CreatorId are unavailable.
+	local infoOk, info = pcall(function()
+		return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId, Enum.InfoType.Asset)
+	end)
+	if infoOk and type(info) == "table" then
+		if type(info.Name) == "string" and info.Name ~= "" then
+			placeName = info.Name
+			-- DataModel.Name is commonly the generic "Place1" even for a
+			-- published experience. Product info is the authoritative visible
+			-- title in that case, so do not create projects named Place1.
+			if genericGameName then
+				gameName = info.Name
+			end
+		end
+		local creator = info.Creator
+		if type(creator) == "table" then
+			creatorType = normalizeCreatorType(creator.CreatorType or creator.Type) or creatorType
+			creatorId = positiveIdString(creator.CreatorTargetId or creator.Id or creator.CreatorId) or creatorId
+		end
+	end
+
+	local metadata = {
+		gameName = gameName,
+		placeName = placeName,
+		gameId = positiveIdString(game.GameId),
+		placeId = positiveIdString(game.PlaceId),
+		creatorType = creatorType,
+		creatorId = creatorId,
+	}
+	if creatorType == "Group" then
+		metadata.groupId = creatorId
+	end
+	return metadata
+end
+
+local function beginDaemonConnection(chosenUrl, chosenPort)
+	local protocolOk, protocolError, daemonPluginCapability = validateDaemonProtocol(chosenUrl)
+	if not protocolOk then
+		log("connect blocked: " .. tostring(protocolError))
+		setPill("error", "update Ro Sync")
+		setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
+		busy = false
+		return false
+	end
+
+	projectInitCandidate = nil
+	pluginCapability = daemonPluginCapability
+	baseUrl = trimTrailingSlash(chosenUrl)
+	connectedPort = tostring(chosenPort or "?")
+	refreshDaemonConfig(baseUrl)
+	setPill("connecting")
+	setBanner(nil)
+
+	-- Initial-sync handshake before hooks + ws.
+	runInitialCompare()
+	return true
+end
+
+local function projectInitErrorMessage(decoded)
+	if type(decoded) ~= "table" then
+		return "the daemon returned a malformed project response"
+	end
+	local err = decoded.error
+	if type(err) == "table" then
+		local message = tostring(err.message or err.code or "project creation failed")
+		if type(err.suggestedDirectoryName) == "string" and err.suggestedDirectoryName ~= "" then
+			message ..= " Suggested folder: " .. err.suggestedDirectoryName
+		end
+		return message
+	end
+	return tostring(err or "project creation failed")
+end
+
+local function createProjectAndWait(candidate, attempt)
+	setPill("project_creating")
+	setBanner("Collecting Studio metadata and creating the Ro Sync project...")
+	local metadata = collectProjectInitMetadata()
+	if metadata.gameId == nil or metadata.placeId == nil then
+		setPill("error", "publish this place first")
+		setBanner("Ro Sync needs a published GameId and PlaceId before it can create a project.")
+		busy = false
+		projectInitCandidate = nil
+		return
+	end
+
+	log(
+		string.format(
+			"requesting project initialization for %s (GameId %s, PlaceId %s)",
+			metadata.gameName,
+			metadata.gameId,
+			metadata.placeId
+		)
+	)
+	local ok, response = httpRequestTo(candidate.url .. candidate.endpoint, "POST", {
+		pluginCapability = candidate.pluginCapability,
+		requestId = HttpService:GenerateGUID(false),
+		gameName = metadata.gameName,
+		placeName = metadata.placeName,
+		gameId = metadata.gameId,
+		placeId = metadata.placeId,
+		creatorType = metadata.creatorType,
+		creatorId = metadata.creatorId,
+		groupId = metadata.groupId,
+	})
+	if attempt ~= connectionAttempt or not busy then
+		return
+	end
+	if not ok then
+		setPill("error", "project request failed")
+		setBanner("Could not reach Ro Sync Desktop: " .. tostring(response))
+		log("project-init request failed: " .. tostring(response))
+		busy = false
+		projectInitCandidate = nil
+		return
+	end
+
+	local decoded = nil
+	local decodeOk = pcall(function()
+		decoded = HttpService:JSONDecode(response.Body or "")
+	end)
+	if not response.Success or not decodeOk or type(decoded) ~= "table" or decoded.ok ~= true then
+		local message = projectInitErrorMessage(decoded)
+		setPill("error", "project creation failed")
+		setBanner(message)
+		log(string.format("project-init rejected (HTTP %s): %s", tostring(response.StatusCode), message))
+		busy = false
+		projectInitCandidate = nil
+		return
+	end
+
+	projectInitCandidate = nil
+	local projectPath =
+		tostring(decoded.project or decoded.projectPath or decoded.directoryName or "the configured projects folder")
+	local initStatus = decoded.status or (decoded.reused == true and "existing" or "created")
+	log(string.format("project-init %s: %s", tostring(initStatus), projectPath))
+	setPill("project_waiting")
+	setBanner("Project created at " .. projectPath .. ". Waiting for Ro Sync Desktop to start its daemon...")
+
+	local deadline = os.clock() + PROJECT_DAEMON_WAIT_SECONDS
+	while busy and attempt == connectionAttempt and os.clock() < deadline do
+		local result = discoverDaemon(metadata.gameId, true, false)
+		if attempt ~= connectionAttempt or not busy then
+			return
+		end
+		if result.found then
+			log(string.format("Desktop daemon ready at %s", tostring(result.url)))
+			beginDaemonConnection(result.url, result.port)
+			return
+		end
+		task.wait(1)
+	end
+
+	if attempt == connectionAttempt and busy then
+		busy = false
+		setPill("no_daemon", metadata.gameId)
+		setBanner(
+			"The project was created at "
+				.. projectPath
+				.. ", but Desktop did not start its daemon. Open Ro Sync Desktop, then click Connect."
+		)
+		log("project-init: timed out waiting for the Desktop-managed daemon")
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -9501,13 +9908,29 @@ startConnect = function()
 		busy = false
 		wsGeneration += 1
 		decisionGeneration += 1
+		connectionAttempt += 1
+		projectInitCandidate = nil
 		setPill("idle")
 		setBanner(nil)
 		log("cancelled")
 		return
 	end
 
+	if projectInitCandidate ~= nil then
+		local candidate = projectInitCandidate
+		projectInitCandidate = nil
+		busy = true
+		connectionAttempt += 1
+		local attempt = connectionAttempt
+		task.spawn(function()
+			createProjectAndWait(candidate, attempt)
+		end)
+		return
+	end
+
 	busy = true
+	connectionAttempt += 1
+	local attempt = connectionAttempt
 
 	-- Persist manual URL if the user typed one
 	local manualUrl = urlBox.Text
@@ -9564,6 +9987,9 @@ startConnect = function()
 			end)
 			while waiting do
 				task.wait(0.05)
+				if attempt ~= connectionAttempt or not busy then
+					return
+				end
 			end
 			setBanner(nil)
 			if resolved == nil or resolved == "" then
@@ -9579,11 +10005,28 @@ startConnect = function()
 			chosenPort = typed:match(":(%d+)") or "?"
 			log("using manual URL from modal: " .. typed)
 		else
-			local result = discoverDaemon(gameId)
+			local result = discoverDaemon(gameId, false)
+			if attempt ~= connectionAttempt or not busy then
+				return
+			end
 			if not result.found then
-				if result.sawWrongGame then
+				if result.initializer ~= nil then
+					projectInitCandidate = result.initializer
+					setPill("project_init")
+					setBanner(
+						"No Ro Sync project exists for this experience. Click Create Project to initialize it under "
+							.. tostring(result.initializer.projectsRoot)
+							.. "."
+					)
+					log(string.format("project initializer available at %s", tostring(result.initializer.url)))
+				elseif result.initializerError ~= nil then
+					setPill("no_daemon", gameId)
+					setBanner(tostring(result.initializerError))
+					log("Desktop project initializer unavailable: " .. tostring(result.initializerError))
+				elseif result.sawWrongGame then
 					setPill("wrong_game")
-					log("found a daemon on a probed port, but no gameId match")
+					setBanner("Ro Sync Desktop is running, but its daemon does not offer project initialization.")
+					log("found a daemon on a probed port, but no gameId match or project initializer")
 				else
 					setPill("no_daemon", gameId)
 				end
@@ -9595,23 +10038,10 @@ startConnect = function()
 			log(string.format("matched daemon at %s", chosenUrl))
 		end
 
-		local protocolOk, protocolError, daemonPluginCapability = validateDaemonProtocol(chosenUrl)
-		if not protocolOk then
-			log("connect blocked: " .. tostring(protocolError))
-			setPill("error", "update Ro Sync")
-			setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
-			busy = false
+		if attempt ~= connectionAttempt or not busy then
 			return
 		end
-
-		pluginCapability = daemonPluginCapability
-		baseUrl = trimTrailingSlash(chosenUrl)
-		connectedPort = chosenPort
-		refreshDaemonConfig(baseUrl)
-		setPill("connecting")
-
-		-- Initial-sync handshake before hooks + ws
-		runInitialCompare()
+		beginDaemonConnection(chosenUrl, chosenPort)
 	end)
 end
 

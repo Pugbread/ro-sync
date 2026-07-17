@@ -26,9 +26,69 @@ IDs with private correlation IDs before routing them to Studio.
 Origin-bearing browser HTTP/WebSocket requests must also carry the owning
 widget's capability as `?widgetToken=...`; native loopback Studio/CLI clients
 do not send an Origin header.
-Protocol 2 corresponds to Studio plugin 2.0.0 and adds structured errors,
+Protocol 2 corresponds to Studio plugin 2.1.0 and adds structured errors,
 capability discovery, artifact-backed capture, playtest runtime routing, and
 workflow transaction/precondition operations.
+
+## Desktop-authorized project initialization
+
+Ro Sync Desktop's project broker (ports `7867`–`7870`) and a daemon started
+with `--projects-root <absolute-directory>` advertise an optional initializer
+in `/hello`:
+
+```json
+{
+  "projectInit": {
+    "available": true,
+    "projectsRoot": "/Users/example/Roblox",
+    "endpoint": "/projects/init"
+  }
+}
+```
+
+Ordinary CLI/manual daemons advertise `available: false` and omit
+`projectsRoot`. The plugin first scans project-daemon ports `7878`–`7890` for
+the open Studio `GameId`; only when there is no match does it scan the Desktop
+broker range. It prefers the lowest-port compatible Desktop broker over a
+wrong-game daemon's initializer. Project creation remains an explicit second
+click: discovery itself never writes to disk. The plugin posts the endpoint
+advertised by that same `/hello`, authenticating it with the process-local
+`pluginCapability` and sending metadata rather than a path:
+
+```json
+{
+  "pluginCapability": "<64 hex characters>",
+  "gameName": "Race Stars",
+  "placeName": "Main Place",
+  "gameId": "123",
+  "placeId": "456",
+  "creatorType": "Group",
+  "creatorId": "789",
+  "groupId": "789"
+}
+```
+
+IDs are positive decimal strings. `creatorType` / `creatorId` are optional but
+must be supplied together; a group creator implies a matching `groupId`. The
+daemon derives a portable slug and creates exactly one direct, non-symlink
+child below its canonical configured root. It never accepts a caller-provided
+path. Existing projects with the same `gameId` are idempotent; unrelated name
+collisions use a deterministic `-<gameId>` suffix, and a second collision is
+refused with `PROJECT_PATH_COLLISION` plus `suggestedDirectoryName`. A repeat
+request scans direct children for the universe even if its display name has
+changed, merges a newly seen `placeId` plus supplied creator/place metadata,
+and preserves unrecognized project settings in `ro-sync.json`.
+
+Success returns `status: "created"` or `"existing"`, the canonical `project`
+path, metadata, initialized-file flags, and `reconnectRequired: true`. It also
+appends a capability-free `project-init` audit entry and broadcasts a
+watcher-visible `project-init` event so Desktop can start the newly created
+project's managed daemon. The plugin does not spawn a process; it displays a
+waiting state and probes for the matching `GameId` daemon until Desktop makes
+it available. Errors use `{ "ok": false, "error": { "code", "message" } }`;
+the stable codes are `PROJECT_INIT_UNAVAILABLE`, `UNAUTHORIZED`,
+`INVALID_REQUEST`, `INVALID_METADATA`, `INVALID_PROJECTS_ROOT`,
+`PROJECT_PATH_COLLISION`, `PROJECT_PATH_ESCAPE`, and `PROJECT_INIT_FAILED`.
 
 ## Filesystem sync operations
 
@@ -107,7 +167,7 @@ The read-only `capabilities` operation is the feature-negotiation entrypoint:
 {"type":"request","request_id":1,"op":"capabilities","args":{}}
 ```
 
-Its value identifies `pluginVersion` (`2.0.0`), `protocolVersion` (`2`), the
+Its value identifies `pluginVersion` (`2.1.0`), `protocolVersion` (`2`), the
 Studio/host DataModel and place/game IDs, limits, current screenshot permission,
 and feature flags. `features.photo`, `features.photoTransparent`,
 `features.photoUiOnly`, `features.photoCameraCFrame`,
@@ -157,6 +217,7 @@ huge WebSocket JSON frame:
 ```text
 POST /artifacts/lease
 POST /artifacts/:id/chunk
+POST /artifacts/:id/read
 POST /artifacts/:id/finalize
 POST /artifacts/:id/abort
 POST /artifacts/:id/consume
@@ -169,12 +230,44 @@ bytes. The token is valid only until finalize/abort/expiry. Finalization checks
 the expected size and optional SHA-256, atomically promotes the private staging
 file, and returns absolute path, MIME, size, and digest metadata. Tokens are
 never returned by lookup or final artifact metadata.
+The bounded `read` route serves finalized chunks by unguessable artifact id and
+echoes exact offsets, total length, EOF state, and digest. It lets a destination
+Studio plugin consume a CLI-uploaded native clipboard without putting large
+binary bodies on the command WebSocket.
 The CLI looks finalized metadata up by the lease ID, verifies bounded bytes,
 MIME, dimensions, PNG structure, size, and SHA-256, writes its requested
 output, then consumes the transport file. Finalized files that are not consumed
 have a TTL, LRU ordering, and a global byte budget. Pending uploads have
 separate lease-count and reserved-byte budgets; expired owned crash leftovers
 are removed on startup or cleanup, and partial/finalized entries are bounded.
+
+## Native cross-project clipboard
+
+`clipboard_copy` resolves explicit `paths` or the current Studio Selection,
+removes duplicate and nested roots, refreshes open Script Editor text, and
+serializes every root together with
+`SerializationService:SerializeInstancesAsync`. Serializing roots in one call
+preserves references between them. The plugin uploads the opaque `.rbxm`
+buffer through an artifact lease and returns only bounded root metadata, size,
+and digest information; binary bytes and script source never enter command
+responses or activity frames.
+
+The CLI verifies and atomically installs that payload in Ro Sync's private,
+platform-native state directory. `clipboard_paste` receives a short-lived
+artifact id on the destination daemon, reads exact bounded chunks, verifies the
+complete SHA-256 with `EncodingService`, and calls
+`SerializationService:DeserializeInstancesAsync`. Every destination parent is
+resolved before mutation. Default destinations use a segment route containing
+name, class, and same-class/name sibling ordinal, so `/` inside a legal Studio
+name and duplicate sibling names remain unambiguous; `--to` remains an explicit
+human path override. Parenting and default Selection replacement happen
+inside one `ChangeHistoryService` recording; errors destroy all detached or
+partly inserted roots and cancel the recording.
+
+Services and other non-creatable roots are rejected. References outside the
+copied roots cannot cross places, matching native Studio copy/paste. Copy and
+paste audit records contain counts and paths only—never lease tokens, base64,
+artifact contents, or script text.
 
 ## Locally packaged Photo transport
 

@@ -253,6 +253,10 @@ pub struct StartLock {
 
 impl StartLock {
     pub fn acquire(path: &Path) -> io::Result<Self> {
+        Self::acquire_named(path, "daemon start")
+    }
+
+    pub fn acquire_named(path: &Path, activity: &str) -> io::Result<Self> {
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -272,13 +276,13 @@ impl StartLock {
             fs::TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "another daemon start is already in progress (lock {})",
+                    "another {activity} is already in progress (lock {})",
                     path.display()
                 ),
             ),
             fs::TryLockError::Error(error) => io::Error::new(
                 error.kind(),
-                format!("lock daemon start file {}: {error}", path.display()),
+                format!("lock {activity} file {}: {error}", path.display()),
             ),
         })?;
 
@@ -325,7 +329,17 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_private_atomic_impl(path, bytes, true)
+}
+
+/// Atomically writes private binary data without the newline terminator used
+/// by Ro Sync's human-readable JSON state records.
+pub(crate) fn write_private_atomic_exact(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_private_atomic_impl(path, bytes, false)
+}
+
+fn write_private_atomic_impl(path: &Path, bytes: &[u8], terminate_line: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid state path"))?;
@@ -348,18 +362,57 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let result = (|| {
         let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
+        if terminate_line {
+            file.write_all(b"\n")?;
         }
-        fs::rename(&temporary, path)
+        file.sync_all()?;
+        replace_private_file(&temporary, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_private_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_private_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+
+    let existing = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

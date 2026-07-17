@@ -9,6 +9,7 @@ import {
 } from "../platform.js";
 import { daemonJson } from "../bridge.js";
 import { copyText, joinProjectFile, platformLabel } from "./runtime.js";
+import { appearanceThemeOptions } from "./theme.js";
 
 const RELEASES_URL = "https://github.com/Pugbread/ro-sync/releases";
 const RUSTUP_URL   = "https://rustup.rs";
@@ -27,7 +28,38 @@ async function readFileViaExec(api, absPath) {
 
 export function mountSettings(root, api) {
   const desktop = api.host.isDesktop;
+  const themeOptions = appearanceThemeOptions({ supportsHost: api.host.supports.hostTheme });
+  const themeOptionMarkup = themeOptions.map((option) => `
+    <label class="theme-option">
+      <input type="radio" name="appearance-theme" value="${option.id}" autocomplete="off" />
+      <span class="theme-preview theme-preview-${option.preview}" aria-hidden="true">
+        <span class="theme-preview-sidebar"></span>
+        <span class="theme-preview-content">
+          <span></span><span></span><span></span>
+        </span>
+      </span>
+      <span class="theme-option-copy">
+        <strong>${option.label}</strong>
+        <span>${option.description}</span>
+      </span>
+    </label>
+  `).join("");
   root.innerHTML = `
+    <section class="section" id="sec-appearance">
+      <div class="section-heading-row">
+        <div>
+          <h3>Appearance</h3>
+          <p>Choose how Ro Sync looks. Your selection follows this app across restarts.</p>
+        </div>
+        <span id="appearance-state" class="status-pill" aria-live="polite">Dark</span>
+      </div>
+      <fieldset class="theme-picker" aria-describedby="appearance-note">
+        <legend>Theme</legend>
+        <div class="theme-options">${themeOptionMarkup}</div>
+      </fieldset>
+      <p id="appearance-note" class="settings-note">System follows your computer. Black uses true black backgrounds for OLED displays.</p>
+    </section>
+
     <section class="section">
       <h3>Secrets</h3>
       <p id="secret-storage-hint" style="color:var(--muted)">${desktop
@@ -48,6 +80,27 @@ export function mountSettings(root, api) {
       <p id="secret-msg" style="color:var(--muted); margin-top:8px"></p>
     </section>
 
+    <section class="section" id="sec-projects-root">
+      <div class="section-heading-row">
+        <div>
+          <h3>Projects folder</h3>
+          <p>${desktop
+            ? "Choose where Ro Sync creates projects requested from Studio. The folder also authorizes its project subfolders for the desktop app."
+            : "Optional home folder for your Ro Sync projects."}</p>
+        </div>
+        <span id="projects-root-state" class="status-pill">Not set</span>
+      </div>
+      <div class="settings-path-card">
+        <code id="projects-root-path">Choose a folder to enable project creation from Studio.</code>
+      </div>
+      <div class="row settings-root-actions">
+        <button id="projects-root-pick" class="primary" type="button">Choose folder</button>
+        <button id="projects-root-open" type="button">Open</button>
+        <button id="projects-root-clear" type="button">Clear</button>
+      </div>
+      <p id="projects-root-msg" class="settings-note"></p>
+    </section>
+
     <section class="section" id="sec-project" hidden>
       <h3>Project: <span id="pp-name">—</span></h3>
       <p style="color:var(--muted)">Stored in <code>ro-sync.json</code> at the project root. The daemon hot-reloads the file.</p>
@@ -55,6 +108,7 @@ export function mountSettings(root, api) {
         <label>Initial sync priority
           <select id="pp-priority">
             <option value="Prompt">Prompt (ask me)</option>
+            <option value="Studio">Studio first (new Studio-created projects)</option>
             <option value="ServerPrefer">Server prefer (Studio wins)</option>
             <option value="FilesystemPrefer">Filesystem prefer (disk wins)</option>
           </select>
@@ -117,7 +171,16 @@ export function mountSettings(root, api) {
     </section>
 
     <section class="section">
-      <h3>Daemon</h3>
+      <div class="section-heading-row">
+        <div>
+          <h3>${desktop ? "Served projects" : "Daemon"}</h3>
+          <p>${desktop
+            ? "Each served project has an independent managed daemon and Studio connection."
+            : "Runtime details for the active project."}</p>
+        </div>
+        <span id="set-daemon-count" class="status-pill">0 served</span>
+      </div>
+      <div id="set-daemon-list" class="settings-daemon-list" ${desktop ? "" : "hidden"}></div>
       <dl class="kv">
         <dt>binary</dt><dd id="set-bin">—</dd>
         <dt>default port</dt><dd>${DEFAULT_PORT}</dd>
@@ -128,7 +191,7 @@ export function mountSettings(root, api) {
         <dt>protocol</dt><dd id="set-protocol">—</dd>
       </dl>
       <div class="row" style="margin-top:8px">
-        <button id="set-start">Start</button>
+        <button id="set-start">Serve focused project</button>
         <button id="set-stop" class="danger">Stop</button>
         <button id="set-restart">Restart</button>
       </div>
@@ -154,6 +217,24 @@ export function mountSettings(root, api) {
   const $start = root.querySelector("#set-start");
   const $stop = root.querySelector("#set-stop");
   const $restart = root.querySelector("#set-restart");
+  const $daemonCount = root.querySelector("#set-daemon-count");
+  const $daemonList = root.querySelector("#set-daemon-list");
+
+  const $appearanceState = root.querySelector("#appearance-state");
+  const $appearanceInputs = [...root.querySelectorAll('input[name="appearance-theme"]')];
+
+  function syncThemeOptionClasses() {
+    for (const input of $appearanceInputs) {
+      input.closest(".theme-option")?.classList.toggle("is-selected", input.checked);
+    }
+  }
+
+  const $projectsRootPath = root.querySelector("#projects-root-path");
+  const $projectsRootState = root.querySelector("#projects-root-state");
+  const $projectsRootPick = root.querySelector("#projects-root-pick");
+  const $projectsRootOpen = root.querySelector("#projects-root-open");
+  const $projectsRootClear = root.querySelector("#projects-root-clear");
+  const $projectsRootMsg = root.querySelector("#projects-root-msg");
 
   const $secretRobloxKey = root.querySelector("#secret-roblox-key");
   const $secretToggle = root.querySelector("#secret-toggle");
@@ -191,8 +272,8 @@ export function mountSettings(root, api) {
     return runtimeInfo;
   }
 
-  async function readDaemonHello() {
-    const base = api.getDaemonBase();
+  async function readDaemonHello(projectId = null) {
+    const base = api.getDaemonBase(projectId);
     if (!base) return null;
     try {
       return await daemonJson(base, "/hello");
@@ -298,33 +379,20 @@ export function mountSettings(root, api) {
 
   $buildRun.addEventListener("click", runBuild);
 
-  let savedRobloxKey = "";
-  let secretInputDirty = false;
-  $secretSave.disabled = true;
-  $secretClear.disabled = true;
-
-  async function hydrateSecrets() {
-    try {
-      savedRobloxKey = String(await api.host.secretGet("robloxCloudApiKey") || "");
-    } catch {
-      savedRobloxKey = "";
-    }
-    if (!secretInputDirty) $secretRobloxKey.value = savedRobloxKey;
-    $secretMsg.textContent = savedRobloxKey ? "Roblox key saved." : "No Roblox key saved.";
-    $secretSave.disabled = false;
-    $secretClear.disabled = false;
-  }
+  $secretMsg.textContent = "Saved credentials stay unchanged until you explicitly replace or clear them.";
 
   async function persistSecrets() {
+    const value = $secretRobloxKey.value.trim();
+    if (!value) {
+      $secretMsg.textContent = "Paste a new key before saving. A blank field does not clear the existing credential.";
+      return;
+    }
     $secretSave.disabled = true;
     try {
-      const value = $secretRobloxKey.value.trim();
-      if (value) await api.host.secretSet("robloxCloudApiKey", value);
-      else await api.host.secretDelete("robloxCloudApiKey");
-      savedRobloxKey = value;
-      secretInputDirty = false;
-      $secretMsg.textContent = value ? "Roblox key saved." : "Roblox key cleared.";
-      api.toast(value ? "Secrets saved" : "Secret cleared");
+      await api.host.secretSet("robloxCloudApiKey", value);
+      $secretRobloxKey.value = "";
+      $secretMsg.textContent = "Roblox key saved. Its value is intentionally not read back into the app.";
+      api.toast("Secrets saved");
     } catch (e) {
       $secretMsg.textContent = `Save failed: ${e.message}`;
       api.toast(`Secrets save failed: ${e.message}`);
@@ -334,8 +402,18 @@ export function mountSettings(root, api) {
   }
 
   async function clearRobloxKey() {
-    $secretRobloxKey.value = "";
-    await persistSecrets();
+    $secretClear.disabled = true;
+    try {
+      await api.host.secretDelete("robloxCloudApiKey");
+      $secretRobloxKey.value = "";
+      $secretMsg.textContent = "Roblox key cleared.";
+      api.toast("Secret cleared");
+    } catch (e) {
+      $secretMsg.textContent = `Clear failed: ${e.message}`;
+      api.toast(`Secret clear failed: ${e.message}`);
+    } finally {
+      $secretClear.disabled = false;
+    }
   }
 
   $secretToggle.addEventListener("click", () => {
@@ -344,10 +422,28 @@ export function mountSettings(root, api) {
     $secretToggle.textContent = showing ? "Show" : "Hide";
   });
   $secretRobloxKey.addEventListener("input", () => {
-    secretInputDirty = true;
+    $secretMsg.textContent = $secretRobloxKey.value.trim()
+      ? "Ready to replace the saved credential."
+      : "Saved credentials stay unchanged until you explicitly replace or clear them.";
   });
   $secretSave.addEventListener("click", persistSecrets);
   $secretClear.addEventListener("click", clearRobloxKey);
+
+  for (const input of $appearanceInputs) {
+    input.addEventListener("change", () => {
+      if (!input.checked) return;
+      const resolved = api.setAppearanceTheme(input.value);
+      syncThemeOptionClasses();
+      const selected = themeOptions.find((option) => option.id === resolved.preference);
+      api.toast(`${selected?.label || "Theme"} appearance enabled`);
+    });
+    input.addEventListener("focus", () => {
+      input.closest(".theme-option")?.classList.add("is-focus-visible");
+    });
+    input.addEventListener("blur", () => {
+      input.closest(".theme-option")?.classList.remove("is-focus-visible");
+    });
+  }
 
   function activeProject() {
     const s = api.getState();
@@ -358,21 +454,99 @@ export function mountSettings(root, api) {
     return { InitialSyncPriority: "Prompt", AutoReconnect: "on", DisplayPrompts: "on" };
   }
 
+  function servedIds(state = api.getState()) {
+    const valid = new Set((state.projects || []).map((project) => project.id));
+    return (state.servedProjectIds || []).filter((id) => valid.has(id));
+  }
+
+  function renderDaemonList(state) {
+    if (!desktop || !$daemonList) return;
+    const ids = servedIds(state);
+    $daemonList.innerHTML = "";
+    if (!ids.length) {
+      const empty = document.createElement("p");
+      empty.className = "settings-daemon-empty";
+      empty.textContent = "No projects are being served. Use a project switch here or in Projects.";
+      $daemonList.appendChild(empty);
+      return;
+    }
+    for (const projectId of ids) {
+      const project = (state.projects || []).find((item) => item.id === projectId);
+      if (!project) continue;
+      const session = api.getDaemonSession?.(projectId) || state.daemonSessions?.[projectId] || {};
+      const row = document.createElement("article");
+      row.className = "settings-daemon-row";
+      const status = session.ok === true ? "Online" : (session.ok === false ? "Error" : "Starting");
+      const dot = session.ok === true ? "dot-ok" : (session.ok === false ? "dot-err" : "dot-warn");
+      row.innerHTML = `
+        <span class="dot ${dot}" aria-hidden="true"></span>
+        <div class="settings-daemon-copy">
+          <strong></strong>
+          <span></span>
+        </div>
+        <div class="settings-daemon-meta">
+          <span class="status-pill"></span>
+          <code></code>
+        </div>
+        <div class="settings-daemon-actions">
+          <button type="button" data-daemon-action="restart">Restart</button>
+          <button type="button" class="danger" data-daemon-action="stop">Stop</button>
+        </div>
+      `;
+      row.querySelector("strong").textContent = project.name || project.path;
+      row.querySelector(".settings-daemon-copy span").textContent = session.error || project.path;
+      const statusPill = row.querySelector(".status-pill");
+      statusPill.textContent = status;
+      statusPill.classList.add(session.ok === true ? "is-ok" : (session.ok === false ? "is-err" : "is-pending"));
+      row.querySelector("code").textContent = session.port ? `:${session.port}` : "—";
+      for (const button of row.querySelectorAll("[data-daemon-action]")) {
+        button.dataset.projectId = projectId;
+      }
+      $daemonList.appendChild(row);
+    }
+  }
+
   function refresh() {
     const s = api.getState();
-    const base = api.getDaemonBase();
+    const proj = activeProject();
+    const session = proj ? api.getDaemonSession?.(proj.id) || s.daemonSessions?.[proj.id] : null;
+    const base = proj ? api.getDaemonBase(proj.id) : null;
+    const appearance = api.getAppearanceTheme();
+    for (const input of $appearanceInputs) {
+      input.checked = input.value === appearance.preference;
+    }
+    syncThemeOptionClasses();
+    const selectedTheme = themeOptions.find((option) => option.id === appearance.preference);
+    const followsAnotherTheme = appearance.preference === "system";
+    $appearanceState.textContent = followsAnotherTheme
+      ? `${selectedTheme?.label || "System"} · ${appearance.effective === "light" ? "Light" : "Dark"}`
+      : (selectedTheme?.label || "Dark");
     $bin.textContent = desktop
       ? (runtimeInfo?.daemonPath || "Bundled with desktop app")
       : joinShell(WIDGET_DIR_SHELL, BINARY_REL);
     const $plat = root.querySelector("#set-platform");
     if ($plat) $plat.textContent = platformLabel(runtimeInfo?.platform || PLATFORM);
-    $port.textContent = s.daemonPort ?? DEFAULT_PORT;
-    $pid.textContent = s.daemonPid ?? "—";
+    $port.textContent = session?.port ?? (desktop ? "—" : (s.daemonPort ?? DEFAULT_PORT));
+    $pid.textContent = session?.pid ?? (desktop ? "—" : (s.daemonPid ?? "—"));
     $base.textContent = base || "—";
     const $proj = root.querySelector("#set-project-path");
-    if ($proj) $proj.textContent = s.daemonProject || "—";
+    if ($proj) $proj.textContent = session?.project || (desktop ? "—" : (s.daemonProject || "—"));
 
-    const proj = activeProject();
+    const ids = servedIds(s);
+    $daemonCount.textContent = `${ids.length} served`;
+    renderDaemonList(s);
+    const focusedIsServed = !!proj && ids.includes(proj.id);
+    $start.disabled = !proj || focusedIsServed;
+    $stop.disabled = !focusedIsServed;
+    $restart.disabled = !focusedIsServed;
+
+    const projectsRoot = s.projectsRoot || "";
+    $projectsRootPath.textContent = projectsRoot || "Choose a folder to enable project creation from Studio.";
+    $projectsRootState.textContent = projectsRoot ? "Ready" : "Not set";
+    $projectsRootState.classList.toggle("is-ok", !!projectsRoot);
+    $projectsRootOpen.disabled = !projectsRoot;
+    $projectsRootClear.disabled = !projectsRoot;
+
     if (!proj) {
       $ppSection.hidden = true;
       return;
@@ -485,33 +659,95 @@ export function mountSettings(root, api) {
     }
   });
 
-  $start.addEventListener("click", async () => {
-    const s = api.getState();
-    if (!s.activeProjectId) {
-      const target = (s.projects || []).find((p) => p.path === s.daemonProject);
-      if (!target) {
-        api.toast("Select a project in Projects before starting the daemon");
-        return;
-      }
-      api.setState({ activeProjectId: target.id });
+  async function refreshBrokerStatus() {
+    if (!desktop) {
+      $projectsRootMsg.textContent = "Used as the default location when adding projects.";
+      return;
     }
-    await api.ensureDaemon();
+    try {
+      const status = await api.host.projectBrokerStatus();
+      if (status?.ok) {
+        $projectsRootMsg.textContent = api.getState().projectsRoot
+          ? `Studio project creation is ready on local broker port ${status.port}. Restart already-served projects after changing this folder.`
+          : "Choose a folder before asking Studio to create or connect a project.";
+      } else {
+        $projectsRootMsg.textContent = `Studio project creation broker unavailable${status?.error ? `: ${status.error}` : "."}`;
+      }
+    } catch (error) {
+      $projectsRootMsg.textContent = `Could not read project broker status: ${error.message}`;
+    }
+  }
+
+  $projectsRootPick.addEventListener("click", async () => {
+    try {
+      const path = String(await api.host.pickFolder("Choose Ro Sync projects folder") || "").trim();
+      if (!path) return;
+      api.setState({ projectsRoot: path });
+      api.toast("Projects folder saved");
+      await refreshBrokerStatus();
+    } catch (error) {
+      api.toast(`Could not choose projects folder: ${error.message}`);
+    }
+  });
+
+  $projectsRootOpen.addEventListener("click", async () => {
+    const path = api.getState().projectsRoot;
+    if (!path) return;
+    try {
+      await api.host.openPath(path);
+    } catch (error) {
+      api.toast(`Could not open projects folder: ${error.message}`);
+    }
+  });
+
+  $projectsRootClear.addEventListener("click", () => {
+    api.setState({ projectsRoot: null });
+    api.toast("Projects folder cleared");
+    void refreshBrokerStatus();
+  });
+
+  $daemonList?.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-daemon-action]");
+    if (!button) return;
+    const projectId = button.dataset.projectId;
+    if (!projectId) return;
+    button.disabled = true;
+    try {
+      if (button.dataset.daemonAction === "stop") await api.stopProject(projectId);
+      else await api.restartProject(projectId);
+    } catch (error) {
+      api.toast(`Daemon action failed: ${error.message}`);
+    } finally {
+      refresh();
+    }
+  });
+
+  $start.addEventListener("click", async () => {
+    const project = activeProject();
+    if (!project) {
+      api.toast("Select a project in Projects before serving it");
+      return;
+    }
+    if (api.serveProject) await api.serveProject(project.id);
+    else await api.ensureDaemon(project.id);
     refresh();
   });
   $stop.addEventListener("click", async () => {
-    const s = api.getState();
-    const active = (s.projects || []).find((p) => p.id === s.activeProjectId);
-    api.setState({
-      activeProjectId: null,
-      daemonProject: active?.path || s.daemonProject || null,
-    });
-    await api.killDaemon({ preserveTarget: true });
+    const project = activeProject();
+    if (!project) return;
+    if (api.stopProject) await api.stopProject(project.id);
+    else await api.killDaemon(project.id);
     refresh();
   });
   $restart.addEventListener("click", async () => {
-    const stopped = await api.killDaemon({ preserveTarget: true });
-    if (!stopped) return;
-    await api.ensureDaemon();
+    const project = activeProject();
+    if (!project) return;
+    if (api.restartProject) await api.restartProject(project.id);
+    else {
+      const stopped = await api.killDaemon(project.id, { preserveTarget: true });
+      if (!stopped) return;
+      await api.ensureDaemon(project.id);
+    }
     refresh();
   });
 
@@ -521,7 +757,7 @@ export function mountSettings(root, api) {
 
   refresh();
   refreshBuildBanner().then(refresh);
-  hydrateSecrets();
+  refreshBrokerStatus();
 
   return () => { offState(); offUp(); offDown(); };
 }

@@ -56,10 +56,12 @@ export function mountOverwriteModal(api) {
   const buttons = overlay.querySelectorAll("[data-act]");
 
   let currentChoiceId = null;
+  let currentProjectId = null;
   let busy = false;
 
   function open(data) {
     currentChoiceId = data.choiceId || null;
+    currentProjectId = data.projectId || null;
     renderComparison(data.comparison);
     $err.hidden = true;
     $err.textContent = "";
@@ -73,6 +75,7 @@ export function mountOverwriteModal(api) {
   function close() {
     overlay.hidden = true;
     currentChoiceId = null;
+    currentProjectId = null;
     setBusy(false);
   }
 
@@ -174,7 +177,7 @@ export function mountOverwriteModal(api) {
 
   async function submit(choice) {
     if (busy || !currentChoiceId) return;
-    const base = api.getDaemonBase();
+    const base = api.getDaemonBase(currentProjectId);
     if (!base) {
       $err.hidden = false;
       $err.textContent = "Daemon offline — cannot send choice.";
@@ -214,21 +217,22 @@ export function mountOverwriteModal(api) {
   });
 
   // Resolve the active project's per-project settings, if any.
-  function activeSettings() {
+  function projectSettings(projectId = null) {
     const s = api.getState && api.getState();
     if (!s) return {};
-    const proj = (s.projects || []).find((p) => p.id === s.activeProjectId);
+    const proj = (s.projects || []).find((p) => p.id === (projectId || s.activeProjectId));
     return (proj && proj.settings) || {};
   }
 
   api.onBus("initial-choice-needed", (data) => {
     if (!data || typeof data !== "object") return;
-    const cfg = activeSettings();
+    currentProjectId = data.projectId || null;
+    const cfg = projectSettings(currentProjectId);
     const priority = cfg.InitialSyncPriority || "Prompt";
     // ServerPrefer = Studio wins (overwrite disk); FilesystemPrefer = Disk wins.
-    if (priority === "ServerPrefer" || priority === "FilesystemPrefer") {
+    if (priority === "Studio" || priority === "ServerPrefer" || priority === "FilesystemPrefer") {
       currentChoiceId = data.choiceId || null;
-      const choice = priority === "ServerPrefer" ? "studio" : "disk";
+      const choice = priority === "Studio" || priority === "ServerPrefer" ? "studio" : "disk";
       submit(choice);
       return;
     }
@@ -243,6 +247,7 @@ export function mountOverwriteModal(api) {
   api.onBus("initial-choice-made", (data) => {
     if (!data || typeof data !== "object") return;
     if (!currentChoiceId) return;
+    if (data.projectId && currentProjectId && data.projectId !== currentProjectId) return;
     // Close if this resolution is for the currently-shown prompt
     // (or if no choiceId is attached, assume it resolves the current one).
     if (!data.choiceId || data.choiceId === currentChoiceId) {

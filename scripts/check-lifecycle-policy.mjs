@@ -37,7 +37,19 @@ const policy = (status, hello, ownershipAuthenticated = true) => canStopDesktopD
 assert.equal(isDesktopManagedStatus(exactStatus), true);
 assert.equal(policy(exactStatus, exactHello), true, "exact authenticated Desktop boot may stop");
 assert.equal(policy(exactStatus, exactHello, false), false, "unauthenticated Desktop boot must survive");
-assert.equal(policy(exactStatus, { ...exactHello, bootId: "replacement" }), false, "replacement boot must survive");
+for (const mismatch of [
+  { ...exactHello, project: "/other-game" },
+  { ...exactHello, bootId: "replacement" },
+  { ...exactHello, pid: 4101 },
+  { ...exactHello, port: 7879 },
+]) {
+  assert.equal(policy(exactStatus, mismatch), false, "every hello identity field must match status");
+}
+assert.equal(
+  policy({ ...exactStatus, canonicalProject: "/other-game" }, exactHello),
+  false,
+  "status and hello must identify the same expected project",
+);
 
 for (const external of [
   { ...exactStatus, managedBy: "cli" },
@@ -49,99 +61,113 @@ for (const external of [
   assert.equal(policy(external, exactHello), false, "external daemon must never be stoppable");
 }
 
-const completeTracking = {
-  daemonProject: "/game",
-  daemonPid: 4100,
-  daemonPort: 7878,
-  daemonBootId: "desktop-boot",
-  daemonOwnerToken: "desktop-owner-token",
+const alphaSession = {
+  project: "/game",
+  pid: 4100,
+  port: 7878,
+  bootId: "desktop-boot",
+  ownerToken: "desktop-owner-token",
 };
-assert.deepEqual(desktopTrackedOwnership(completeTracking), {
+const betaSession = {
+  project: "/other-game",
+  pid: 4200,
+  port: 7879,
+  bootId: "other-desktop-boot",
+  ownerToken: "other-desktop-owner-token",
+};
+const projectState = {
+  servedProjectIds: ["alpha", "beta"],
+  daemonSessions: { alpha: alphaSession, beta: betaSession },
+};
+assert.deepEqual(desktopTrackedOwnership(projectState, "alpha"), {
   project: "/game",
   pid: 4100,
   port: 7878,
   bootId: "desktop-boot",
   ownerToken: "desktop-owner-token",
 });
-assert.deepEqual(desktopStopPlan(completeTracking), {
+assert.deepEqual(desktopTrackedOwnership(projectState, "beta"), {
+  project: "/other-game",
+  pid: 4200,
+  port: 7879,
+  bootId: "other-desktop-boot",
+  ownerToken: "other-desktop-owner-token",
+});
+assert.equal(desktopTrackedOwnership(projectState, "missing"), null);
+assert.deepEqual(desktopStopPlan(projectState, "alpha"), {
   kind: "stop-owned",
-  spec: desktopTrackedOwnership(completeTracking),
+  spec: desktopTrackedOwnership(projectState, "alpha"),
 });
 
-for (const field of [
-  "daemonProject",
-  "daemonBootId",
-  "daemonOwnerToken",
-]) {
-  const incomplete = { ...completeTracking, [field]: null };
-  assert.equal(desktopTrackedOwnership(incomplete), null, `${field} is required for Desktop ownership`);
+for (const field of ["project", "bootId", "ownerToken"]) {
+  const incomplete = {
+    ...projectState,
+    daemonSessions: { ...projectState.daemonSessions, alpha: { ...alphaSession, [field]: null } },
+  };
+  assert.equal(
+    desktopTrackedOwnership(incomplete, "alpha"),
+    null,
+    `${field} is required for one project's Desktop ownership`,
+  );
   assert.deepEqual(
-    desktopStopPlan(incomplete),
+    desktopStopPlan(incomplete, "alpha"),
     { kind: "clear-local" },
-    "incomplete Desktop tracking must never issue a remote stop",
+    "incomplete project tracking must never issue a remote stop",
+  );
+  assert.deepEqual(
+    desktopTrackedOwnership(incomplete, "beta"),
+    desktopTrackedOwnership(projectState, "beta"),
+    "one incomplete project must not alter another project's claim",
   );
 }
-for (const field of ["daemonPid", "daemonPort"]) {
-  const recoverable = { ...completeTracking, [field]: null };
+for (const field of ["pid", "port"]) {
+  const recoverable = { ...alphaSession, [field]: null };
   const claim = desktopTrackedOwnership(recoverable);
   assert.ok(claim, `${field} may be recovered from authenticated daemon status`);
-  assert.equal(claim[field === "daemonPid" ? "pid" : "port"], null);
+  assert.equal(claim[field], null);
   assert.equal(desktopStopPlan(recoverable).kind, "stop-owned");
 }
-for (const invalid of [
-  { daemonOwnerToken: "too-short" },
-  { daemonOwnerToken: "invalid token with spaces" },
-]) {
+for (const invalid of ["too-short", "invalid token with spaces"]) {
   assert.equal(
-    desktopTrackedOwnership({ ...completeTracking, ...invalid }),
+    desktopTrackedOwnership({ ...alphaSession, ownerToken: invalid }),
     null,
-    "malformed Desktop ownership fields must be rejected locally",
+    "malformed Desktop ownership tokens must be rejected locally",
   );
 }
 
-const orphanTracking = {
-  daemonProject: null,
-  daemonPid: null,
-  daemonPort: null,
-  daemonBootId: null,
-  daemonOwnerToken: "orphan-owner-token",
-};
-const orphanBefore = structuredClone(orphanTracking);
+const emptyState = { daemonSessions: {} };
+const emptyBefore = structuredClone(emptyState);
 assert.deepEqual(
-  desktopStartOwnership(orphanTracking, "/game", "fresh-token"),
+  desktopStartOwnership(emptyState, "/game", "fresh-token", null, "alpha"),
   { token: "fresh-token", reusedClaim: false, reusedPending: false },
-  "an orphan capability must not be reused or persisted by Desktop startup",
+  "a missing project claim must receive a fresh memory-only capability",
 );
-assert.deepEqual(orphanTracking, orphanBefore, "Desktop start planning must not mutate state");
+assert.deepEqual(emptyState, emptyBefore, "Desktop start planning must not mutate state");
 assert.deepEqual(
-  desktopStartOwnership(completeTracking, "/game", "fresh-token"),
+  desktopStartOwnership(projectState, "/game", "fresh-token", null, "alpha"),
   { token: "desktop-owner-token", reusedClaim: true, reusedPending: false },
-  "a complete claim must remain reusable across Desktop reconnects",
+  "a complete same-project claim remains reusable across Desktop reloads",
 );
 assert.deepEqual(
-  desktopStartOwnership(completeTracking, "/other-game", "fresh-token"),
+  desktopStartOwnership(projectState, "/other-game", "fresh-token", null, "alpha"),
   { token: "fresh-token", reusedClaim: false, reusedPending: false },
-  "a claim for another project must never authorize a fresh start",
+  "a selected project's capability must never authorize a different project",
 );
 assert.deepEqual(
-  desktopStartOwnership(
-    orphanTracking,
-    "/game",
-    "fresh-token",
-    { project: "/game", token: "pending-owner-token" },
-  ),
+  desktopStartOwnership(emptyState, "/game", "fresh-token", {
+    project: "/game",
+    token: "pending-owner-token",
+  }, "alpha"),
   { token: "pending-owner-token", reusedClaim: false, reusedPending: true },
-  "a same-project pending capability must survive transient verification failure",
+  "a same-project pending capability survives transient verification failure",
 );
 assert.deepEqual(
-  desktopStartOwnership(
-    orphanTracking,
-    "/game",
-    "fresh-token",
-    { project: "/other-game", token: "pending-owner-token" },
-  ),
+  desktopStartOwnership(emptyState, "/game", "fresh-token", {
+    project: "/other-game",
+    token: "pending-owner-token",
+  }, "alpha"),
   { token: "fresh-token", reusedClaim: false, reusedPending: false },
-  "a pending capability must never cross project boundaries",
+  "pending capabilities must never cross project boundaries",
 );
 
 const appSource = fs.readFileSync(new URL("../app.js", import.meta.url), "utf8");
@@ -149,58 +175,200 @@ const bridgeSource = fs.readFileSync(new URL("../bridge.js", import.meta.url), "
 const prepareSource = fs.readFileSync(new URL("../desktop/scripts/prepare.mjs", import.meta.url), "utf8");
 const tauriLibSource = fs.readFileSync(new URL("../desktop/src-tauri/src/lib.rs", import.meta.url), "utf8");
 const tauriDaemonSource = fs.readFileSync(new URL("../desktop/src-tauri/src/daemon.rs", import.meta.url), "utf8");
-assert.equal(
-  appSource.includes("host.daemonStop("),
-  false,
-  "renderer must not bypass authenticated HTTP ownership with native record-based stop",
+
+assert.match(
+  appSource,
+  /servedProjectIds:\s*\[\][\s\S]*?daemonSessions:\s*\{\}/,
+  "Desktop state must represent desired projects and daemon sessions independently",
+);
+assert.match(
+  appSource,
+  /const pendingDesktopOwnershipByProject = new Map\(\)/,
+  "in-flight ownership capabilities must be isolated by project ID",
 );
 assert.equal(
   appSource.includes('"--owner-token", ensureOwnerToken()'),
   false,
-  "Terminal 64 launch must not put the owner token in argv",
+  "Terminal 64 launch must not put an owner token in argv",
 );
-assert.equal(
-  bridgeSource.includes("async daemonStop("),
-  false,
-  "shared renderer host must not expose the unauthenticated native stop command",
+
+const bridgeStopSource = bridgeSource.slice(
+  bridgeSource.indexOf("async daemonStop("),
+  bridgeSource.indexOf("async projectBrokerStatus("),
 );
-assert.equal(
-  tauriLibSource.includes("daemon::daemon_stop"),
-  false,
-  "Tauri invoke surface must not expose record-based native stop",
+assert.match(
+  bridgeStopSource,
+  /invokeDesktop\("daemon_stop"[\s\S]*?project: spec\.project[\s\S]*?bootId: spec\.bootId[\s\S]*?ownerToken: spec\.ownerToken/,
+  "the native stop bridge must send the complete project, boot, and owner claim",
+);
+assert.equal(bridgeStopSource.includes("pid:"), false, "native stop must never accept PID authority");
+assert.equal(bridgeStopSource.includes("port:"), false, "native stop must never accept port authority");
+assert.match(tauriLibSource, /daemon::daemon_list[\s\S]*?daemon::daemon_status[\s\S]*?daemon::daemon_stop/);
+
+assert.match(
+  tauriDaemonSource,
+  /struct ExactManagedDaemonClaim \{[\s\S]*?project: String,[\s\S]*?port: u16,[\s\S]*?pid: u32,[\s\S]*?boot_id: String,[\s\S]*?owner_token: String,/,
+  "native ownership must retain the complete exact daemon identity and capability",
 );
 assert.match(
   tauriDaemonSource,
-  /for port in attempts[\s\S]*?run_lifecycle[\s\S]*?Ok\(value\) => \{[\s\S]*?managed_daemon\.remember\(&value, &owner_token\);[\s\S]*?return Ok\(value\);/,
-  "Desktop must retry managed startup through the daemon's free-port scan",
+  /struct ManagedDaemonClaimsState \{[\s\S]*?exiting: bool,[\s\S]*?by_project: HashMap<String, ExactManagedDaemonClaim>/,
+  "native exit ownership must be plural and keyed by canonical project",
 );
+const exactClaimSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("fn exact_managed_daemon_claim"),
+  tauriDaemonSource.indexOf("fn close_managed_daemons"),
+);
+for (const required of [
+  'get("running")',
+  'get("managed")',
+  'get("managedBy")',
+  'Some("desktop")',
+  'get("externallyManaged")',
+  "validate_owner_token(owner_token)",
+  'get("bootId")',
+  'get("canonicalProject")',
+  'get("pid")',
+  'get("port")',
+]) {
+  assert.equal(exactClaimSource.includes(required), true, `exact native claim must check ${required}`);
+}
 assert.match(
   tauriDaemonSource,
-  /fn preferred_port_attempts[\s\S]*?Some\(port\) => vec!\[Some\(port\), None\]/,
-  "Desktop must preserve a preferred listener first and fall back without stopping its owner",
+  /fn close_managed_daemons[\s\S]*?thread::scope[\s\S]*?for claim in &claims[\s\S]*?close_exact_managed_daemon\(claim\)/,
+  "all project claims must close independently and in parallel during app exit",
+);
+
+const closeExactSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("fn close_exact_managed_daemon"),
+  tauriDaemonSource.indexOf("fn local_json_request"),
 );
 assert.match(
-  tauriDaemonSource,
-  /local_json_request\(claim\.port, "GET", "\/hello", &\[\]\)[\s\S]*?bootId[\s\S]*?local_json_request\(claim\.port, "POST", "\/manager-close", &body\)/,
-  "Native exit cleanup must revalidate the exact daemon boot before sending its ownership capability",
+  closeExactSource,
+  /local_json_request\(claim\.port, "GET", "\/hello", &\[\]\)[\s\S]*?managedBy[\s\S]*?claim\.project[\s\S]*?claim\.boot_id[\s\S]*?claim\.pid[\s\S]*?claim\.port[\s\S]*?"token": claim\.owner_token[\s\S]*?local_json_request\(claim\.port, "POST", "\/manager-close", &body\)/,
+  "native cleanup must revalidate project, boot, PID, and port before sending the owner token",
 );
-assert.match(
-  tauriLibSource,
-  /managed_daemon\.mark_exiting\(\);[\s\S]*?lifecycle_children\.terminate_all\(\);[\s\S]*?managed_daemon\.terminate\(\);/,
-  "Desktop exit must reject late daemon claims before terminating in-flight lifecycle children",
-);
+
 const tauriEnsureSource = tauriDaemonSource.slice(
   tauriDaemonSource.indexOf("pub(crate) async fn daemon_ensure"),
   tauriDaemonSource.indexOf("fn preferred_port_attempts"),
 );
-const tauriStatusSource = tauriDaemonSource.slice(
-  tauriDaemonSource.indexOf("pub(crate) async fn daemon_status"),
-  tauriDaemonSource.indexOf("async fn run_lifecycle"),
+assert.match(
+  tauriEnsureSource,
+  /for port in attempts[\s\S]*?run_lifecycle[\s\S]*?Ok\(value\) => \{[\s\S]*?managed_daemons\.remember\(&value, &owner_token\);[\s\S]*?return Ok\(value\);/,
+  "every successful project start must register its exact native ownership claim",
+);
+assert.match(
+  tauriDaemonSource,
+  /fn preferred_port_attempts[\s\S]*?Some\(port\) => vec!\[Some\(port\), None\]/,
+  "Desktop must preserve a preferred listener first and fall back without evicting its owner",
 );
 assert.equal(
   tauriEnsureSource.includes('"--parent-stdin-lease"'),
   true,
   "Desktop daemon start must hold a parent-stdin lease",
+);
+
+const tauriStopSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("pub(crate) async fn daemon_stop"),
+  tauriDaemonSource.indexOf("pub(crate) fn daemon_list"),
+);
+assert.match(
+  tauriStopSource,
+  /validate_project\(&spec\.project\)[\s\S]*?ensure_authorized_path[\s\S]*?expected_boot_id[\s\S]*?validate_lifecycle_identity[\s\S]*?owner_token[\s\S]*?validate_owner_token/,
+  "native stop must validate the authorized project, boot ID, and owner capability",
+);
+assert.match(
+  tauriStopSource,
+  /daemon_status_for_project[\s\S]*?exact_managed_daemon_claim\(&value, owner_token\)[\s\S]*?claim\.project != canonical_project[\s\S]*?claim\.boot_id != expected_boot_id[\s\S]*?close_exact_managed_daemon\(&claim\)/,
+  "native stop must status-check and close only the exact requested project boot",
+);
+for (const forbidden of ["CommandChild", ".kill()", '"daemon".to_string(),\n        "stop".to_string()']) {
+  assert.equal(tauriStopSource.includes(forbidden), false, "native stop must not use process/PID termination");
+}
+assert.equal(
+  tauriDaemonSource.includes("native_exit_close_never_claims_external_daemons"),
+  true,
+  "the native suite must retain an explicit external-daemon non-ownership regression test",
+);
+
+const desktopKillSource = appSource.slice(
+  appSource.indexOf("async function killDaemon"),
+  appSource.indexOf("// ---------- Health loop ----------"),
+);
+const desktopKillBranch = desktopKillSource.slice(0, desktopKillSource.indexOf("  if (!pid) {"));
+assert.match(
+  desktopKillBranch,
+  /daemonSessions\?\.\[projectId\][\s\S]*?desktopStopPlan\(sessionPolicyState\(session\)\)[\s\S]*?stopOwnedDesktopDaemon/,
+  "Desktop stop must select exactly one project session and require its ownership plan",
+);
+assert.equal(
+  desktopKillBranch.includes("killPidCmd"),
+  false,
+  "Desktop-managed daemons must never be stopped by PID",
+);
+const ownedStopSource = appSource.slice(
+  appSource.indexOf("async function stopOwnedDesktopDaemon"),
+  appSource.indexOf("function clearDesktopDaemonTracking"),
+);
+assert.match(
+  ownedStopSource,
+  /inspectOwnedDesktopDaemon\(spec\)[\s\S]*?host\.daemonStop\(\{[\s\S]*?project: spec\.project[\s\S]*?bootId: owned\.bootId[\s\S]*?ownerToken: owned\.token/,
+  "renderer stop must authenticate status/hello before invoking exact native stop",
+);
+
+const desktopEnsureDispatchSource = appSource.slice(
+  appSource.indexOf("async function ensureDaemon(projectId = null)"),
+  appSource.indexOf("function lifecycleValue"),
+);
+assert.match(
+  desktopEnsureDispatchSource,
+  /const promise = Promise\.resolve\(\)[\s\S]*?\.then\(\(\) => ensureDesktopDaemon\(id, project\.path\)\)[\s\S]*?desktopEnsurePromises\.get\(id\) === promise[\s\S]*?desktopEnsurePromises\.set\(id, promise\)/,
+  "Desktop must reserve one project startup before its synchronous state updates can re-enter ensureDaemon",
+);
+const servedStateObserverSource = appSource.slice(
+  appSource.indexOf('on("state", () => {'),
+  appSource.indexOf("// Toast helper"),
+);
+assert.match(
+  servedStateObserverSource,
+  /const newlyServed =[\s\S]*?lastServedProjects = next;[\s\S]*?for \(const projectId of newlyServed\) void ensureDaemon\(projectId\)/,
+  "served-project observation must commit before startup publishes nested state",
+);
+
+assert.match(
+  tauriLibSource,
+  /managed_daemons\.mark_exiting\(\);[\s\S]*?lifecycle_children\.terminate_all\(\);[\s\S]*?managed_daemons\.terminate\(\);/,
+  "Desktop exit must reject late claims, terminate lifecycle children, then close all exact daemon claims",
+);
+const nativeListSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("fn list(&self)"),
+  tauriDaemonSource.indexOf("pub(crate) fn mark_exiting"),
+);
+assert.equal(nativeListSource.includes("owner_token"), false, "daemon_list must never expose owner tokens");
+
+const healthSource = appSource.slice(
+  appSource.indexOf("async function healthTickDesktop"),
+  appSource.indexOf("async function healthTick()"),
+);
+assert.match(
+  healthSource,
+  /host\.daemonList\(\)[\s\S]*?const nativeClaim = nativeByProject\.get[\s\S]*?if \(!nativeClaim\) \{[\s\S]*?await ensureDaemon\(projectId\)/,
+  "a renderer reload must reattach every persisted project claim to native exit cleanup",
+);
+const closeSource = appSource.slice(
+  appSource.indexOf("function notifyWidgetClosing"),
+  appSource.indexOf("function activeProject"),
+);
+assert.match(
+  closeSource,
+  /Object\.values\(app\.state\.daemonSessions \|\| \{\}\)[\s\S]*?pendingDesktopOwnershipByProject\.values\(\)[\s\S]*?for \(const \[base, token\] of closeTargets\)/,
+  "renderer close beacons must cover all committed and pending project sessions",
+);
+
+const tauriStatusSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("pub(crate) async fn daemon_status"),
+  tauriDaemonSource.indexOf("async fn run_lifecycle"),
 );
 assert.equal(
   tauriStatusSource.includes('"--parent-stdin-lease"'),
@@ -212,105 +380,17 @@ assert.equal(
   true,
   "Desktop packaging must include the shared lifecycle policy module",
 );
-const desktopEnsureSource = appSource.slice(
-  appSource.indexOf("async function ensureDesktopDaemon"),
-  appSource.indexOf("async function ensureDaemonInner"),
-);
-assert.equal(
-  desktopEnsureSource.includes("ensureOwnerToken()"),
-  false,
-  "Desktop must not persist a fresh owner token before authenticated ownership proof",
-);
-assert.equal(
-  desktopEnsureSource.includes("activeProjectPath() !== project"),
-  true,
-  "Desktop must cancel a daemon start superseded by a newer UI intent",
-);
-assert.match(
-  desktopEnsureSource,
-  /if \(!startOwnership\.reusedClaim && !startOwnership\.reusedPending\) \{[\s\S]*?clearDesktopDaemonTracking\(\);/,
-  "Desktop must clear partial tracking before a fresh memory-only capability is used",
-);
-assert.match(
-  desktopEnsureSource,
-  /pendingDesktopOwnership = \{[\s\S]*?project,[\s\S]*?token: startOwnership\.token,[\s\S]*?base:/,
-  "Desktop must retain a fresh capability in memory until ownership is proven",
-);
-assert.match(
-  desktopEnsureSource,
-  /startOwnership\.reusedClaim && !pendingDesktopOwnership[\s\S]*?pendingDesktopOwnership = \{[\s\S]*?token: startOwnership\.token/,
-  "Desktop must retain a persisted claim as a close target while reattaching",
-);
-assert.match(
-  desktopEnsureSource,
-  /pendingDesktopOwnership = \{ project, token, base, port \};[\s\S]*?ownedCandidate = await inspectOwnedDesktopDaemon/,
-  "Desktop must replace a provisional target with the exact fallback listener before verification",
-);
-assert.match(
-  desktopEnsureSource,
-  /owned daemon cleanup failed[\s\S]*?daemonOwnerToken: ownedCandidate\.token[\s\S]*?pendingDesktopOwnership = \{[\s\S]*?base: ownedCandidate\.base/,
-  "Desktop must retain proven ownership and a close target when startup cleanup is uncertain",
-);
-const desktopKillSource = appSource.slice(
-  appSource.indexOf("async function killDaemon"),
-  appSource.indexOf("async function healthTick"),
-);
-assert.equal(
-  desktopKillSource.includes("desktopStopPlan(app.state)"),
-  true,
-  "Desktop stop must reject incomplete ownership before any remote lifecycle request",
-);
-assert.match(
-  desktopKillSource,
-  /if \(pendingDesktopOwnership\)[\s\S]*?stopOwnedDesktopDaemon\([\s\S]*?desktop cancelled a pending startup/,
-  "explicit Desktop Stop must clean up an in-flight authenticated capability immediately",
-);
-const closeSource = appSource.slice(
-  appSource.indexOf("function notifyWidgetClosing"),
-  appSource.indexOf("function activeProject"),
-);
-assert.match(
-  closeSource,
-  /pendingDesktopOwnership\?\.base[\s\S]*?daemonLifecyclePost\(endpoint, reason, true, pending\)/,
-  "Desktop close must use a pending startup capability when committed ownership is not available",
-);
-assert.match(
-  appSource,
-  /function daemonLifecyclePost[\s\S]*?daemonURL\(base, path, token\)/,
-  "lifecycle beacons must authenticate their URL with an explicit pending or committed token",
-);
-const healthSource = appSource.slice(
-  appSource.indexOf("async function healthTick"),
-  appSource.indexOf("async function runHealthTick"),
-);
-assert.match(
-  healthSource,
-  /if \(!app\.daemonBase\)[\s\S]*?await ensureDaemon\(\)/,
-  "an active Desktop project must retry after an external daemon leaves the port",
-);
-assert.match(
-  healthSource,
-  /if \(!IS_DESKTOP_HOST\) return;/,
-  "Desktop no-base recovery must not change Terminal 64 lifecycle behavior",
-);
+
 const settingsSource = fs.readFileSync(new URL("../views/settings.js", import.meta.url), "utf8");
-const settingsStopSource = settingsSource.slice(
-  settingsSource.indexOf('$stop.addEventListener("click"'),
-  settingsSource.indexOf('$restart.addEventListener("click"'),
+assert.match(
+  settingsSource,
+  /data-daemon-action="restart"[\s\S]*?data-daemon-action="stop"[\s\S]*?api\.stopProject\(projectId\)[\s\S]*?api\.restartProject\(projectId\)/,
+  "Settings controls must address one served project rather than a singleton daemon",
 );
 assert.match(
-  settingsStopSource,
-  /activeProjectId: null[\s\S]*?active\?\.path \|\| s\.daemonProject[\s\S]*?killDaemon\(\{ preserveTarget: true \}\)/,
-  "Settings Stop must preserve its active target while clearing desired-serving state",
-);
-const settingsStartSource = settingsSource.slice(
-  settingsSource.indexOf('$start.addEventListener("click"'),
-  settingsSource.indexOf('$stop.addEventListener("click"'),
-);
-assert.match(
-  settingsStartSource,
-  /p\.path === s\.daemonProject[\s\S]*?activeProjectId: target\.id[\s\S]*?ensureDaemon\(\)/,
-  "Settings Start must restore the explicitly paused project target",
+  settingsSource,
+  /\$start\.addEventListener\("click"[\s\S]*?api\.serveProject\(project\.id\)/,
+  "Settings Start must add the selected project to the served set",
 );
 
 console.log("lifecycle policy checks passed");

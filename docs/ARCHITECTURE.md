@@ -4,9 +4,9 @@ Ro Sync is one local engine with three interchangeable control surfaces:
 
 ```text
 Ro Sync Desktop ──┐
-Terminal 64 ──────┼── localhost HTTP/WebSocket ── rosync daemon ── Studio plugin
-rosync CLI ───────┘                                  │
-                                                    └── project filesystem
+Terminal 64 ──────┼── localhost HTTP/WebSocket ── rosync daemon(s) ── Studio plugin(s)
+rosync CLI ───────┘                                      │
+                                                        └── project filesystem(s)
 ```
 
 The desktop app and Terminal 64 widget use the same HTML, CSS, JavaScript views,
@@ -63,6 +63,14 @@ operating system's credential store where supported.
 
 The Tauri webview receives only the main-window capability and registered Ro
 Sync commands. It cannot spawn arbitrary processes or read arbitrary files.
+
+Desktop tracks desired serving separately from UI focus and holds one exact
+native ownership claim per canonical project. Starts are serialized only while
+choosing a free listener; the resulting daemons run concurrently. A separate
+loopback broker on ports 7867–7870 exists before any project daemon, allowing a
+published Studio place to request safe creation beneath the user-authorized
+Projects folder. The renderer adopts the queued project and starts its daemon;
+the plugin never spawns a process itself.
 
 ### Roblox Studio plugin
 

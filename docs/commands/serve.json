@@ -3,13 +3,14 @@
   "title": "rosync serve",
   "category": "Daemon",
   "description": "Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem watcher, and CLI.",
-  "usage": "rosync serve --project <path> [--port <port>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]",
+  "usage": "rosync serve --project <path> [--port <port>] [--projects-root <path>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]",
   "examples": [
     "rosync serve --project . --port 7878",
     "rosync serve --project . --port 7878 --game-id 1234567890"
   ],
   "notes": [
     "serve stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.",
-    "For an ordinary CLI-managed background process, use rosync daemon start instead."
+    "For an ordinary CLI-managed background process, use rosync daemon start instead.",
+    "--projects-root advertises the authenticated Studio project initializer and constrains creation to one direct child below that canonical directory. Omit it for ordinary manual daemons."
   ]
 }

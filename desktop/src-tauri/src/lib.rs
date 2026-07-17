@@ -1,28 +1,34 @@
 mod commands;
 mod daemon;
+mod project_broker;
 mod resources;
 mod secrets;
 mod storage;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use resources::AppPaths;
 use tauri::Manager;
 
 pub(crate) struct AppState {
     paths: AppPaths,
-    io_lock: Mutex<()>,
+    io_lock: Arc<Mutex<()>>,
+    daemon_start_lock: tokio::sync::Mutex<()>,
     lifecycle_children: daemon::LifecycleChildren,
-    managed_daemon: daemon::ManagedDaemonClaim,
+    managed_daemons: daemon::ManagedDaemonClaims,
+    project_broker: project_broker::ProjectInitBroker,
 }
 
 impl AppState {
     fn new(paths: AppPaths) -> Self {
+        let project_broker = project_broker::ProjectInitBroker::start(paths.clone());
         Self {
             paths,
-            io_lock: Mutex::new(()),
+            io_lock: Arc::new(Mutex::new(())),
+            daemon_start_lock: tokio::sync::Mutex::new(()),
             lifecycle_children: daemon::LifecycleChildren::default(),
-            managed_daemon: daemon::ManagedDaemonClaim::default(),
+            managed_daemons: daemon::ManagedDaemonClaims::default(),
+            project_broker,
         }
     }
 }
@@ -56,16 +62,21 @@ pub fn run() {
             commands::plugin_install,
             commands::wally_install,
             daemon::daemon_ensure,
+            daemon::daemon_list,
             daemon::daemon_status,
+            daemon::daemon_stop,
+            project_broker::project_broker_status,
+            project_broker::project_init_drain,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Ro Sync desktop");
     app.run(|app, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             let state = app.state::<AppState>();
-            state.managed_daemon.mark_exiting();
+            state.managed_daemons.mark_exiting();
+            state.project_broker.stop();
             state.lifecycle_children.terminate_all();
-            state.managed_daemon.terminate();
+            state.managed_daemons.terminate();
         }
     });
 }

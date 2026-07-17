@@ -105,7 +105,8 @@ rosync daemon logs --project . --lines 100
 
 **Notes**
 
-- start and restart accept --port, --managed-by, --data-dir, --timeout, --game-id, --group-id, and repeated --place-id. status, stop, and logs use the same canonical project identity and optional --data-dir.
+- start and restart accept --port, --projects-root, --managed-by, --data-dir, --timeout, --game-id, --group-id, and repeated --place-id. status, stop, and logs use the same canonical project identity and optional --data-dir.
+- --projects-root enables the authenticated Studio project initializer for a manager-authorized canonical root; it is not required for normal project daemons.
 - A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error.
 - Stop authenticates an exact project and boot ID before graceful shutdown. Ro Sync never kills a PID read from a stale runtime record.
 - Desktop managers should supply their browser capability through --owner-token-env <ENV>; secrets are never returned by lifecycle JSON.
@@ -189,7 +190,7 @@ rosync capabilities --project . --raw
 
 **Notes**
 
-- The protocol 2 / plugin 2.0.0 document reports feature flags for screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.photo`, `features.photoTransparent`, `features.photoUiOnly`, and `features.photoInstanceTightCrop`, plus the `photoAxis`, `photoPixels`, and `photoChunkBytes` limits, are independent of Studio screenshot authorization. `photoInstanceTightCrop` advertises automatic rendered-alpha cropping for isolated transparent focus captures.
+- The protocol 2 / plugin 2.1.0 document reports feature flags for native instance clipboard copy/paste, screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.instanceClipboard` advertises `rosync copy`/`paste`. Photo feature flags and limits remain independent of Studio screenshot authorization.
 - Use this cheap read before relying on optional Studio APIs; Studio version and permission differences are reported instead of guessed.
 - `--raw` prints the complete correlated response envelope for machine use.
 
@@ -1403,6 +1404,62 @@ rosync select set --project . --paths '["Workspace/Box","Workspace/SpawnLocation
 - `select get` is read-only; `select set` is a Studio state change.
 
 ---
+### `rosync copy`
+
+Copies arbitrary native Studio instance trees into Ro Sync's private cross-project clipboard.
+
+**Category:** Studio clipboard
+
+**Usage**
+
+```sh
+rosync copy [<studio-path> ...] [--path <studio-path> ...] [--project <path>] [--port <port>] [--timeout <seconds>] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync copy --project .
+rosync copy Workspace/Map/Boss ReplicatedStorage/Shared/BossConfig --project .
+rosync copy --project . --path StarterGui/HUD --path ReplicatedStorage/HUDAssets
+```
+
+**Notes**
+
+- With no paths, copies the current Studio Explorer selection.
+- Roblox SerializationService preserves native instance types, descendants, properties, attributes, tags, scripts, and references among roots copied together.
+- The private clipboard is shared across Ro Sync projects and survives CLI process exit; a successful copy atomically replaces it.
+- Services cannot be copied. References to instances outside the copied roots cannot cross places, matching native Studio behavior.
+
+---
+### `rosync paste`
+
+Pastes Ro Sync's native instance clipboard into the connected Studio as one undoable change.
+
+**Category:** Studio clipboard
+
+**Usage**
+
+```sh
+rosync paste [--project <path>] [--port <port>] [--to <parent-path>] [--no-select] [--timeout <seconds>] [--raw]
+```
+
+**Examples**
+
+```sh
+rosync paste --project .
+rosync paste --project . --to Workspace/Imported
+rosync paste --project . --parent ReplicatedStorage/Assets --no-select
+```
+
+**Notes**
+
+- Without `--to`, every copied root returns to its recorded class/name/ordinal parent route in the destination place, including paths with `/` in a name and duplicate same-named siblings.
+- Use `--to` (alias `--parent`) when the original parent hierarchy does not exist in the destination.
+- Pasted roots are selected by default. One Studio Undo removes the full paste.
+- Paste is reusable: it does not consume the private clipboard.
+
+---
 ### `rosync eval`
 
 Executes Luau source inside Studio through the plugin sandbox.
@@ -1560,7 +1617,7 @@ Runs the local HTTP/WebSocket daemon that bridges the Studio plugin, filesystem 
 **Usage**
 
 ```sh
-rosync serve --project <path> [--port <port>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]
+rosync serve --project <path> [--port <port>] [--projects-root <path>] [--game-id <id>] [--group-id <id>] [--place-id <id>...]
 ```
 
 **Examples**
@@ -1574,5 +1631,6 @@ rosync serve --project . --port 7878 --game-id 1234567890
 
 - serve stays in the foreground for launchd, systemd, Task Scheduler, containers, or development terminals.
 - For an ordinary CLI-managed background process, use rosync daemon start instead.
+- --projects-root advertises the authenticated Studio project initializer and constrains creation to one direct child below that canonical directory. Omit it for ordinary manual daemons.
 
 ---

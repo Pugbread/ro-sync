@@ -22,11 +22,13 @@ mod native_capture;
 mod path_resolver;
 mod playtest_run;
 mod project_config;
+mod project_init;
 #[cfg(test)]
 mod query;
 mod remote;
 mod snapshot;
 mod sourcemap;
+mod studio_clipboard;
 mod sync_scope;
 mod watch;
 mod workflow;
@@ -207,6 +209,10 @@ pub enum Command {
     Call(CallArgs),
     /// Selection service: `select get|set`.
     Select(SelectArgs),
+    /// Copy arbitrary Studio instances into Ro Sync's cross-project clipboard.
+    Copy(studio_clipboard::CopyArgs),
+    /// Paste Ro Sync's cross-project clipboard into the connected Studio.
+    Paste(studio_clipboard::PasteArgs),
     /// Class introspection — list properties (by category) and methods for a
     /// class, so agents can build a mental model before calling `get`/`set`.
     Classinfo(ClassInfoArgs),
@@ -1962,6 +1968,10 @@ pub struct ServeArgs {
     #[arg(long = "place-id")]
     pub place_id: Vec<String>,
 
+    /// Desktop-authorized parent directory for plugin-created projects.
+    #[arg(long = "projects-root")]
+    pub projects_root: Option<PathBuf>,
+
     /// Mark this daemon as owned by the Terminal 64 widget lifecycle.
     #[arg(long = "widget-owned", hide = true)]
     pub widget_owned: bool,
@@ -2063,6 +2073,9 @@ pub struct DaemonStartArgs {
     /// Roblox PlaceId override; repeat for multiple place IDs.
     #[arg(long = "place-id")]
     pub place_id: Vec<String>,
+    /// Desktop-authorized parent directory for plugin-created projects.
+    #[arg(long = "projects-root")]
+    pub projects_root: Option<PathBuf>,
     /// Override the platform-native Ro Sync state directory.
     #[arg(long = "data-dir")]
     pub data_dir: Option<PathBuf>,
@@ -2124,6 +2137,9 @@ pub struct DaemonRestartArgs {
     pub group_id: Option<String>,
     #[arg(long = "place-id")]
     pub place_id: Vec<String>,
+    /// Desktop-authorized parent directory for plugin-created projects.
+    #[arg(long = "projects-root")]
+    pub projects_root: Option<PathBuf>,
     #[arg(long = "data-dir")]
     pub data_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 10.0)]
@@ -2440,6 +2456,9 @@ pub struct AppState {
     /// filesystem — guarantees `/private/tmp/...` from the watcher and
     /// `/tmp/...` from `/push` hash into the same key.
     pub canonical_project: Arc<PathBuf>,
+    /// Canonical desktop-authorized parent for plugin-created projects.
+    /// Absent on ordinary CLI/manual daemons, which disables `/projects/init`.
+    pub projects_root: Arc<Option<PathBuf>>,
     pub events: broadcast::Sender<String>,
     pub conflict: Arc<ConflictEngine>,
     /// Short-lived, bounded binary artifacts uploaded by the Studio plugin.
@@ -2669,6 +2688,10 @@ fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error:
                 resolve_port_field(&mut args.port, args.project.as_deref(), "select set")?
             }
         },
+        Command::Copy(args) => resolve_port_field(&mut args.port, args.project.as_deref(), "copy")?,
+        Command::Paste(args) => {
+            resolve_port_field(&mut args.port, args.project.as_deref(), "paste")?
+        }
         Command::Classinfo(args) => {
             resolve_port_field(&mut args.port, args.project.as_deref(), "classinfo")?
         }
@@ -2854,6 +2877,8 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Tag(args)) => run_tag(args).await,
         Some(Command::Call(args)) => run_call(args).await,
         Some(Command::Select(args)) => run_select(args).await,
+        Some(Command::Copy(args)) => studio_clipboard::run_copy(args).await,
+        Some(Command::Paste(args)) => studio_clipboard::run_paste(args).await,
         Some(Command::Classinfo(args)) => run_classinfo(args).await,
         Some(Command::Enums(args)) => run_enums(args).await,
         Some(Command::Enum(args)) => run_enum(args).await,
@@ -2871,6 +2896,7 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 game_id: cli.game_id,
                 group_id: cli.group_id,
                 place_id: cli.place_id,
+                projects_root: None,
                 widget_owned: false,
                 owner_token: None,
                 owner_token_state_file: None,
@@ -3381,6 +3407,7 @@ async fn run_daemon(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> 
                 game_id: args.game_id,
                 group_id: args.group_id,
                 place_id: args.place_id,
+                projects_root: args.projects_root,
                 data_dir: args.data_dir,
                 timeout: args.timeout,
                 parent_stdin_lease: false,
@@ -3523,6 +3550,31 @@ fn normalize_optional_metadata(
         Some(value) if value.trim().is_empty() => Err(format!("{flag} cannot be empty").into()),
         Some(value) => Ok(Some(value.trim().to_string())),
         None => Ok(None),
+    }
+}
+
+fn validate_existing_daemon_owner(
+    record: &lifecycle::RuntimeRecord,
+    supplied_owner_token: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(supplied) = supplied_owner_token else {
+        return Ok(());
+    };
+    let expected = record.control_token.as_bytes();
+    let supplied = supplied.as_bytes();
+    if expected.len() != supplied.len() {
+        return Err("matching managed daemon is owned by a different lifecycle capability");
+    }
+    let difference = expected
+        .iter()
+        .zip(supplied)
+        .fold(0_u8, |difference, (expected, supplied)| {
+            difference | (expected ^ supplied)
+        });
+    if difference == 0 {
+        Ok(())
+    } else {
+        Err("matching managed daemon is owned by a different lifecycle capability")
     }
 }
 
@@ -3743,6 +3795,12 @@ async fn daemon_start(
             args.project.display()
         )
     })?;
+    let projects_root = args
+        .projects_root
+        .as_deref()
+        .map(project_init::resolve_projects_root)
+        .transpose()
+        .map_err(|error| format!("daemon start: {error}"))?;
     let paths = daemon_runtime_paths(args.data_dir.as_deref(), &canonical_project)?;
     let _lock = lifecycle::StartLock::acquire(&paths.start_lock)?;
 
@@ -3772,6 +3830,38 @@ async fn daemon_start(
 
     let current = daemon_status(&canonical_project, &paths, true)?;
     if current.running {
+        // An idempotent start is only idempotent for the same lifecycle
+        // capability. Returning an existing boot to a caller that supplied a
+        // different token makes that caller believe it owns a daemon it can
+        // neither authenticate nor safely stop.
+        if !current.externally_managed {
+            let record = lifecycle::read_record(&paths.record)?.ok_or_else(|| {
+                format!(
+                    "daemon start: managed daemon is running but runtime record {} is missing",
+                    paths.record.display()
+                )
+            })?;
+            validate_existing_daemon_owner(&record, supplied_owner_token.as_deref())
+                .map_err(|error| format!("daemon start: {error}"))?;
+        }
+        if let Some(requested_root) = projects_root.as_deref() {
+            let advertised_root = current
+                .port
+                .and_then(|port| fetch_daemon_hello(port).ok())
+                .and_then(|hello| {
+                    hello
+                        .pointer("/projectInit/projectsRoot")
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from)
+                });
+            if advertised_root.as_deref() != Some(requested_root) {
+                return Err(format!(
+                    "daemon start: the matching daemon is already running without the requested projects root {}; restart it to enable Studio project creation",
+                    requested_root.display()
+                )
+                .into());
+            }
+        }
         if let Some(requested_port) = args.port {
             if current.port != Some(requested_port) {
                 if let Ok(hello) = fetch_daemon_hello(requested_port) {
@@ -3835,6 +3925,7 @@ async fn daemon_start(
         started_at,
         timeout,
         owner_token_env: args.owner_token_env.as_deref(),
+        projects_root: projects_root.as_deref(),
     })
     .await
 }
@@ -3859,6 +3950,7 @@ struct ManagedDaemonLaunch<'a> {
     started_at: u64,
     timeout: Duration,
     owner_token_env: Option<&'a str>,
+    projects_root: Option<&'a std::path::Path>,
 }
 
 async fn spawn_managed_daemon(
@@ -3874,6 +3966,7 @@ async fn spawn_managed_daemon(
         started_at,
         timeout,
         owner_token_env,
+        projects_root,
     } = launch;
     let executable = std::env::current_exe()?;
     let stdout = lifecycle::open_private_log(&paths.log)?;
@@ -3901,6 +3994,9 @@ async fn spawn_managed_daemon(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    if let Some(projects_root) = projects_root {
+        command.arg("--projects-root").arg(projects_root);
+    }
     // The short-lived lifecycle process receives the manager secret through
     // an environment variable, but the long-lived daemon needs only its
     // dedicated control-token copy. Do not retain or propagate the source
@@ -4207,6 +4303,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let canonical_project = lifecycle::canonical_project(&args.project)
         .map_err(|error| format!("serve: canonicalize {}: {error}", args.project.display()))?;
+    let projects_root = args
+        .projects_root
+        .as_deref()
+        .map(project_init::resolve_projects_root)
+        .transpose()
+        .map_err(|error| format!("serve: {error}"))?;
     let widget_owner_token = resolve_widget_owner_token(
         args.owner_token.clone(),
         args.owner_token_state_file.as_deref(),
@@ -4301,6 +4403,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         project: Arc::new(canonical_project.clone()),
         canonical_project: Arc::new(canonical_project.clone()),
+        projects_root: Arc::new(projects_root),
         events: tx.clone(),
         conflict: conflict_engine.clone(),
         artifacts: artifact::ArtifactStore::new(
@@ -14483,10 +14586,9 @@ fn command_output_cost(name: &str) -> &'static str {
         | "open" | "classinfo" | "enums" | "enum" | "ping" | "version" => "low",
         "init" | "plugin" | "auth" | "daemon" | "status" | "doctor" | "ls" | "tree" | "props"
         | "find" | "find-attr" | "logs" | "resolve" | "decision" | "lint" | "upload"
-        | "monetization" | "set" | "new" | "rm" | "mv" | "attr" | "tag" | "select" | "save"
-        | "waypoint" | "undo" | "redo" | "refresh" | "repair" | "capture" | "playtest" | "run" => {
-            "medium"
-        }
+        | "monetization" | "set" | "new" | "rm" | "mv" | "attr" | "tag" | "select" | "copy"
+        | "paste" | "save" | "waypoint" | "undo" | "redo" | "refresh" | "repair" | "capture"
+        | "playtest" | "run" => "medium",
         "source" | "conflicts" => "medium-special-case",
         "diff" | "changes" | "snapshot" | "get" | "eval" | "transmit" | "call" | "tail"
         | "watch" | "serve" => "high-or-streaming",
@@ -14496,9 +14598,9 @@ fn command_output_cost(name: &str) -> &'static str {
 
 fn command_safety_class(name: &str) -> &'static str {
     match name {
-        "set" | "new" | "rm" | "mv" | "attr" | "tag" | "save" | "waypoint" | "undo" | "redo" => {
-            "mutates-studio"
-        }
+        "set" | "new" | "rm" | "mv" | "attr" | "tag" | "paste" | "save" | "waypoint" | "undo"
+        | "redo" => "mutates-studio",
+        "copy" => "reads-studio-and-writes-private-clipboard",
         "resolve" | "decision" => "mutates-disk-or-studio",
         "eval" | "call" | "transmit" => "risky-live-execution",
         "playtest" => "controls-playtest-and-runtime-execution",
@@ -14522,7 +14624,7 @@ fn command_safety_class(name: &str) -> &'static str {
 fn command_requirements(name: &str) -> Vec<&'static str> {
     match name {
         "query" | "path" | "meta" | "services" | "source" | "decision" | "capabilities"
-        | "capture" | "playtest" => {
+        | "capture" | "playtest" | "copy" | "paste" => {
             vec!["project", "daemon", "studio-plugin"]
         }
         "run" => vec!["project", "daemon", "studio-plugin", "workflow-file"],
@@ -14557,6 +14659,11 @@ fn command_prefer_before(name: &str) -> Vec<&'static str> {
         "attr" | "tag" | "call" | "eval" | "transmit" | "select" | "save" => {
             vec!["status --raw", "waypoint for multi-step edits"]
         }
+        "copy" => vec!["select get when copying the current selection"],
+        "paste" => vec![
+            "status --raw",
+            "use --to when original parents do not exist",
+        ],
         "upload" => vec!["enumerate exact files", "use --manifest for bulk uploads"],
         "capture" => vec![
             "capabilities",
@@ -16227,6 +16334,26 @@ mod tier2_tests {
     }
 
     #[test]
+    fn idempotent_daemon_start_requires_the_original_owner_capability() {
+        let record = lifecycle::RuntimeRecord {
+            version: lifecycle::RUNTIME_RECORD_VERSION,
+            project: "/game".into(),
+            canonical_project: "/game".into(),
+            pid: 41,
+            port: 7878,
+            boot_id: "boot".into(),
+            control_token: "0123456789abcdef".into(),
+            managed_by: "desktop".into(),
+            log_path: "/tmp/rosync.log".into(),
+            started_at: 1,
+        };
+        assert!(validate_existing_daemon_owner(&record, None).is_ok());
+        assert!(validate_existing_daemon_owner(&record, Some("0123456789abcdef")).is_ok());
+        assert!(validate_existing_daemon_owner(&record, Some("fedcba9876543210")).is_err());
+        assert!(validate_existing_daemon_owner(&record, Some("short")).is_err());
+    }
+
+    #[test]
     fn lifecycle_json_does_not_expose_the_control_token() {
         let status = DaemonLifecycleStatus {
             ok: true,
@@ -17066,6 +17193,53 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             }
             RepairCommand::Sourcemap(_) => panic!("expected repair tree command"),
         }
+    }
+
+    #[test]
+    fn studio_clipboard_commands_parse_selection_paths_and_destination() {
+        let cli = Cli::try_parse_from(["rosync", "copy", "--project", "."]).unwrap();
+        let Some(Command::Copy(args)) = cli.command else {
+            panic!("expected copy command");
+        };
+        assert!(args.path.is_empty());
+        assert!(args.paths.is_empty());
+        assert_eq!(args.project.unwrap(), PathBuf::from("."));
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "copy",
+            "Workspace/One",
+            "ReplicatedStorage/Two",
+            "--path",
+            "StarterGui/HUD",
+            "--timeout",
+            "45",
+        ])
+        .unwrap();
+        let Some(Command::Copy(args)) = cli.command else {
+            panic!("expected copy command");
+        };
+        assert_eq!(args.path, ["StarterGui/HUD"]);
+        assert_eq!(args.paths, ["Workspace/One", "ReplicatedStorage/Two"]);
+        assert_eq!(args.timeout, 45.0);
+
+        let cli = Cli::try_parse_from([
+            "rosync",
+            "paste",
+            "--project",
+            ".",
+            "--parent",
+            "Workspace/Imported",
+            "--no-select",
+            "--raw",
+        ])
+        .unwrap();
+        let Some(Command::Paste(args)) = cli.command else {
+            panic!("expected paste command");
+        };
+        assert_eq!(args.to.as_deref(), Some("Workspace/Imported"));
+        assert!(args.no_select);
+        assert!(args.raw);
     }
 
     #[test]

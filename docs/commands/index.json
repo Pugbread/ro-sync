@@ -53,6 +53,8 @@
     "tag",
     "call",
     "select",
+    "copy",
+    "paste",
     "eval",
     "save",
     "transmit",

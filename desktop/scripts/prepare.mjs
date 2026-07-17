@@ -16,6 +16,7 @@ const frontendEntries = [
   "app.js",
   "bridge.js",
   "lifecycle-policy.js",
+  "project-init.js",
   "platform.js",
   "style.css",
   "views",
@@ -197,6 +198,7 @@ function verifySidecarContract(binary) {
         "--game-id",
         "--group-id",
         "--place-id",
+        "--projects-root",
       ],
     },
     {

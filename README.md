@@ -37,6 +37,9 @@ competing processes for the same project.
   tool registry or opaque editor automation.
 - **Live Studio truth.** Query Models, Parts, UI, attributes, tags, selection,
   enums, methods, output, and script source through the connected plugin.
+- **Cross-project Studio clipboard.** Copy arbitrary native instance trees in
+  one connected project, change directories, and paste them into another with
+  internal references intact and the full paste grouped into one Undo.
 - **Safe filesystem sync.** Only folders and Luau scripts round-trip; every
   other class remains Studio-authoritative.
 - **Native capture.** Render isolated models, exact camera views, transparent
@@ -64,7 +67,16 @@ npm run dev
 ```
 
 Open **Settings → Studio plugin**, install the bundled plugin, restart Studio,
-then add and start a project from **Projects**.
+then choose a **Projects folder** in Settings. You can add existing folders from
+**Projects**, or open a published place in Studio and click **Connect → Create
+Project** in the plugin. Studio sends its universe, place, creator, group, and
+display metadata to the desktop broker; Ro Sync creates or reuses the matching
+folder below the authorized root and starts its managed daemon automatically.
+
+Desktop can serve several projects at once. Each Projects-row switch owns an
+independent daemon, port, Studio connection, and authenticated lifecycle claim;
+selecting another row only changes the focused project. Stopping one switch or
+quitting Desktop never kills CLI-owned daemons or another project's process.
 
 ### Terminal 64 widget
 
@@ -122,6 +134,23 @@ rosync get --project . --path Workspace/Camera --prop FieldOfView
 # Check touched code with Studio-aware types and compiler coverage
 rosync lint --project . --path ReplicatedStorage/Shared --summary
 ```
+
+Move native Studio content between two served projects without exporting a
+model by hand:
+
+```sh
+cd /path/to/source
+rosync copy --project . Workspace/Map/Boss ReplicatedStorage/BossConfig
+
+cd /path/to/destination
+rosync paste --project . --to Workspace/Imported
+```
+
+With no paths, `copy` uses the current Explorer selection. With no `--to`,
+`paste` restores each root beneath its recorded parent route, including legal
+names containing `/` and duplicate same-named siblings. Roblox's native
+serializer carries arbitrary engine-supported instance hierarchies, scripts,
+attributes, tags, and references between roots copied together.
 
 Use `rosync commands --compact` to choose a command family and
 `rosync commands <name>` for exact machine-readable usage. The full generated

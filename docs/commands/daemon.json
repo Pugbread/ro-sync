@@ -12,7 +12,8 @@
     "rosync daemon logs --project . --lines 100"
   ],
   "notes": [
-    "start and restart accept --port, --managed-by, --data-dir, --timeout, --game-id, --group-id, and repeated --place-id. status, stop, and logs use the same canonical project identity and optional --data-dir.",
+    "start and restart accept --port, --projects-root, --managed-by, --data-dir, --timeout, --game-id, --group-id, and repeated --place-id. status, stop, and logs use the same canonical project identity and optional --data-dir.",
+    "--projects-root enables the authenticated Studio project initializer for a manager-authorized canonical root; it is not required for normal project daemons.",
     "A matching daemon already running for the project is returned instead of spawning a duplicate. A requested port serving another project is a hard error.",
     "Stop authenticates an exact project and boot ID before graceful shutdown. Ro Sync never kills a PID read from a stale runtime record.",
     "Desktop managers should supply their browser capability through --owner-token-env <ENV>; secrets are never returned by lifecycle JSON."

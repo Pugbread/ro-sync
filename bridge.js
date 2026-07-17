@@ -41,6 +41,17 @@ import {
 const pending = new Map();          // id -> {resolve, reject, timer}
 const listeners = new Map();        // t64 event type -> Set<fn>
 let daemonAuthToken = null;
+const daemonAuthTokensByBase = new Map();
+
+function daemonBaseKey(base) {
+  if (!base) return null;
+  try {
+    const url = new URL(String(base));
+    return `${url.protocol}//${url.host}`.toLowerCase();
+  } catch {
+    return String(base).replace(/\/+$/, "").toLowerCase();
+  }
+}
 
 function findTauriInvoke() {
   const globalApi = globalThis.__TAURI__;
@@ -142,9 +153,25 @@ export const host = Object.freeze({
   isDesktop: IS_DESKTOP_HOST,
   supports: Object.freeze({
     buildDaemon: !IS_DESKTOP_HOST,
+    multiDaemon: IS_DESKTOP_HOST,
     spawnSession: !IS_DESKTOP_HOST,
     hostTheme: !IS_DESKTOP_HOST,
+    windowDrag: IS_DESKTOP_HOST,
   }),
+
+  async startWindowDrag() {
+    if (!IS_DESKTOP_HOST) return { supported: false };
+    const getCurrentWindow = globalThis.__TAURI__?.window?.getCurrentWindow;
+    if (typeof getCurrentWindow !== "function") {
+      throw new Error("the Tauri window API is unavailable");
+    }
+    const currentWindow = getCurrentWindow();
+    if (!currentWindow || typeof currentWindow.startDragging !== "function") {
+      throw new Error("window dragging is unavailable");
+    }
+    await currentWindow.startDragging();
+    return { supported: true };
+  },
 
   async appInfo() {
     if (IS_DESKTOP_HOST) {
@@ -297,6 +324,7 @@ export const host = Object.freeze({
     return invokeDesktop("daemon_ensure", {
       spec: {
         project: spec.project,
+        projectsRoot: spec.projectsRoot ?? null,
         preferredPort: spec.preferredPort,
         gameId: spec.gameId ?? null,
         groupId: spec.groupId ?? null,
@@ -308,6 +336,33 @@ export const host = Object.freeze({
 
   async daemonStatus(project = null) {
     return invokeDesktop("daemon_status", { project });
+  },
+
+  async daemonList() {
+    if (!IS_DESKTOP_HOST) return { ok: true, daemons: [] };
+    return invokeDesktop("daemon_list");
+  },
+
+  async daemonStop(spec) {
+    if (!IS_DESKTOP_HOST) throw new Error("managed daemon stop is only available in the desktop app");
+    return invokeDesktop("daemon_stop", {
+      spec: {
+        project: spec.project,
+        bootId: spec.bootId ?? null,
+        ownerToken: spec.ownerToken ?? null,
+      },
+    });
+  },
+
+  async projectBrokerStatus() {
+    if (!IS_DESKTOP_HOST) return { ok: false, supported: false };
+    return invokeDesktop("project_broker_status");
+  },
+
+  async projectInitDrain() {
+    if (!IS_DESKTOP_HOST) return [];
+    const events = await invokeDesktop("project_init_drain");
+    return Array.isArray(events) ? events : [];
   },
 
   ready() {
@@ -350,17 +405,27 @@ window.addEventListener("message", (ev) => {
 // the localhost daemon with the same unguessable owner token used for process
 // lifecycle control. Native Studio/CLI requests have no browser Origin and do
 // not use this query capability.
-export function setDaemonAuthToken(token) {
-  daemonAuthToken = typeof token === "string" && token.length ? token : null;
+export function setDaemonAuthToken(token, base = null) {
+  const value = typeof token === "string" && token.length ? token : null;
+  const key = daemonBaseKey(base);
+  if (!key) {
+    daemonAuthToken = value;
+    return;
+  }
+  if (value) daemonAuthTokensByBase.set(key, value);
+  else daemonAuthTokensByBase.delete(key);
 }
 
-export function daemonURL(base, path = "", authToken = daemonAuthToken) {
+export function daemonURL(base, path = "", authToken) {
   if (!base) throw new Error("daemon not running");
   const url = new URL(base.replace(/\/+$/, "") + path);
   if (!["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
     throw new Error("daemon URL must use a loopback host");
   }
-  if (authToken) url.searchParams.set("widgetToken", authToken);
+  const token = authToken === undefined
+    ? (daemonAuthTokensByBase.get(daemonBaseKey(base)) || daemonAuthToken)
+    : authToken;
+  if (token) url.searchParams.set("widgetToken", token);
   return url.toString();
 }
 

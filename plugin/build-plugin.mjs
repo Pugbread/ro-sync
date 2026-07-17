@@ -34,6 +34,12 @@ await copyFile(
   path.join(repoRoot, "plugin", "Playscript.luau"),
   path.join(pluginSrcDir, "src", "Playscript.luau"),
 );
+await copyFile(
+  path.join(repoRoot, "plugin", "Clipboard.luau"),
+  path.join(pluginSrcDir, "src", "Clipboard.luau"),
+);
 
-run("wally", ["install"]);
+if (process.env.ROSYNC_SKIP_WALLY !== "1") {
+  run("wally", ["install"]);
+}
 run("rojo", ["build", "plugin.project.json", "--output", "../plugin/Plugin.rbxm"]);

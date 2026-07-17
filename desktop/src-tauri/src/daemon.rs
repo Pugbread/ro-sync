@@ -24,54 +24,46 @@ const EXIT_CLOSE_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 struct ExactManagedDaemonClaim {
+    project: String,
     port: u16,
+    pid: u32,
     boot_id: String,
     owner_token: String,
 }
 
 #[derive(Default)]
-pub(crate) struct ManagedDaemonClaim {
-    state: Mutex<ManagedDaemonClaimState>,
+pub(crate) struct ManagedDaemonClaims {
+    state: Mutex<ManagedDaemonClaimsState>,
 }
 
 #[derive(Default)]
-struct ManagedDaemonClaimState {
+struct ManagedDaemonClaimsState {
     exiting: bool,
-    current: Option<ExactManagedDaemonClaim>,
+    by_project: HashMap<String, ExactManagedDaemonClaim>,
 }
 
-impl ManagedDaemonClaim {
+impl ManagedDaemonClaims {
     fn remember(&self, value: &Value, owner_token: &str) {
-        let status = value.get("status").unwrap_or(value);
-        let is_owned = status.get("running").and_then(Value::as_bool) == Some(true)
-            && status.get("managed").and_then(Value::as_bool) == Some(true)
-            && status.get("managedBy").and_then(Value::as_str) == Some("desktop")
-            && status.get("externallyManaged").and_then(Value::as_bool) != Some(true);
-        let port = status
-            .get("port")
-            .and_then(Value::as_u64)
-            .and_then(|port| u16::try_from(port).ok())
-            .filter(|port| *port > 0);
-        let boot_id = status
-            .get("bootId")
-            .and_then(Value::as_str)
-            .filter(|boot_id| !boot_id.is_empty());
-        if !is_owned
-            || port.is_none()
-            || boot_id.is_none()
-            || validate_owner_token(owner_token).is_err()
-        {
+        let Some(claim) = exact_managed_daemon_claim(value, owner_token) else {
             return;
-        }
-        let claim = ExactManagedDaemonClaim {
-            port: port.unwrap(),
-            boot_id: boot_id.unwrap().to_string(),
-            owner_token: owner_token.to_string(),
         };
         let close_after_exit = match self.state.lock() {
             Ok(state) if state.exiting => true,
             Ok(mut state) => {
-                state.current = Some(claim.clone());
+                match state.by_project.get(&claim.project) {
+                    // An idempotent ensure can rediscover the same daemon with
+                    // a fresh, unproven token. Preserve the first exact claim
+                    // rather than replacing a working capability.
+                    Some(current)
+                        if current.boot_id == claim.boot_id
+                            && current.pid == claim.pid
+                            && current.port == claim.port => {}
+                    _ => {
+                        state
+                            .by_project
+                            .insert(claim.project.clone(), claim.clone());
+                    }
+                }
                 false
             }
             Err(_) => true,
@@ -81,6 +73,39 @@ impl ManagedDaemonClaim {
         }
     }
 
+    fn forget(&self, project: &str, boot_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            if state
+                .by_project
+                .get(project)
+                .is_some_and(|claim| claim.boot_id == boot_id)
+            {
+                state.by_project.remove(project);
+            }
+        }
+    }
+
+    fn list(&self) -> Result<Value, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "managed daemon claim registry is poisoned".to_string())?;
+        let mut claims = state.by_project.values().collect::<Vec<_>>();
+        claims.sort_by(|left, right| left.project.cmp(&right.project));
+        Ok(serde_json::json!({
+            "ok": true,
+            "daemons": claims.into_iter().map(|claim| serde_json::json!({
+                "tracked": true,
+                "managedBy": "desktop",
+                "project": claim.project,
+                "canonicalProject": claim.project,
+                "port": claim.port,
+                "pid": claim.pid,
+                "bootId": claim.boot_id,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
     pub(crate) fn mark_exiting(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.exiting = true;
@@ -88,21 +113,78 @@ impl ManagedDaemonClaim {
     }
 
     pub(crate) fn terminate(&self) {
-        let claim = self.state.lock().ok().and_then(|mut state| {
+        let claims = self.state.lock().ok().map(|mut state| {
             state.exiting = true;
-            state.current.take()
+            state
+                .by_project
+                .drain()
+                .map(|(_, claim)| claim)
+                .collect::<Vec<_>>()
         });
-        if let Some(claim) = claim {
-            let _ = close_exact_managed_daemon(&claim);
+        if let Some(claims) = claims {
+            close_managed_daemons(claims);
         }
     }
+}
+
+fn exact_managed_daemon_claim(value: &Value, owner_token: &str) -> Option<ExactManagedDaemonClaim> {
+    let status = value.get("status").unwrap_or(value);
+    let is_owned = status.get("running").and_then(Value::as_bool) == Some(true)
+        && status.get("managed").and_then(Value::as_bool) == Some(true)
+        && status.get("managedBy").and_then(Value::as_str) == Some("desktop")
+        && status.get("externallyManaged").and_then(Value::as_bool) != Some(true);
+    let port = status
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port > 0)?;
+    let pid = status
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)?;
+    let boot_id = status
+        .get("bootId")
+        .and_then(Value::as_str)
+        .filter(|boot_id| !boot_id.is_empty())?;
+    let project = status
+        .get("canonicalProject")
+        .or_else(|| status.get("project"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|project| !project.is_empty())?;
+    if !is_owned || validate_owner_token(owner_token).is_err() {
+        return None;
+    }
+    Some(ExactManagedDaemonClaim {
+        project: project.to_string(),
+        port,
+        pid,
+        boot_id: boot_id.to_string(),
+        owner_token: owner_token.to_string(),
+    })
+}
+
+fn close_managed_daemons(claims: Vec<ExactManagedDaemonClaim>) {
+    // Each exact close has its own bounded network deadline. Run them in
+    // parallel so app exit remains bounded by one close window rather than by
+    // the number of simultaneously served projects.
+    thread::scope(|scope| {
+        for claim in &claims {
+            scope.spawn(|| {
+                let _ = close_exact_managed_daemon(claim);
+            });
+        }
+    });
 }
 
 fn close_exact_managed_daemon(claim: &ExactManagedDaemonClaim) -> Result<(), String> {
     let hello = local_json_request(claim.port, "GET", "/hello", &[])?;
     let exact_daemon = hello.get("managed").and_then(Value::as_bool) == Some(true)
         && hello.get("managedBy").and_then(Value::as_str) == Some("desktop")
+        && hello.get("project").and_then(Value::as_str) == Some(claim.project.as_str())
         && hello.get("bootId").and_then(Value::as_str) == Some(claim.boot_id.as_str())
+        && hello.get("pid").and_then(Value::as_u64) == Some(u64::from(claim.pid))
         && hello.get("port").and_then(Value::as_u64) == Some(u64::from(claim.port));
     if !exact_daemon {
         return Err("managed daemon identity changed before native exit cleanup".into());
@@ -262,6 +344,7 @@ impl LifecycleFailure {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DaemonEnsureSpec {
     project: String,
+    projects_root: Option<String>,
     preferred_port: Option<u16>,
     game_id: Option<String>,
     group_id: Option<String>,
@@ -278,10 +361,27 @@ pub(crate) async fn daemon_ensure(
 ) -> Result<Value, String> {
     let project = validate_project(&spec.project)?;
     crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &project)?;
+    let projects_root = match spec
+        .projects_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        Some(root) => {
+            let root = validate_project(root)?;
+            crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &root)?;
+            Some(root)
+        }
+        None => None,
+    };
     let owner_token = spec
         .owner_token
         .ok_or_else(|| "managed daemon ownership token is required".to_string())?;
     validate_owner_token(&owner_token)?;
+    // Port discovery and listener launch are separate daemon operations. Keep
+    // starts for different projects serial inside one Desktop process so two
+    // concurrent UI requests cannot both select the same free port.
+    let _start_guard = state.daemon_start_lock.lock().await;
 
     let mut base_args = vec![
         "daemon".to_string(),
@@ -299,6 +399,9 @@ pub(crate) async fn daemon_ensure(
         "10".to_string(),
         "--raw".to_string(),
     ];
+    if let Some(projects_root) = projects_root.as_deref() {
+        base_args.extend(["--projects-root".to_string(), display_path(projects_root)]);
+    }
     push_nonblank_flag(&mut base_args, "--game-id", spec.game_id.as_deref());
     push_nonblank_flag(&mut base_args, "--group-id", spec.group_id.as_deref());
     for place_id in spec.place_ids {
@@ -327,7 +430,7 @@ pub(crate) async fn daemon_ensure(
         .await
         {
             Ok(value) => {
-                state.managed_daemon.remember(&value, &owner_token);
+                state.managed_daemons.remember(&value, &owner_token);
                 return Ok(value);
             }
             // A timeout is not evidence that the preferred port is occupied.
@@ -370,6 +473,14 @@ fn push_nonblank_flag(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
     args.push(value.to_owned());
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DaemonStopSpec {
+    project: String,
+    boot_id: Option<String>,
+    owner_token: Option<String>,
+}
+
 #[tauri::command]
 pub(crate) async fn daemon_status(
     app: AppHandle,
@@ -381,18 +492,101 @@ pub(crate) async fn daemon_status(
     };
     let project = validate_project(&project)?;
     crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &project)?;
+    daemon_status_for_project(&app, state.inner(), &project).await
+}
+
+#[tauri::command]
+pub(crate) async fn daemon_stop(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    spec: DaemonStopSpec,
+) -> Result<Value, String> {
+    let project = validate_project(&spec.project)?;
+    crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &project)?;
+    let expected_boot_id = spec
+        .boot_id
+        .as_deref()
+        .ok_or_else(|| "managed daemon boot ID is required".to_string())?;
+    validate_lifecycle_identity(expected_boot_id, "managed daemon boot ID")?;
+    let owner_token = spec
+        .owner_token
+        .as_deref()
+        .ok_or_else(|| "managed daemon ownership token is required".to_string())?;
+    validate_owner_token(owner_token)?;
+
+    let value = daemon_status_for_project(&app, state.inner(), &project).await?;
+    let status = value.get("status").unwrap_or(&value);
+    let canonical_project = display_path(&project);
+    if status.get("running").and_then(Value::as_bool) != Some(true) {
+        state
+            .managed_daemons
+            .forget(&canonical_project, expected_boot_id);
+        return Ok(serde_json::json!({
+            "ok": true,
+            "stopped": true,
+            "running": false,
+            "project": canonical_project,
+            "bootId": expected_boot_id,
+        }));
+    }
+
+    let claim = exact_managed_daemon_claim(&value, owner_token).ok_or_else(|| {
+        "daemon is not an exact Desktop-managed lifecycle target; it was left running".to_string()
+    })?;
+    if claim.project != canonical_project {
+        return Err("managed daemon project identity changed; it was left running".into());
+    }
+    if claim.boot_id != expected_boot_id {
+        return Err("managed daemon boot identity changed; it was left running".into());
+    }
+
+    // Make an exact stop discovered after an app relaunch visible to native
+    // exit cleanup before the blocking authenticated close begins.
+    state.managed_daemons.remember(&value, owner_token);
+    let stopped_project = claim.project.clone();
+    let stopped_boot_id = claim.boot_id.clone();
+    let stopped_port = claim.port;
+    let stopped_pid = claim.pid;
+    tokio::task::spawn_blocking(move || close_exact_managed_daemon(&claim))
+        .await
+        .map_err(|error| format!("managed daemon close task failed: {error}"))??;
+    state
+        .managed_daemons
+        .forget(&stopped_project, &stopped_boot_id);
+    Ok(serde_json::json!({
+        "ok": true,
+        "stopped": true,
+        "running": false,
+        "project": stopped_project,
+        "canonicalProject": stopped_project,
+        "bootId": stopped_boot_id,
+        "port": stopped_port,
+        "pid": stopped_pid,
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn daemon_list(state: State<'_, AppState>) -> Result<Value, String> {
+    state.managed_daemons.list()
+}
+
+async fn daemon_status_for_project(
+    app: &AppHandle,
+    state: &AppState,
+    project: &Path,
+) -> Result<Value, String> {
     let args = vec![
         "daemon".to_string(),
         "status".to_string(),
         "--parent-stdin-lease".to_string(),
         "--project".to_string(),
-        display_path(&project),
+        display_path(project),
         "--data-dir".to_string(),
         display_path(&state.paths.daemon_data_dir),
         "--raw".to_string(),
     ];
     run_lifecycle(
-        &app,
+        app,
         &state.paths.resource_dir,
         &state.lifecycle_children,
         args,
@@ -454,6 +648,16 @@ async fn run_lifecycle(
             Some(CommandEvent::Stdout(line)) => {
                 stdout.extend(line);
                 stdout.push(b'\n');
+                // Raw lifecycle commands emit exactly one JSON document. The
+                // shell plugin can delay its separate Terminated event after
+                // stdout has already closed, especially when the command
+                // spawned a detached daemon. Treat a complete JSON document
+                // as the terminal success signal and close only this exact
+                // short-lived sidecar handle.
+                if let Some(value) = parse_lifecycle_stdout(&stdout) {
+                    let _ = lifecycle_children.terminate(pid);
+                    return Ok(normalize_lifecycle(value));
+                }
             }
             Some(CommandEvent::Stderr(line)) => {
                 stderr.extend(line);
@@ -476,11 +680,11 @@ async fn run_lifecycle(
         }
     }
 
-    let stdout = String::from_utf8_lossy(&stdout);
-    if let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) {
+    if let Some(value) = parse_lifecycle_stdout(&stdout) {
         return Ok(normalize_lifecycle(value));
     }
 
+    let stdout = String::from_utf8_lossy(&stdout);
     let stderr = String::from_utf8_lossy(&stderr);
     let mut message = if stderr.trim().is_empty() {
         stdout.trim().to_owned()
@@ -501,6 +705,11 @@ async fn run_lifecycle(
         };
     }
     Err(LifecycleFailure::Message(message))
+}
+
+fn parse_lifecycle_stdout(stdout: &[u8]) -> Option<Value> {
+    let stdout = String::from_utf8_lossy(stdout);
+    serde_json::from_str(stdout.trim()).ok()
 }
 
 fn lifecycle_timeout_message(
@@ -625,12 +834,16 @@ fn validate_project(raw: &str) -> Result<PathBuf, String> {
 }
 
 fn validate_owner_token(token: &str) -> Result<(), String> {
-    if !(16..=512).contains(&token.len())
-        || !token
+    validate_lifecycle_identity(token, "managed daemon ownership token")
+}
+
+fn validate_lifecycle_identity(value: &str, label: &str) -> Result<(), String> {
+    if !(16..=512).contains(&value.len())
+        || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
     {
-        return Err("managed daemon ownership token has an invalid format".into());
+        return Err(format!("{label} has an invalid format"));
     }
     Ok(())
 }
@@ -655,6 +868,32 @@ mod tests {
         assert!(validate_owner_token("0123456789abcdef").is_ok());
         assert!(validate_owner_token("too short").is_err());
         assert!(validate_owner_token("0123456789abcdef\n--flag").is_err());
+        assert!(validate_lifecycle_identity("0123456789abcdef", "boot ID").is_ok());
+        assert!(validate_lifecycle_identity("short", "boot ID").is_err());
+    }
+
+    #[test]
+    fn lifecycle_command_specs_keep_existing_fields_and_accept_multi_project_fields() {
+        let ensure = serde_json::from_value::<DaemonEnsureSpec>(serde_json::json!({
+            "project": "/projects/alpha",
+            "projectsRoot": "/projects",
+            "preferredPort": 7878,
+            "ownerToken": "0123456789abcdef",
+        }))
+        .unwrap();
+        assert_eq!(ensure.project, "/projects/alpha");
+        assert_eq!(ensure.projects_root.as_deref(), Some("/projects"));
+        assert_eq!(ensure.preferred_port, Some(7878));
+
+        let stop = serde_json::from_value::<DaemonStopSpec>(serde_json::json!({
+            "project": "/projects/alpha",
+            "bootId": "0123456789abcdef",
+            "ownerToken": "fedcba9876543210",
+        }))
+        .unwrap();
+        assert_eq!(stop.project, "/projects/alpha");
+        assert_eq!(stop.boot_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(stop.owner_token.as_deref(), Some("fedcba9876543210"));
     }
 
     #[test]
@@ -676,6 +915,14 @@ mod tests {
         assert!(message.contains("process 42"));
         assert!(message.contains("owner [redacted]"));
         assert!(!message.contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn complete_lifecycle_json_is_a_terminal_result() {
+        assert!(parse_lifecycle_stdout(br#"{"ok":true"#).is_none());
+        let value = parse_lifecycle_stdout(b"  {\"ok\":true,\"port\":7879}\n").unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["port"], 7879);
     }
 
     #[test]
@@ -732,7 +979,9 @@ mod tests {
                 &serde_json::json!({
                     "managed": true,
                     "managedBy": "desktop",
+                    "project": "/project-exact",
                     "bootId": "boot-exact",
+                    "pid": 4242,
                     "port": port,
                 })
                 .to_string(),
@@ -745,40 +994,216 @@ mod tests {
             close_request
         });
 
-        let claim = ManagedDaemonClaim::default();
-        claim.remember(
+        let claims = ManagedDaemonClaims::default();
+        claims.remember(
             &serde_json::json!({
                 "running": true,
                 "managed": true,
                 "managedBy": "desktop",
                 "externallyManaged": false,
+                "canonicalProject": "/project-exact",
                 "port": port,
+                "pid": 4242,
                 "bootId": "boot-exact",
             }),
             "0123456789abcdef",
         );
-        claim.terminate();
+        claims.terminate();
 
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /manager-close HTTP/1.1\r\n"));
         assert!(request.contains("\"token\":\"0123456789abcdef\""));
-        assert!(claim.state.lock().unwrap().current.is_none());
+        assert!(claims.state.lock().unwrap().by_project.is_empty());
     }
 
     #[test]
     fn native_exit_close_never_claims_external_daemons() {
-        let claim = ManagedDaemonClaim::default();
-        claim.remember(
+        let claims = ManagedDaemonClaims::default();
+        claims.remember(
             &serde_json::json!({
                 "running": true,
                 "managed": true,
                 "managedBy": "cli",
                 "externallyManaged": true,
+                "canonicalProject": "/external-project",
                 "port": 7878,
+                "pid": 4242,
+                "bootId": "external-boot",
             }),
             "0123456789abcdef",
         );
-        assert!(claim.state.lock().unwrap().current.is_none());
+        assert!(claims.state.lock().unwrap().by_project.is_empty());
+    }
+
+    #[test]
+    fn native_exit_tracks_owned_projects_independently() {
+        let claims = ManagedDaemonClaims::default();
+        for (project, port, pid, boot_id, token) in [
+            ("/project-a", 7878, 4101, "boot-a", "token-project-a1"),
+            ("/project-b", 7879, 4102, "boot-b", "token-project-b2"),
+        ] {
+            claims.remember(
+                &serde_json::json!({
+                    "running": true,
+                    "managed": true,
+                    "managedBy": "desktop",
+                    "externallyManaged": false,
+                    "canonicalProject": project,
+                    "port": port,
+                    "pid": pid,
+                    "bootId": boot_id,
+                }),
+                token,
+            );
+        }
+
+        {
+            let state = claims.state.lock().unwrap();
+            assert_eq!(state.by_project.len(), 2);
+            assert_eq!(state.by_project["/project-a"].boot_id, "boot-a");
+            assert_eq!(state.by_project["/project-b"].boot_id, "boot-b");
+        }
+        let listed = claims.list().unwrap();
+        assert_eq!(listed["daemons"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["daemons"][0]["project"], "/project-a");
+        assert_eq!(listed["daemons"][1]["project"], "/project-b");
+        assert!(listed["daemons"][0].get("ownerToken").is_none());
+        assert!(listed["daemons"][0].get("running").is_none());
+    }
+
+    #[test]
+    fn native_exit_closes_all_owned_projects() {
+        fn spawn_daemon(
+            project: &'static str,
+            pid: u32,
+            boot_id: &'static str,
+        ) -> (u16, std::thread::JoinHandle<String>) {
+            fn read_request(connection: &mut std::net::TcpStream) -> String {
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let count = connection.read(&mut chunk).unwrap();
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let body_bytes = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    if request.len() >= header_end + 4 + body_bytes {
+                        return String::from_utf8_lossy(&request).into_owned();
+                    }
+                }
+            }
+
+            fn respond(connection: &mut std::net::TcpStream, body: &str) {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                connection.write_all(response.as_bytes()).unwrap();
+            }
+
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut hello_connection, _) = listener.accept().unwrap();
+                let hello_request = read_request(&mut hello_connection);
+                assert!(hello_request.starts_with("GET /hello HTTP/1.1\r\n"));
+                respond(
+                    &mut hello_connection,
+                    &serde_json::json!({
+                        "managed": true,
+                        "managedBy": "desktop",
+                        "project": project,
+                        "bootId": boot_id,
+                        "pid": pid,
+                        "port": port,
+                    })
+                    .to_string(),
+                );
+                drop(hello_connection);
+
+                let (mut close_connection, _) = listener.accept().unwrap();
+                let close_request = read_request(&mut close_connection);
+                respond(&mut close_connection, "{\"ok\":true}");
+                close_request
+            });
+            (port, server)
+        }
+
+        let (port_a, server_a) = spawn_daemon("/parallel-a", 5101, "parallel-boot-a");
+        let (port_b, server_b) = spawn_daemon("/parallel-b", 5102, "parallel-boot-b");
+        let claims = ManagedDaemonClaims::default();
+        for (project, port, pid, boot_id, token) in [
+            (
+                "/parallel-a",
+                port_a,
+                5101,
+                "parallel-boot-a",
+                "parallel-token-a",
+            ),
+            (
+                "/parallel-b",
+                port_b,
+                5102,
+                "parallel-boot-b",
+                "parallel-token-b",
+            ),
+        ] {
+            claims.remember(
+                &serde_json::json!({
+                    "running": true,
+                    "managed": true,
+                    "managedBy": "desktop",
+                    "externallyManaged": false,
+                    "canonicalProject": project,
+                    "port": port,
+                    "pid": pid,
+                    "bootId": boot_id,
+                }),
+                token,
+            );
+        }
+
+        claims.terminate();
+        let request_a = server_a.join().unwrap();
+        let request_b = server_b.join().unwrap();
+        assert!(request_a.contains("\"token\":\"parallel-token-a\""));
+        assert!(request_b.contains("\"token\":\"parallel-token-b\""));
+        assert!(claims.state.lock().unwrap().by_project.is_empty());
+    }
+
+    #[test]
+    fn idempotent_ensure_does_not_replace_an_existing_exact_capability() {
+        let claims = ManagedDaemonClaims::default();
+        let status = serde_json::json!({
+            "running": true,
+            "managed": true,
+            "managedBy": "desktop",
+            "externallyManaged": false,
+            "canonicalProject": "/same-project",
+            "port": 7878,
+            "pid": 4200,
+            "bootId": "same-boot",
+        });
+        claims.remember(&status, "first-valid-token");
+        claims.remember(&status, "second-new-token");
+
+        let state = claims.state.lock().unwrap();
+        assert_eq!(state.by_project.len(), 1);
+        assert_eq!(
+            state.by_project["/same-project"].owner_token,
+            "first-valid-token"
+        );
     }
 
     #[test]
@@ -787,22 +1212,24 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let claim = ManagedDaemonClaim::default();
-        claim.mark_exiting();
-        claim.remember(
+        let claims = ManagedDaemonClaims::default();
+        claims.mark_exiting();
+        claims.remember(
             &serde_json::json!({
                 "running": true,
                 "managed": true,
                 "managedBy": "desktop",
                 "externallyManaged": false,
+                "canonicalProject": "/late-project",
                 "port": port,
+                "pid": 4343,
                 "bootId": "late-boot",
             }),
             "0123456789abcdef",
         );
 
-        let state = claim.state.lock().unwrap();
+        let state = claims.state.lock().unwrap();
         assert!(state.exiting);
-        assert!(state.current.is_none());
+        assert!(state.by_project.is_empty());
     }
 }

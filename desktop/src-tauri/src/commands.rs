@@ -100,15 +100,20 @@ pub(crate) fn state_set(
 }
 
 #[tauri::command]
-pub(crate) fn secret_get(
+pub(crate) async fn secret_get(
     state: State<'_, AppState>,
     key: String,
 ) -> Result<Option<String>, String> {
-    let _guard = state
-        .io_lock
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?;
-    SecretStore::new(state.paths.secrets_file.clone()).get(&key)
+    let io_lock = state.io_lock.clone();
+    let secrets_file = state.paths.secrets_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = io_lock
+            .lock()
+            .map_err(|_| "application state lock is poisoned".to_string())?;
+        SecretStore::new(secrets_file).get(&key)
+    })
+    .await
+    .map_err(|error| format!("secret lookup task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -266,30 +271,43 @@ pub(crate) fn read_resource_file(
 }
 
 #[tauri::command]
-pub(crate) fn pick_folder(
+pub(crate) async fn pick_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     prompt: String,
 ) -> Result<Option<String>, String> {
     let prompt = if prompt.trim().is_empty() {
-        "Pick a folder"
+        "Pick a folder".to_string()
     } else {
-        prompt.trim()
+        prompt.trim().to_string()
     };
-    let selected = app.dialog().file().set_title(prompt).blocking_pick_folder();
+    let io_lock = state.io_lock.clone();
+    let authorized_roots_file = state.paths.authorized_roots_file.clone();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title(prompt)
+        .pick_folder(move |selected| {
+            let _ = sender.send(selected);
+        });
+    let selected = receiver
+        .await
+        .map_err(|_| "folder picker closed before returning a selection".to_string())?;
     let Some(selected) = selected else {
         return Ok(None);
     };
     let selected = selected
         .into_path()
         .map_err(|error| format!("selected folder is not a local path: {error}"))?;
-    let _guard = state
-        .io_lock
-        .lock()
-        .map_err(|_| "application state lock is poisoned".to_string())?;
-    let authorized =
-        crate::storage::authorize_project_root(&state.paths.authorized_roots_file, &selected)?;
-    Ok(Some(display_path(&authorized)))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = io_lock
+            .lock()
+            .map_err(|_| "application state lock is poisoned".to_string())?;
+        let authorized = crate::storage::authorize_project_root(&authorized_roots_file, &selected)?;
+        Ok(Some(display_path(&authorized)))
+    })
+    .await
+    .map_err(|error| format!("folder authorization task failed: {error}"))?
 }
 
 #[tauri::command]

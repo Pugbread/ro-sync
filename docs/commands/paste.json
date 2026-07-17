@@ -1,0 +1,18 @@
+{
+  "name": "paste",
+  "title": "rosync paste",
+  "category": "Studio clipboard",
+  "description": "Pastes Ro Sync's native instance clipboard into the connected Studio as one undoable change.",
+  "usage": "rosync paste [--project <path>] [--port <port>] [--to <parent-path>] [--no-select] [--timeout <seconds>] [--raw]",
+  "examples": [
+    "rosync paste --project .",
+    "rosync paste --project . --to Workspace/Imported",
+    "rosync paste --project . --parent ReplicatedStorage/Assets --no-select"
+  ],
+  "notes": [
+    "Without `--to`, every copied root returns to its recorded class/name/ordinal parent route in the destination place, including paths with `/` in a name and duplicate same-named siblings.",
+    "Use `--to` (alias `--parent`) when the original parent hierarchy does not exist in the destination.",
+    "Pasted roots are selected by default. One Studio Undo removes the full paste.",
+    "Paste is reusable: it does not consume the private clipboard."
+  ]
+}

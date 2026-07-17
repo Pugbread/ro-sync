@@ -392,7 +392,42 @@ rosync select get --project .
 rosync select set --project . --paths '["Workspace/Box","Workspace/SpawnLocation"]'
 ```
 
-## 6d. Introspection — class info, enums, attribute-scoped search
+## 6d. Cross-project Studio clipboard
+
+`rosync copy` and `rosync paste` move arbitrary native Roblox instance trees
+between simultaneously connected projects. The clipboard lives in Ro Sync's
+private platform state directory, so the normal agent flow is simply copy in
+one project directory, `cd` to another, and paste there:
+
+```
+# Source Studio: no paths means the current Explorer Selection.
+cd /path/to/source-project
+rosync copy --project .
+
+# Multiple explicit roots are serialized together, preserving references
+# between them.
+rosync copy --project . Workspace/Map/Boss ReplicatedStorage/BossConfig
+
+# Destination Studio: original parent routes are restored when they exist.
+cd /path/to/destination-project
+rosync paste --project .
+
+# Override the parent for every copied root.
+rosync paste --project . --to Workspace/Imported
+```
+
+The payload is native `.rbxm` produced by Roblox `SerializationService`, not a
+lossy JSON property projection. It preserves engine-supported classes,
+properties, descendants, attributes, tags, scripts, and references among all
+roots copied in the same command. Open Script Editor text is refreshed before
+serialization. Services themselves cannot be copied, and references to
+instances outside the copied roots do not cross places, matching native Studio
+copy/paste behavior. Paste selects the new roots by default and is recorded as
+one Studio Undo action; use `--no-select` to keep the current selection. Copy is
+reusable and atomically replaces the prior private clipboard only after size
+and SHA-256 verification.
+
+## 6e. Introspection — class info, enums, attribute-scoped search
 
 Read-only helpers for mapping an agent's mental model of the DataModel onto
 Studio's real type system. Cheap, safe to call freely.
@@ -419,9 +454,9 @@ rosync find-attr --project . --name Color --value \
   '{"__type":"Color3","r":1,"g":0,"b":0}'
 ```
 
-## 6e. Capability discovery and screenshots
+## 6f. Capability discovery and screenshots
 
-Protocol 2 / plugin 2.0.0 exposes optional Studio features explicitly. Check
+Protocol 2 / plugin 2.1.0 exposes optional Studio features explicitly. Check
 them before choosing capture or playtest commands:
 
 ```
@@ -507,7 +542,7 @@ SHA checks and are written directly. The CLI verifies and consumes Studio
 transport artifacts after writing the requested output; orphaned finalized
 artifacts are bounded by TTL, LRU, and a total-byte budget.
 
-## 6f. Playtest agents
+## 6g. Playtest agents
 
 Playtests run as asynchronous jobs. Runtime plugin copies communicate with the
 edit plugin through PluginConnectionService and appear as `server` and
@@ -723,7 +758,7 @@ pixel, byte, session-count, and TTL limits as edit-mode capture. Plugin-identity
 timeouts are cooperative, so code that spawns its own tasks remains responsible
 for stopping them.
 
-## 6g. Versioned workflows
+## 6h. Versioned workflows
 
 `rosync run` validates schema version 1, then executes all steps over one
 persistent remote session:
@@ -786,7 +821,7 @@ Workflows do not grant write authority: inspect live targets and confirm user
 intent before running a workflow that mutates Studio, starts a test, sends
 input, or uploads assets.
 
-## 6h. LLM-first command budget
+## 6i. LLM-first command budget
 
 Do not paste or request the full command registry by default. It is large and
 usually worse for agent reasoning. Use this flow instead:

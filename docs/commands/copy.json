@@ -1,0 +1,18 @@
+{
+  "name": "copy",
+  "title": "rosync copy",
+  "category": "Studio clipboard",
+  "description": "Copies arbitrary native Studio instance trees into Ro Sync's private cross-project clipboard.",
+  "usage": "rosync copy [<studio-path> ...] [--path <studio-path> ...] [--project <path>] [--port <port>] [--timeout <seconds>] [--raw]",
+  "examples": [
+    "rosync copy --project .",
+    "rosync copy Workspace/Map/Boss ReplicatedStorage/Shared/BossConfig --project .",
+    "rosync copy --project . --path StarterGui/HUD --path ReplicatedStorage/HUDAssets"
+  ],
+  "notes": [
+    "With no paths, copies the current Studio Explorer selection.",
+    "Roblox SerializationService preserves native instance types, descendants, properties, attributes, tags, scripts, and references among roots copied together.",
+    "The private clipboard is shared across Ro Sync projects and survives CLI process exit; a successful copy atomically replaces it.",
+    "Services cannot be copied. References to instances outside the copied roots cannot cross places, matching native Studio behavior."
+  ]
+}

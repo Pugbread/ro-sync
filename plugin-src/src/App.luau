@@ -23,6 +23,11 @@ local Colors = {
 	Overlay = Color3.fromRGB(0, 0, 0),
 }
 
+local function normalizeManualUrl(value)
+	local trimmed = tostring(value or ""):match("^%s*(.-)%s*$") or ""
+	return (trimmed:gsub("/+$", ""))
+end
+
 local function corner(radius)
 	return React.createElement("UICorner", {
 		CornerRadius = UDim.new(0, radius),
@@ -55,6 +60,12 @@ local function statusView(state, detail)
 		return "Connecting...", Colors.Accent, "Cancel"
 	elseif state == "waiting" then
 		return "Waiting for initial sync...", Colors.Accent, "Cancel"
+	elseif state == "project_init" then
+		return "New Studio project · ready to create", Colors.Accent, "Create Project"
+	elseif state == "project_creating" then
+		return "Creating Ro Sync project...", Colors.Accent, "Cancel"
+	elseif state == "project_waiting" then
+		return "Project ready · waiting for Desktop...", Colors.Accent, "Cancel"
 	elseif state == "connected" then
 		return string.format("localhost:%s", tostring(detail or "?")), Colors.Good, "Disconnect"
 	elseif state == "no_daemon" then
@@ -526,9 +537,11 @@ function App.mount(target, props)
 						Text = manualUrl,
 						PlaceholderText = props.defaultUrl,
 						OnTextChanged = setManualUrl,
-						OnFocusLost = function(enterPressed)
-							if enterPressed and props.onUrlCommit then
-								props.onUrlCommit(currentManualUrl)
+						OnFocusLost = function()
+							local normalized = normalizeManualUrl(currentManualUrl)
+							setManualUrl(normalized)
+							if props.onUrlCommit then
+								props.onUrlCommit(normalized)
 							end
 						end,
 					}),

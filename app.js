@@ -18,11 +18,11 @@ import { mountConflicts } from "./views/conflicts.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
+import { mergeProjectInitEvent } from "./project-init.js";
 import {
   canStopDesktopDaemon,
   desktopStartOwnership,
   desktopStopPlan,
-  desktopTrackedOwnership,
   isDesktopManagedStatus,
 } from "./lifecycle-policy.js";
 import {
@@ -35,25 +35,126 @@ import {
   launchDaemonCmd, tmpLogPath,
   joinShell,
 } from "./platform.js";
+import {
+  applyAppearanceTheme,
+  defaultAppearanceTheme,
+  normalizeAppearanceTheme,
+  resolveAppearanceTheme,
+} from "./views/theme.js";
+
+const APPEARANCE_CONTEXT = Object.freeze({
+  supportsHost: host.supports.hostTheme,
+  isDesktop: IS_DESKTOP_HOST,
+});
+const DEFAULT_APPEARANCE_THEME = defaultAppearanceTheme(APPEARANCE_CONTEXT);
 
 // ---------- State store ----------
 // Persisted shape:
 //   {
 //     projects: [{ id, name, path, addedAt, gameId, groupId, placeIds }],
-//     activeProjectId,
+//     activeProjectId, servedProjectIds, daemonSessions, projectsRoot,
 //     daemonPid, daemonPort, daemonProject, daemonBootId, daemonOwnerToken,
-//     lastView,
+//     appearanceTheme, lastView,
 //   }
 const DEFAULT_STATE = {
   projects: [],
+  projectsRoot: null,
   activeProjectId: null,
+  servedProjectIds: [],
+  daemonSessions: {},
   daemonPid: null,
   daemonPort: null,
   daemonProject: null,
   daemonBootId: null,
   daemonOwnerToken: null,
+  appearanceTheme: DEFAULT_APPEARANCE_THEME,
   lastView: "projects",
 };
+
+function validProjectIdSet(state) {
+  return new Set((state.projects || []).map((project) => project?.id).filter(Boolean));
+}
+
+function normalizeDaemonSession(session, project = null) {
+  if (!session || typeof session !== "object" || Array.isArray(session)) return null;
+  const path = session.project || project?.path || null;
+  if (!path) return null;
+  return {
+    project: path,
+    canonicalProject: session.canonicalProject || null,
+    port: session.port ?? null,
+    pid: session.pid ?? null,
+    base: session.base || (session.port ? `http://127.0.0.1:${session.port}` : null),
+    bootId: session.bootId || null,
+    ownerToken: session.ownerToken || null,
+    ok: session.ok === true ? true : (session.ok === false ? false : null),
+    error: session.error || null,
+  };
+}
+
+function normalizePersistedState(value) {
+  const incoming = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const next = { ...DEFAULT_STATE, ...incoming };
+  next.projects = Array.isArray(incoming.projects) ? incoming.projects.filter(Boolean) : [];
+  next.projectsRoot = typeof incoming.projectsRoot === "string" && incoming.projectsRoot.trim()
+    ? incoming.projectsRoot.trim()
+    : null;
+  next.appearanceTheme = normalizeAppearanceTheme(
+    incoming.appearanceTheme,
+    APPEARANCE_CONTEXT,
+  );
+
+  const validIds = validProjectIdSet(next);
+  const hasServedProjectIds = Array.isArray(incoming.servedProjectIds);
+  const served = hasServedProjectIds
+    ? incoming.servedProjectIds.filter((id) => validIds.has(id))
+    : [];
+  // Version-1 state represented the only served project as activeProjectId.
+  // Seed the new collection once, while keeping activeProjectId as the
+  // selected/detail focus for existing installs.
+  if (!hasServedProjectIds && incoming.activeProjectId && validIds.has(incoming.activeProjectId)) {
+    served.push(incoming.activeProjectId);
+  }
+  next.servedProjectIds = [...new Set(served)];
+
+  const sessions = {};
+  const incomingSessions = incoming.daemonSessions;
+  if (incomingSessions && typeof incomingSessions === "object" && !Array.isArray(incomingSessions)) {
+    for (const [projectId, session] of Object.entries(incomingSessions)) {
+      if (!validIds.has(projectId)) continue;
+      const project = next.projects.find((item) => item.id === projectId);
+      const normalized = normalizeDaemonSession(session, project);
+      if (normalized) sessions[projectId] = normalized;
+    }
+  }
+  // Migrate the singleton daemon claim into the matching project session.
+  const legacyProject = incoming.daemonProject
+    ? next.projects.find((project) => project.path === incoming.daemonProject)
+    : next.projects.find((project) => project.id === incoming.activeProjectId);
+  if (
+    !hasServedProjectIds
+    && !next.servedProjectIds.length
+    && legacyProject
+    && incoming.daemonBootId
+    && incoming.daemonOwnerToken
+  ) {
+    next.servedProjectIds = [legacyProject.id];
+  }
+  if (legacyProject && !sessions[legacyProject.id] && (
+    incoming.daemonProject || incoming.daemonPort || incoming.daemonBootId || incoming.daemonOwnerToken
+  )) {
+    sessions[legacyProject.id] = normalizeDaemonSession({
+      project: incoming.daemonProject || legacyProject.path,
+      port: incoming.daemonPort,
+      pid: incoming.daemonPid,
+      bootId: incoming.daemonBootId,
+      ownerToken: incoming.daemonOwnerToken,
+      ok: null,
+    }, legacyProject);
+  }
+  next.daemonSessions = sessions;
+  return next;
+}
 
 const app = {
   state: { ...DEFAULT_STATE },
@@ -61,7 +162,50 @@ const app = {
   daemonOk: false,
   currentView: null,
   unmountCurrent: null,
+  projectBrokerStatus: null,
 };
+
+let currentHostTheme = null;
+let appearanceStateLoaded = false;
+let appearanceRevealTimer = null;
+const systemThemeQuery = typeof globalThis.matchMedia === "function"
+  ? globalThis.matchMedia("(prefers-color-scheme: dark)")
+  : null;
+
+function systemPrefersDark() {
+  return systemThemeQuery ? systemThemeQuery.matches : true;
+}
+
+export function getAppearanceTheme() {
+  return resolveAppearanceTheme(app.state.appearanceTheme, {
+    ...APPEARANCE_CONTEXT,
+    hostTheme: currentHostTheme,
+    systemDark: systemPrefersDark(),
+  });
+}
+
+function appearanceCanReveal() {
+  if (!appearanceStateLoaded) return false;
+  return app.state.appearanceTheme !== "host" || !!currentHostTheme;
+}
+
+function applyCurrentAppearanceTheme({ forceReveal = false } = {}) {
+  return applyAppearanceTheme(document.documentElement, app.state.appearanceTheme, {
+    ...APPEARANCE_CONTEXT,
+    hostTheme: currentHostTheme,
+    systemDark: systemPrefersDark(),
+    reveal: forceReveal || appearanceCanReveal(),
+  });
+}
+
+function scheduleAppearanceRevealFallback() {
+  clearTimeout(appearanceRevealTimer);
+  if (!document.documentElement.classList.contains("theme-pending")) return;
+  appearanceRevealTimer = setTimeout(() => {
+    appearanceRevealTimer = null;
+    applyCurrentAppearanceTheme({ forceReveal: true });
+  }, 800);
+}
 
 let stateSaveChain = Promise.resolve();
 
@@ -85,21 +229,54 @@ async function loadState() {
   try {
     const value = await host.stateGet("state");
     if (value && typeof value === "object") {
-      app.state = { ...DEFAULT_STATE, ...value };
+      app.state = normalizePersistedState(value);
     }
   } catch {
     // No stored state yet — that's fine.
   }
   setDaemonAuthToken(app.state.daemonOwnerToken);
+  for (const session of Object.values(app.state.daemonSessions || {})) {
+    if (session?.base && session?.ownerToken) {
+      setDaemonAuthToken(session.ownerToken, session.base);
+    }
+  }
 }
 
 export function getState() { return app.state; }
-export function getDaemonBase() { return app.daemonOk ? app.daemonBase : null; }
+export function getDaemonBase(projectId = null) {
+  if (IS_DESKTOP_HOST) {
+    const id = projectId || app.state.activeProjectId || app.state.servedProjectIds?.[0] || null;
+    const session = id && app.state.daemonSessions?.[id];
+    return session?.ok === true ? session.base || null : null;
+  }
+  return app.daemonOk ? app.daemonBase : null;
+}
+export function getDaemonSession(projectId = null) {
+  const id = projectId || app.state.activeProjectId || app.state.servedProjectIds?.[0] || null;
+  return id ? app.state.daemonSessions?.[id] || null : null;
+}
+export function isProjectServed(projectId) {
+  return !!projectId && (app.state.servedProjectIds || []).includes(projectId);
+}
 export function setState(patch) {
-  app.state = { ...app.state, ...patch };
+  const nextPatch = patch && typeof patch === "object" ? { ...patch } : {};
+  if (Object.hasOwn(nextPatch, "appearanceTheme")) {
+    nextPatch.appearanceTheme = normalizeAppearanceTheme(
+      nextPatch.appearanceTheme,
+      APPEARANCE_CONTEXT,
+    );
+  }
+  app.state = { ...app.state, ...nextPatch };
+  if (Object.hasOwn(nextPatch, "appearanceTheme")) applyCurrentAppearanceTheme();
   setDaemonAuthToken(app.state.daemonOwnerToken);
   saveState();
   emit("state", app.state);
+}
+
+export function setAppearanceTheme(value) {
+  const appearanceTheme = normalizeAppearanceTheme(value, APPEARANCE_CONTEXT);
+  setState({ appearanceTheme });
+  return getAppearanceTheme();
 }
 
 // ---------- Daemon supervision ----------
@@ -111,9 +288,10 @@ const PORT_SCAN_MAX = 7890;   // inclusive — scan 7878..7890 before giving up
 const DAEMON_HEARTBEAT_INTERVAL_MS = 5000;
 
 let daemonHeartbeatTimer = null;
+const desktopHeartbeatTimers = new Map();
 let widgetCloseSent = false;
 let lastHeartbeatFailureNoticeAt = 0;
-let pendingDesktopOwnership = null;
+const pendingDesktopOwnershipByProject = new Map();
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
 // Persisted via t64:get-state/set-state under key "sessions". Shape:
@@ -347,19 +525,34 @@ async function verifyDaemonOwnership(base) {
   return result.ok;
 }
 
-function stopDaemonHeartbeat() {
+function stopDaemonHeartbeat(projectId = null) {
+  if (IS_DESKTOP_HOST) {
+    if (projectId) {
+      const timer = desktopHeartbeatTimers.get(projectId);
+      if (timer) clearInterval(timer);
+      desktopHeartbeatTimers.delete(projectId);
+    } else {
+      for (const timer of desktopHeartbeatTimers.values()) clearInterval(timer);
+      desktopHeartbeatTimers.clear();
+    }
+    return;
+  }
   if (daemonHeartbeatTimer) {
     clearInterval(daemonHeartbeatTimer);
     daemonHeartbeatTimer = null;
   }
 }
 
-function sendDaemonHeartbeat() {
-  const base = app.daemonBase;
-  if (!base || !app.state.daemonOwnerToken) return;
+function sendDaemonHeartbeat(projectId = null) {
+  const session = IS_DESKTOP_HOST && projectId
+    ? app.state.daemonSessions?.[projectId]
+    : null;
+  const base = session?.base || app.daemonBase;
+  const ownerToken = session?.ownerToken || app.state.daemonOwnerToken;
+  if (!base || !ownerToken) return;
   const endpoint = IS_DESKTOP_HOST ? "/manager-heartbeat" : "/widget-heartbeat";
   const reason = IS_DESKTOP_HOST ? "desktop heartbeat" : "widget heartbeat";
-  daemonLifecycleRequest(base, endpoint, reason).then((result) => {
+  daemonLifecycleRequest(base, endpoint, reason, ownerToken).then((result) => {
     if (result.ok) return;
     const now = Date.now();
     if (now - lastHeartbeatFailureNoticeAt > 30_000) {
@@ -369,7 +562,19 @@ function sendDaemonHeartbeat() {
   });
 }
 
-function startDaemonHeartbeat() {
+function startDaemonHeartbeat(projectId = null) {
+  if (IS_DESKTOP_HOST) {
+    if (!projectId) return;
+    stopDaemonHeartbeat(projectId);
+    const session = app.state.daemonSessions?.[projectId];
+    if (!session?.base || !session?.ownerToken) return;
+    sendDaemonHeartbeat(projectId);
+    desktopHeartbeatTimers.set(
+      projectId,
+      setInterval(() => sendDaemonHeartbeat(projectId), DAEMON_HEARTBEAT_INTERVAL_MS),
+    );
+    return;
+  }
   stopDaemonHeartbeat();
   if (!app.daemonBase || !app.state.daemonOwnerToken) return;
   sendDaemonHeartbeat();
@@ -379,18 +584,93 @@ function startDaemonHeartbeat() {
 function notifyWidgetClosing() {
   if (widgetCloseSent) return;
   widgetCloseSent = true;
+  if (projectBrokerTimer) {
+    clearTimeout(projectBrokerTimer);
+    projectBrokerTimer = null;
+  }
   stopDaemonHeartbeat();
   const endpoint = IS_DESKTOP_HOST ? "/manager-close" : "/widget-close";
   const reason = IS_DESKTOP_HOST ? "desktop app closed" : "widget closed";
-  const pending = IS_DESKTOP_HOST && !app.daemonBase && pendingDesktopOwnership?.base
-    ? { base: pendingDesktopOwnership.base, token: pendingDesktopOwnership.token }
-    : null;
-  daemonLifecyclePost(endpoint, reason, true, pending);
+  if (IS_DESKTOP_HOST) {
+    const closeTargets = new Map();
+    for (const session of Object.values(app.state.daemonSessions || {})) {
+      if (session?.base && session?.ownerToken) closeTargets.set(session.base, session.ownerToken);
+    }
+    for (const pending of pendingDesktopOwnershipByProject.values()) {
+      if (pending?.base && pending?.token) closeTargets.set(pending.base, pending.token);
+    }
+    for (const [base, token] of closeTargets) {
+      daemonLifecyclePost(endpoint, reason, true, { base, token });
+    }
+    return;
+  }
+  daemonLifecyclePost(endpoint, reason, true);
 }
 
 function activeProject() {
   const s = app.state;
   return (s.projects || []).find((x) => x.id === s.activeProjectId) || null;
+}
+
+function projectById(projectId) {
+  return (app.state.projects || []).find((project) => project.id === projectId) || null;
+}
+
+function servedProjectIds() {
+  const validIds = validProjectIdSet(app.state);
+  return (app.state.servedProjectIds || []).filter((id) => validIds.has(id));
+}
+
+function projectIdForPath(path) {
+  return (app.state.projects || []).find((project) => project.path === path)?.id || null;
+}
+
+function sessionPolicyState(session) {
+  return {
+    daemonPid: session?.pid ?? null,
+    daemonPort: session?.port ?? null,
+    daemonProject: session?.project ?? null,
+    daemonBootId: session?.bootId ?? null,
+    daemonOwnerToken: session?.ownerToken ?? null,
+  };
+}
+
+function legacyDaemonPatch(sessions, preferredProjectId = app.state.activeProjectId) {
+  const fallbackId = servedProjectIds().find((id) => sessions[id])
+    || Object.keys(sessions)[0]
+    || null;
+  const session = sessions[preferredProjectId] || sessions[fallbackId] || null;
+  return {
+    daemonPid: session?.pid ?? null,
+    daemonPort: session?.port ?? null,
+    daemonProject: session?.project ?? null,
+    daemonBootId: session?.bootId ?? null,
+    daemonOwnerToken: session?.ownerToken ?? null,
+  };
+}
+
+function setDesktopDaemonSession(projectId, session) {
+  if (!projectId) return;
+  const previous = app.state.daemonSessions?.[projectId] || null;
+  const sessions = { ...(app.state.daemonSessions || {}) };
+  if (session) sessions[projectId] = normalizeDaemonSession(session, projectById(projectId));
+  else delete sessions[projectId];
+  if (previous?.base && (
+    !session
+    || previous.base !== sessions[projectId]?.base
+    || previous.ownerToken !== sessions[projectId]?.ownerToken
+  )) {
+    setDaemonAuthToken(null, previous.base);
+  }
+  const next = sessions[projectId];
+  if (next?.base && next?.ownerToken) setDaemonAuthToken(next.ownerToken, next.base);
+  setState({ daemonSessions: sessions, ...legacyDaemonPatch(sessions, projectId) });
+}
+
+function patchDesktopDaemonSession(projectId, patch) {
+  const current = app.state.daemonSessions?.[projectId]
+    || { project: projectById(projectId)?.path || null };
+  setDesktopDaemonSession(projectId, { ...current, ...patch });
 }
 
 function activeProjectPath() {
@@ -571,8 +851,29 @@ async function launchAndWait(project, port) {
 
 let ensureDaemonPromise = null;
 let ensureDaemonQueued = false;
+const desktopEnsurePromises = new Map();
 
-async function ensureDaemon() {
+async function ensureDaemon(projectId = null) {
+  if (IS_DESKTOP_HOST) {
+    const id = projectId || app.state.activeProjectId || servedProjectIds()[0] || null;
+    const project = projectById(id);
+    if (!project || !isProjectServed(id)) return;
+    if (desktopEnsurePromises.has(id)) return desktopEnsurePromises.get(id);
+    // Reserve the per-project slot before ensureDesktopDaemon can synchronously
+    // publish an intermediate session state. Without this microtask boundary,
+    // that state event can re-enter ensureDaemon with a fresh owner token before
+    // this promise reaches the map, leaving the renderer unable to authenticate
+    // the exact daemon boot that the first call just created.
+    const promise = Promise.resolve()
+      .then(() => ensureDesktopDaemon(id, project.path))
+      .finally(() => {
+        if (desktopEnsurePromises.get(id) === promise) {
+          desktopEnsurePromises.delete(id);
+        }
+      });
+    desktopEnsurePromises.set(id, promise);
+    return promise;
+  }
   if (ensureDaemonPromise) {
     ensureDaemonQueued = true;
     return ensureDaemonPromise;
@@ -642,7 +943,7 @@ async function inspectOwnedDesktopDaemon(spec) {
 
   // CORS and the lifecycle endpoint both require the exact manager token. A
   // manager label or a persisted PID is never treated as proof of ownership.
-  setDaemonAuthToken(token);
+  setDaemonAuthToken(token, base);
   let info;
   try {
     info = await daemonJson(base, "/hello");
@@ -689,139 +990,104 @@ async function inspectOwnedDesktopDaemon(spec) {
 
 async function stopOwnedDesktopDaemon(spec, reason) {
   const owned = await inspectOwnedDesktopDaemon(spec);
-  if (!owned.running) return { stopped: true, alreadyStopped: true, status: owned.status };
-
-  const response = await daemonLifecycleRequest(
-    owned.base,
-    "/manager-close",
-    reason || "desktop daemon stop requested",
-    owned.token,
-  );
-  if (!response.ok) {
+  if (!owned.running) {
+    if (spec?.bootId && spec?.ownerToken) {
+      await host.daemonStop({
+        project: spec.project,
+        bootId: spec.bootId,
+        ownerToken: spec.ownerToken,
+        reason,
+      });
+    }
+    return { stopped: true, alreadyStopped: true, status: owned.status };
+  }
+  const response = lifecycleValue(await host.daemonStop({
+    project: spec.project,
+    bootId: owned.bootId,
+    ownerToken: owned.token,
+    reason,
+  }));
+  if (response.ok === false || response.stopped === false) {
     throw new Error(response.error || "the authenticated daemon stop was rejected");
   }
+  return { stopped: true, status: response, replacementRunning: false };
+}
 
-  // The HTTP acknowledgement means the exact owned process accepted shutdown;
-  // only clear persisted tracking once the lifecycle record confirms that boot
-  // is gone. A replacement external/CLI daemon is reported but never stopped.
-  const deadline = Date.now() + 6000;
-  while (Date.now() < deadline) {
-    await sleep(100);
-    const status = lifecycleValue(await host.daemonStatus(spec.project));
-    if (!status.running || status.bootId !== owned.bootId) {
-      return {
-        stopped: true,
-        status,
-        replacementRunning: !!status.running,
-      };
+function clearDesktopDaemonTracking(projectId, { preserveTarget = false } = {}) {
+  const session = app.state.daemonSessions?.[projectId] || null;
+  const retained = preserveTarget && session?.project
+    ? {
+      project: session.project,
+      canonicalProject: session.canonicalProject || null,
+      port: session.port || null,
+      pid: null,
+      base: null,
+      bootId: null,
+      ownerToken: null,
+      ok: null,
+      error: null,
     }
+    : null;
+  setDesktopDaemonSession(projectId, retained);
+  if (app.state.activeProjectId === projectId) {
+    app.daemonBase = null;
+    app.daemonOk = false;
   }
-  throw new Error(`owned daemon boot ${owned.bootId} did not stop before the timeout`);
 }
 
-function clearDesktopDaemonTracking({ preserveTarget = false } = {}) {
-  setDaemonAuthToken(null);
-  app.daemonBase = null;
-  app.daemonOk = false;
-  setState({
-    daemonPid: null,
-    daemonProject: preserveTarget ? app.state.daemonProject : null,
-    daemonBootId: null,
-    daemonOwnerToken: null,
-  });
-}
-
-async function ensureDesktopDaemon(project) {
-  const projectInfo = activeProject();
+async function ensureDesktopDaemon(projectId, project) {
+  const projectInfo = projectById(projectId);
+  if (!projectInfo || projectInfo.path !== project || !isProjectServed(projectId)) return;
   let ownedCandidate = null;
   let requestedToken = null;
-  let preferredPort =
-    app.state.daemonProject === project && app.state.daemonPort
-      ? app.state.daemonPort
-      : DEFAULT_PORT;
+  const existingSession = app.state.daemonSessions?.[projectId] || null;
+  const preferredPort = existingSession?.project === project && existingSession?.port
+    ? existingSession.port
+    : DEFAULT_PORT;
+  let pending = pendingDesktopOwnershipByProject.get(projectId) || null;
+
   try {
-    if (pendingDesktopOwnership && pendingDesktopOwnership.project !== project) {
-      try {
-        await stopOwnedDesktopDaemon(
-          {
-            project: pendingDesktopOwnership.project,
-            ownerToken: pendingDesktopOwnership.token,
-          },
-          "desktop switched away from a pending startup",
-        );
-        pendingDesktopOwnership = null;
-      } catch (error) {
-        if (error?.code !== "EXTERNAL_DAEMON" || !shouldClearDesktopClaim(error)) {
-          throw error;
-        }
-        pendingDesktopOwnership = null;
-      }
-    }
-
-    const previousProject = app.state.daemonProject;
-    if (previousProject && previousProject !== project) {
-      const previousClaim = desktopTrackedOwnership(app.state);
-      if (!previousClaim) {
-        clearDesktopDaemonTracking();
-        preferredPort = null;
-      } else {
-        try {
-          await stopOwnedDesktopDaemon(previousClaim, "desktop switched projects");
-          clearDesktopDaemonTracking();
-        } catch (error) {
-          if (error?.code !== "EXTERNAL_DAEMON") throw error;
-          toast(error.message);
-          if (!shouldClearDesktopClaim(error)) throw error;
-          // The tracked boot was definitively replaced/adopted elsewhere. Forget
-          // only our stale claim and let discovery choose a different free port.
-          clearDesktopDaemonTracking();
-          preferredPort = null;
-        }
-      }
-    }
-
     const startOwnership = desktopStartOwnership(
-      app.state,
+      sessionPolicyState(existingSession),
       project,
       makeOwnerToken(),
-      pendingDesktopOwnership,
+      pending,
     );
+    requestedToken = startOwnership.token;
     if (!startOwnership.reusedClaim && !startOwnership.reusedPending) {
-      // Remove migration/failed-start fragments before using a fresh capability.
-      // The new token stays memory-only until exact ownership is authenticated.
-      clearDesktopDaemonTracking();
-      pendingDesktopOwnership = {
+      // Fresh capabilities stay memory-only until the exact daemon boot proves
+      // ownership. A failed start never turns a partial state record into stop
+      // authority.
+      clearDesktopDaemonTracking(projectId, { preserveTarget: true });
+      pending = {
         project,
-        token: startOwnership.token,
+        token: requestedToken,
         base: preferredPort ? `http://127.0.0.1:${preferredPort}` : null,
       };
-    } else if (startOwnership.reusedClaim && !pendingDesktopOwnership) {
-      // A complete persisted claim is safe to use, but app.daemonBase is not
-      // restored until the async sidecar handshake finishes. Keep a temporary
-      // close target so quitting during that window cannot orphan the exact
-      // Desktop-managed boot from the previous renderer session.
-      pendingDesktopOwnership = {
+      pendingDesktopOwnershipByProject.set(projectId, pending);
+    } else if (startOwnership.reusedClaim && !pending) {
+      pending = {
         project,
-        token: startOwnership.token,
+        token: requestedToken,
         base: preferredPort ? `http://127.0.0.1:${preferredPort}` : null,
         port: preferredPort || null,
       };
+      pendingDesktopOwnershipByProject.set(projectId, pending);
     }
-    requestedToken = startOwnership.token;
-    setDaemonAuthToken(requestedToken);
+
     let result = await host.daemonEnsure({
       project,
+      projectsRoot: app.state.projectsRoot || null,
       preferredPort,
-      gameId: projectInfo?.gameId || null,
-      groupId: projectInfo?.groupId || null,
-      placeIds: projectInfo?.placeIds || [],
+      gameId: projectInfo.gameId || null,
+      groupId: projectInfo.groupId || null,
+      placeIds: projectInfo.placeIds || [],
       ownerToken: requestedToken,
     });
     result = lifecycleValue(result);
     if (result.ok === false || result.running === false) {
       throw new Error(result.error || "managed daemon did not start");
     }
-
     if (result.externallyManaged || result.managedBy !== "desktop") {
       const manager = result.managedBy ? ` (${result.managedBy})` : "";
       throw desktopOwnershipError(
@@ -831,114 +1097,111 @@ async function ensureDesktopDaemon(project) {
       );
     }
 
-    const port = Number(result.port || app.state.daemonPort || DEFAULT_PORT);
+    const port = Number(result.port || preferredPort);
     if (!Number.isFinite(port) || port <= 0) throw new Error("managed daemon returned an invalid port");
-    const token = requestedToken;
-    const base = result.base || `http://127.0.0.1:${port}`;
-    // The lifecycle command may have fallen back from a stale/occupied
-    // preferred port. Replace the provisional close target with the exact
-    // reported listener before ownership verification.
-    pendingDesktopOwnership = { project, token, base, port };
+    const base = result.base || result.baseUrl || `http://127.0.0.1:${port}`;
+    setDaemonAuthToken(requestedToken, base);
+    pending = { project, token: requestedToken, base, port };
+    pendingDesktopOwnershipByProject.set(projectId, pending);
     ownedCandidate = await inspectOwnedDesktopDaemon({
       project,
       canonicalProject: result.canonicalProject,
       port,
       base,
-      ownerToken: token,
+      ownerToken: requestedToken,
     });
     if (!ownedCandidate.running) throw new Error("managed daemon stopped during startup");
-    const info = ownedCandidate.info;
 
-    // Serve/Stop and project switches can race the async sidecar handshake. A
-    // superseded start must never commit a now-unwanted daemon after the UI
-    // has moved on; authenticate it first, then stop that exact boot safely.
-    if (activeProjectPath() !== project) {
-      await stopOwnedDesktopDaemon(
-        {
-          project,
-          port: ownedCandidate.port,
-          pid: ownedCandidate.status.pid,
-          bootId: ownedCandidate.bootId,
-          ownerToken: requestedToken,
-        },
-        "desktop startup was superseded",
-      );
-      pendingDesktopOwnership = null;
-      clearDesktopDaemonTracking();
-      setDaemonDot("idle", "daemon stopped");
-      emit("daemon:down", { host: HOST_KIND });
+    // Stop only this exact authenticated boot if its own toggle was switched
+    // off while the native sidecar handshake was in flight. Other served
+    // projects are independent and remain untouched.
+    if (!isProjectServed(projectId)) {
+      await stopOwnedDesktopDaemon({
+        project,
+        port: ownedCandidate.port,
+        pid: ownedCandidate.status.pid,
+        bootId: ownedCandidate.bootId,
+        ownerToken: requestedToken,
+      }, "desktop startup was superseded");
+      pendingDesktopOwnershipByProject.delete(projectId);
+      clearDesktopDaemonTracking(projectId);
+      emit("daemon:down", { projectId, project, host: HOST_KIND });
+      refreshDesktopDaemonPresentation();
       return;
     }
 
-    app.daemonBase = ownedCandidate.base;
-    app.daemonOk = true;
-    setState({
-      daemonPid: ownedCandidate.status.pid || null,
-      daemonPort: ownedCandidate.port,
-      daemonProject: project,
-      daemonBootId: ownedCandidate.bootId,
-      daemonOwnerToken: token,
+    setDesktopDaemonSession(projectId, {
+      project,
+      canonicalProject: ownedCandidate.status.canonicalProject || ownedCandidate.info.project || project,
+      pid: ownedCandidate.status.pid || null,
+      port: ownedCandidate.port,
+      base: ownedCandidate.base,
+      bootId: ownedCandidate.bootId,
+      ownerToken: requestedToken,
+      ok: true,
+      error: null,
     });
-    pendingDesktopOwnership = null;
-    setDaemonDot("ok", `:${ownedCandidate.port}`);
-    emit("daemon:up", { base: ownedCandidate.base, info, project, host: HOST_KIND });
+    pendingDesktopOwnershipByProject.delete(projectId);
+    if (app.state.activeProjectId === projectId) {
+      app.daemonBase = ownedCandidate.base;
+      app.daemonOk = true;
+    }
+    emit("daemon:up", {
+      projectId,
+      base: ownedCandidate.base,
+      info: ownedCandidate.info,
+      project,
+      host: HOST_KIND,
+    });
+    refreshDesktopDaemonPresentation();
   } catch (error) {
-    // Cleanup is allowed only after an authenticated ownership proof. A CLI,
-    // manual, or other Desktop manager remains untouched on every failure.
     let retainedOwnedCandidate = false;
     if (ownedCandidate?.running) {
       try {
-        const stopped = await stopOwnedDesktopDaemon(
-          {
-            project,
-            port: ownedCandidate.port,
-            bootId: ownedCandidate.bootId,
-            ownerToken: ownedCandidate.token,
-          },
-          "desktop startup did not complete",
-        );
-        if (stopped.stopped) {
-          pendingDesktopOwnership = null;
-          clearDesktopDaemonTracking();
-        }
+        await stopOwnedDesktopDaemon({
+          project,
+          port: ownedCandidate.port,
+          bootId: ownedCandidate.bootId,
+          ownerToken: ownedCandidate.token,
+        }, "desktop startup did not complete");
+        pendingDesktopOwnershipByProject.delete(projectId);
+        clearDesktopDaemonTracking(projectId, { preserveTarget: isProjectServed(projectId) });
       } catch (cleanupError) {
         console.warn("owned daemon cleanup failed", cleanupError);
-        // Ownership was already proven. Retain the complete capability if a
-        // transient close failed so a later health tick/restart can retry the
-        // exact boot instead of orphaning it.
-        setState({
-          daemonPid: ownedCandidate.status.pid || null,
-          daemonPort: ownedCandidate.port,
-          daemonProject: project,
-          daemonBootId: ownedCandidate.bootId,
-          daemonOwnerToken: ownedCandidate.token,
+        setDesktopDaemonSession(projectId, {
+          project,
+          pid: ownedCandidate.status.pid || null,
+          port: ownedCandidate.port,
+          base: ownedCandidate.base,
+          bootId: ownedCandidate.bootId,
+          ownerToken: ownedCandidate.token,
+          ok: false,
+          error: cleanupError.message,
         });
-        pendingDesktopOwnership = {
+        pendingDesktopOwnershipByProject.set(projectId, {
           project,
           token: ownedCandidate.token,
           base: ownedCandidate.base,
           port: ownedCandidate.port,
-        };
+        });
         retainedOwnedCandidate = true;
       }
     }
     if (!retainedOwnedCandidate && shouldClearDesktopClaim(error)) {
-      if (!requestedToken || pendingDesktopOwnership?.token === requestedToken) {
-        pendingDesktopOwnership = null;
+      const currentPending = pendingDesktopOwnershipByProject.get(projectId);
+      if (!requestedToken || currentPending?.token === requestedToken) {
+        pendingDesktopOwnershipByProject.delete(projectId);
       }
-      clearDesktopDaemonTracking();
+      clearDesktopDaemonTracking(projectId, { preserveTarget: isProjectServed(projectId) });
     }
-    setDaemonAuthToken(null);
-    app.daemonOk = false;
-    app.daemonBase = null;
-    if (activeProjectPath() !== project && !retainedOwnedCandidate) {
-      setDaemonDot("idle", "no active project");
-      emit("daemon:down", { host: HOST_KIND });
-      return;
+    if (!retainedOwnedCandidate) {
+      const session = app.state.daemonSessions?.[projectId];
+      if (session?.base) setDaemonAuthToken(null, session.base);
+      patchDesktopDaemonSession(projectId, { ok: false, error: error.message });
     }
-    setDaemonDot("err", "daemon down");
-    setStatus(`managed daemon failed: ${error.message}`, "err");
-    emit("daemon:down", { error: error.message, host: HOST_KIND });
+    setStatus(`managed daemon failed for ${projectInfo.name || project}: ${error.message}`, "err");
+    emit("daemon:down", { projectId, project, error: error.message, host: HOST_KIND });
+    refreshDesktopDaemonPresentation();
   }
 }
 
@@ -958,7 +1221,7 @@ async function ensureDaemonInner() {
   }
 
   if (IS_DESKTOP_HOST) {
-    await ensureDesktopDaemon(project);
+    await ensureDesktopDaemon(app.state.activeProjectId, project);
     return;
   }
 
@@ -1048,48 +1311,62 @@ async function ensureDaemonInner() {
   }
 }
 
-async function killDaemon({ preserveTarget = false } = {}) {
+async function killDaemon(projectIdOrOptions = null, maybeOptions = {}) {
+  const options = projectIdOrOptions && typeof projectIdOrOptions === "object"
+    ? projectIdOrOptions
+    : maybeOptions;
+  const preserveTarget = options?.preserveTarget === true;
+  const requestedProjectId = typeof projectIdOrOptions === "string" ? projectIdOrOptions : null;
   const pid = app.state.daemonPid;
   const port = app.state.daemonPort;
   if (IS_DESKTOP_HOST) {
-    if (pendingDesktopOwnership) {
+    const projectId = requestedProjectId || app.state.activeProjectId || servedProjectIds()[0] || null;
+    if (!projectId) return true;
+    const project = projectById(projectId);
+    const pending = pendingDesktopOwnershipByProject.get(projectId) || null;
+    if (pending) {
       try {
         await stopOwnedDesktopDaemon(
           {
-            project: pendingDesktopOwnership.project,
-            ownerToken: pendingDesktopOwnership.token,
+            project: pending.project,
+            ownerToken: pending.token,
           },
           "desktop cancelled a pending startup",
         );
-        pendingDesktopOwnership = null;
+        pendingDesktopOwnershipByProject.delete(projectId);
       } catch (error) {
         if (shouldClearDesktopClaim(error)) {
-          pendingDesktopOwnership = null;
+          pendingDesktopOwnershipByProject.delete(projectId);
         } else {
           toast(`Could not stop pending daemon safely: ${error.message}`);
           return false;
         }
       }
     }
-    const plan = desktopStopPlan(app.state);
+    const session = app.state.daemonSessions?.[projectId] || null;
+    const plan = desktopStopPlan(sessionPolicyState(session));
     if (plan.kind === "clear-local") {
-      clearDesktopDaemonTracking({ preserveTarget });
-      setDaemonDot("idle", "daemon stopped");
-      emit("daemon:down", { host: HOST_KIND });
+      clearDesktopDaemonTracking(projectId, { preserveTarget });
+      stopDaemonHeartbeat(projectId);
+      emit("daemon:down", { projectId, project: project?.path || session?.project, host: HOST_KIND });
+      refreshDesktopDaemonPresentation();
       return true;
     }
     try {
       const result = await stopOwnedDesktopDaemon(plan.spec, "desktop daemon stopped");
       if (!result.stopped) throw new Error("managed daemon did not stop");
-      clearDesktopDaemonTracking({ preserveTarget });
-      setDaemonDot("idle", "daemon stopped");
-      emit("daemon:down", { host: HOST_KIND });
+      clearDesktopDaemonTracking(projectId, { preserveTarget });
+      stopDaemonHeartbeat(projectId);
+      emit("daemon:down", { projectId, project: project?.path || session?.project, host: HOST_KIND });
+      refreshDesktopDaemonPresentation();
       return true;
     } catch (error) {
       if (shouldClearDesktopClaim(error)) {
-        clearDesktopDaemonTracking({ preserveTarget });
+        clearDesktopDaemonTracking(projectId, { preserveTarget });
       }
       toast(`Could not stop managed daemon: ${error.message}`);
+      patchDesktopDaemonSession(projectId, { ok: false, error: error.message });
+      refreshDesktopDaemonPresentation();
       return false;
     }
   }
@@ -1150,45 +1427,85 @@ async function killDaemon({ preserveTarget = false } = {}) {
 }
 
 // ---------- Health loop ----------
-async function healthTick() {
-  if (!app.daemonBase) {
-    if (!IS_DESKTOP_HOST) return;
-    const project = activeProject();
-    if (!project) {
-      if (pendingDesktopOwnership) {
-        try {
-          await stopOwnedDesktopDaemon(
-            {
-              project: pendingDesktopOwnership.project,
-              ownerToken: pendingDesktopOwnership.token,
-            },
-            "desktop cleaned up a cancelled pending startup",
-          );
-          pendingDesktopOwnership = null;
-        } catch (error) {
-          if (shouldClearDesktopClaim(error)) {
-            pendingDesktopOwnership = null;
-          } else {
-            return;
-          }
-        }
-      }
-      if (desktopTrackedOwnership(app.state)) {
-        await killDaemon();
-      }
-      return;
-    }
-    // `preserveTarget` marks controlled Desktop pauses (restart/plugin build)
-    // with the desired project but no authenticated boot. Do not race those
-    // workflows; an external-start failure clears daemonProject and may retry.
-    if (
-      app.state.daemonProject === project.path &&
-      !desktopTrackedOwnership(app.state)
-    ) return;
+async function healthTickDesktop() {
+  const ids = servedProjectIds();
+  const nativeList = await host.daemonList().catch(() => null);
+  const nativeClaims = Array.isArray(nativeList?.daemons) ? nativeList.daemons : null;
+  const nativeByProject = new Map(
+    (nativeClaims || [])
+      .filter((item) => item?.project)
+      .map((item) => [item.project, item]),
+  );
+
+  for (const projectId of ids) {
+    const project = projectById(projectId);
+    if (!project) continue;
+    const session = app.state.daemonSessions?.[projectId] || null;
     const cfg = project.settings || {};
-    if (cfg.AutoReconnect === "off") return;
-    setDaemonDot("warn", "reconnecting…");
-    await ensureDaemon();
+    if (!session?.base || !session?.ownerToken || !session?.bootId) {
+      if (!pendingDesktopOwnershipByProject.has(projectId)
+          && !desktopEnsurePromises.has(projectId)
+          && cfg.AutoReconnect !== "off") {
+        await ensureDaemon(projectId);
+      }
+      continue;
+    }
+
+    // A renderer reload can restore an authenticated persisted session before
+    // the native in-memory claim registry has seen that boot. Re-run the
+    // idempotent ensure with the same capability so native exit cleanup and
+    // daemon_stop regain the exact project-keyed claim.
+    const nativeClaim = nativeByProject.get(session.canonicalProject)
+      || nativeByProject.get(session.project)
+      || nativeByProject.get(project.path)
+      || null;
+    if (!nativeClaim) {
+      if (nativeClaims) {
+        await ensureDaemon(projectId);
+        continue;
+      }
+    }
+
+    try {
+      setDaemonAuthToken(session.ownerToken, session.base);
+      const info = await daemonJson(session.base, "/hello");
+      const expectedProjects = new Set([
+        project.path,
+        session.project,
+        session.canonicalProject,
+        nativeClaim?.project,
+        nativeClaim?.canonicalProject,
+      ].filter(Boolean));
+      if (
+        info.bootId !== session.bootId
+        || !expectedProjects.has(info.project)
+        || info.managed !== true
+        || info.managedBy !== "desktop"
+        || (nativeClaim && nativeClaim.bootId !== session.bootId)
+      ) {
+        throw new Error("managed daemon identity changed");
+      }
+      if (session.ok !== true || session.error) {
+        patchDesktopDaemonSession(projectId, { ok: true, error: null });
+        emit("daemon:up", { projectId, project: project.path, base: session.base, info, host: HOST_KIND });
+      }
+    } catch (error) {
+      if (session.ok !== false || session.error !== error.message) {
+        patchDesktopDaemonSession(projectId, { ok: false, error: error.message });
+        emit("daemon:down", { projectId, project: project.path, error: error.message, host: HOST_KIND });
+      }
+      if (cfg.AutoReconnect !== "off") await ensureDaemon(projectId);
+    }
+  }
+  refreshDesktopDaemonPresentation();
+}
+
+async function healthTick() {
+  if (IS_DESKTOP_HOST) {
+    await healthTickDesktop();
+    return;
+  }
+  if (!app.daemonBase) {
     return;
   }
   try {
@@ -1263,6 +1580,20 @@ async function hydrateHostPresentation() {
   }
 }
 
+function wireDesktopTitlebar() {
+  const titlebar = document.getElementById("desktop-titlebar");
+  if (!titlebar || !IS_DESKTOP_HOST || !host.supports.windowDrag) return;
+  titlebar.addEventListener("mousedown", (event) => {
+    if (event.button !== 0 || event.buttons !== 1 || event.ctrlKey) return;
+    if (event.target.closest("button, a, input, select, textarea, [role='button']")) return;
+    host.startWindowDrag().catch((error) => {
+      console.warn("window drag failed", error);
+    });
+  });
+}
+
+wireDesktopTitlebar();
+
 const ROUTES = {
   projects: mountProjects,
   active: mountActive,
@@ -1276,6 +1607,67 @@ function setDaemonDot(kind, label) {
   $daemonDot.title = `Daemon: ${label}`;
   $statusRight.textContent = `daemon: ${label}`;
   document.getElementById("root").dataset.connection = kind;
+}
+
+function refreshDesktopDaemonPresentation() {
+  if (!IS_DESKTOP_HOST) return;
+  const ids = servedProjectIds();
+  const sessions = ids.map((id) => app.state.daemonSessions?.[id]).filter(Boolean);
+  const healthy = sessions.filter((session) => session.ok === true);
+  const failed = sessions.filter((session) => session.ok === false);
+  const pending = Math.max(0, ids.length - healthy.length - failed.length);
+  const focused = getDaemonSession(app.state.activeProjectId);
+  app.daemonBase = focused?.ok === true ? focused.base : null;
+  app.daemonOk = !!app.daemonBase;
+
+  if (!ids.length) {
+    setDaemonDot("idle", "no projects served");
+  } else if (healthy.length === ids.length) {
+    const ports = healthy.filter((session) => session.port).map((session) => `:${session.port}`).join(", ");
+    setDaemonDot("ok", `${healthy.length} ${healthy.length === 1 ? "project" : "projects"}${ports ? ` · ${ports}` : ""}`);
+  } else if (failed.length) {
+    setDaemonDot("err", `${healthy.length}/${ids.length} projects online`);
+  } else {
+    setDaemonDot("warn", `${pending || ids.length} ${ids.length === 1 ? "project" : "projects"} starting…`);
+  }
+}
+
+async function serveProject(projectId) {
+  const project = projectById(projectId);
+  if (!project) return false;
+  if (IS_DESKTOP_HOST) {
+    const next = [...new Set([...servedProjectIds(), projectId])];
+    setState({ servedProjectIds: next, activeProjectId: projectId });
+    refreshDesktopDaemonPresentation();
+    await ensureDaemon(projectId);
+    return getDaemonSession(projectId)?.ok === true;
+  }
+  setState({ servedProjectIds: [projectId], activeProjectId: projectId });
+  await ensureDaemon();
+  return app.daemonOk;
+}
+
+async function stopProject(projectId) {
+  if (!projectById(projectId)) return true;
+  if (IS_DESKTOP_HOST) {
+    const previous = servedProjectIds();
+    setState({ servedProjectIds: previous.filter((id) => id !== projectId) });
+    const stopped = await killDaemon(projectId);
+    if (!stopped) setState({ servedProjectIds: previous });
+    refreshDesktopDaemonPresentation();
+    return stopped;
+  }
+  if (app.state.activeProjectId !== projectId) return true;
+  setState({ servedProjectIds: [], activeProjectId: null });
+  return killDaemon();
+}
+
+async function restartProject(projectId) {
+  if (!projectById(projectId) || !isProjectServed(projectId)) return false;
+  const stopped = await killDaemon(projectId, { preserveTarget: true });
+  if (!stopped) return false;
+  await ensureDaemon(projectId);
+  return !!getDaemonBase(projectId);
 }
 
 function setStatus(msg, kind) {
@@ -1301,9 +1693,16 @@ function navigate(route) {
   const api = {
     getState,
     setState,
+    getAppearanceTheme,
+    setAppearanceTheme,
     getDaemonBase,
+    getDaemonSession,
+    isProjectServed,
     ensureDaemon,
     killDaemon,
+    serveProject,
+    stopProject,
+    restartProject,
     setStatus,
     toast,
     onBus: on,
@@ -1338,12 +1737,26 @@ window.addEventListener("beforeunload", notifyWidgetClosing);
 // Re-render active view on daemon state changes (cheap).
 on("daemon:up", () => emit("view:refresh", app.currentView));
 on("daemon:down", () => emit("view:refresh", app.currentView));
-on("daemon:up", startDaemonHeartbeat);
-on("daemon:down", stopDaemonHeartbeat);
+on("daemon:up", (event) => startDaemonHeartbeat(event?.projectId || null));
+on("daemon:down", (event) => stopDaemonHeartbeat(event?.projectId || null));
 
-// When the active project changes, (re)launch the daemon against it.
+// Desktop treats activeProjectId as the focused project and serves the
+// independent servedProjectIds set. Terminal 64 retains its historical
+// single-daemon active-project behavior.
 let lastActiveProject = null;
+let lastServedProjects = new Set();
 on("state", () => {
+  if (IS_DESKTOP_HOST) {
+    const next = new Set(servedProjectIds());
+    const newlyServed = [...next].filter((projectId) => !lastServedProjects.has(projectId));
+    // Commit the observation before starting anything. Daemon startup itself
+    // emits state while recording pending ownership, so callbacks must see this
+    // project as already observed rather than recursively starting it again.
+    lastServedProjects = next;
+    for (const projectId of newlyServed) void ensureDaemon(projectId);
+    refreshDesktopDaemonPresentation();
+    return;
+  }
   const p = activeProjectPath();
   if (p !== lastActiveProject) {
     lastActiveProject = p;
@@ -1369,34 +1782,43 @@ function toast(msg) {
   toastT = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
-// Theme from t64:init -> CSS custom properties.
-function applyTheme(theme) {
-  if (!theme || typeof theme !== "object") return;
-  const map = {
-    bg: "--bg", fg: "--fg", foreground: "--fg", background: "--bg",
-    accent: "--accent", border: "--border",
-    surface: "--surface", muted: "--muted",
-    danger: "--danger", warn: "--warn", ok: "--ok",
-  };
-  const root = document.documentElement;
-  for (const [k, v] of Object.entries(theme)) {
-    const css = map[k] || (k.startsWith("--") ? k : null);
-    if (css && typeof v === "string") root.style.setProperty(css, v);
+function applyHostThemePayload(payload) {
+  const ui = payload?.theme?.ui;
+  if (ui && typeof ui === "object" && !Array.isArray(ui)) {
+    currentHostTheme = ui;
+    applyCurrentAppearanceTheme();
+    if (!document.documentElement.classList.contains("theme-pending")) {
+      clearTimeout(appearanceRevealTimer);
+      appearanceRevealTimer = null;
+    }
   }
 }
 
 onT64("t64:init", (payload) => {
-  if (payload && payload.theme) applyTheme(payload.theme);
+  applyHostThemePayload(payload);
   if (payload && payload.state) {
-    app.state = {
-      ...DEFAULT_STATE,
+    app.state = normalizePersistedState({
       ...payload.state,
       daemonOwnerToken: payload.state.daemonOwnerToken || app.state.daemonOwnerToken || null,
-    };
+    });
     setDaemonAuthToken(app.state.daemonOwnerToken);
+    for (const session of Object.values(app.state.daemonSessions || {})) {
+      if (session?.base && session?.ownerToken) setDaemonAuthToken(session.ownerToken, session.base);
+    }
     emit("state", app.state);
   }
+  applyCurrentAppearanceTheme();
 });
+onT64("t64:state", applyHostThemePayload);
+
+function onSystemAppearanceChanged() {
+  if (app.state.appearanceTheme === "system") applyCurrentAppearanceTheme();
+}
+if (systemThemeQuery?.addEventListener) {
+  systemThemeQuery.addEventListener("change", onSystemAppearanceChanged);
+} else if (systemThemeQuery?.addListener) {
+  systemThemeQuery.addListener(onSystemAppearanceChanged);
+}
 
 // ---------- App-level WS relay ----------
 // Opens a single WebSocket per daemon so events (e.g. initial-choice-needed)
@@ -1414,7 +1836,7 @@ const ENABLE_APP_REALTIME_STREAM = true;
 //       → emit(type, frame)
 //   {type:"ping"} / {type:"pong"} / {type:"lagged"} / {type:"push-result"} /
 //   {type:"error"} → transport-only, ignored here
-let appWS = null;
+const appStreams = new Map();
 const RAW_OP_RE = /"type"\s*:\s*"op"/;
 
 // Op frames are intentionally skipped on the app-level stream so large file
@@ -1424,14 +1846,20 @@ function shouldSkipRawAppFrame(raw) {
   return true;
 }
 
-function openAppStream() {
+function openAppStream(event = {}) {
   if (!ENABLE_APP_REALTIME_STREAM) {
     return;
   }
-  if (!app.daemonBase) return;
-  if (appWS) { try { appWS.close(); } catch {} appWS = null; }
+  const projectId = event.projectId
+    || projectIdForPath(event.project)
+    || app.state.activeProjectId
+    || "__single";
+  const base = event.base || getDaemonBase(projectId === "__single" ? null : projectId);
+  if (!base) return;
+  const previous = appStreams.get(projectId);
+  if (previous) { try { previous.close(); } catch {} }
   try {
-    appWS = daemonWS(app.daemonBase, "/ws", {
+    const stream = daemonWS(base, "/ws", {
       skipRaw: shouldSkipRawAppFrame,
       message: (data) => {
         if (!data || typeof data !== "object") return;
@@ -1452,21 +1880,91 @@ function openAppStream() {
         // can react.
         if (t === "initial-choice-needed" || t === "initial-choice-made"
             || t === "config-changed" || t === "conflict") {
-          emit(t, data);
+          emit(t, {
+            ...data,
+            projectId: projectId === "__single" ? app.state.activeProjectId : projectId,
+            projectPath: event.project || projectById(projectId)?.path || null,
+          });
+          return;
+        }
+        if (t === "project-init") {
+          adoptProjectInitEvents([data]);
           return;
         }
         // Unknown event — no-op.
       },
       error: () => { /* daemonWS handles reconnect */ },
     });
+    appStreams.set(projectId, stream);
   } catch (e) {
     console.warn("app WS failed", e);
   }
 }
 on("daemon:up", openAppStream);
-on("daemon:down", () => {
-  if (appWS) { try { appWS.close(); } catch {} appWS = null; }
+on("daemon:down", (event = {}) => {
+  const projectId = event.projectId || projectIdForPath(event.project) || "__single";
+  const stream = appStreams.get(projectId);
+  if (stream) { try { stream.close(); } catch {} }
+  appStreams.delete(projectId);
 });
+
+// ---------- Native Studio project-initialization broker ----------
+let projectBrokerTimer = null;
+let projectBrokerInFlight = false;
+
+function adoptProjectInitEvents(events) {
+  let nextState = app.state;
+  const mergedEvents = [];
+  for (const event of events) {
+    try {
+      const merged = mergeProjectInitEvent(nextState, event);
+      nextState = { ...nextState, ...merged.patch };
+      mergedEvents.push({ event, ...merged });
+    } catch (error) {
+      console.warn("project initialization event rejected", event, error);
+    }
+  }
+  if (!mergedEvents.length) return [];
+  setState({
+    projects: nextState.projects,
+    servedProjectIds: nextState.servedProjectIds,
+    activeProjectId: nextState.activeProjectId,
+  });
+  for (const merged of mergedEvents) {
+    emit("project:init", { ...merged.event, projectId: merged.project.id, created: merged.created });
+  }
+  const last = mergedEvents[mergedEvents.length - 1];
+  toast(last.created
+    ? `Created and started ${last.project.name}`
+    : `Connected ${last.project.name}`);
+  return mergedEvents;
+}
+
+async function drainProjectInitEvents() {
+  if (!IS_DESKTOP_HOST || projectBrokerInFlight) return;
+  projectBrokerInFlight = true;
+  try {
+    const events = await host.projectInitDrain();
+    if (!events.length) return;
+    adoptProjectInitEvents(events);
+  } finally {
+    projectBrokerInFlight = false;
+  }
+}
+
+async function pollProjectBroker() {
+  if (!IS_DESKTOP_HOST) return;
+  try {
+    app.projectBrokerStatus = await host.projectBrokerStatus();
+    emit("broker:status", app.projectBrokerStatus);
+    await drainProjectInitEvents();
+  } catch (error) {
+    app.projectBrokerStatus = { ok: false, error: error.message };
+    emit("broker:status", app.projectBrokerStatus);
+  } finally {
+    if (!widgetCloseSent) projectBrokerTimer = setTimeout(pollProjectBroker, 1200);
+  }
+}
 
 // ---------- Boot ----------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -1474,10 +1972,17 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 (async function boot() {
   void hydrateHostPresentation();
   await loadState();
+  appearanceStateLoaded = true;
+  // Appearance is persisted independently of the last route. Apply it before
+  // mounting a view so restored sessions never render a page in the wrong
+  // preset and then flash to the chosen one.
+  applyCurrentAppearanceTheme();
   // Reap dead-PID sessions before we try to reuse any recorded port.
   if (!IS_DESKTOP_HOST) await pruneDeadSessions();
   // Signal readiness so host can send t64:init.
   host.ready().catch(() => {});
+  scheduleAppearanceRevealFallback();
+  if (IS_DESKTOP_HOST) void pollProjectBroker();
   navigate(app.state.lastView || "projects");
   // Mount the blocking overwrite-choice modal at app-level.
   mountOverwriteModal({
@@ -1491,4 +1996,16 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 })();
 
 // Expose for debugging from devtools.
-window.__rosync = { getState, setState, getDaemonBase, ensureDaemon, killDaemon };
+window.__rosync = {
+  getState,
+  setState,
+  getAppearanceTheme,
+  setAppearanceTheme,
+  getDaemonBase,
+  getDaemonSession,
+  serveProject,
+  stopProject,
+  restartProject,
+  ensureDaemon,
+  killDaemon,
+};

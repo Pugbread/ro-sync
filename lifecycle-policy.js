@@ -31,28 +31,55 @@ function validOwnerToken(value) {
     : null;
 }
 
+// Desktop persists one lifecycle session per project ID. Accepting the legacy
+// daemon* field names here keeps migration and Terminal 64 callers compatible,
+// but authorization always resolves to one selected project record; claims can
+// never bleed between entries in daemonSessions.
+function projectSession(state, projectId = null) {
+  if (projectId != null) {
+    const sessions = state?.daemonSessions;
+    if (!sessions || typeof sessions !== "object" || Array.isArray(sessions)) return null;
+    return sessions[projectId] || null;
+  }
+  if (state && (
+    Object.hasOwn(state, "project") ||
+    Object.hasOwn(state, "bootId") ||
+    Object.hasOwn(state, "ownerToken")
+  )) {
+    return state;
+  }
+  return state ? {
+    project: state.daemonProject,
+    bootId: state.daemonBootId,
+    ownerToken: state.daemonOwnerToken,
+    pid: state.daemonPid,
+    port: state.daemonPort,
+  } : null;
+}
+
 // A persisted Desktop token is authority, not a launch preference. Treat it
 // as usable only when it was committed with the complete authenticated boot
-// identity. Partial migration/startup state must never trigger a remote stop.
-export function desktopTrackedOwnership(state) {
-  const project = nonBlankString(state?.daemonProject);
-  const bootId = nonBlankString(state?.daemonBootId);
-  const ownerToken = validOwnerToken(state?.daemonOwnerToken);
-  const pid = positiveInteger(state?.daemonPid, 0xffff_ffff);
-  const port = positiveInteger(state?.daemonPort, 0xffff);
+// identity. PID and port remain recoverable descriptions, never authority.
+export function desktopTrackedOwnership(state, projectId = null) {
+  const session = projectSession(state, projectId);
+  const project = nonBlankString(session?.project);
+  const bootId = nonBlankString(session?.bootId);
+  const ownerToken = validOwnerToken(session?.ownerToken);
+  const pid = positiveInteger(session?.pid, 0xffff_ffff);
+  const port = positiveInteger(session?.port, 0xffff);
   if (!project || !bootId || !ownerToken) return null;
   return { project, bootId, ownerToken, pid, port };
 }
 
-export function desktopStopPlan(state) {
-  const spec = desktopTrackedOwnership(state);
+export function desktopStopPlan(state, projectId = null) {
+  const spec = desktopTrackedOwnership(state, projectId);
   return spec ? { kind: "stop-owned", spec } : { kind: "clear-local" };
 }
 
 // Fresh Desktop capabilities stay in memory until the daemon proves exact
 // ownership. A complete prior claim may reuse its token to reattach/relaunch.
-export function desktopStartOwnership(state, project, freshToken, pending = null) {
-  const claim = desktopTrackedOwnership(state);
+export function desktopStartOwnership(state, project, freshToken, pending = null, projectId = null) {
+  const claim = desktopTrackedOwnership(state, projectId);
   if (claim && claim.project === project) {
     return { token: claim.ownerToken, reusedClaim: true, reusedPending: false };
   }
@@ -73,13 +100,23 @@ export function canStopDesktopDaemon({
   if (!isDesktopManagedStatus(status) || ownershipAuthenticated !== true) return false;
   if (!hello || hello.managed !== true || hello.managedBy !== "desktop") return false;
   const projects = new Set(Array.from(expectedProjects || []).filter(Boolean));
+  const statusProject = nonBlankString(status.canonicalProject || status.project);
+  const helloProject = nonBlankString(hello.project);
+  const statusBootId = nonBlankString(status.bootId);
+  const helloBootId = nonBlankString(hello.bootId);
+  const statusPid = positiveInteger(status.pid, 0xffff_ffff);
+  const helloPid = positiveInteger(hello.pid, 0xffff_ffff);
+  const statusPort = positiveInteger(status.port, 0xffff);
+  const helloPort = positiveInteger(hello.port, 0xffff);
   return (
-    projects.has(hello.project) &&
-    !!status.bootId &&
-    hello.bootId === status.bootId &&
-    Number.isFinite(Number(status.pid)) &&
-    Number(hello.pid) === Number(status.pid) &&
-    Number.isFinite(Number(status.port)) &&
-    Number(hello.port) === Number(status.port)
+    !!statusProject &&
+    helloProject === statusProject &&
+    projects.has(statusProject) &&
+    !!statusBootId &&
+    helloBootId === statusBootId &&
+    !!statusPid &&
+    helloPid === statusPid &&
+    !!statusPort &&
+    helloPort === statusPort
   );
 }

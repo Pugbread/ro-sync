@@ -36,7 +36,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Check Luau formatting
-        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Playscript.luau plugin/Photo.luau plugin-src/src/App.luau
+        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/Playscript.luau plugin/Photo.luau plugin-src/src/App.luau
 
       - name: Install pinned Luau compiler
         run: |
@@ -71,9 +71,16 @@ jobs:
       - name: Compile Studio plugin Luau bytecode
         run: |
           node scripts/check-luau-bytecode.mjs plugin/Plugin.luau
+          node scripts/check-luau-bytecode.mjs plugin/Clipboard.luau
           node scripts/check-luau-bytecode.mjs plugin/Playscript.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
+
+      - name: Analyze native clipboard Luau
+        run: >-
+          "$ROSYNC_LUAU_LSP" analyze --platform roblox
+          --definitions tools/luau-lsp/roblox/globalTypes.d.luau
+          plugin/Clipboard.luau
 
       - name: Check strict DataModel lint parity
         working-directory: daemon
@@ -142,6 +149,7 @@ jobs:
           node --check app.js
           node --check bridge.js
           node --check lifecycle-policy.js
+          node --check project-init.js
           node --check platform.js
           node --check scripts/install-luau-compiler.mjs
           for file in views/*.js; do node --check "$file"; done
@@ -149,6 +157,9 @@ jobs:
           node scripts/check-lifecycle-policy.mjs
           node scripts/check-platform-commands.mjs
           node scripts/check-project-path-policy.mjs
+          node scripts/check-project-init-policy.mjs
+          node scripts/check-activity-format.mjs
+          node scripts/check-theme-policy.mjs
 
       - name: Install plugin build tools
         run: |

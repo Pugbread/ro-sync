@@ -9,6 +9,9 @@
       },
       "Playscript": {
         "$path": "src/Playscript.luau"
+      },
+      "Clipboard": {
+        "$path": "src/Clipboard.luau"
       }
     },
     "App": {

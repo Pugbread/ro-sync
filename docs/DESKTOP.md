@@ -32,6 +32,22 @@ folder selection reauthorizes the existing project without moving or copying
 it. Production builds should Developer ID-sign and notarize both the bundled
 `rosync` sidecar and the outer app so that approval survives upgrades.
 
+## Projects and Studio bootstrap
+
+Set **Settings → Projects folder** once. The native picker authorizes that root
+for the app and is also the only location where Studio-requested projects can
+be created. When Studio cannot find a daemon for the open published universe,
+the plugin discovers Ro Sync Desktop's loopback broker, shows **Create Project**,
+and sends only Roblox metadata—never a filesystem path. Desktop creates or
+reuses a direct child matched by `gameId`, imports it into Projects, starts its
+managed daemon, and the plugin connects when that daemon becomes available.
+
+Project switches are independent. Desktop may serve multiple projects at the
+same time, each on its own loopback port. `activeProjectId` is only the focused
+row for Activity, conflicts, and settings; it does not stop other served
+projects. Settings lists every managed session with its own restart and stop
+controls.
+
 ## Run from source
 
 Prerequisites:
@@ -92,10 +108,11 @@ daemon ownership tokens travel through a private child-process environment,
 are redacted from errors, and are never returned to the renderer.
 Lifecycle sidecars are held by exact native child handles and terminated when
 the app exits or a bounded command times out. On normal exit, the native host
-also sends an authenticated close using the exact in-memory capability of the
-Desktop-managed daemon it launched; CLI-owned, manual, and replaced daemons are
-left untouched. The daemon additionally shuts itself down after a prolonged
-loss of authenticated manager heartbeats, so a crash or interrupted cleanup
-cannot leave a permanent inaccessible background process.
+sends authenticated closes in parallel using the exact project, boot, PID,
+port, and in-memory capability of every Desktop-managed daemon it launched;
+CLI-owned, manual, replaced, and mismatched daemons are left untouched. Each
+daemon additionally shuts itself down after a prolonged loss of authenticated
+manager heartbeats, so a crash or interrupted cleanup cannot leave a permanent
+inaccessible background process.
 
 For the component and trust-boundary map, see [ARCHITECTURE.md](ARCHITECTURE.md).

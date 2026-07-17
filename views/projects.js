@@ -2,6 +2,7 @@
 // per-project controls, and a throttled activity tail for the served project.
 import { daemonJson, daemonWS } from "../bridge.js";
 import { copyText, joinProjectFile, pathFromDrop } from "./runtime.js";
+import { pushActivity, renderActivityFeed } from "./activity-format.js";
 
 const MAX_PROJECT_LOG_LINES = 100;
 const MAX_PROJECT_PARSED_OPS_PER_SECOND = 20;
@@ -135,7 +136,7 @@ export function mountProjects(root, api) {
   let filter = "all";
   let activityWs = null;
   let activityRaf = 0;
-  let activityProjectId = initialState.activeProjectId || null;
+  let activityProjectId = null;
   let activityRawWindowStart = 0;
   let activityParsedOpsInWindow = 0;
   let skippedActivityOps = 0;
@@ -145,6 +146,7 @@ export function mountProjects(root, api) {
   let disposed = false;
   let authorizedDesktopPath = "";
   const activityFrames = [];
+  const activityExpandedKeys = new Set();
 
   if (api.host.isDesktop) {
     $path.readOnly = true;
@@ -158,6 +160,11 @@ export function mountProjects(root, api) {
     return String(raw).split(",").map((s) => s.trim()).filter(Boolean);
   }
 
+  function isServing(projectId) {
+    if (typeof api.isProjectServed === "function") return api.isProjectServed(projectId);
+    return api.getState().activeProjectId === projectId;
+  }
+
   function visibleProjects() {
     const s = api.getState();
     const all = s.projects || [];
@@ -168,7 +175,7 @@ export function mountProjects(root, api) {
         if (!hay.includes(q)) return false;
       }
       if (filter === "connected") {
-        if (p.id !== s.activeProjectId) return false;
+        if (!isServing(p.id)) return false;
         const st = snapshotByProject.get(p.id);
         if (!st || st.ok !== true) return false;
       } else if (filter === "needs-setup") {
@@ -179,9 +186,12 @@ export function mountProjects(root, api) {
   }
 
   function statusFor(p) {
-    const s = api.getState();
     const st = snapshotByProject.get(p.id) || {};
-    if (p.id !== s.activeProjectId) return { kind: "idle", label: "Not Serving", dot: "dot-idle" };
+    if (!isServing(p.id)) return { kind: "idle", label: "Not Serving", dot: "dot-idle" };
+    const session = api.getDaemonSession?.(p.id) || api.getState().daemonSessions?.[p.id] || null;
+    if (session?.ok === false && st.ok !== true) {
+      return { kind: "err", label: session.error || st.label || "Daemon offline", dot: "dot-err" };
+    }
     if (st.ok === true) return { kind: "ok", label: "Serving", dot: "dot-ok" };
     if (st.ok === false) return { kind: "err", label: st.label || "Error", dot: "dot-err" };
     return { kind: "idle", label: st.label || "Starting…", dot: "dot-idle" };
@@ -216,7 +226,7 @@ export function mountProjects(root, api) {
       if (p.id === selectedId) li.setAttribute("aria-current", "true");
 
       const initials = leafInitials(p.name || basename(p.path));
-      const isServing = p.id === s.activeProjectId;
+      const projectIsServing = isServing(p.id);
       const st = statusFor(p);
       const dupeGroups = (snapshotByProject.get(p.id) || {}).dupeGroups || 0;
 
@@ -226,8 +236,8 @@ export function mountProjects(root, api) {
           <span class="name"></span>
           <span class="path"></span>
         </div>
-        <label class="switch toggle" title="${isServing ? "Stop serving" : "Start serving"}" data-act="serve-wrap">
-          <input type="checkbox" data-act="serve" ${isServing ? "checked" : ""} aria-label="Serve this project" />
+        <label class="switch toggle" title="${projectIsServing ? "Stop serving" : "Start serving"}" data-act="serve-wrap">
+          <input type="checkbox" data-act="serve" ${projectIsServing ? "checked" : ""} aria-label="Serve this project" />
           <span class="switch-track"><span class="switch-thumb"></span></span>
         </label>
         <div class="chips">
@@ -266,6 +276,7 @@ export function mountProjects(root, api) {
   }
 
   function renderDetail() {
+    rememberActivityExpansion();
     const s = api.getState();
     const projects = s.projects || [];
     const p = projects.find((x) => x.id === selectedId)
@@ -294,7 +305,7 @@ export function mountProjects(root, api) {
     const initials = leafInitials(p.name || basename(p.path));
     const lastSync = (snapshotByProject.get(p.id) || {}).lastSync || null;
     const lastSyncLabel = formatRelative(lastSync);
-    const isActive = p.id === s.activeProjectId;
+    const isActive = isServing(p.id);
 
     $detail.innerHTML = `
       <div class="detail-head">
@@ -315,7 +326,7 @@ export function mountProjects(root, api) {
           <span>Recent actions</span>
           <span class="muted-sm">${isActive ? "last 100" : "inactive"}</span>
         </div>
-        <div class="project-log" data-project-log aria-live="polite"></div>
+        <div class="activity-feed activity-feed--compact" data-project-log aria-live="polite" aria-label="Recent project actions"></div>
       </div>
     `;
 
@@ -341,8 +352,8 @@ export function mountProjects(root, api) {
     const lastSync = (snapshotByProject.get(p.id) || {}).lastSync || null;
     const lastSyncLabel = formatRelative(lastSync);
     const summary = (snapshotByProject.get(p.id) || {}).label || (st.kind === "ok" ? "Up to date" : "—");
-    const isActive = p.id === s.activeProjectId;
-    const daemonOk = !!api.getDaemonBase();
+    const isActive = isServing(p.id);
+    const daemonOk = !!api.getDaemonBase(p.id);
     const wallyEnabled = !!p.wallyEnabled;
     const wallyFolder = p.wallyFolder || (wallyEnabled ? DEFAULT_WALLY_FOLDER : "");
     const wallyFile = p.wallyFile || DEFAULT_WALLY_FILE;
@@ -523,6 +534,7 @@ export function mountProjects(root, api) {
 
   function selectProject(id) {
     selectedId = id;
+    if (api.host.supports.multiDaemon) api.setState({ activeProjectId: id });
     editingId = null;
     $workspace.dataset.mode = "detail";
     renderList();
@@ -605,12 +617,16 @@ export function mountProjects(root, api) {
     editingId = null;
     render();
 
-    if (id === s.activeProjectId && changedLaunchArgs) {
-      if (typeof api.killDaemon === "function") {
-        try { await api.killDaemon(); } catch (e) { console.warn("killDaemon", e); }
-      }
-      if (typeof api.ensureDaemon === "function") {
-        try { await api.ensureDaemon(); } catch (e) { console.warn("ensureDaemon", e); }
+    if (isServing(id) && changedLaunchArgs) {
+      if (typeof api.restartProject === "function") {
+        try { await api.restartProject(id); } catch (e) { console.warn("restartProject", e); }
+      } else {
+        if (typeof api.killDaemon === "function") {
+          try { await api.killDaemon(id); } catch (e) { console.warn("killDaemon", e); }
+        }
+        if (typeof api.ensureDaemon === "function") {
+          try { await api.ensureDaemon(id); } catch (e) { console.warn("ensureDaemon", e); }
+        }
       }
       api.toast("Saved — daemon restarted");
     } else {
@@ -663,15 +679,28 @@ export function mountProjects(root, api) {
 
   async function remove(id) {
     const s = api.getState();
-    const wasServing = s.activeProjectId === id;
+    const wasServing = isServing(id);
+    if (wasServing) {
+      try {
+        const stopped = typeof api.stopProject === "function"
+          ? await api.stopProject(id)
+          : (typeof api.killDaemon === "function" ? await api.killDaemon(id) : true);
+        if (stopped === false) {
+          api.toast("Could not stop this project; it was not removed");
+          return;
+        }
+      } catch (e) {
+        console.warn("stopProject", e);
+        api.toast("Could not stop this project; it was not removed");
+        return;
+      }
+    }
     const next = (s.projects || []).filter((p) => p.id !== id);
     api.setState({
       projects: next,
-      activeProjectId: wasServing ? null : s.activeProjectId,
+      activeProjectId: s.activeProjectId === id ? null : s.activeProjectId,
+      servedProjectIds: (api.getState().servedProjectIds || []).filter((projectId) => projectId !== id),
     });
-    if (wasServing && typeof api.killDaemon === "function") {
-      try { await api.killDaemon(); } catch (e) { console.warn("killDaemon", e); }
-    }
     snapshotByProject.delete(id);
     if (editingId === id) editingId = null;
     if (selectedId === id) selectedId = (next[0] && next[0].id) || null;
@@ -679,22 +708,34 @@ export function mountProjects(root, api) {
     render();
   }
 
-  function serve(id) {
+  async function serve(id) {
     api.setState({ activeProjectId: id });
     selectedId = id;
     render();
-    refreshStatuses();
+    try {
+      if (typeof api.serveProject === "function") await api.serveProject(id);
+      else {
+        api.setState({ activeProjectId: id });
+        await api.ensureDaemon?.(id);
+      }
+    } catch (error) {
+      console.warn("serveProject", error);
+      api.toast(`Could not start project: ${error.message}`);
+    }
+    await refreshStatuses();
   }
 
   async function stopServing(id) {
-    const s = api.getState();
-    if (s.activeProjectId !== id) { render(); return; }
-    api.setState({ activeProjectId: null });
-    if (typeof api.killDaemon === "function") {
-      try { await api.killDaemon(); } catch (e) { console.warn("killDaemon", e); }
+    if (!isServing(id)) { render(); return; }
+    try {
+      if (typeof api.stopProject === "function") await api.stopProject(id);
+      else if (typeof api.killDaemon === "function") await api.killDaemon(id);
+    } catch (e) {
+      console.warn("stopProject", e);
+      api.toast(`Could not stop project: ${e.message}`);
     }
     render();
-    refreshStatuses();
+    await refreshStatuses();
   }
 
   async function pickFolder() {
@@ -844,7 +885,7 @@ export function mountProjects(root, api) {
     if (button) button.disabled = true;
     if (statusEl) statusEl.textContent = "Saving Wally config...";
     const s = api.getState();
-    const wasActive = s.activeProjectId === proj.id;
+    const wasActive = isServing(proj.id);
 
     try {
       const nextProj = { ...proj, wallyEnabled: true, wallyFolder: folder, wallyFile: file };
@@ -872,9 +913,8 @@ export function mountProjects(root, api) {
   }
 
   async function snapshotNow(id) {
-    const base = api.getDaemonBase();
-    const s = api.getState();
-    if (id !== s.activeProjectId || !base) {
+    const base = api.getDaemonBase(id);
+    if (!isServing(id) || !base) {
       api.toast("Start serving this project first");
       return;
     }
@@ -917,13 +957,13 @@ export function mountProjects(root, api) {
   }
 
   async function refreshStatuses() {
-    const base = api.getDaemonBase();
     const s = api.getState();
     for (const p of s.projects || []) {
-      if (p.id !== s.activeProjectId) {
+      if (!isServing(p.id)) {
         snapshotByProject.set(p.id, { ok: null, label: "inactive" });
         continue;
       }
+      const base = api.getDaemonBase(p.id);
       if (!base) {
         snapshotByProject.set(p.id, { ok: null, label: "daemon offline" });
         continue;
@@ -944,19 +984,19 @@ export function mountProjects(root, api) {
   }
 
   function ensureActivityStream() {
-    const s = api.getState();
-    const nextProjectId = s.activeProjectId || null;
+    const nextProjectId = selectedId && isServing(selectedId) ? selectedId : null;
     if (nextProjectId !== activityProjectId) {
       closeActivityStream();
       activityProjectId = nextProjectId;
       activityFrames.length = 0;
+      activityExpandedKeys.clear();
       activityRawWindowStart = 0;
       activityParsedOpsInWindow = 0;
       skippedActivityOps = 0;
       scheduleActivityRender();
     }
 
-    const base = api.getDaemonBase();
+    const base = api.getDaemonBase(activityProjectId);
     if (!base || !activityProjectId) {
       closeActivityStream();
       return;
@@ -980,17 +1020,11 @@ export function mountProjects(root, api) {
           if (t === "ping" || t === "pong" || t === "lagged"
               || t === "push-result" || t === "error") return;
           if (t === "plugin") {
-            pushActivityFrame({
-              type: "plugin",
-              message: data.connected ? "plugin connected" : "plugin disconnected",
-            });
+            pushActivityFrame(data);
             return;
           }
           if (t === "shutdown") {
-            pushActivityFrame({
-              type: "shutdown",
-              message: data.reason ? `daemon shutdown: ${data.reason}` : "daemon shutdown",
-            });
+            pushActivityFrame(data);
             closeActivityStream();
             return;
           }
@@ -998,7 +1032,7 @@ export function mountProjects(root, api) {
         },
       });
     } catch (e) {
-      pushActivityFrame({ type: "error", message: `activity stream failed: ${e.message}` });
+      pushActivityFrame({ type: "stream-error", attempts: 1 });
     }
   }
 
@@ -1010,10 +1044,8 @@ export function mountProjects(root, api) {
     activityErrorCount = 0;
     lastActivityErrorAt = now;
     pushActivityFrame({
-      type: "error",
-      message: count > 1
-        ? `activity stream error (${count} reconnect attempts)`
-        : "activity stream error",
+      type: "stream-error",
+      attempts: count,
     });
   }
 
@@ -1052,7 +1084,7 @@ export function mountProjects(root, api) {
     skippedActivityOps = 0;
     pushActivityFrame({
       type: "busy",
-      message: `collapsed ${count} daemon events while the project log was saturated`,
+      count,
     });
   }
 
@@ -1065,8 +1097,7 @@ export function mountProjects(root, api) {
 
   function pushActivityFrame(frame) {
     if (disposed) return;
-    activityFrames.push({ at: Date.now(), frame });
-    while (activityFrames.length > MAX_PROJECT_LOG_LINES) activityFrames.shift();
+    pushActivity(activityFrames, frame, Date.now(), MAX_PROJECT_LOG_LINES);
     scheduleActivityRender();
   }
 
@@ -1081,26 +1112,34 @@ export function mountProjects(root, api) {
   function renderActivityLog() {
     const $log = $detail.querySelector("[data-project-log]");
     if (!$log) return;
-    const s = api.getState();
-    const selectedIsActive = selectedId && selectedId === s.activeProjectId;
+    const selectedIsActive = selectedId && isServing(selectedId);
     if (!selectedIsActive) {
-      $log.innerHTML = `<span class="project-log-empty">Start serving this project to see actions.</span>`;
+      renderActivityFeed($log, [], {
+        emptyMessage: "Start serving this project to see its actions.",
+        expandedKeys: activityExpandedKeys,
+      });
       return;
     }
     if (!activityFrames.length) {
-      $log.innerHTML = `<span class="project-log-empty">Waiting for project actions…</span>`;
+      renderActivityFeed($log, [], {
+        emptyMessage: "Studio and filesystem actions will appear here.",
+        expandedKeys: activityExpandedKeys,
+      });
       return;
     }
 
     const stickToBottom = $log.scrollHeight - $log.scrollTop - $log.clientHeight < 32;
-    const fragment = document.createDocumentFragment();
-    for (const entry of activityFrames) {
-      const line = renderActivityLine(entry);
-      if (line) fragment.appendChild(line);
-    }
-    $log.innerHTML = "";
-    $log.appendChild(fragment);
+    renderActivityFeed($log, activityFrames, { expandedKeys: activityExpandedKeys });
     if (stickToBottom) $log.scrollTop = $log.scrollHeight;
+  }
+
+  function rememberActivityExpansion() {
+    const details = $detail.querySelectorAll("details[data-activity-key]");
+    if (!details.length) return;
+    activityExpandedKeys.clear();
+    for (const item of details) {
+      if (item.open && item.dataset.activityKey) activityExpandedKeys.add(item.dataset.activityKey);
+    }
   }
 
   function openAddPanel() {
@@ -1346,76 +1385,6 @@ function pluginStatusLabel(isActive, daemonOk, st) {
   if (!daemonOk) return "Daemon offline";
   if (st.kind === "ok") return "Daemon reachable";
   return "Waiting for daemon…";
-}
-function renderActivityLine(entry) {
-  const rendered = activitySummary(entry.frame);
-  if (!rendered) return null;
-  const card = document.createElement("article");
-  card.className = `project-log-card ${rendered.cls}`;
-  const meta = Array.isArray(rendered.meta) ? rendered.meta.filter(Boolean) : [];
-  card.innerHTML =
-    `<div class="project-log-card-head">` +
-      `<span class="project-log-kind">${escapeHTML(rendered.kind)}</span>` +
-      `<span class="project-log-time">${formatClock(entry.at)}</span>` +
-    `</div>` +
-    `<div class="project-log-title">${escapeHTML(rendered.title)}</div>` +
-    (rendered.path ? (
-      `<div class="project-log-path-row">` +
-        `<div class="project-log-path">${escapeHTML(rendered.path)}</div>` +
-        `<button class="project-log-copy" data-copy-path="${escapeHTML(rendered.path)}">Copy path</button>` +
-      `</div>`
-    ) : "") +
-    (meta.length ? `<div class="project-log-meta">${meta.map((item) => `<span>${escapeHTML(item)}</span>`).join("")}</div>` : "");
-  return card;
-}
-function activitySummary(frame) {
-  if (!frame || typeof frame !== "object") return null;
-  if (frame.type === "op") return activityOpSummary(frame);
-
-  const t = String(frame.type || "event").toLowerCase();
-  const cls = t.includes("error") || t.includes("conflict") ? "is-err"
-    : t.includes("sync") ? "is-ok"
-    : t.includes("plugin") ? "is-warn"
-    : "is-info";
-  let title = "";
-  let path = "";
-  const meta = [];
-  if (t === "initial-choice-needed") title = "Initial sync needs a source choice";
-  else if (t === "initial-choice-made") {
-    title = "Initial sync choice applied";
-    meta.push(`choice ${frame.choice || "?"}`);
-  } else if (t === "config-changed") title = "Project config reloaded";
-  else if (t === "conflict") {
-    title = "Sync conflict detected";
-    path = frame.path || "";
-  } else if (t === "busy") {
-    title = frame.message || frame.msg || "Daemon event burst collapsed";
-    meta.push("log throttle");
-  } else title = frame.message || frame.msg || JSON.stringify(frame);
-  return { kind: t, cls, title, path, meta };
-}
-function activityOpSummary(frame) {
-  const innerOp = frame && frame.op;
-  if (!innerOp || typeof innerOp !== "object") return null;
-  const kind = String(innerOp.op || "op").toLowerCase();
-  const pathArr = Array.isArray(innerOp.path) ? innerOp.path : [];
-  const pathStr = pathArr.join("/");
-  const meta = ["filesystem watcher"];
-  const node = innerOp.node && typeof innerOp.node === "object" ? innerOp.node : null;
-  if (node && node.class) meta.push(`class ${node.class}`);
-  if (kind === "rename") {
-    const from = Array.isArray(innerOp.from) ? innerOp.from.join("/") : "?";
-    const to = Array.isArray(innerOp.to) ? innerOp.to.join("/") : "?";
-    return { kind, cls: "is-fs", title: "Renamed synced path", path: to, meta: [`from ${from}`] };
-  }
-  if (kind === "delete") return { kind, cls: "is-fs", title: "Deleted synced path", path: pathStr || "unknown path", meta };
-  if (kind === "set") return { kind, cls: "is-fs", title: "Created or replaced synced path", path: pathStr || "unknown path", meta };
-  if (kind === "update") return { kind, cls: "is-fs", title: "Updated synced path", path: pathStr || "unknown path", meta };
-  return { kind, cls: "is-info", title: "Daemon operation", path: pathStr, meta: [JSON.stringify(innerOp)] };
-}
-function formatClock(ts) {
-  const d = new Date(ts || Date.now());
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 function countDupeGroups(tree) {
   if (!tree || typeof tree !== "object") return 0;

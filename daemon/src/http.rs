@@ -76,9 +76,14 @@ pub fn router(state: AppState) -> Router {
 
     const ARTIFACT_CONTROL_BODY: usize = 4 * 1024;
     const ARTIFACT_CHUNK_BODY: usize = 768 * 1024;
+    const PROJECT_INIT_BODY: usize = 16 * 1024;
 
     Router::new()
         .route("/hello", get(hello))
+        .route(
+            "/projects/init",
+            post(project_init).layer(DefaultBodyLimit::max(PROJECT_INIT_BODY)),
+        )
         .route("/snapshot", get(snapshot))
         .route("/push", post(push))
         .route("/poll", get(poll))
@@ -98,6 +103,10 @@ pub fn router(state: AppState) -> Router {
             post(artifact_lease).layer(DefaultBodyLimit::max(ARTIFACT_CONTROL_BODY)),
         )
         .route("/artifacts/:id", get(artifact_lookup))
+        .route(
+            "/artifacts/:id/read",
+            post(artifact_read).layer(DefaultBodyLimit::max(ARTIFACT_CONTROL_BODY)),
+        )
         .route(
             "/artifacts/:id/chunk",
             post(artifact_chunk).layer(DefaultBodyLimit::max(ARTIFACT_CHUNK_BODY)),
@@ -265,6 +274,125 @@ async fn artifact_lookup(
         })),
         Err(error) => artifact_error_json(error),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactReadBody {
+    offset: u64,
+    max_bytes: Option<u64>,
+}
+
+/// Read one bounded chunk from a finalized artifact.
+///
+/// Artifact ids contain 192 bits of randomness, the server is loopback-only,
+/// and only finalized files registered by [`ArtifactStore`] can be addressed.
+/// This gives the Studio plugin a bounded download path for native `.rbxm`
+/// clipboard payloads without putting large binary values on the command WS.
+async fn artifact_read(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ArtifactReadBody>,
+) -> Json<Value> {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    const MAX_READ_BYTES: u64 = 512 * 1024;
+    let metadata = match state.artifacts.lookup(&id) {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            return Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "ARTIFACT_NOT_FOUND",
+                    "message": "artifact was not found or is not finalized",
+                    "retryable": false,
+                }
+            }));
+        }
+        Err(error) => return artifact_error_json(error),
+    };
+    if body.offset >= metadata.size {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_READ_RANGE",
+                "message": format!(
+                    "artifact read offset {} is outside {} bytes",
+                    body.offset, metadata.size
+                ),
+                "retryable": false,
+            }
+        }));
+    }
+    let requested = body.max_bytes.unwrap_or(MAX_READ_BYTES);
+    if requested == 0 || requested > MAX_READ_BYTES {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_READ_RANGE",
+                "message": format!("maxBytes must be between 1 and {MAX_READ_BYTES}"),
+                "retryable": false,
+            }
+        }));
+    }
+    let count = requested.min(metadata.size - body.offset);
+    let mut file = match tokio::fs::File::open(&metadata.path).await {
+        Ok(file) => file,
+        Err(error) => {
+            return Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "ARTIFACT_IO",
+                    "message": format!("open finalized artifact: {error}"),
+                    "retryable": true,
+                }
+            }));
+        }
+    };
+    if let Err(error) = file.seek(std::io::SeekFrom::Start(body.offset)).await {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_IO",
+                "message": format!("seek finalized artifact: {error}"),
+                "retryable": true,
+            }
+        }));
+    }
+    let Ok(count_usize) = usize::try_from(count) else {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_READ_RANGE",
+                "message": "artifact chunk length does not fit this platform",
+                "retryable": false,
+            }
+        }));
+    };
+    let mut bytes = vec![0u8; count_usize];
+    if let Err(error) = file.read_exact(&mut bytes).await {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "ARTIFACT_IO",
+                "message": format!("read finalized artifact: {error}"),
+                "retryable": true,
+            }
+        }));
+    }
+    let next_offset = body.offset + count;
+    Json(json!({
+        "ok": true,
+        "chunk": {
+            "offset": body.offset,
+            "nextOffset": next_offset,
+            "eof": next_offset == metadata.size,
+            "byteLength": metadata.size,
+            "sha256": metadata.sha256,
+            "bytesBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }))
 }
 
 async fn artifact_consume(
@@ -644,10 +772,25 @@ struct Hello {
     plugin_protocol: u64,
     #[serde(rename = "pluginCapability")]
     plugin_capability: &'static str,
+    #[serde(rename = "projectInit")]
+    project_init: ProjectInitHello,
+}
+
+#[derive(Serialize)]
+struct ProjectInitHello {
+    available: bool,
+    #[serde(rename = "projectsRoot", skip_serializing_if = "Option::is_none")]
+    projects_root: Option<String>,
+    endpoint: &'static str,
 }
 
 async fn hello(State(state): State<AppState>) -> Json<Hello> {
     let plugin_connected = state.active_plugin.lock().unwrap().is_some();
+    let projects_root = state
+        .projects_root
+        .as_ref()
+        .as_ref()
+        .map(|path| path.display().to_string());
     Json(Hello {
         name: state.project_name.read().unwrap().clone(),
         version: env!("CARGO_PKG_VERSION"),
@@ -667,7 +810,142 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         plugin_connected,
         plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
         plugin_capability: crate::ws::plugin_capability(),
+        project_init: ProjectInitHello {
+            available: projects_root.is_some(),
+            projects_root,
+            endpoint: "/projects/init",
+        },
     })
+}
+
+// ---------------------------------------------------------------------------
+// POST /projects/init — explicit Studio request to initialize one safe project
+// below the desktop-authorized projects root. The request contains metadata,
+// never a filesystem path. A per-boot plugin capability prevents arbitrary
+// localhost callers from creating directories.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ProjectInitBody {
+    #[serde(rename = "pluginCapability")]
+    plugin_capability: String,
+    #[serde(rename = "gameName")]
+    game_name: String,
+    #[serde(rename = "placeName")]
+    place_name: String,
+    #[serde(rename = "gameId")]
+    game_id: String,
+    #[serde(rename = "placeId")]
+    place_id: String,
+    #[serde(rename = "creatorType", default)]
+    creator_type: Option<String>,
+    #[serde(rename = "creatorId", default)]
+    creator_id: Option<String>,
+    #[serde(rename = "groupId", default)]
+    group_id: Option<String>,
+}
+
+async fn project_init(State(state): State<AppState>, body: Bytes) -> Json<Value> {
+    project_init_inner(&state, &body)
+}
+
+fn project_init_inner(state: &AppState, body: &[u8]) -> Json<Value> {
+    let Some(projects_root) = state.projects_root.as_ref().as_ref() else {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "PROJECT_INIT_UNAVAILABLE",
+                "message": "this daemon was not started with a desktop-authorized projects root",
+            },
+        }));
+    };
+    let body = match serde_json::from_slice::<ProjectInitBody>(body) {
+        Ok(body) => body,
+        Err(error) => {
+            return Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": format!("parse project initialization request: {error}"),
+                },
+            }));
+        }
+    };
+    if !constant_time_text_eq(
+        body.plugin_capability.as_str(),
+        crate::ws::plugin_capability(),
+    ) {
+        return Json(json!({
+            "ok": false,
+            "error": {
+                "code": "UNAUTHORIZED",
+                "message": "the advertised Studio plugin capability is missing or stale",
+            },
+        }));
+    }
+
+    let outcome = match crate::project_init::initialize_project(
+        projects_root,
+        crate::project_init::ProjectInitRequest {
+            game_name: body.game_name,
+            place_name: body.place_name,
+            game_id: body.game_id,
+            place_id: body.place_id,
+            creator_type: body.creator_type,
+            creator_id: body.creator_id,
+            group_id: body.group_id,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Json(json!({
+                "ok": false,
+                "error": {
+                    "code": error.code(),
+                    "message": error.message(),
+                    "suggestedDirectoryName": error.suggested_directory_name(),
+                },
+            }));
+        }
+    };
+
+    let status = if outcome.created {
+        "created"
+    } else {
+        "existing"
+    };
+    let event = json!({
+        "type": "project-init",
+        "status": status,
+        "project": outcome.project,
+        "directoryName": outcome.directory_name,
+        "name": outcome.name,
+        "metadata": outcome.metadata,
+        "changed": outcome.changed,
+    });
+    let _ = state.events.send(event.to_string());
+    let _ = write_log_entry(Json(json!({
+        "source": "studio-plugin",
+        "action": "project-init",
+        "outcome": status,
+        "project": outcome.project,
+        "directoryName": outcome.directory_name,
+        "name": outcome.name,
+        "metadata": outcome.metadata,
+        "changed": outcome.changed,
+    })));
+
+    Json(json!({
+        "ok": true,
+        "status": status,
+        "created": outcome.created,
+        "project": outcome.project,
+        "directoryName": outcome.directory_name,
+        "name": outcome.name,
+        "metadata": outcome.metadata,
+        "changed": outcome.changed,
+        "reconnectRequired": true,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3896,14 +4174,15 @@ mod tests {
         Mutex::new(HashMap::new())
     }
 
-    fn artifact_test_app(temp: &TempDir) -> Router {
+    fn test_state(temp: &TempDir, projects_root: Option<PathBuf>) -> AppState {
         let project = std::fs::canonicalize(temp.path()).unwrap();
         let (events, _) = broadcast::channel::<String>(16);
         let (request_tx, _) = broadcast::channel::<crate::RequestEnvelope>(16);
         let (shutdown_tx, _) = tokio::sync::watch::channel::<Option<String>>(None);
-        router(AppState {
+        AppState {
             project: Arc::new(project.clone()),
             canonical_project: Arc::new(project.clone()),
+            projects_root: Arc::new(projects_root),
             events,
             conflict: Arc::new(ConflictEngine::new()),
             artifacts: crate::artifact::ArtifactStore::new(
@@ -3935,7 +4214,11 @@ mod tests {
             widget_owner_token: Arc::new(Some("artifact-widget-token".into())),
             widget_last_seen: Arc::new(Mutex::new(None)),
             shutdown_tx,
-        })
+        }
+    }
+
+    fn artifact_test_app(temp: &TempDir) -> Router {
+        router(test_state(temp, None))
     }
 
     async fn artifact_json_request(
@@ -3963,6 +4246,134 @@ mod tests {
             .unwrap();
         let body = serde_json::from_slice(&bytes).unwrap();
         (status, headers, body)
+    }
+
+    #[tokio::test]
+    async fn hello_advertises_only_a_canonical_configured_projects_root() {
+        let project = TempDir::new("project-init-hello-project");
+        let projects = TempDir::new("project-init-hello-root");
+        let canonical_projects = std::fs::canonicalize(projects.path()).unwrap();
+        let app = router(test_state(&project, Some(canonical_projects.clone())));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let hello: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(hello["projectInit"]["available"], true);
+        assert_eq!(hello["projectInit"]["endpoint"], "/projects/init");
+        assert_eq!(
+            hello["projectInit"]["projectsRoot"],
+            canonical_projects.display().to_string()
+        );
+
+        let disabled = router(test_state(&project, None));
+        let response = disabled
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let hello: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(hello["projectInit"]["available"], false);
+        assert!(hello["projectInit"].get("projectsRoot").is_none());
+    }
+
+    #[tokio::test]
+    async fn project_init_requires_availability_and_the_advertised_plugin_capability() {
+        let project = TempDir::new("project-init-auth-project");
+        let projects = TempDir::new("project-init-auth-root");
+        let request = json!({
+            "pluginCapability": "0".repeat(64),
+            "gameName": "Race Stars",
+            "placeName": "Main Place",
+            "gameId": "123",
+            "placeId": "456",
+        });
+
+        let disabled = router(test_state(&project, None));
+        let (_, _, body) =
+            artifact_json_request(&disabled, Method::POST, "/projects/init", request.clone()).await;
+        assert_eq!(body["error"]["code"], "PROJECT_INIT_UNAVAILABLE");
+
+        let enabled = router(test_state(
+            &project,
+            Some(std::fs::canonicalize(projects.path()).unwrap()),
+        ));
+        let (_, _, body) =
+            artifact_json_request(&enabled, Method::POST, "/projects/init", request).await;
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        assert!(std::fs::read_dir(projects.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn project_init_creates_once_broadcasts_and_audits_without_exposing_capability() {
+        let _guard = WRITELOG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous_test_home = std::env::var_os("ROSYNC_TEST_HOME");
+        let fake_home = TempDir::new("project-init-audit-home");
+        std::env::set_var("ROSYNC_TEST_HOME", fake_home.path());
+
+        let project = TempDir::new("project-init-route-project");
+        let projects = TempDir::new("project-init-route-root");
+        let canonical_projects = std::fs::canonicalize(projects.path()).unwrap();
+        let state = test_state(&project, Some(canonical_projects.clone()));
+        let mut events = state.events.subscribe();
+        let request = json!({
+            "pluginCapability": crate::ws::plugin_capability(),
+            "gameName": "Race Stars",
+            "placeName": "Main Place",
+            "gameId": "123",
+            "placeId": "456",
+            "creatorType": "Group",
+            "creatorId": "789",
+            "groupId": "789",
+        });
+
+        let created = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["status"], "created");
+        assert_eq!(created["directoryName"], "race-stars");
+        assert_eq!(created["name"], "Race Stars");
+        let created_path = PathBuf::from(created["project"].as_str().unwrap());
+        assert_eq!(created_path.parent(), Some(canonical_projects.as_path()));
+        assert!(created_path
+            .join(crate::project_config::CONFIG_FILE)
+            .is_file());
+
+        let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "project-init");
+        assert_eq!(event["status"], "created");
+        assert_eq!(event["name"], "Race Stars");
+        assert_eq!(event["metadata"]["gameId"], "123");
+
+        let existing = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
+        assert_eq!(existing["ok"], true);
+        assert_eq!(existing["status"], "existing");
+        assert_eq!(existing["project"], created["project"]);
+
+        let (log_path, _) = writes_log_paths(fake_home.path());
+        let audit = std::fs::read_to_string(log_path).unwrap();
+        assert!(audit.contains("\"action\":\"project-init\""));
+        assert!(!audit.contains(crate::ws::plugin_capability()));
+
+        if let Some(previous) = previous_test_home {
+            std::env::set_var("ROSYNC_TEST_HOME", previous);
+        } else {
+            std::env::remove_var("ROSYNC_TEST_HOME");
+        }
     }
 
     async fn create_artifact_lease(
@@ -4031,6 +4442,52 @@ mod tests {
                 .await;
         assert_eq!(lookup["ok"], true, "lookup response: {lookup}");
         assert_eq!(lookup["artifact"], finalized["artifact"]);
+
+        let (_, _, first_read) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/read"),
+            json!({ "offset": 0, "maxBytes": 5 }),
+        )
+        .await;
+        assert_eq!(first_read["ok"], true, "read response: {first_read}");
+        assert_eq!(first_read["chunk"]["offset"], 0);
+        assert_eq!(first_read["chunk"]["nextOffset"], 5);
+        assert_eq!(first_read["chunk"]["eof"], false);
+        assert_eq!(first_read["chunk"]["byteLength"], payload.len());
+        assert_eq!(first_read["chunk"]["sha256"], expected_sha256);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(first_read["chunk"]["bytesBase64"].as_str().unwrap())
+                .unwrap(),
+            &payload[..5],
+        );
+
+        let (_, _, final_read) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/read"),
+            json!({ "offset": 5, "maxBytes": payload.len() }),
+        )
+        .await;
+        assert_eq!(final_read["ok"], true);
+        assert_eq!(final_read["chunk"]["eof"], true);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(final_read["chunk"]["bytesBase64"].as_str().unwrap())
+                .unwrap(),
+            &payload[5..],
+        );
+
+        let (_, _, invalid_read) = artifact_json_request(
+            &app,
+            Method::POST,
+            &format!("/artifacts/{id}/read"),
+            json!({ "offset": payload.len(), "maxBytes": 1 }),
+        )
+        .await;
+        assert_eq!(invalid_read["ok"], false);
+        assert_eq!(invalid_read["error"]["code"], "ARTIFACT_READ_RANGE");
 
         let (_, _, consumed) = artifact_json_request(
             &app,

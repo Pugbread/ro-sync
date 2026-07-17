@@ -35,7 +35,7 @@ use serde_json::Value;
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -54,6 +54,10 @@ pub struct PendingRoute {
     client_request_id: u64,
     origin_conn_id: u64,
     sink: UnboundedSender<Message>,
+    activity_op: String,
+    activity_detail: Value,
+    activity_started_at: Instant,
+    publish_activity: bool,
 }
 
 /// Broadcast envelope for a client-originated request. Every connection's
@@ -248,8 +252,29 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // On disconnect, purge any pending routes that pointed at this connection's
     // out_tx so routes to dead senders don't leak. The check is "sender is
     // closed", which the mpsc flags automatically once the receiver is dropped.
-    let mut routes = state.pending_routes.lock().unwrap();
-    routes.retain(|_, route| route.origin_conn_id != conn_id && !route.sink.is_closed());
+    let aborted_activities = {
+        let mut routes = state.pending_routes.lock().unwrap();
+        let mut events = Vec::new();
+        routes.retain(|request_id, route| {
+            let keep = route.origin_conn_id != conn_id && !route.sink.is_closed();
+            if !keep {
+                if let Some(event) = command_activity_event(
+                    state.boot_id.as_str(),
+                    *request_id,
+                    route,
+                    CommandActivityPhase::Aborted,
+                    None,
+                ) {
+                    events.push(event);
+                }
+            }
+            keep
+        });
+        events
+    };
+    for event in aborted_activities {
+        let _ = state.events.send(event);
+    }
     let disconnected_plugin = {
         let mut active = state.active_plugin.lock().unwrap();
         if *active == Some(conn_id) {
@@ -432,7 +457,10 @@ async fn recv_loop(
                         request_id,
                         conn_id,
                         out_tx.clone(),
+                        &op,
+                        &args,
                     );
+                    publish_command_activity_started(&state, daemon_request_id);
                     // Broadcast to every other connection's send-loop.
                     let _ = state.request_tx.send(RequestEnvelope {
                         origin: conn_id,
@@ -461,6 +489,15 @@ async fn recv_loop(
                         routes.remove(&request_id)
                     };
                     if let Some(route) = sink {
+                        if let Some(event) = command_activity_event(
+                            state.boot_id.as_str(),
+                            request_id,
+                            &route,
+                            CommandActivityPhase::Completed,
+                            Some(ok),
+                        ) {
+                            let _ = state.events.send(event);
+                        }
                         let msg = ServerMsg::Response {
                             request_id: route.client_request_id,
                             ok,
@@ -533,13 +570,23 @@ async fn send_loop(
                 match ev_res {
                     Ok(s) => {
                         if let Some(op) = event_to_plugin_op(state.canonical_project.as_path(), &s) {
-                            if PeerKind::load(&peer_kind) != PeerKind::Plugin
-                                || *state.active_plugin.lock().unwrap() != Some(conn_id)
-                            {
-                                continue;
-                            }
-                            if !send_ws_msg(&mut sender, &ServerMsg::Op { op }).await {
-                                break;
+                            let current_peer = PeerKind::load(&peer_kind);
+                            if current_peer == PeerKind::Plugin {
+                                if *state.active_plugin.lock().unwrap() == Some(conn_id)
+                                    && !send_ws_msg(&mut sender, &ServerMsg::Op { op }).await
+                                {
+                                    break;
+                                }
+                            } else if current_peer == PeerKind::Watch {
+                                if let Some(activity) = sanitized_sync_activity(&op) {
+                                    if sender
+                                        .send(Message::Text(activity.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -570,12 +617,430 @@ async fn send_loop(
     }
 }
 
+#[derive(Clone, Copy)]
+enum CommandActivityPhase {
+    Started,
+    Completed,
+    Aborted,
+}
+
+impl CommandActivityPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+fn publish_command_activity_started(state: &AppState, request_id: u64) {
+    let event = {
+        let routes = state.pending_routes.lock().unwrap();
+        routes.get(&request_id).and_then(|route| {
+            command_activity_event(
+                state.boot_id.as_str(),
+                request_id,
+                route,
+                CommandActivityPhase::Started,
+                None,
+            )
+        })
+    };
+    if let Some(event) = event {
+        let _ = state.events.send(event);
+    }
+}
+
+fn command_activity_event(
+    boot_id: &str,
+    request_id: u64,
+    route: &PendingRoute,
+    phase: CommandActivityPhase,
+    ok: Option<bool>,
+) -> Option<String> {
+    if !route.publish_activity {
+        return None;
+    }
+    let mut event = serde_json::Map::new();
+    event.insert("type".into(), Value::String("command-activity".into()));
+    event.insert(
+        "activityId".into(),
+        Value::String(command_activity_id(boot_id, request_id)),
+    );
+    event.insert("phase".into(), Value::String(phase.as_str().into()));
+    event.insert("op".into(), Value::String(route.activity_op.clone()));
+    event.insert("detail".into(), route.activity_detail.clone());
+    if !matches!(phase, CommandActivityPhase::Started) {
+        event.insert(
+            "durationMs".into(),
+            Value::from(
+                u64::try_from(route.activity_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
+        );
+    }
+    if let Some(ok) = ok {
+        event.insert("ok".into(), Value::Bool(ok));
+        if !ok {
+            // Plugin error values can contain source excerpts, property values,
+            // or other private command inputs. The activity feed only needs a
+            // stable failure label; the originating CLI still receives the full
+            // error response through its private route.
+            event.insert("error".into(), Value::String("Command failed".into()));
+        }
+    } else if matches!(phase, CommandActivityPhase::Aborted) {
+        event.insert("ok".into(), Value::Bool(false));
+        event.insert(
+            "error".into(),
+            Value::String("Requester disconnected".into()),
+        );
+    }
+    serde_json::to_string(&Value::Object(event)).ok()
+}
+
+fn command_activity_id(boot_id: &str, request_id: u64) -> String {
+    // A request counter is unique only for one daemon process. Scope it to a
+    // non-reversible digest of the daemon boot identity so a desktop feed can
+    // survive reconnects without merging a new command into a stale card.
+    let digest = crate::conflict::hash(boot_id.as_bytes());
+    let mut generation_bytes = [0u8; 8];
+    generation_bytes.copy_from_slice(&digest[..8]);
+    let generation = u64::from_be_bytes(generation_bytes);
+    format!("request:{generation:016x}:{request_id}")
+}
+
+fn should_publish_command_activity(op: &str) -> bool {
+    !matches!(
+        op,
+        "ping"
+            | "version"
+            | "capture_read"
+            | "capture_close"
+            | "photo_read"
+            | "photo_close"
+            | "transmit_read"
+            | "transmit_close"
+            | "playtest_run_poll"
+            | "playtest_wait"
+            | "playtest_status"
+    )
+}
+
+fn sanitized_command_op(op: &str) -> String {
+    let trimmed = op.trim();
+    if !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
+    {
+        trimmed.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn sanitized_command_detail(op: &str, args: &Value) -> Value {
+    let mut detail = serde_json::Map::new();
+    match op {
+        "get" | "inspect_ref" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+            copy_activity_string_alias(&mut detail, args, &["prop", "property"], "property", 128);
+            copy_activity_string_alias(
+                &mut detail,
+                args,
+                &["expectedClass", "class"],
+                "expectedClass",
+                128,
+            );
+            copy_activity_array_count(&mut detail, args, "props", "propertyCount");
+        }
+        "set" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+            copy_activity_string_alias(&mut detail, args, &["prop", "property"], "property", 128);
+        }
+        "ls" | "tree" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+            copy_activity_u64(&mut detail, args, "depth", "depth");
+        }
+        "query" => {
+            copy_activity_string(&mut detail, args, "selector", "selector", 512);
+            copy_activity_u64(&mut detail, args, "limit", "limit");
+            copy_activity_array_count(&mut detail, args, "props", "propertyCount");
+        }
+        "find" => {
+            copy_activity_string_alias(&mut detail, args, &["under", "root"], "under", 512);
+            copy_activity_string(&mut detail, args, "className", "class", 128);
+            copy_activity_string(&mut detail, args, "name", "name", 256);
+        }
+        "find_by_attr" => {
+            copy_activity_string_alias(&mut detail, args, &["under", "root"], "under", 512);
+            copy_activity_string(&mut detail, args, "name", "attribute", 128);
+        }
+        "new" => {
+            copy_activity_string_alias(&mut detail, args, &["parent", "path"], "path", 512);
+            copy_activity_string(&mut detail, args, "class", "class", 128);
+            copy_activity_string(&mut detail, args, "name", "name", 256);
+        }
+        "rm" | "attr_ls" | "tag_ls" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+        }
+        "mv" => {
+            copy_activity_string(&mut detail, args, "from", "from", 512);
+            copy_activity_string(&mut detail, args, "to", "to", 512);
+        }
+        "set_attr" | "rm_attr" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+            copy_activity_string(&mut detail, args, "name", "attribute", 128);
+        }
+        "add_tag" | "rm_tag" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+            copy_activity_string(&mut detail, args, "tag", "tag", 128);
+        }
+        "call" => {
+            copy_activity_string(&mut detail, args, "path", "path", 512);
+            copy_activity_string(&mut detail, args, "method", "method", 128);
+            copy_activity_array_count(&mut detail, args, "args", "argumentCount");
+        }
+        "select_set" => {
+            copy_activity_array_count(&mut detail, args, "paths", "selectionCount");
+        }
+        "clipboard_copy" => {
+            let count = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            detail.insert("itemCount".into(), Value::from(count as u64));
+            detail.insert(
+                "selectionMode".into(),
+                Value::String(if count == 0 { "selection" } else { "paths" }.into()),
+            );
+        }
+        "clipboard_paste" => {
+            copy_activity_string(&mut detail, args, "parent", "parent", 512);
+            copy_activity_array_count(&mut detail, args, "roots", "itemCount");
+            copy_activity_u64(&mut detail, args, "byteLength", "byteLength");
+        }
+        "transaction_begin" | "transaction_finish" => {
+            copy_activity_string(&mut detail, args, "id", "transaction", 128);
+            copy_activity_string(&mut detail, args, "action", "action", 32);
+            copy_activity_string(&mut detail, args, "name", "name", 256);
+        }
+        "waypoint" => {
+            copy_activity_string(&mut detail, args, "name", "name", 256);
+        }
+        "class_info" => {
+            copy_activity_string_alias(
+                &mut detail,
+                args,
+                &["class_name", "className"],
+                "class",
+                128,
+            );
+        }
+        "enum_list" => {
+            copy_activity_string_alias(&mut detail, args, &["enum_name", "name"], "enum", 128);
+        }
+        "eval" => {
+            copy_activity_string_length(&mut detail, args, "source", "sourceBytes");
+        }
+        "capture_prepare" | "photo_prepare" => {
+            copy_activity_string(&mut detail, args, "focus", "focus", 512);
+            copy_activity_string_alias(
+                &mut detail,
+                args,
+                &["uiTarget", "ui_target"],
+                "uiTarget",
+                512,
+            );
+            copy_activity_string(&mut detail, args, "ui", "ui", 32);
+            copy_activity_string(&mut detail, args, "view", "view", 32);
+        }
+        "capture_export" => {
+            copy_activity_string(&mut detail, args, "format", "format", 32);
+        }
+        "playtest_start" | "playtest_run_start" => {
+            copy_activity_string(&mut detail, args, "mode", "mode", 32);
+            copy_activity_u64(&mut detail, args, "players", "players");
+            copy_activity_string(&mut detail, args, "context", "context", 64);
+            copy_activity_string(&mut detail, args, "identity", "identity", 32);
+        }
+        "playtest_request" => {
+            copy_activity_string(&mut detail, args, "context", "context", 64);
+            if let Some(operation) = args
+                .get("op")
+                .and_then(Value::as_str)
+                .map(sanitized_command_op)
+            {
+                detail.insert("operation".into(), Value::String(operation));
+            }
+        }
+        "playtest_capture" => {
+            copy_activity_string(&mut detail, args, "context", "context", 64);
+        }
+        "playtest_stop" => {
+            copy_activity_string(&mut detail, args, "jobId", "jobId", 128);
+        }
+        "logs" => {
+            copy_activity_string(&mut detail, args, "level_min", "level", 16);
+            copy_activity_u64(&mut detail, args, "limit", "limit");
+        }
+        _ => {}
+    }
+    Value::Object(detail)
+}
+
+fn copy_activity_string(
+    out: &mut serde_json::Map<String, Value>,
+    args: &Value,
+    input_key: &str,
+    output_key: &str,
+    max_chars: usize,
+) {
+    if let Some(value) = args
+        .get(input_key)
+        .and_then(Value::as_str)
+        .and_then(|value| sanitized_activity_string(value, max_chars))
+    {
+        out.insert(output_key.into(), Value::String(value));
+    }
+}
+
+fn copy_activity_string_alias(
+    out: &mut serde_json::Map<String, Value>,
+    args: &Value,
+    input_keys: &[&str],
+    output_key: &str,
+    max_chars: usize,
+) {
+    for input_key in input_keys {
+        if let Some(value) = args
+            .get(*input_key)
+            .and_then(Value::as_str)
+            .and_then(|value| sanitized_activity_string(value, max_chars))
+        {
+            out.insert(output_key.into(), Value::String(value));
+            return;
+        }
+    }
+}
+
+fn copy_activity_string_length(
+    out: &mut serde_json::Map<String, Value>,
+    args: &Value,
+    input_key: &str,
+    output_key: &str,
+) {
+    if let Some(value) = args.get(input_key).and_then(Value::as_str) {
+        out.insert(output_key.into(), Value::from(value.len() as u64));
+    }
+}
+
+fn copy_activity_u64(
+    out: &mut serde_json::Map<String, Value>,
+    args: &Value,
+    input_key: &str,
+    output_key: &str,
+) {
+    if let Some(value) = args.get(input_key).and_then(Value::as_u64) {
+        out.insert(output_key.into(), Value::from(value));
+    }
+}
+
+fn copy_activity_array_count(
+    out: &mut serde_json::Map<String, Value>,
+    args: &Value,
+    input_key: &str,
+    output_key: &str,
+) {
+    if let Some(values) = args.get(input_key).and_then(Value::as_array) {
+        out.insert(output_key.into(), Value::from(values.len() as u64));
+    }
+}
+
+fn sanitized_activity_string(value: &str, max_chars: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut sanitized = String::new();
+    for ch in value.chars().filter(|ch| !ch.is_control()).take(max_chars) {
+        sanitized.push(ch);
+    }
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn sanitized_sync_activity(plugin_op: &Value) -> Option<Value> {
+    let operation = plugin_op.get("op")?.as_str()?;
+    if !matches!(operation, "set" | "delete" | "rename" | "class_change") {
+        return None;
+    }
+    let mut event = serde_json::Map::new();
+    event.insert("type".into(), Value::String("sync-activity".into()));
+    event.insert("op".into(), Value::String(operation.to_string()));
+
+    copy_sync_path(&mut event, plugin_op, "path", "path");
+    copy_sync_path(&mut event, plugin_op, "from", "from");
+    copy_sync_path(&mut event, plugin_op, "to", "to");
+    if operation == "set" {
+        if let Some(node) = plugin_op.get("node") {
+            copy_activity_string(&mut event, node, "class", "class", 128);
+            copy_activity_string(&mut event, node, "name", "name", 256);
+        }
+    } else {
+        copy_activity_string(&mut event, plugin_op, "class", "class", 128);
+        let naming_path = plugin_op
+            .get("to")
+            .or_else(|| plugin_op.get("path"))
+            .and_then(sanitized_instance_path);
+        if let Some(name) = naming_path
+            .as_deref()
+            .and_then(|path| path.rsplit('/').next())
+            .and_then(|name| sanitized_activity_string(name, 256))
+        {
+            event.insert("name".into(), Value::String(name));
+        }
+    }
+    Some(Value::Object(event))
+}
+
+fn copy_sync_path(
+    out: &mut serde_json::Map<String, Value>,
+    source: &Value,
+    input_key: &str,
+    output_key: &str,
+) {
+    if let Some(path) = source.get(input_key).and_then(sanitized_instance_path) {
+        out.insert(output_key.into(), Value::String(path));
+    }
+}
+
+fn sanitized_instance_path(value: &Value) -> Option<String> {
+    if let Some(path) = value.as_str() {
+        return sanitized_activity_string(path, 512);
+    }
+    let segments = value.as_array()?;
+    if segments.len() > 128 {
+        return None;
+    }
+    let mut safe_segments = Vec::with_capacity(segments.len());
+    for segment in segments {
+        safe_segments.push(sanitized_activity_string(segment.as_str()?, 128)?);
+    }
+    sanitized_activity_string(&safe_segments.join("/"), 512)
+}
+
 fn register_pending_route(
     routes: &PendingRoutes,
     client_request_id: u64,
     origin_conn_id: u64,
     sink: UnboundedSender<Message>,
+    op: &str,
+    args: &Value,
 ) -> u64 {
+    let activity_op = sanitized_command_op(op);
+    let activity_detail = sanitized_command_detail(op, args);
+    let publish_activity = should_publish_command_activity(op);
     let mut routes = routes.lock().unwrap();
     loop {
         let candidate = NEXT_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
@@ -587,6 +1052,10 @@ fn register_pending_route(
                 client_request_id,
                 origin_conn_id,
                 sink,
+                activity_op: activity_op.clone(),
+                activity_detail: activity_detail.clone(),
+                activity_started_at: Instant::now(),
+                publish_activity,
             });
             return candidate;
         }
@@ -702,6 +1171,7 @@ mod tests {
         let state = AppState {
             project: Arc::new(project),
             canonical_project: Arc::new(canonical.clone()),
+            projects_root: Arc::new(None),
             events: events_tx,
             conflict: Arc::new(ConflictEngine::new()),
             artifacts: crate::artifact::ArtifactStore::new(
@@ -1019,6 +1489,13 @@ mod tests {
             .send(client_hello("terminal64-widget", "watch"))
             .await
             .unwrap();
+        watch
+            .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        recv_until_type(&mut watch, "pong", Duration::from_secs(3))
+            .await
+            .expect("watch hello should be processed before the request");
 
         for _ in 0..50 {
             if h.state.request_tx.receiver_count() >= 2 {
@@ -1030,10 +1507,24 @@ mod tests {
 
         // CLI sends a request.
         cli.send(tungstenite::Message::Text(
-            r#"{"type":"request","request_id":42,"op":"get","args":{"path":"Workspace"}}"#.into(),
+            r#"{"type":"request","request_id":42,"op":"get","args":{"path":"Workspace","source":"SECRET_SOURCE","value":"SECRET_VALUE","apiKey":"SECRET_KEY"}}"#.into(),
         ))
         .await
         .unwrap();
+
+        let started = recv_until_type(&mut watch, "command-activity", Duration::from_secs(3))
+            .await
+            .expect("watch should receive a sanitized started activity");
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["op"], "get");
+        assert_eq!(
+            started["detail"],
+            serde_json::json!({ "path": "Workspace" })
+        );
+        let started_text = started.to_string();
+        assert!(!started_text.contains("SECRET_SOURCE"));
+        assert!(!started_text.contains("SECRET_VALUE"));
+        assert!(!started_text.contains("SECRET_KEY"));
 
         // Plugin should receive the forwarded request.
         let forwarded = recv_until_type(&mut plugin, "request", Duration::from_secs(3))
@@ -1071,6 +1562,14 @@ mod tests {
         assert_eq!(got["request_id"], 42);
         assert_eq!(got["ok"], true);
         assert_eq!(got["value"]["class"], "Workspace");
+
+        let completed = recv_until_type(&mut watch, "command-activity", Duration::from_secs(3))
+            .await
+            .expect("watch should receive a completed activity");
+        assert_eq!(completed["activityId"], started["activityId"]);
+        assert_eq!(completed["phase"], "completed");
+        assert_eq!(completed["ok"], true);
+        assert!(completed["durationMs"].is_u64());
 
         // CLI should NOT see its own outgoing request echoed back (origin skip).
         let echoed = tokio::time::timeout(Duration::from_millis(200), async {
@@ -1247,6 +1746,138 @@ mod tests {
         assert!(h.state.pending_routes.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn requester_disconnect_publishes_sanitized_aborted_activity() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+        let (mut watch, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        watch.send(client_hello("widget", "watch")).await.unwrap();
+        watch
+            .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        recv_until_type(&mut watch, "pong", Duration::from_secs(3))
+            .await
+            .expect("watch hello should be processed");
+
+        let (mut cli, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        cli.send(client_hello("cli", "agent")).await.unwrap();
+        cli.send(tungstenite::Message::Text(
+            r#"{"type":"request","request_id":9,"op":"eval","args":{"source":"SECRET_SOURCE","value":"SECRET_VALUE"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let started = recv_until_type(&mut watch, "command-activity", Duration::from_secs(3))
+            .await
+            .expect("watch should receive started activity");
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["detail"]["sourceBytes"], 13);
+        assert!(!started.to_string().contains("SECRET_SOURCE"));
+
+        cli.close(None).await.unwrap();
+        let aborted = recv_until_type(&mut watch, "command-activity", Duration::from_secs(3))
+            .await
+            .expect("watch should receive aborted activity");
+        assert_eq!(aborted["activityId"], started["activityId"]);
+        assert_eq!(aborted["phase"], "aborted");
+        assert_eq!(aborted["ok"], false);
+        assert_eq!(aborted["error"], "Requester disconnected");
+        assert!(!aborted.to_string().contains("SECRET_SOURCE"));
+    }
+
+    #[test]
+    fn command_activity_sanitizer_never_copies_private_values_or_bulk_arrays() {
+        let args = serde_json::json!({
+            "path": "Workspace/Part",
+            "prop": "Color",
+            "value": { "token": "SECRET_VALUE" },
+            "source": "SECRET_SOURCE",
+            "apiKey": "SECRET_KEY",
+            "args": ["SECRET_ARG", 2, 3],
+        });
+        let set_detail = sanitized_command_detail("set", &args);
+        assert_eq!(
+            set_detail,
+            serde_json::json!({ "path": "Workspace/Part", "property": "Color" })
+        );
+        let call_detail = sanitized_command_detail("call", &args);
+        assert_eq!(call_detail["path"], "Workspace/Part");
+        assert_eq!(call_detail["argumentCount"], 3);
+        let serialized = format!("{set_detail}{call_detail}");
+        for secret in ["SECRET_VALUE", "SECRET_SOURCE", "SECRET_KEY", "SECRET_ARG"] {
+            assert!(!serialized.contains(secret));
+        }
+
+        let clipboard_copy = sanitized_command_detail(
+            "clipboard_copy",
+            &serde_json::json!({
+                "paths": ["Workspace/One", "ReplicatedStorage/Two"],
+                "lease": { "id": "SECRET_ARTIFACT", "token": "SECRET_TOKEN" },
+            }),
+        );
+        assert_eq!(
+            clipboard_copy,
+            serde_json::json!({ "itemCount": 2, "selectionMode": "paths" })
+        );
+        let clipboard_paste = sanitized_command_detail(
+            "clipboard_paste",
+            &serde_json::json!({
+                "artifactId": "SECRET_ARTIFACT",
+                "sha256": "SECRET_SHA",
+                "parent": "Workspace/Imported",
+                "byteLength": 4096,
+                "roots": [
+                    { "name": "SECRET_ROOT_ONE" },
+                    { "name": "SECRET_ROOT_TWO" }
+                ],
+            }),
+        );
+        assert_eq!(
+            clipboard_paste,
+            serde_json::json!({
+                "parent": "Workspace/Imported",
+                "itemCount": 2,
+                "byteLength": 4096,
+            })
+        );
+        let clipboard_serialized = format!("{clipboard_copy}{clipboard_paste}");
+        for secret in [
+            "SECRET_ARTIFACT",
+            "SECRET_TOKEN",
+            "SECRET_SHA",
+            "SECRET_ROOT_ONE",
+            "SECRET_ROOT_TWO",
+        ] {
+            assert!(!clipboard_serialized.contains(secret));
+        }
+
+        for op in [
+            "ping",
+            "capture_read",
+            "photo_close",
+            "transmit_read",
+            "playtest_run_poll",
+            "playtest_wait",
+            "playtest_status",
+        ] {
+            assert!(!should_publish_command_activity(op));
+        }
+        assert!(should_publish_command_activity("set"));
+    }
+
+    #[test]
+    fn command_activity_ids_are_scoped_to_the_daemon_boot() {
+        let first = command_activity_id("boot-a", 7);
+        let repeated = command_activity_id("boot-a", 7);
+        let restarted = command_activity_id("boot-b", 7);
+        assert_eq!(first, repeated);
+        assert_ne!(first, restarted);
+        assert!(first.starts_with("request:"));
+        assert!(first.ends_with(":7"));
+        assert!(!first.contains("boot-a"));
+    }
+
     /// End-to-end test using the `remote::request` client against a real
     /// daemon-shaped server, with a fake plugin client that echoes a canned
     /// response. Proves the CLI's reader threads the right request_id
@@ -1327,6 +1958,13 @@ mod tests {
             .send(client_hello("terminal64-widget", "watch"))
             .await
             .unwrap();
+        watch
+            .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        recv_until_type(&mut watch, "pong", Duration::from_secs(3))
+            .await
+            .expect("watch hello should be processed before the sync event");
 
         // `connect_async` returns as soon as the HTTP 101 upgrade completes,
         // but axum's `on_upgrade` callback (which subscribes to the
@@ -1363,11 +2001,21 @@ mod tests {
             .await
             .expect("should receive op frame");
         assert_eq!(got["type"], "op");
+        let activity = recv_until_type(&mut watch, "sync-activity", Duration::from_secs(3))
+            .await
+            .expect("watch peers should receive sanitized sync activity");
+        assert_eq!(activity["op"], "set");
+        assert_eq!(activity["path"], "Workspace");
+        assert_eq!(activity["class"], "Script");
+        assert_eq!(activity["name"], "Hello");
+        let activity_text = activity.to_string();
+        assert!(!activity_text.contains("Source"));
+        assert!(!activity_text.contains("print('hi')"));
         assert!(
             recv_until_type(&mut watch, "op", Duration::from_millis(200))
                 .await
                 .is_none(),
-            "watch peers must never receive filesystem operation payloads"
+            "watch peers must never receive the source-bearing plugin operation"
         );
         // Plugin-shape set op with path segments.
         assert_eq!(got["op"]["op"], "set");

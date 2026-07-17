@@ -3,6 +3,7 @@
 //! subsequent ones; fields are only overwritten by explicit CLI args.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -15,8 +16,20 @@ pub const CONFIG_VERSION: u32 = 1;
 pub struct ProjectConfig {
     #[serde(default)]
     pub name: String,
+    #[serde(rename = "gameName", default, skip_serializing_if = "Option::is_none")]
+    pub game_name: Option<String>,
     #[serde(rename = "gameId", default)]
     pub game_id: Option<String>,
+    #[serde(rename = "placeName", default, skip_serializing_if = "Option::is_none")]
+    pub place_name: Option<String>,
+    #[serde(
+        rename = "creatorType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub creator_type: Option<String>,
+    #[serde(rename = "creatorId", default, skip_serializing_if = "Option::is_none")]
+    pub creator_id: Option<String>,
     #[serde(rename = "groupId", default)]
     pub group_id: Option<String>,
     #[serde(rename = "placeIds", default)]
@@ -33,6 +46,10 @@ pub struct ProjectConfig {
     pub wally_file: Option<String>,
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Preserve desktop/user settings that this daemon version does not know
+    /// about when project initialization merges newly discovered metadata.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_version() -> u32 {
@@ -52,13 +69,18 @@ impl ProjectConfig {
             .unwrap_or_else(|| "project".to_string());
         ProjectConfig {
             name,
+            game_name: None,
             game_id: None,
+            place_name: None,
+            creator_type: None,
+            creator_id: None,
             group_id: None,
             place_ids: Vec::new(),
             wally_enabled: false,
             wally_folder: None,
             wally_file: None,
             version: CONFIG_VERSION,
+            extra: BTreeMap::new(),
         }
     }
 }
