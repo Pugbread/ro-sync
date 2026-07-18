@@ -1,12 +1,45 @@
 use sha2::{Digest as _, Sha256};
 use std::io::Read as _;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 fn project_key(project: &std::path::Path) -> String {
     let mut digest = Sha256::new();
     digest.update(project.to_string_lossy().as_bytes());
     format!("{:x}", digest.finalize())
+}
+
+fn wait_for_lifecycle_probe(child: &mut std::process::Child, accepted: &Receiver<()>) {
+    // Process creation can take more than two seconds on a cold Windows CI
+    // worker. Wait for the actual TCP probe while still detecting an early
+    // child exit, rather than guessing when startup should have completed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lifecycle process did not reach the blocked hello probe within ten seconds");
+        }
+
+        match accepted.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(()) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("hanging hello server exited before accepting the lifecycle probe");
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .expect("poll lifecycle process during startup")
+        {
+            panic!("lifecycle process exited before its blocked hello probe: {status}");
+        }
+    }
 }
 
 #[test]
@@ -70,9 +103,7 @@ fn closing_parent_stdin_terminates_a_blocked_lifecycle_process() {
         .expect("spawn lifecycle process");
     let parent_stdin = child.stdin.take().expect("piped lifecycle stdin");
 
-    accepted_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("lifecycle process should reach the blocked hello probe");
+    wait_for_lifecycle_probe(&mut child, &accepted_rx);
     let disconnected_at = Instant::now();
     drop(parent_stdin);
 

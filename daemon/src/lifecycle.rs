@@ -471,15 +471,18 @@ mod tests {
     fn start_lock_recovers_from_a_stale_unlocked_file() {
         let temporary = tempfile::tempdir().unwrap();
         let lock_path = temporary.path().join("daemon.start.lock");
-        fs::write(&lock_path, "pid=999999\nacquiredAt=1\n").unwrap();
+        let stale_contents = format!("pid=999999\nacquiredAt=1\nstale={}\n", "x".repeat(256));
+        fs::write(&lock_path, &stale_contents).unwrap();
 
         let lock = StartLock::acquire(&lock_path).unwrap();
+        assert!(lock._file.metadata().unwrap().len() < stale_contents.len() as u64);
         // Windows file locks are mandatory: a second handle cannot read a
         // range held by this exclusive lock, even from the same process.
         // Release the guard before inspecting the persisted diagnostics.
         drop(lock);
         let contents = fs::read_to_string(&lock_path).unwrap();
         assert!(contents.contains(&format!("pid={}", std::process::id())));
+        assert!(!contents.contains("stale="));
     }
 
     #[cfg(unix)]

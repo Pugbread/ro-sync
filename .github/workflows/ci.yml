@@ -333,6 +333,10 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      - name: Prepare desktop native-host resources
+        working-directory: desktop
+        run: npm run sync
+
       - name: Test desktop native host
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
 

@@ -304,6 +304,10 @@ jobs:
             fs.appendFileSync(process.env.GITHUB_ENV, `ROSYNC_DESKTOP_VERSION=${version}\n`);
           '
 
+      - name: Prepare desktop native-host resources
+        working-directory: desktop
+        run: npm run sync
+
       - name: Test desktop native host
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
 
