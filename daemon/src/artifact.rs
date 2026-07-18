@@ -1770,7 +1770,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(3));
 
         let mut threads = Vec::new();
-        for byte in [b'a', b'b'] {
+        for byte in *b"ab" {
             let store = store.clone();
             let lease = lease.clone();
             let barrier = barrier.clone();

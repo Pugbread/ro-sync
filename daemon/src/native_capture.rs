@@ -627,7 +627,7 @@ pub async fn capture_studio_window(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = request;
-        return Err("native Studio window capture is only available on macOS".into());
+        Err("native Studio window capture is only available on macOS".into())
     }
 
     #[cfg(target_os = "macos")]
