@@ -207,13 +207,13 @@ jobs:
           workspaces: desktop/src-tauri -> target
 
       - name: Download same-commit daemon sidecar
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.sidecar_artifact }}
           path: .release-input/daemon
 
       - name: Download same-commit Studio plugin
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: RoSyncPlugin.rbxm
           path: .release-input/plugin
@@ -438,7 +438,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
