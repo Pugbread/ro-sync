@@ -1,0 +1,4 @@
+# Keep text resources byte-for-byte deterministic on every development and CI host.
+# In particular, Rust include_str!/include_bytes! snapshots must not be rewritten
+# to CRLF by Git for Windows before compilation.
+* text=auto eol=lf

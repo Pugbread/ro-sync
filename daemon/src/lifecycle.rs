@@ -474,9 +474,12 @@ mod tests {
         fs::write(&lock_path, "pid=999999\nacquiredAt=1\n").unwrap();
 
         let lock = StartLock::acquire(&lock_path).unwrap();
+        // Windows file locks are mandatory: a second handle cannot read a
+        // range held by this exclusive lock, even from the same process.
+        // Release the guard before inspecting the persisted diagnostics.
+        drop(lock);
         let contents = fs::read_to_string(&lock_path).unwrap();
         assert!(contents.contains(&format!("pid={}", std::process::id())));
-        drop(lock);
     }
 
     #[cfg(unix)]
