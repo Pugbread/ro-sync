@@ -10,6 +10,15 @@ fn project_key(project: &std::path::Path) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn take_child_stderr(child: &mut std::process::Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut text = String::new();
+    let _ = stderr.read_to_string(&mut text);
+    text
+}
+
 fn wait_for_lifecycle_probe(child: &mut std::process::Child, accepted: &Receiver<()>) {
     // Process creation can take more than two seconds on a cold Windows CI
     // worker. Wait for the actual TCP probe while still detecting an early
@@ -20,7 +29,10 @@ fn wait_for_lifecycle_probe(child: &mut std::process::Child, accepted: &Receiver
         if remaining.is_zero() {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("lifecycle process did not reach the blocked hello probe within ten seconds");
+            let stderr = take_child_stderr(child);
+            panic!(
+                "lifecycle process did not reach the blocked hello probe within ten seconds; stderr: {stderr}"
+            );
         }
 
         match accepted.recv_timeout(remaining.min(Duration::from_millis(100))) {
@@ -28,7 +40,10 @@ fn wait_for_lifecycle_probe(child: &mut std::process::Child, accepted: &Receiver
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("hanging hello server exited before accepting the lifecycle probe");
+                let stderr = take_child_stderr(child);
+                panic!(
+                    "hanging hello server exited before accepting the lifecycle probe; stderr: {stderr}"
+                );
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -37,9 +52,50 @@ fn wait_for_lifecycle_probe(child: &mut std::process::Child, accepted: &Receiver
             .try_wait()
             .expect("poll lifecycle process during startup")
         {
-            panic!("lifecycle process exited before its blocked hello probe: {status}");
+            let stderr = take_child_stderr(child);
+            panic!(
+                "lifecycle process exited before its blocked hello probe: {status}; stderr: {stderr}"
+            );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_status_survives_a_one_mib_process_stack() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let project = temporary.path().join("project");
+    let state_dir = temporary.path().join("state");
+    std::fs::create_dir(&project).expect("project directory");
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "ulimit -s 1024 && exec \"$@\"", "rosync-stack-test"])
+        .arg(env!("CARGO_BIN_EXE_rosync"))
+        .args([
+            "daemon",
+            "status",
+            "--project",
+            project.to_str().expect("UTF-8 project path"),
+            "--data-dir",
+            state_dir.to_str().expect("UTF-8 state path"),
+            "--raw",
+        ])
+        .stdin(Stdio::null());
+    // Match the default Windows executable stack that exposed the regression.
+    // The CLI coordinator must stay within it and run the command future on
+    // the explicitly sized worker stack.
+
+    let output = command.output().expect("run daemon status");
+    assert!(
+        output.status.success(),
+        "daemon status failed with {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("daemon status JSON");
+    assert_eq!(status.get("running"), Some(&serde_json::Value::Bool(false)));
 }
 
 #[test]
@@ -98,7 +154,7 @@ fn closing_parent_stdin_terminates_a_blocked_lifecycle_process() {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn lifecycle process");
     let parent_stdin = child.stdin.take().expect("piped lifecycle stdin");
@@ -120,7 +176,8 @@ fn closing_parent_stdin_terminates_a_blocked_lifecycle_process() {
         std::thread::sleep(Duration::from_millis(10));
     };
 
-    assert_eq!(status.code(), Some(1));
+    let stderr = take_child_stderr(&mut child);
+    assert_eq!(status.code(), Some(1), "lifecycle stderr: {stderr}");
     assert!(
         disconnected_at.elapsed() < Duration::from_secs(1),
         "parent EOF termination should be prompt"

@@ -2814,14 +2814,55 @@ fn canonicalize_project_path(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run_cli().await {
-        if let Some(exit) = error.downcast_ref::<playtest_run::PlaytestRunExit>() {
-            std::process::exit(exit.code());
+const CLI_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() {
+    // Windows executables default to a 1 MiB main-thread stack. Clap's command
+    // graph plus the top-level CLI future can exceed that before lifecycle
+    // commands have a chance to arm their parent-stdin lease. Poll the future
+    // on an explicitly sized stack instead of relying on platform linker
+    // defaults; the coordinator thread does nothing but join it.
+    let worker = std::thread::Builder::new()
+        .name("rosync-cli".to_string())
+        .stack_size(CLI_WORKER_STACK_SIZE)
+        .spawn(run_cli_worker)
+        .unwrap_or_else(|error| {
+            eprintln!("Error: spawn CLI worker: {error}");
+            std::process::exit(1);
+        });
+    match worker.join() {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run_cli_worker() -> i32 {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Error: initialize async runtime: {error}");
+            return 1;
         }
-        eprintln!("Error: {error}");
-        std::process::exit(1);
+    };
+    match runtime.block_on(run_cli()) {
+        Ok(()) => 0,
+        Err(error) => {
+            let code = if let Some(exit) = error.downcast_ref::<playtest_run::PlaytestRunExit>() {
+                exit.code()
+            } else {
+                eprintln!("Error: {error}");
+                1
+            };
+            // The old `#[tokio::main]` entrypoint exited the process directly
+            // on errors. Avoid making the coordinator wait indefinitely for a
+            // spawned blocking task before it can preserve that exit code.
+            runtime.shutdown_background();
+            code
+        }
     }
 }
 
