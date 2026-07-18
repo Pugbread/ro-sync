@@ -4,8 +4,12 @@ mod project_broker;
 mod resources;
 mod secrets;
 mod storage;
+mod updater;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use resources::AppPaths;
 use tauri::Manager;
@@ -17,6 +21,8 @@ pub(crate) struct AppState {
     lifecycle_children: daemon::LifecycleChildren,
     managed_daemons: daemon::ManagedDaemonClaims,
     project_broker: project_broker::ProjectInitBroker,
+    update_install_lock: tokio::sync::Mutex<()>,
+    exit_cleanup_started: AtomicBool,
 }
 
 impl AppState {
@@ -29,17 +35,35 @@ impl AppState {
             lifecycle_children: daemon::LifecycleChildren::default(),
             managed_daemons: daemon::ManagedDaemonClaims::default(),
             project_broker,
+            update_install_lock: tokio::sync::Mutex::new(()),
+            exit_cleanup_started: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn cleanup_runtime_once(&self) {
+        if self.exit_cleanup_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.managed_daemons.mark_exiting();
+        self.project_broker.stop();
+        self.lifecycle_children.terminate_all();
+        self.managed_daemons.terminate();
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let updater_public_key = updater::embedded_public_key().unwrap_or_default();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(updater_public_key)
+                .build(),
+        )
         .setup(|app| {
             let paths = AppPaths::initialize(app.handle()).map_err(std::io::Error::other)?;
             app.manage(AppState::new(paths));
@@ -67,16 +91,14 @@ pub fn run() {
             daemon::daemon_stop,
             project_broker::project_broker_status,
             project_broker::project_init_drain,
+            updater::update_check,
+            updater::update_install,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Ro Sync desktop");
     app.run(|app, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            let state = app.state::<AppState>();
-            state.managed_daemons.mark_exiting();
-            state.project_broker.stop();
-            state.lifecycle_children.terminate_all();
-            state.managed_daemons.terminate();
+            app.state::<AppState>().cleanup_runtime_once();
         }
     });
 }

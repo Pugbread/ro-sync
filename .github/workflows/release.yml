@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  updater-smoke:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop signing tools
+        working-directory: desktop
+        run: npm ci
+      - name: Test updater trust and manifest pipeline with an ephemeral key
+        run: node scripts/smoke-updater-release.mjs
+
   build:
     strategy:
       fail-fast: false
@@ -142,7 +157,7 @@ jobs:
           path: plugin/Plugin.rbxm
 
   desktop:
-    needs: [build, plugin]
+    needs: [build, plugin, updater-smoke]
     strategy:
       fail-fast: false
       matrix:
@@ -292,16 +307,51 @@ jobs:
       - name: Test desktop native host
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
 
-      - name: Build unsigned desktop installers
+      - name: Build desktop installers and signed updater artifacts
         working-directory: desktop
         shell: bash
+        env:
+          ROSYNC_UPDATER_PUBLIC_KEY: ${{ vars.ROSYNC_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          npm run build -- \
-            --target "${{ matrix.target }}" \
-            --ci \
-            --no-sign \
-            --config "{\"version\":\"$ROSYNC_DESKTOP_VERSION\"}"
+          config="$RUNNER_TEMP/ro-sync-release-config.json"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test -n "$ROSYNC_UPDATER_PUBLIC_KEY" || {
+              echo "ROSYNC_UPDATER_PUBLIC_KEY repository variable is required for tagged releases" >&2
+              exit 1
+            }
+            test -n "$TAURI_SIGNING_PRIVATE_KEY" || {
+              echo "TAURI_SIGNING_PRIVATE_KEY repository secret is required for tagged releases" >&2
+              exit 1
+            }
+            node ../scripts/check-updater-key-pin.mjs verify
+            node -e '
+              const fs = require("node:fs");
+              fs.writeFileSync(process.argv[1], JSON.stringify({
+                version: process.env.ROSYNC_DESKTOP_VERSION,
+                bundle: { createUpdaterArtifacts: true },
+                plugins: { updater: { pubkey: process.env.ROSYNC_UPDATER_PUBLIC_KEY } },
+              }));
+            ' "$config"
+          else
+            node -e '
+              require("node:fs").writeFileSync(
+                process.argv[1],
+                JSON.stringify({ version: process.env.ROSYNC_DESKTOP_VERSION }),
+              );
+            ' "$config"
+          fi
+          build_args=(
+            --target "${{ matrix.target }}"
+            --ci
+            --config "$config"
+          )
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            build_args+=(--no-sign)
+          fi
+          npm run build -- "${build_args[@]}"
 
       - name: Stage desktop release assets
         shell: bash
@@ -319,13 +369,29 @@ jobs:
             installer="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
             test -n "$installer"
             cp "$installer" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-macos-arm64.dmg"
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              updater="$(find "$bundle_root/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+              test -n "$updater"
+              test -f "$updater.sig"
+              updater_asset="$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-macos-arm64.app.tar.gz"
+              cp "$updater" "$updater_asset"
+              cp "$updater.sig" "$updater_asset.sig"
+            fi
           else
             msi="$(find "$bundle_root/msi" -maxdepth 1 -type f -name '*.msi' -print -quit)"
             setup="$(find "$bundle_root/nsis" -maxdepth 1 -type f -name '*-setup.exe' -print -quit)"
             test -n "$msi"
             test -n "$setup"
-            cp "$msi" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64.msi"
-            cp "$setup" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64-setup.exe"
+            msi_asset="$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64.msi"
+            setup_asset="$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64-setup.exe"
+            cp "$msi" "$msi_asset"
+            cp "$setup" "$setup_asset"
+            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+              test -f "$msi.sig"
+              test -f "$setup.sig"
+              cp "$msi.sig" "$msi_asset.sig"
+              cp "$setup.sig" "$setup_asset.sig"
+            fi
           fi
 
           node -e '
@@ -371,6 +437,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -393,13 +460,21 @@ jobs:
           desktop_manifests=(Ro-Sync-*.manifest.json)
           desktop_checksums=(Ro-Sync-*.sha256)
           mac_installers=(Ro-Sync-*-macos-arm64.dmg)
+          mac_updaters=(Ro-Sync-*-macos-arm64.app.tar.gz)
+          mac_updater_signatures=(Ro-Sync-*-macos-arm64.app.tar.gz.sig)
           windows_msis=(Ro-Sync-*-windows-x64.msi)
           windows_setups=(Ro-Sync-*-windows-x64-setup.exe)
+          windows_msi_updater_signatures=(Ro-Sync-*-windows-x64.msi.sig)
+          windows_nsis_updater_signatures=(Ro-Sync-*-windows-x64-setup.exe.sig)
           test "${#desktop_manifests[@]}" -eq 2
-          test "${#desktop_checksums[@]}" -eq 5
+          test "${#desktop_checksums[@]}" -eq 9
           test "${#mac_installers[@]}" -eq 1
+          test "${#mac_updaters[@]}" -eq 1
+          test "${#mac_updater_signatures[@]}" -eq 1
           test "${#windows_msis[@]}" -eq 1
           test "${#windows_setups[@]}" -eq 1
+          test "${#windows_msi_updater_signatures[@]}" -eq 1
+          test "${#windows_nsis_updater_signatures[@]}" -eq 1
           sha256sum --check --strict -- Ro-Sync-*.sha256
           for manifest in "${desktop_manifests[@]}"; do
             jq -e --arg commit "$GITHUB_SHA" '
@@ -413,7 +488,47 @@ jobs:
               any(.prepared.resources[]; .path == "tools/luau-lsp/LICENSE.md")
             ' "$manifest"
           done
+      - name: Create signed updater manifest
+        shell: bash
+        env:
+          ROSYNC_UPDATER_PUBLIC_KEY: ${{ vars.ROSYNC_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mac_asset="Ro-Sync-$version-macos-arm64.app.tar.gz"
+          windows_msi_asset="Ro-Sync-$version-windows-x64.msi"
+          windows_nsis_asset="Ro-Sync-$version-windows-x64-setup.exe"
+          node scripts/check-updater-key-pin.mjs verify
+          node scripts/create-updater-manifest.mjs \
+            --version "$version" \
+            --tag "$GITHUB_REF_NAME" \
+            --asset-dir artifacts \
+            --mac-asset "$mac_asset" \
+            --windows-msi-asset "$windows_msi_asset" \
+            --windows-nsis-asset "$windows_nsis_asset" \
+            --output artifacts/latest.json
+          jq -e --arg version "$version" \
+            '.version == $version and (.platforms | keys | sort) == ["darwin-aarch64-app", "windows-x86_64-msi", "windows-x86_64-nsis"]' \
+            artifacts/latest.json
+      - name: Resolve GitHub release policy
+        id: release-policy
+        env:
+          ROSYNC_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import { updaterReleasePolicy } from "./scripts/create-updater-manifest.mjs";
+            const tag = process.env.ROSYNC_RELEASE_TAG || "";
+            if (!tag.startsWith("v")) throw new Error(`invalid release tag: ${tag}`);
+            const policy = updaterReleasePolicy(tag.slice(1));
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              `prerelease=${policy.prerelease}\nmake_latest=${policy.makeLatest}\n`,
+            );
+          '
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           generate_release_notes: true
+          prerelease: ${{ steps.release-policy.outputs.prerelease }}
+          make_latest: ${{ steps.release-policy.outputs.make_latest }}

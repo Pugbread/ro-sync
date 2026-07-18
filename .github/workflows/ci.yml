@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  updater-smoke:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop signing tools
+        working-directory: desktop
+        run: npm ci
+      - name: Test updater trust and manifest pipeline with an ephemeral key
+        run: node scripts/smoke-updater-release.mjs
+
   quality:
     runs-on: ubuntu-22.04
     steps:
@@ -158,6 +173,7 @@ jobs:
           node scripts/check-platform-commands.mjs
           node scripts/check-project-path-policy.mjs
           node scripts/check-project-init-policy.mjs
+          node scripts/check-plugin-reconnect-policy.mjs
           node scripts/check-activity-format.mjs
           node scripts/check-theme-policy.mjs
 

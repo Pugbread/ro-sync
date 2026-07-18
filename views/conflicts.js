@@ -43,28 +43,30 @@ export function mountConflicts(root, api) {
   let disposed = false;
   let loadSeq = 0;
 
-  function updateBadge(n) {
-    const badge = document.getElementById("conflicts-badge");
-    if (!badge) return;
-    if (n > 0) { badge.hidden = false; badge.textContent = String(n); }
-    else badge.hidden = true;
-  }
-
   async function load() {
     const seq = ++loadSeq;
     const base = api.getDaemonBase();
     const s = api.getState();
     const proj = (s.projects || []).find((p) => p.id === s.activeProjectId);
-    if (!base) { $count.textContent = "daemon offline"; return; }
+    if (!base) {
+      $count.textContent = "daemon offline";
+      if (proj) api.invalidateConflictCount?.(proj.id);
+      return;
+    }
     if (!proj) { $count.textContent = "no active project"; $list.innerHTML = ""; $empty.hidden = true; return; }
     try {
       const data = await daemonJson(base, "/resolve");
       if (disposed || seq !== loadSeq) return;
-      conflicts = Array.isArray(data) ? data : (data.conflicts || []);
+      const nextConflicts = Array.isArray(data)
+        ? data
+        : (Array.isArray(data?.conflicts) ? data.conflicts : null);
+      if (!nextConflicts) throw new Error("invalid conflict response");
+      conflicts = nextConflicts;
       render(seq);
     } catch (e) {
       if (disposed || seq !== loadSeq) return;
       $count.textContent = `error: ${e.message}`;
+      api.invalidateConflictCount?.(proj.id);
     }
   }
 
@@ -72,7 +74,9 @@ export function mountConflicts(root, api) {
     if (disposed || seq !== loadSeq) return;
     $list.innerHTML = "";
     $count.textContent = `${conflicts.length} conflict(s)`;
-    updateBadge(conflicts.length);
+    const s = api.getState();
+    const projectId = (s.projects || []).find((p) => p.id === s.activeProjectId)?.id;
+    if (projectId) api.reportConflictCount?.(projectId, conflicts.length);
     $empty.hidden = conflicts.length > 0;
     if (!conflicts.length) return;
 

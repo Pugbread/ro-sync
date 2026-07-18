@@ -175,6 +175,9 @@ const bridgeSource = fs.readFileSync(new URL("../bridge.js", import.meta.url), "
 const prepareSource = fs.readFileSync(new URL("../desktop/scripts/prepare.mjs", import.meta.url), "utf8");
 const tauriLibSource = fs.readFileSync(new URL("../desktop/src-tauri/src/lib.rs", import.meta.url), "utf8");
 const tauriDaemonSource = fs.readFileSync(new URL("../desktop/src-tauri/src/daemon.rs", import.meta.url), "utf8");
+const tauriConfig = JSON.parse(
+  fs.readFileSync(new URL("../desktop/src-tauri/tauri.conf.json", import.meta.url), "utf8"),
+);
 
 assert.match(
   appSource,
@@ -263,6 +266,16 @@ assert.match(
   /fn preferred_port_attempts[\s\S]*?Some\(port\) => vec!\[Some\(port\), None\]/,
   "Desktop must preserve a preferred listener first and fall back without evicting its owner",
 );
+assert.match(
+  tauriEnsureSource,
+  /preferred_port_collision\(&error, port\)[\s\S]*?continue;[\s\S]*?return if let Some\(preferred_error\)/,
+  "Desktop may retry without the preferred port only for an identified port collision",
+);
+assert.match(
+  tauriDaemonSource,
+  /fn preferred_port_collision[\s\S]*?already serving[\s\S]*?requested port[\s\S]*?serve: bind 127\.0\.0\.1/,
+  "preferred-port fallback must be restricted to explicit listener collision diagnostics",
+);
 assert.equal(
   tauriEnsureSource.includes('"--parent-stdin-lease"'),
   true,
@@ -346,6 +359,16 @@ const nativeListSource = tauriDaemonSource.slice(
   tauriDaemonSource.indexOf("pub(crate) fn mark_exiting"),
 );
 assert.equal(nativeListSource.includes("owner_token"), false, "daemon_list must never expose owner tokens");
+assert.match(
+  tauriDaemonSource,
+  /fn ensure_supervisor[\s\S]*?MANAGED_DAEMON_HEARTBEAT_INTERVAL[\s\S]*?heartbeat_exact_managed_daemon/,
+  "native Desktop ownership must supervise heartbeats independently of the renderer",
+);
+assert.match(
+  tauriDaemonSource,
+  /fn heartbeat_exact_managed_daemon[\s\S]*?GET", "\/hello"[\s\S]*?managedBy[\s\S]*?claim\.boot_id[\s\S]*?"\/manager-heartbeat"/,
+  "native heartbeats must revalidate the exact Desktop daemon before using its capability",
+);
 
 const healthSource = appSource.slice(
   appSource.indexOf("async function healthTickDesktop"),
@@ -362,8 +385,28 @@ const closeSource = appSource.slice(
 );
 assert.match(
   closeSource,
-  /Object\.values\(app\.state\.daemonSessions \|\| \{\}\)[\s\S]*?pendingDesktopOwnershipByProject\.values\(\)[\s\S]*?for \(const \[base, token\] of closeTargets\)/,
-  "renderer close beacons must cover all committed and pending project sessions",
+  /if \(IS_DESKTOP_HOST\) return;[\s\S]*?"\/widget-close"/,
+  "Desktop renderer teardown must defer daemon cleanup to native RunEvent::Exit",
+);
+assert.equal(closeSource.includes("/manager-close"), false, "renderer teardown must never stop Desktop daemons");
+assert.match(
+  appSource,
+  /if \(!IS_DESKTOP_HOST\) \{[\s\S]*?addEventListener\("pagehide"[\s\S]*?addEventListener\("beforeunload"/,
+  "page lifecycle close handlers must remain Terminal 64-only",
+);
+const ensureDesktopSource = appSource.slice(
+  appSource.indexOf("async function ensureDesktopDaemon"),
+  appSource.indexOf("async function ensureDaemonInner"),
+);
+assert.match(
+  ensureDesktopSource,
+  /await setDesktopDaemonSession\(projectId,[\s\S]*?emit\("daemon:up"/,
+  "Desktop must durably persist an exact daemon session before announcing it as up",
+);
+assert.equal(
+  tauriConfig.app.windows[0].backgroundThrottling,
+  "disabled",
+  "Desktop WebView background throttling must be disabled as a renderer liveness mitigation",
 );
 
 const tauriStatusSource = tauriDaemonSource.slice(

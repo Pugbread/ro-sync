@@ -2896,11 +2896,25 @@ local wsGeneration = 0
 local decisionGeneration = 0
 local connectedPort: string? = nil
 local ws: any = nil
--- Short-lived daemon-issued proof that this Studio plugin completed the local
--- HTTP hello. Never persist or log it; a fresh daemon process issues a new one.
-local pluginCapability: string? = nil
+-- Desired connection state and recovery helpers share one table to keep this
+-- already-large top-level chunk comfortably below Luau's 200-register limit.
+-- `desired` stays true across transport/daemon restarts; only an explicit user
+-- cancel, plugin unload, or non-retryable protocol rejection turns it off.
+local reconnectState = {
+	desired = false,
+	compareRetryPending = false,
+	discoverDaemon = nil,
+	-- Short-lived proof from /hello. Never persist or log it; every fresh
+	-- daemon process issues a new capability.
+	pluginCapability = nil,
+	-- Capability against which the most recent full initial comparison ran.
+	-- A different value at WebSocket time means the daemon changed between
+	-- snapshot reconciliation and live transport authentication.
+	comparedCapability = nil,
+}
 -- Forward-declared so wsLoop (below) can re-enter the initial-sync handshake
--- after a `lagged` message. The real function assignment happens further down.
+-- after any established transport gap. The real function assignment happens
+-- further down.
 local runInitialCompare: () -> ()
 
 -- Strip NULs and replace invalid UTF-8 bytes with the Unicode replacement
@@ -8997,40 +9011,182 @@ end
 
 local applyWallyConfig
 
+reconnectState.stopTerminal = function(reason)
+	local message = tostring(reason or "connection rejected")
+	reconnectState.desired = false
+	reconnectState.compareRetryPending = false
+	connected = false
+	busy = false
+	wsGeneration += 1
+	decisionGeneration += 1
+	disconnectHooks()
+	reconnectState.pluginCapability = nil
+	reconnectState.comparedCapability = nil
+	if ws then
+		local toClose = ws
+		ws = nil
+		pcall(function()
+			toClose:Close()
+		end)
+	end
+	setPill("error", "update Ro Sync")
+	if message:lower():find("protocol", 1, true) then
+		setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
+	else
+		setBanner("Ro Sync connection rejected: " .. message)
+	end
+	log("ws: terminal rejection — " .. message)
+end
+
+-- A daemon restart rotates the process-scoped plugin capability. Refresh it
+-- immediately before every WebSocket attempt, and rediscover the matching
+-- project daemon when Desktop had to move it to another port.
+reconnectState.refreshHello = function()
+	local function readHello(candidateUrl)
+		if type(candidateUrl) ~= "string" or candidateUrl == "" then
+			return nil, "daemon URL is missing"
+		end
+		local ok, response = httpRequestTo(candidateUrl:gsub("/+$", "") .. "/hello", "GET")
+		if not ok then
+			return nil, tostring(response)
+		end
+		if not response.Success then
+			return nil,
+				string.format("HTTP %s %s", tostring(response.StatusCode), tostring(response.StatusMessage or ""))
+		end
+		local decoded = nil
+		local decodeOk = pcall(function()
+			decoded = HttpService:JSONDecode(response.Body or "")
+		end)
+		if not decodeOk or type(decoded) ~= "table" then
+			return nil, "daemon hello was malformed"
+		end
+		return decoded, nil
+	end
+
+	local expectedGameId = tostring(game.GameId)
+	local candidateUrl = tostring(baseUrl or ""):gsub("/+$", "")
+	local candidatePort = connectedPort
+	local hello, helloError = readHello(candidateUrl)
+	if hello ~= nil and expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
+		hello = nil
+		helloError = "daemon now belongs to a different GameId"
+	end
+
+	if hello == nil and type(reconnectState.discoverDaemon) == "function" and expectedGameId ~= "0" then
+		local discovered = reconnectState.discoverDaemon(expectedGameId, true, false)
+		if type(discovered) == "table" and discovered.found == true then
+			candidateUrl = tostring(discovered.url or ""):gsub("/+$", "")
+			candidatePort = tostring(discovered.port or candidatePort or "?")
+			hello, helloError = readHello(candidateUrl)
+		end
+	end
+
+	if hello == nil then
+		return false, "daemon hello unavailable: " .. tostring(helloError or "not found"), false
+	end
+	if expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
+		return false, "daemon hello changed to a different GameId during discovery", false
+	end
+	local protocol = tonumber(hello.pluginProtocol)
+	if protocol ~= PLUGIN_PROTOCOL_VERSION then
+		return false,
+			string.format(
+				"daemon protocol %s is incompatible; expected %d",
+				tostring(protocol or "missing"),
+				PLUGIN_PROTOCOL_VERSION
+			),
+			true
+	end
+	local capability = hello.pluginCapability
+	if type(capability) ~= "string" or #capability ~= 64 or not capability:match("^[0-9a-fA-F]+$") then
+		return false, "daemon hello omitted a valid plugin capability", false
+	end
+
+	baseUrl = candidateUrl
+	connectedPort = candidatePort or candidateUrl:match(":(%d+)$") or "?"
+	reconnectState.pluginCapability = capability
+	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
+	if ui and ui.setProjectName and type(hello.name) == "string" and hello.name ~= "" then
+		ui.setProjectName(hello.name)
+	end
+	return true, nil, false
+end
+
 local function wsLoop(gen)
 	local clientId = tostring(game.GameId)
 	while connected and gen == wsGeneration do
-		if
-			type(pluginCapability) ~= "string"
-			or #pluginCapability ~= 64
-			or not pluginCapability:match("^[0-9a-fA-F]+$")
-		then
-			log("ws: missing or malformed plugin capability; reconnect through daemon hello")
-			connected = false
-			break
+		local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
+		if not reconnectState.desired or not connected or gen ~= wsGeneration then
+			return
 		end
-		local url = toWsUrl(baseUrl)
-		log("ws: connecting to " .. url)
+		if not helloOk and terminalHelloError then
+			reconnectState.stopTerminal(helloError)
+			return
+		end
+		local recoveryContext = "WebSocket transport unavailable after initial comparison"
+		if helloOk and reconnectState.comparedCapability ~= reconnectState.pluginCapability then
+			helloOk = false
+			helloError = "daemon identity changed after initial comparison"
+			recoveryContext = helloError
+		end
 		local client
+		local createOk = false
+		local createErr = helloError
 		-- CreateWebStreamClient takes a CONFIG TABLE, not a bare URL string.
 		-- Roblox rejects arg 2 with "unable to cast string to dictionary" if a
 		-- string is passed. The documented field is `Url`.
-		local createOk, createErr = pcall(function()
-			client = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
-		end)
-		local needResyncAfter = false
+		if helloOk then
+			local url = toWsUrl(baseUrl)
+			log("ws: connecting to " .. url)
+			createOk, createErr = pcall(function()
+				client = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
+			end)
+		else
+			log("ws: " .. tostring(helloError))
+			setPill("connecting")
+		end
+		-- Hooks are already live after /initial-compare. Any failed or rejected
+		-- transport attempt can therefore straddle unseen filesystem events, even
+		-- when the daemon never acknowledged our hello. Fail closed into another
+		-- full comparison instead of reconnecting this socket in place.
+		local needResyncAfter = true
 		if not createOk or not client then
 			log("ws: create err: " .. tostring(createErr))
+			setPill("connecting")
 		else
-			ws = client
 			local closed = false
-			local lagged = false
+			local accepted = false
+			local terminalReason = nil
 			local lastPongClock = os.clock()
 			local conns: { RBXScriptConnection } = {}
+			local function acceptTransport()
+				if accepted or not reconnectState.desired or not connected or gen ~= wsGeneration then
+					if not reconnectState.desired or not connected or gen ~= wsGeneration then
+						pcall(function()
+							client:Close()
+						end)
+					end
+					return
+				end
+				accepted = true
+				ws = client
+				wsBackoff = WS_BACKOFF_START
+				setPill("connected", tostring(connectedPort or "?"))
+				setBanner(nil)
+				log("ws: authenticated — live sync resumed")
+				schedulePushRetry(0)
+			end
 
 			table.insert(
 				conns,
 				client.MessageReceived:Connect(function(payload)
+					if not reconnectState.desired or not connected or gen ~= wsGeneration then
+						pcall(function()
+							client:Close()
+						end)
+						return
+					end
 					local msg = parseWsPayload(payload)
 					if not msg then
 						return
@@ -9040,6 +9196,16 @@ local function wsLoop(gen)
 					-- so we don't need to see a pong specifically.
 					lastPongClock = os.clock()
 					local kind = tostring(msg.type or "")
+					if
+						kind == "op"
+						or kind == "lagged"
+						or kind == "pong"
+						or kind == "ping"
+						or kind == "push-result"
+						or kind == "request"
+					then
+						acceptTransport()
+					end
 					if kind == "op" then
 						-- Daemon wraps the op under msg.op (nested, per Agent 1).
 						if type(msg.op) == "table" then
@@ -9056,18 +9222,28 @@ local function wsLoop(gen)
 						end
 					elseif kind == "lagged" then
 						log("ws: daemon broadcast lagged — will resync via /initial-compare")
-						lagged = true
+						recoveryContext = "daemon broadcast lagged"
 						pcall(function()
 							client:Close()
 						end)
 					elseif kind == "shutdown" then
-						log("ws: daemon shutdown — " .. tostring(msg.reason or "?"))
-						connected = false
-						busy = false
-						wsGeneration += 1
-						disconnectHooks()
-						setPill("idle")
-						setBanner(nil)
+						local reason = tostring(msg.reason or "daemon requested reconnect")
+						local retryable = msg.retryable
+						recoveryContext = "daemon rejected WebSocket: " .. tostring(msg.code or reason)
+						local lowered = reason:lower()
+						if
+							retryable == false
+							or (lowered:find("incompatible", 1, true) and lowered:find("protocol", 1, true))
+						then
+							terminalReason = reason
+						end
+						log(
+							string.format(
+								"ws: daemon shutdown%s — %s",
+								msg.code and " [" .. tostring(msg.code) .. "]" or "",
+								reason
+							)
+						)
 						pcall(function()
 							client:Close()
 						end)
@@ -9114,18 +9290,26 @@ local function wsLoop(gen)
 				end)
 			)
 
-			-- Announce ourselves. If the initial Send fails outright, bail and
-			-- let the outer backoff loop retry.
+			-- Announce ourselves. If the initial Send fails outright, the common
+			-- recovery path below re-runs the full comparison with backoff.
 			local helloOk = wsSend(client, {
 				type = "hello",
 				clientId = clientId,
 				role = "plugin",
 				protocol = PLUGIN_PROTOCOL_VERSION,
-				pluginCapability = pluginCapability,
+				pluginCapability = reconnectState.pluginCapability,
 			})
 			if helloOk then
-				wsBackoff = WS_BACKOFF_START
 				lastPongClock = os.clock()
+				-- A pong is the daemon's acknowledgement that it accepted our
+				-- authenticated hello. Keep `ws` unpublished until then so queued
+				-- filesystem pushes cannot race ahead of authentication.
+				if not wsSend(client, { type = "ping" }) then
+					closed = true
+					pcall(function()
+						client:Close()
+					end)
+				end
 				local lastPing = os.clock()
 				while connected and gen == wsGeneration and not closed do
 					task.wait(1)
@@ -9160,8 +9344,12 @@ local function wsLoop(gen)
 			if ws == client then
 				ws = nil
 			end
-			if lagged then
-				needResyncAfter = true
+			if terminalReason ~= nil then
+				reconnectState.stopTerminal(terminalReason)
+				return
+			end
+			if accepted and recoveryContext == "WebSocket transport unavailable after initial comparison" then
+				recoveryContext = "authenticated WebSocket closed"
 			end
 		end
 
@@ -9172,42 +9360,74 @@ local function wsLoop(gen)
 		if needResyncAfter then
 			-- Tear down Studio hooks and re-enter the full initial-sync handshake.
 			-- Bumping wsGeneration ensures any other in-flight wsLoop iteration
-			-- exits, and setting connected=false means the subsequent
-			-- runInitialCompare -> startHooksAndWs path is responsible for
-			-- restoring the connected state.
-			log("ws: re-running /initial-compare after lag")
+			-- exits. Pending point ops are represented by the fresh Studio snapshot,
+			-- so discard them before a disk-win decision can accidentally replay one.
+			log("ws: transport gap — scheduling full /initial-compare")
 			disconnectHooks()
+			pendingOps = {}
+			pushPending = false
 			connected = false
+			busy = true
+			reconnectState.pluginCapability = nil
+			reconnectState.comparedCapability = nil
 			wsGeneration += 1
-			task.spawn(function()
-				busy = true
-				setPill("connecting")
-				runInitialCompare()
-			end)
+			setPill("connecting")
+			reconnectState.retryInitialCompare(recoveryContext)
 			return
-		end
-
-		local waitSec = wsBackoff
-		wsBackoff = math.min(wsBackoff * 2, WS_BACKOFF_MAX)
-		log(string.format("ws: reconnecting in %ds", waitSec))
-		local waited = 0
-		while waited < waitSec and connected and gen == wsGeneration do
-			task.wait(0.25)
-			waited += 0.25
 		end
 	end
 end
 
+reconnectState.retryInitialCompare = function(context)
+	if not reconnectState.desired then
+		busy = false
+		return
+	end
+	if reconnectState.compareRetryPending then
+		return
+	end
+	reconnectState.compareRetryPending = true
+	busy = true
+	setPill("connecting")
+	setBanner("Connection interrupted. Ro Sync is waiting for the matching daemon and will resync automatically.")
+	local generation = wsGeneration
+	local waitSec = wsBackoff
+	wsBackoff = math.min(wsBackoff * 2, WS_BACKOFF_MAX)
+	log(string.format("recovery: %s; retrying initial sync in %ds", tostring(context or "transport error"), waitSec))
+	task.delay(waitSec, function()
+		reconnectState.compareRetryPending = false
+		if not reconnectState.desired or generation ~= wsGeneration or not busy then
+			return
+		end
+		local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
+		if not reconnectState.desired or generation ~= wsGeneration or not busy then
+			return
+		end
+		if not helloOk then
+			if terminalHelloError then
+				reconnectState.stopTerminal(helloError)
+			else
+				reconnectState.retryInitialCompare(helloError)
+			end
+			return
+		end
+		runInitialCompare()
+	end)
+end
+
 local function startHooksAndWs()
+	if not reconnectState.desired or not busy then
+		return
+	end
 	installHooks()
+	reconnectState.compareRetryPending = false
 	connected = true
 	busy = false
 	wsGeneration += 1
-	wsBackoff = WS_BACKOFF_START
 	local gen = wsGeneration
-	setPill("connected", tostring(connectedPort or "?"))
-	setBanner(nil)
-	log("connected — watching " .. #WATCHED_SERVICES .. " services")
+	setPill("connecting")
+	setBanner("Initial sync complete. Authenticating the live Studio connection...")
+	log("initial sync complete — watching " .. #WATCHED_SERVICES .. " services; authenticating WebSocket")
 	task.spawn(function()
 		wsLoop(gen)
 	end)
@@ -9232,6 +9452,9 @@ local function doPushPath(strictStudio: boolean?)
 	local okCount, skipCount = 0, 0
 	local firstErr = nil
 	for _, svc in ipairs(services) do
+		if not reconnectState.desired or not busy then
+			return false
+		end
 		local svcName = (svc and svc.name) or "?"
 		local encOk, encErr = pcall(function()
 			return HttpService:JSONEncode(svc)
@@ -9247,6 +9470,9 @@ local function doPushPath(strictStudio: boolean?)
 				pluginProtocol = PLUGIN_PROTOCOL_VERSION,
 				services = { svc },
 			})
+			if not reconnectState.desired or not busy then
+				return false
+			end
 			if ok then
 				okCount += 1
 			else
@@ -9257,16 +9483,16 @@ local function doPushPath(strictStudio: boolean?)
 		end
 	end
 
-	if okCount == 0 then
+	if okCount == 0 or firstErr ~= nil then
 		setPill("error", "push failed")
 		log(
 			string.format(
-				"bootstrap failed: 0/%d services pushed (first err: %s)",
+				"bootstrap incomplete: %d/%d services pushed (first err: %s)",
+				okCount,
 				#services,
 				tostring(firstErr):sub(1, 200)
 			)
 		)
-		busy = false
 		return false
 	end
 
@@ -9278,10 +9504,12 @@ local function doPullPath(strictDisk: boolean?)
 	log("initial-compare → pull: applying disk snapshot to Studio")
 	local snapshotPath = strictDisk == true and "/snapshot?strict=true&forcePrune=true" or "/snapshot"
 	local ok, snap = httpJson(snapshotPath, "GET")
+	if not reconnectState.desired or not busy then
+		return false
+	end
 	if not ok then
 		log("snapshot err: " .. tostring(snap))
 		setPill("error", "snapshot failed")
-		busy = false
 		return false
 	end
 	applySnapshot(snap)
@@ -9295,6 +9523,8 @@ local projectInitCandidate: any = nil
 local connectionAttempt = 0
 
 local function disconnect(reason)
+	reconnectState.desired = false
+	reconnectState.compareRetryPending = false
 	connected = false
 	busy = false
 	wsGeneration += 1
@@ -9311,7 +9541,8 @@ local function disconnect(reason)
 	setPill("idle")
 	setBanner(nil)
 	connectedPort = nil
-	pluginCapability = nil
+	reconnectState.pluginCapability = nil
+	reconnectState.comparedCapability = nil
 	projectInitCandidate = nil
 	connectionAttempt += 1
 	if reason then
@@ -9334,6 +9565,16 @@ local function waitForDecision(choiceId, gen)
 		end
 		if not ok then
 			log("decision poll err: " .. tostring(resp))
+			local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
+			if gen ~= decisionGeneration or not busy then
+				return nil
+			end
+			if terminalHelloError then
+				reconnectState.stopTerminal(helloError)
+				return nil
+			elseif not helloOk then
+				log("decision recovery: " .. tostring(helloError))
+			end
 			task.wait(2)
 		elseif not resp.Success then
 			if resp.StatusCode == 408 or resp.StatusCode == 204 then
@@ -9391,26 +9632,40 @@ local function describeInitialComparison(comparison)
 end
 
 -- Assigned to the forward-declared local at the top of the HTTP helpers
--- section so wsLoop's lagged-resync path can reach it without a circular decl.
+-- section so wsLoop's transport-gap recovery can reach it without a circular
+-- declaration.
 runInitialCompare = function()
+	local compareGeneration = wsGeneration
+	local compareCapability = reconnectState.pluginCapability
+	local function completeInitialCompare()
+		if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+			return
+		end
+		reconnectState.comparedCapability = compareCapability
+		startHooksAndWs()
+	end
 	local studioStats = collectStudioStats()
 	local studioSnapshot = collectSnapshot()
+	if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+		return
+	end
 	log("initial-compare: comparing synced paths")
 	local ok, resp = httpJson("/initial-compare", "POST", {
 		studioStats = studioStats,
 		studioSnapshot = studioSnapshot,
 		pluginProtocol = PLUGIN_PROTOCOL_VERSION,
 	})
+	if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+		return
+	end
 	if not ok then
 		log("initial-compare err: " .. tostring(resp))
-		setPill("error", "compare failed")
-		busy = false
+		reconnectState.retryInitialCompare(resp)
 		return
 	end
 	if type(resp) ~= "table" or not resp.action then
 		log("initial-compare: malformed response")
-		setPill("error", "bad compare")
-		busy = false
+		reconnectState.stopTerminal("daemon returned a malformed initial-compare response")
 		return
 	end
 	local action = tostring(resp.action)
@@ -9418,14 +9673,18 @@ runInitialCompare = function()
 		-- Daemon says disk and Studio already match within tolerance — skip
 		-- the overwrite prompt and start hooks directly.
 		log("initial-compare: already in sync, skipping decision modal")
-		startHooksAndWs()
+		completeInitialCompare()
 	elseif action == "push" then
 		if doPushPath() then
-			startHooksAndWs()
+			completeInitialCompare()
+		else
+			reconnectState.retryInitialCompare("snapshot push failed")
 		end
 	elseif action == "pull" then
 		if doPullPath() then
-			startHooksAndWs()
+			completeInitialCompare()
+		else
+			reconnectState.retryInitialCompare("snapshot pull failed")
 		end
 	elseif action == "decide" then
 		local choiceId = resp.choiceId
@@ -9439,11 +9698,15 @@ runInitialCompare = function()
 			end
 			if choice == "disk" then
 				if doPullPath(true) then
-					startHooksAndWs()
+					completeInitialCompare()
+				else
+					reconnectState.retryInitialCompare("strict snapshot pull failed")
 				end
 			elseif choice == "studio" then
 				if doPushPath(true) then
-					startHooksAndWs()
+					completeInitialCompare()
+				else
+					reconnectState.retryInitialCompare("strict snapshot push failed")
 				end
 			elseif choice == "cancel" then
 				log("decision: cancel")
@@ -9461,8 +9724,7 @@ runInitialCompare = function()
 		end)
 	else
 		log("initial-compare: unknown action " .. action)
-		setPill("error", "bad action")
-		busy = false
+		reconnectState.stopTerminal("daemon returned an unknown initial-compare action: " .. action)
 	end
 end
 
@@ -9608,7 +9870,7 @@ local function projectInitUnavailableMessage(hello)
 	return "Set a Projects folder in Ro Sync Desktop Settings before creating this project."
 end
 
-local function discoverDaemon(gameId, quiet, includeInitializer)
+reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 	-- Probe concurrently, but choose the lowest-port exact match and initializer
 	-- deterministically after all completed probes have been collected.
 	if not quiet then
@@ -9768,6 +10030,7 @@ end
 local function beginDaemonConnection(chosenUrl, chosenPort)
 	local protocolOk, protocolError, daemonPluginCapability = validateDaemonProtocol(chosenUrl)
 	if not protocolOk then
+		reconnectState.desired = false
 		log("connect blocked: " .. tostring(protocolError))
 		setPill("error", "update Ro Sync")
 		setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
@@ -9776,7 +10039,10 @@ local function beginDaemonConnection(chosenUrl, chosenPort)
 	end
 
 	projectInitCandidate = nil
-	pluginCapability = daemonPluginCapability
+	reconnectState.desired = true
+	reconnectState.pluginCapability = daemonPluginCapability
+	reconnectState.comparedCapability = nil
+	wsBackoff = WS_BACKOFF_START
 	baseUrl = trimTrailingSlash(chosenUrl)
 	connectedPort = tostring(chosenPort or "?")
 	refreshDaemonConfig(baseUrl)
@@ -9870,7 +10136,7 @@ local function createProjectAndWait(candidate, attempt)
 
 	local deadline = os.clock() + PROJECT_DAEMON_WAIT_SECONDS
 	while busy and attempt == connectionAttempt and os.clock() < deadline do
-		local result = discoverDaemon(metadata.gameId, true, false)
+		local result = reconnectState.discoverDaemon(metadata.gameId, true, false)
 		if attempt ~= connectionAttempt or not busy then
 			return
 		end
@@ -9905,6 +10171,10 @@ startConnect = function()
 	end
 	if busy then
 		-- Cancel in-flight probing/connecting/waiting
+		reconnectState.desired = false
+		reconnectState.compareRetryPending = false
+		reconnectState.pluginCapability = nil
+		reconnectState.comparedCapability = nil
 		busy = false
 		wsGeneration += 1
 		decisionGeneration += 1
@@ -10005,7 +10275,7 @@ startConnect = function()
 			chosenPort = typed:match(":(%d+)") or "?"
 			log("using manual URL from modal: " .. typed)
 		else
-			local result = discoverDaemon(gameId, false)
+			local result = reconnectState.discoverDaemon(gameId, false)
 			if attempt ~= connectionAttempt or not busy then
 				return
 			end

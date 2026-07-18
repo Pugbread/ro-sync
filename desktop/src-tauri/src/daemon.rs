@@ -3,7 +3,10 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -21,6 +24,7 @@ use crate::{resources::display_path, AppState};
 const LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_CLOSE_IO_TIMEOUT: Duration = Duration::from_millis(750);
 const EXIT_CLOSE_WAIT: Duration = Duration::from_secs(3);
+const MANAGED_DAEMON_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct ExactManagedDaemonClaim {
@@ -31,15 +35,32 @@ struct ExactManagedDaemonClaim {
     owner_token: String,
 }
 
-#[derive(Default)]
 pub(crate) struct ManagedDaemonClaims {
-    state: Mutex<ManagedDaemonClaimsState>,
+    state: Arc<Mutex<ManagedDaemonClaimsState>>,
+    supervisor_started: AtomicBool,
 }
 
 #[derive(Default)]
 struct ManagedDaemonClaimsState {
     exiting: bool,
     by_project: HashMap<String, ExactManagedDaemonClaim>,
+}
+
+impl Default for ManagedDaemonClaims {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ManagedDaemonClaimsState::default())),
+            supervisor_started: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for ManagedDaemonClaims {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.exiting = true;
+        }
+    }
 }
 
 impl ManagedDaemonClaims {
@@ -70,6 +91,36 @@ impl ManagedDaemonClaims {
         };
         if close_after_exit {
             let _ = close_exact_managed_daemon(&claim);
+        } else {
+            self.ensure_supervisor();
+        }
+    }
+
+    fn ensure_supervisor(&self) {
+        if self
+            .supervisor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        if thread::Builder::new()
+            .name("rosync-daemon-heartbeats".to_string())
+            .spawn(move || loop {
+                thread::sleep(MANAGED_DAEMON_HEARTBEAT_INTERVAL);
+                let claims = match state.lock() {
+                    Ok(state) if state.exiting => return,
+                    Ok(state) => state.by_project.values().cloned().collect::<Vec<_>>(),
+                    Err(_) => return,
+                };
+                for claim in claims {
+                    let _ = heartbeat_exact_managed_daemon(&claim);
+                }
+            })
+            .is_err()
+        {
+            self.supervisor_started.store(false, Ordering::Release);
         }
     }
 
@@ -209,6 +260,30 @@ fn close_exact_managed_daemon(claim: &ExactManagedDaemonClaim) -> Result<(), Str
         thread::sleep(Duration::from_millis(50));
     }
     Err("managed daemon remained reachable after the authenticated close request".into())
+}
+
+fn heartbeat_exact_managed_daemon(claim: &ExactManagedDaemonClaim) -> Result<(), String> {
+    let hello = local_json_request(claim.port, "GET", "/hello", &[])?;
+    let exact_daemon = hello.get("managed").and_then(Value::as_bool) == Some(true)
+        && hello.get("managedBy").and_then(Value::as_str) == Some("desktop")
+        && hello.get("project").and_then(Value::as_str) == Some(claim.project.as_str())
+        && hello.get("bootId").and_then(Value::as_str) == Some(claim.boot_id.as_str())
+        && hello.get("pid").and_then(Value::as_u64) == Some(u64::from(claim.pid))
+        && hello.get("port").and_then(Value::as_u64) == Some(u64::from(claim.port));
+    if !exact_daemon {
+        return Err("managed daemon identity changed before native heartbeat".into());
+    }
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "token": claim.owner_token,
+        "reason": "native desktop supervisor",
+    }))
+    .map_err(|error| format!("encode managed daemon heartbeat request: {error}"))?;
+    let response = local_json_request(claim.port, "POST", "/manager-heartbeat", &body)?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("managed daemon rejected the authenticated heartbeat".into());
+    }
+    Ok(())
 }
 
 fn local_json_request(port: u16, method: &str, path: &str, body: &[u8]) -> Result<Value, String> {
@@ -414,7 +489,7 @@ pub(crate) async fn daemon_ensure(
     }
 
     let attempts = preferred_port_attempts(spec.preferred_port);
-    let mut errors = Vec::with_capacity(attempts.len());
+    let mut preferred_collision = None;
     for port in attempts {
         let mut args = base_args.clone();
         if let Some(port) = port {
@@ -437,20 +512,26 @@ pub(crate) async fn daemon_ensure(
             // On macOS it can mean a Files & Folders prompt is pending, and a
             // second attempt would only launch another blocked sidecar.
             Err(LifecycleFailure::Timeout(error)) => return Err(error),
-            Err(error) => errors.push(error.message()),
+            Err(error) => {
+                let error = error.message();
+                if port.is_some_and(|port| preferred_port_collision(&error, port)) {
+                    preferred_collision = Some(error);
+                    continue;
+                }
+                return if let Some(preferred_error) = preferred_collision {
+                    Err(format!(
+                        "preferred-port start failed: {preferred_error}\nfallback start failed: {error}"
+                    ))
+                } else {
+                    Err(error)
+                };
+            }
         }
     }
 
-    let fallback_error = errors.pop().unwrap_or_else(|| {
+    Err(preferred_collision.unwrap_or_else(|| {
         "managed daemon lifecycle command did not make a start attempt".to_string()
-    });
-    if let Some(preferred_error) = errors.pop() {
-        Err(format!(
-            "preferred-port start failed: {preferred_error}\nfallback start failed: {fallback_error}"
-        ))
-    } else {
-        Err(fallback_error)
-    }
+    }))
 }
 
 // A preferred port preserves a connected Studio plugin across controlled
@@ -463,6 +544,16 @@ fn preferred_port_attempts(preferred: Option<u16>) -> Vec<Option<u16>> {
         Some(port) => vec![Some(port), None],
         None => vec![None],
     }
+}
+
+fn preferred_port_collision(error: &str, port: u16) -> bool {
+    [
+        format!("daemon start: port {port} is already serving "),
+        format!("daemon start: requested port {port} serves "),
+        format!("serve: bind 127.0.0.1:{port}:"),
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 fn push_nonblank_flag(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
@@ -900,6 +991,99 @@ mod tests {
     fn preferred_port_falls_back_without_overwriting_its_listener() {
         assert_eq!(preferred_port_attempts(Some(7878)), vec![Some(7878), None]);
         assert_eq!(preferred_port_attempts(None), vec![None]);
+        assert!(preferred_port_collision(
+            "daemon start: port 7878 is already serving /other",
+            7878,
+        ));
+        assert!(preferred_port_collision(
+            "daemon start: child exited\nError: serve: bind 127.0.0.1:7878: Address already in use",
+            7878,
+        ));
+        assert!(!preferred_port_collision(
+            "daemon start: matching managed daemon is owned by a different lifecycle capability",
+            7878,
+        ));
+        assert!(!preferred_port_collision(
+            "daemon start: the matching daemon is already running without the requested projects root",
+            7878,
+        ));
+    }
+
+    #[test]
+    fn native_supervisor_heartbeats_only_the_exact_desktop_daemon() {
+        fn read_request(connection: &mut std::net::TcpStream) -> String {
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = connection.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let body_bytes = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if request.len() >= header_end + 4 + body_bytes {
+                    return String::from_utf8_lossy(&request).into_owned();
+                }
+            }
+        }
+
+        fn respond(connection: &mut std::net::TcpStream, body: &str) {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            connection.write_all(response.as_bytes()).unwrap();
+        }
+
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut hello_connection, _) = listener.accept().unwrap();
+            let hello_request = read_request(&mut hello_connection);
+            assert!(hello_request.starts_with("GET /hello HTTP/1.1\r\n"));
+            respond(
+                &mut hello_connection,
+                &serde_json::json!({
+                    "managed": true,
+                    "managedBy": "desktop",
+                    "project": "/heartbeat-project",
+                    "bootId": "heartbeat-boot",
+                    "pid": 5252,
+                    "port": port,
+                })
+                .to_string(),
+            );
+            drop(hello_connection);
+
+            let (mut heartbeat_connection, _) = listener.accept().unwrap();
+            let heartbeat_request = read_request(&mut heartbeat_connection);
+            respond(&mut heartbeat_connection, "{\"ok\":true}");
+            heartbeat_request
+        });
+        let claim = ExactManagedDaemonClaim {
+            project: "/heartbeat-project".into(),
+            port,
+            pid: 5252,
+            boot_id: "heartbeat-boot".into(),
+            owner_token: "heartbeat-owner-token".into(),
+        };
+
+        heartbeat_exact_managed_daemon(&claim).unwrap();
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /manager-heartbeat HTTP/1.1\r\n"));
+        assert!(request.contains("\"token\":\"heartbeat-owner-token\""));
+        assert!(request.contains("native desktop supervisor"));
     }
 
     #[test]

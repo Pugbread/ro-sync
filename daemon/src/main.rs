@@ -2515,9 +2515,23 @@ pub const PUSH_QUIET_MS: u64 = 1500;
 const WIDGET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DESKTOP_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const OWNER_HEARTBEAT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+// `Instant` advances while a machine is asleep on supported platforms. Treat a
+// newly-observed stale heartbeat as suspect first so the manager gets a chance
+// to run after wake before the daemon commits to shutdown.
+const OWNER_HEARTBEAT_SUSPECT_GRACE: Duration = Duration::from_secs(30);
 
 fn owner_heartbeat_expired(last_seen: Option<Instant>, timeout: Duration) -> bool {
     last_seen.is_some_and(|last_seen| last_seen.elapsed() > timeout)
+}
+
+fn owner_heartbeat_should_shutdown(
+    last_seen: Option<Instant>,
+    suspect_since: Option<Instant>,
+    timeout: Duration,
+    suspect_grace: Duration,
+) -> bool {
+    owner_heartbeat_expired(last_seen, timeout)
+        && suspect_since.is_some_and(|since| since.elapsed() > suspect_grace)
 }
 
 fn resolve_command_port(command: &mut Command) -> Result<(), Box<dyn std::error::Error>> {
@@ -3553,6 +3567,24 @@ fn normalize_optional_metadata(
     }
 }
 
+fn persist_daemon_start_metadata(
+    canonical_project: &std::path::Path,
+    game_id: Option<String>,
+    group_id: Option<String>,
+    place_ids: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if game_id.is_none() && group_id.is_none() && place_ids.is_none() {
+        return Ok(());
+    }
+    let mut config = project_config::load_or_create(canonical_project)
+        .map_err(|error| format!("daemon start: load ro-sync.json: {error}"))?;
+    if project_config::apply_overrides(&mut config, game_id, group_id, place_ids) {
+        project_config::write(canonical_project, &config)
+            .map_err(|error| format!("daemon start: write ro-sync.json: {error}"))?;
+    }
+    Ok(())
+}
+
 fn validate_existing_daemon_owner(
     record: &lifecycle::RuntimeRecord,
     supplied_owner_token: Option<&str>,
@@ -3575,6 +3607,19 @@ fn validate_existing_daemon_owner(
         Ok(())
     } else {
         Err("matching managed daemon is owned by a different lifecycle capability")
+    }
+}
+
+fn classify_running_daemon_for_manager(
+    status: &mut DaemonLifecycleStatus,
+    requested_manager: &str,
+) {
+    if status.running && status.managed && status.managed_by.as_deref() != Some(requested_manager) {
+        // A live daemon owned by another manager is useful discovery, not an
+        // ownership failure. Do not compare the caller's secret with the other
+        // manager's runtime capability, and expose only ordinary /hello state.
+        status.externally_managed = true;
+        status.log_path = None;
     }
 }
 
@@ -3819,17 +3864,12 @@ async fn daemon_start(
                 .collect::<Result<Vec<String>, Box<dyn std::error::Error>>>()?,
         )
     };
-    if game_id.is_some() || group_id.is_some() || place_ids.is_some() {
-        let mut config = project_config::load_or_create(&canonical_project)
-            .map_err(|error| format!("daemon start: load ro-sync.json: {error}"))?;
-        if project_config::apply_overrides(&mut config, game_id, group_id, place_ids) {
-            project_config::write(&canonical_project, &config)
-                .map_err(|error| format!("daemon start: write ro-sync.json: {error}"))?;
-        }
-    }
-
-    let current = daemon_status(&canonical_project, &paths, true)?;
+    let mut current = daemon_status(&canonical_project, &paths, true)?;
+    classify_running_daemon_for_manager(&mut current, args.managed_by.trim());
     if current.running {
+        if current.externally_managed {
+            return Ok(current);
+        }
         // An idempotent start is only idempotent for the same lifecycle
         // capability. Returning an existing boot to a caller that supplied a
         // different token makes that caller believe it owns a daemon it can
@@ -3877,6 +3917,10 @@ async fn daemon_start(
                 }
             }
         }
+        // Metadata belongs to the lifecycle owner just as shutdown authority
+        // does. Defer disk writes until the exact live boot has accepted this
+        // caller's capability and all idempotent-start checks will succeed.
+        persist_daemon_start_metadata(&canonical_project, game_id, group_id, place_ids)?;
         return Ok(current);
     }
 
@@ -3898,6 +3942,11 @@ async fn daemon_start(
             .into());
         }
     }
+
+    // No matching live daemon exists after the locked status/port probes, so
+    // these explicit launch overrides can safely seed the process about to be
+    // created. A foreign live daemon always returned above without mutation.
+    persist_daemon_start_metadata(&canonical_project, game_id, group_id, place_ids)?;
 
     let port = match args.port {
         Some(0) => reserve_ephemeral_port()?,
@@ -4531,18 +4580,31 @@ async fn serve_shutdown_signal(
 fn spawn_widget_owner_watchdog(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(OWNER_HEARTBEAT_CHECK_INTERVAL);
+        let mut suspect_since = None;
         loop {
             interval.tick().await;
             let last_seen = *state.widget_last_seen.lock().unwrap();
             if owner_heartbeat_expired(last_seen, WIDGET_HEARTBEAT_TIMEOUT) {
                 let plugin_connected = state.active_plugin.lock().unwrap().is_some();
                 if plugin_connected {
+                    suspect_since = None;
+                    continue;
+                }
+                let first_suspect = *suspect_since.get_or_insert_with(Instant::now);
+                if !owner_heartbeat_should_shutdown(
+                    last_seen,
+                    Some(first_suspect),
+                    WIDGET_HEARTBEAT_TIMEOUT,
+                    OWNER_HEARTBEAT_SUSPECT_GRACE,
+                ) {
                     continue;
                 }
                 let _ = state
                     .shutdown_tx
                     .send(Some("widget heartbeat lost".to_string()));
                 break;
+            } else {
+                suspect_since = None;
             }
         }
     });
@@ -4551,14 +4613,26 @@ fn spawn_widget_owner_watchdog(state: AppState) {
 fn spawn_desktop_owner_watchdog(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(OWNER_HEARTBEAT_CHECK_INTERVAL);
+        let mut suspect_since = None;
         loop {
             interval.tick().await;
             let last_seen = *state.manager_last_seen.lock().unwrap();
             if owner_heartbeat_expired(last_seen, DESKTOP_HEARTBEAT_TIMEOUT) {
+                let first_suspect = *suspect_since.get_or_insert_with(Instant::now);
+                if !owner_heartbeat_should_shutdown(
+                    last_seen,
+                    Some(first_suspect),
+                    DESKTOP_HEARTBEAT_TIMEOUT,
+                    OWNER_HEARTBEAT_SUSPECT_GRACE,
+                ) {
+                    continue;
+                }
                 let _ = state
                     .shutdown_tx
                     .send(Some("desktop heartbeat lost".to_string()));
                 break;
+            } else {
+                suspect_since = None;
             }
         }
     });
@@ -15975,6 +16049,25 @@ mod tier2_tests {
             Some(Instant::now() - Duration::from_secs(31)),
             timeout,
         ));
+        let stale = Some(Instant::now() - Duration::from_secs(31));
+        assert!(!owner_heartbeat_should_shutdown(
+            stale,
+            None,
+            timeout,
+            Duration::from_secs(10),
+        ));
+        assert!(!owner_heartbeat_should_shutdown(
+            stale,
+            Some(Instant::now()),
+            timeout,
+            Duration::from_secs(10),
+        ));
+        assert!(owner_heartbeat_should_shutdown(
+            stale,
+            Some(Instant::now() - Duration::from_secs(11)),
+            timeout,
+            Duration::from_secs(10),
+        ));
     }
 
     #[test]
@@ -16351,6 +16444,208 @@ mod tier2_tests {
         assert!(validate_existing_daemon_owner(&record, Some("0123456789abcdef")).is_ok());
         assert!(validate_existing_daemon_owner(&record, Some("fedcba9876543210")).is_err());
         assert!(validate_existing_daemon_owner(&record, Some("short")).is_err());
+    }
+
+    #[test]
+    fn cross_manager_daemon_is_external_before_capability_validation() {
+        let mut status = DaemonLifecycleStatus {
+            ok: true,
+            running: true,
+            managed: true,
+            managed_by: Some("cli".into()),
+            project: "/game".into(),
+            canonical_project: "/game".into(),
+            pid: Some(41),
+            port: Some(7878),
+            base_url: Some("http://127.0.0.1:7878".into()),
+            boot_id: Some("cli-boot".into()),
+            log_path: Some("/private/manager.log".into()),
+            started_at: Some(1),
+            plugin_connected: Some(true),
+            stale: false,
+            externally_managed: false,
+        };
+
+        classify_running_daemon_for_manager(&mut status, "desktop");
+
+        assert!(status.externally_managed);
+        assert_eq!(status.managed_by.as_deref(), Some("cli"));
+        assert!(status.log_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_start_returns_cross_manager_boot_without_testing_its_secret_or_mutating_config()
+    {
+        let project_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let canonical_project = std::fs::canonicalize(project_root.path()).unwrap();
+        let mut initial_config = project_config::ProjectConfig::default_for(&canonical_project);
+        initial_config.game_id = Some("original-game".into());
+        initial_config.group_id = Some("original-group".into());
+        initial_config.place_ids = vec!["original-place".into()];
+        project_config::write(&canonical_project, &initial_config).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let paths = daemon_runtime_paths(Some(state_root.path()), &canonical_project).unwrap();
+        let record = lifecycle::RuntimeRecord {
+            version: lifecycle::RUNTIME_RECORD_VERSION,
+            project: canonical_project.display().to_string(),
+            canonical_project: canonical_project.display().to_string(),
+            pid: 4242,
+            port,
+            boot_id: "cli-owned-boot".into(),
+            control_token: "cli-owner-capability".into(),
+            managed_by: "cli".into(),
+            log_path: state_root.path().join("private.log").display().to_string(),
+            started_at: 1,
+        };
+        lifecycle::write_record(&paths.record, &record).unwrap();
+        let hello_project = canonical_project.display().to_string();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let count = connection.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /hello "));
+            let body = serde_json::json!({
+                "managed": true,
+                "managedBy": "cli",
+                "project": hello_project,
+                "bootId": "cli-owned-boot",
+                "pid": 4242,
+                "port": port,
+                "startedAt": 1,
+                "pluginConnected": true,
+            })
+            .to_string();
+            write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let status = daemon_start(DaemonStartArgs {
+            project: canonical_project.clone(),
+            port: Some(port),
+            managed_by: "desktop".into(),
+            owner_token: Some("different-desktop-capability".into()),
+            owner_token_env: None,
+            game_id: Some("replacement-game".into()),
+            group_id: Some("replacement-group".into()),
+            place_id: vec!["replacement-place".into()],
+            projects_root: None,
+            data_dir: Some(state_root.path().to_path_buf()),
+            timeout: 1.0,
+            parent_stdin_lease: false,
+            raw: true,
+        })
+        .await
+        .unwrap();
+        server.join().unwrap();
+
+        assert!(status.running);
+        assert!(status.externally_managed);
+        assert_eq!(status.managed_by.as_deref(), Some("cli"));
+        assert!(status.log_path.is_none());
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("cli-owner-capability"));
+        assert!(!serialized.contains("different-desktop-capability"));
+        let persisted = project_config::read_from_disk(&canonical_project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.game_id.as_deref(), Some("original-game"));
+        assert_eq!(persisted.group_id.as_deref(), Some("original-group"));
+        assert_eq!(persisted.place_ids, ["original-place"]);
+    }
+
+    #[tokio::test]
+    async fn daemon_start_rejects_wrong_capability_before_mutating_config() {
+        let project_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let canonical_project = std::fs::canonicalize(project_root.path()).unwrap();
+        let mut initial_config = project_config::ProjectConfig::default_for(&canonical_project);
+        initial_config.game_id = Some("owned-game".into());
+        initial_config.group_id = Some("owned-group".into());
+        initial_config.place_ids = vec!["owned-place".into()];
+        project_config::write(&canonical_project, &initial_config).unwrap();
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let paths = daemon_runtime_paths(Some(state_root.path()), &canonical_project).unwrap();
+        let record = lifecycle::RuntimeRecord {
+            version: lifecycle::RUNTIME_RECORD_VERSION,
+            project: canonical_project.display().to_string(),
+            canonical_project: canonical_project.display().to_string(),
+            pid: 4343,
+            port,
+            boot_id: "desktop-owned-boot".into(),
+            control_token: "original-desktop-capability".into(),
+            managed_by: "desktop".into(),
+            log_path: state_root.path().join("private.log").display().to_string(),
+            started_at: 1,
+        };
+        lifecycle::write_record(&paths.record, &record).unwrap();
+        let hello_project = canonical_project.display().to_string();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let count = connection.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /hello "));
+            let body = serde_json::json!({
+                "managed": true,
+                "managedBy": "desktop",
+                "project": hello_project,
+                "bootId": "desktop-owned-boot",
+                "pid": 4343,
+                "port": port,
+                "startedAt": 1,
+                "pluginConnected": true,
+            })
+            .to_string();
+            write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let error = daemon_start(DaemonStartArgs {
+            project: canonical_project.clone(),
+            port: Some(port),
+            managed_by: "desktop".into(),
+            owner_token: Some("different-desktop-capability".into()),
+            owner_token_env: None,
+            game_id: Some("replacement-game".into()),
+            group_id: Some("replacement-group".into()),
+            place_id: vec!["replacement-place".into()],
+            projects_root: None,
+            data_dir: Some(state_root.path().to_path_buf()),
+            timeout: 1.0,
+            parent_stdin_lease: false,
+            raw: true,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        server.join().unwrap();
+
+        assert!(error.contains("different lifecycle capability"));
+        let persisted = project_config::read_from_disk(&canonical_project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.game_id.as_deref(), Some("owned-game"));
+        assert_eq!(persisted.group_id.as_deref(), Some("owned-group"));
+        assert_eq!(persisted.place_ids, ["owned-place"]);
     }
 
     #[test]

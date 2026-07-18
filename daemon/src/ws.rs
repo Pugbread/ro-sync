@@ -16,7 +16,8 @@
 //     {"type":"op","op":<plugin-shape op>}
 //     {"type":"ping"}            // 10-second heartbeat
 //     {"type":"pong"}            // reply to client ping
-//     {"type":"shutdown","reason":"..."} // daemon/plugin session is closing
+//     {"type":"shutdown","reason":"...","code":"...","retryable":true}
+//                                      // daemon/plugin session is closing
 //     {"type":"lagged"}          // broadcast overflow; close follows
 //     {"type":"push-result", ok, applied, skipped, conflicts, errors}
 //     {"type":"error","error":"..."}
@@ -43,6 +44,7 @@ use crate::http::{apply_push_ops, event_to_plugin_op, is_authorized_widget_brows
 use crate::AppState;
 
 pub(crate) const PLUGIN_PROTOCOL_VERSION: u64 = 2;
+const PLUGIN_INBOUND_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Routing table for in-flight request/response pairs, keyed by a daemon-owned
 /// correlation id. Client-provided ids are retained only for translating the
@@ -97,6 +99,25 @@ impl PeerKind {
     fn store(self, value: &AtomicU8) {
         value.store(self as u8, Ordering::Release);
     }
+}
+
+struct PeerState {
+    kind: AtomicU8,
+    last_inbound: Mutex<Instant>,
+}
+
+impl PeerState {
+    fn new() -> Self {
+        Self {
+            kind: AtomicU8::new(PeerKind::Unidentified as u8),
+            last_inbound: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+fn plugin_inbound_expired(peer_kind: PeerKind, last_seen: Instant, now: Instant) -> bool {
+    peer_kind == PeerKind::Plugin
+        && now.saturating_duration_since(last_seen) > PLUGIN_INBOUND_TIMEOUT
 }
 
 /// Capability presented by the native Studio plugin during its WS hello.
@@ -159,6 +180,8 @@ pub enum ServerMsg {
     Pong,
     Shutdown {
         reason: String,
+        code: &'static str,
+        retryable: bool,
     },
     Lagged,
     PushResult {
@@ -225,14 +248,14 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // frames that land on this connection's route) through the same SplitSink
     // the send-task owns; avoids an Arc<Mutex<_>> around it.
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let peer_kind = Arc::new(AtomicU8::new(PeerKind::Unidentified as u8));
+    let peer = Arc::new(PeerState::new());
 
     let mut recv_task = tokio::spawn(recv_loop(
         receiver,
         state.clone(),
         out_tx.clone(),
         conn_id,
-        peer_kind.clone(),
+        peer.clone(),
     ));
     let mut send_task = tokio::spawn(send_loop(
         sender,
@@ -241,7 +264,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         events_rx,
         request_rx,
         conn_id,
-        peer_kind,
+        peer,
     ));
 
     tokio::select! {
@@ -294,7 +317,7 @@ async fn recv_loop(
     state: AppState,
     out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     conn_id: u64,
-    shared_peer_kind: Arc<AtomicU8>,
+    peer: Arc<PeerState>,
 ) {
     let mut rejecting = false;
     let mut peer_kind = PeerKind::Unidentified;
@@ -303,6 +326,9 @@ async fn recv_loop(
             Ok(f) => f,
             Err(_) => break,
         };
+        if let Ok(mut seen) = peer.last_inbound.lock() {
+            *seen = Instant::now();
+        }
         match frame {
             Message::Text(txt) => match serde_json::from_str::<ClientMsg>(&txt) {
                 _ if rejecting => {}
@@ -317,6 +343,8 @@ async fn recv_loop(
                             &out_tx,
                             &ServerMsg::Shutdown {
                                 reason: "WebSocket hello may only be sent once".into(),
+                                code: "hello-already-sent",
+                                retryable: false,
                             },
                         );
                         let _ = out_tx.send(Message::Close(None));
@@ -332,6 +360,8 @@ async fn recv_loop(
                                     "unrecognized WebSocket role {:?}",
                                     role.as_deref().unwrap_or("missing")
                                 ),
+                                code: "unrecognized-role",
+                                retryable: false,
                             },
                         );
                         let _ = out_tx.send(Message::Close(None));
@@ -356,6 +386,8 @@ async fn recv_loop(
                                     "incompatible Ro Sync {role_name} protocol {got}; expected {}{reinstall}",
                                     PLUGIN_PROTOCOL_VERSION,
                                 ),
+                                code: "protocol-mismatch",
+                                retryable: false,
                             },
                         );
                         let _ = out_tx.send(Message::Close(None));
@@ -369,6 +401,8 @@ async fn recv_loop(
                                 &ServerMsg::Shutdown {
                                     reason: "invalid or missing Studio plugin capability; reconnect or reinstall the Studio plugin"
                                         .into(),
+                                    code: "stale-plugin-capability",
+                                    retryable: true,
                                 },
                             );
                             let _ = out_tx.send(Message::Close(None));
@@ -380,12 +414,12 @@ async fn recv_loop(
                             match *active {
                                 Some(existing) if existing != conn_id => (true, false),
                                 Some(_) => {
-                                    PeerKind::Plugin.store(&shared_peer_kind);
+                                    PeerKind::Plugin.store(&peer.kind);
                                     (false, false)
                                 }
                                 _ => {
                                     *active = Some(conn_id);
-                                    PeerKind::Plugin.store(&shared_peer_kind);
+                                    PeerKind::Plugin.store(&peer.kind);
                                     (false, true)
                                 }
                             }
@@ -396,6 +430,8 @@ async fn recv_loop(
                                 &ServerMsg::Shutdown {
                                     reason: "another Roblox Studio plugin is already connected"
                                         .into(),
+                                    code: "plugin-already-connected",
+                                    retryable: true,
                                 },
                             );
                             let _ = out_tx.send(Message::Close(None));
@@ -408,7 +444,7 @@ async fn recv_loop(
                         peer_kind = PeerKind::Plugin;
                     } else {
                         peer_kind = classified_peer;
-                        classified_peer.store(&shared_peer_kind);
+                        classified_peer.store(&peer.kind);
                     }
                 }
                 Ok(ClientMsg::Pong) => {}
@@ -534,7 +570,7 @@ async fn send_loop(
     mut events_rx: broadcast::Receiver<String>,
     mut request_rx: broadcast::Receiver<RequestEnvelope>,
     conn_id: u64,
-    peer_kind: Arc<AtomicU8>,
+    peer: Arc<PeerState>,
 ) {
     let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
     // Skip the immediate first tick so we don't blast a ping at connect time.
@@ -550,7 +586,7 @@ async fn send_loop(
                 match req_res {
                     Ok(env) => {
                         if env.origin == conn_id
-                            || PeerKind::load(&peer_kind) != PeerKind::Plugin
+                            || PeerKind::load(&peer.kind) != PeerKind::Plugin
                             || *state.active_plugin.lock().unwrap() != Some(conn_id)
                         {
                             continue;
@@ -570,7 +606,7 @@ async fn send_loop(
                 match ev_res {
                     Ok(s) => {
                         if let Some(op) = event_to_plugin_op(state.canonical_project.as_path(), &s) {
-                            let current_peer = PeerKind::load(&peer_kind);
+                            let current_peer = PeerKind::load(&peer.kind);
                             if current_peer == PeerKind::Plugin {
                                 if *state.active_plugin.lock().unwrap() == Some(conn_id)
                                     && !send_ws_msg(&mut sender, &ServerMsg::Op { op }).await
@@ -591,7 +627,7 @@ async fn send_loop(
                             continue;
                         }
                         let is_shutdown = has_type(&s, "shutdown");
-                        if !is_shutdown && PeerKind::load(&peer_kind) != PeerKind::Watch {
+                        if !is_shutdown && PeerKind::load(&peer.kind) != PeerKind::Watch {
                             continue;
                         }
                         if sender.send(Message::Text(s)).await.is_err() { break; }
@@ -609,6 +645,18 @@ async fn send_loop(
                 }
             }
             _ = ping_interval.tick() => {
+                let current_peer = PeerKind::load(&peer.kind);
+                let now = Instant::now();
+                let plugin_timed_out = peer
+                    .last_inbound
+                    .lock()
+                    .map_or(current_peer == PeerKind::Plugin, |seen| {
+                        plugin_inbound_expired(current_peer, *seen, now)
+                    });
+                if plugin_timed_out {
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
                 if !send_ws_msg(&mut sender, &ServerMsg::Ping).await {
                     break;
                 }
@@ -1160,6 +1208,32 @@ mod tests {
         start_server_with_widget(false).await
     }
 
+    #[test]
+    fn only_silent_plugin_peers_expire() {
+        let last_seen = Instant::now();
+        let expired_at = last_seen + PLUGIN_INBOUND_TIMEOUT + Duration::from_millis(1);
+        assert!(plugin_inbound_expired(
+            PeerKind::Plugin,
+            last_seen,
+            expired_at
+        ));
+        assert!(!plugin_inbound_expired(
+            PeerKind::Plugin,
+            last_seen,
+            last_seen + PLUGIN_INBOUND_TIMEOUT
+        ));
+        assert!(!plugin_inbound_expired(
+            PeerKind::Client,
+            last_seen,
+            expired_at
+        ));
+        assert!(!plugin_inbound_expired(
+            PeerKind::Watch,
+            last_seen,
+            expired_at
+        ));
+    }
+
     async fn start_server_with_widget(widget_owned: bool) -> TestHarness {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().to_path_buf();
@@ -1672,6 +1746,8 @@ mod tests {
             shutdown["reason"],
             "another Roblox Studio plugin is already connected"
         );
+        assert_eq!(shutdown["code"], "plugin-already-connected");
+        assert_eq!(shutdown["retryable"], true);
 
         first
             .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
@@ -1704,6 +1780,8 @@ mod tests {
             .await
             .expect("role-only plugin hello must be rejected");
         assert!(shutdown["reason"].as_str().unwrap().contains("capability"));
+        assert_eq!(shutdown["code"], "stale-plugin-capability");
+        assert_eq!(shutdown["retryable"], true);
         assert!(h.state.active_plugin.lock().unwrap().is_none());
     }
 
@@ -1724,6 +1802,8 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("only be sent once"));
+        assert_eq!(shutdown["code"], "hello-already-sent");
+        assert_eq!(shutdown["retryable"], false);
     }
 
     #[tokio::test]

@@ -157,6 +157,7 @@ export const host = Object.freeze({
     spawnSession: !IS_DESKTOP_HOST,
     hostTheme: !IS_DESKTOP_HOST,
     windowDrag: IS_DESKTOP_HOST,
+    updates: IS_DESKTOP_HOST,
   }),
 
   async startWindowDrag() {
@@ -184,6 +185,18 @@ export const host = Object.freeze({
       daemonPath: joinShell(WIDGET_DIR_SHELL, BINARY_REL),
       pluginDir: PLUGIN_DIR_DISPLAY,
     };
+  },
+
+  async updateCheck() {
+    if (!IS_DESKTOP_HOST) {
+      return { configured: false, available: false, currentVersion: null, version: null };
+    }
+    return invokeDesktop("update_check");
+  },
+
+  async updateInstall(expectedVersion) {
+    if (!IS_DESKTOP_HOST) throw new Error("application updates are only available in the desktop app");
+    return invokeDesktop("update_install", { expectedVersion: String(expectedVersion || "") });
   },
 
   async stateGet(key) {

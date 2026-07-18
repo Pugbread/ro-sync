@@ -216,13 +216,14 @@ function saveState() {
   // daemonProject/daemonPort snapshot. Queue immutable snapshots in call
   // order; a failed write is logged without breaking later saves.
   const value = { ...app.state };
-  stateSaveChain = stateSaveChain.then(
+  const write = stateSaveChain.then(
     () => host.stateSet("state", value),
     () => host.stateSet("state", value),
-  ).catch((e) => {
+  );
+  stateSaveChain = write.catch((e) => {
     console.warn("t64:set-state failed", e);
   });
-  return stateSaveChain;
+  return write;
 }
 
 async function loadState() {
@@ -269,8 +270,9 @@ export function setState(patch) {
   app.state = { ...app.state, ...nextPatch };
   if (Object.hasOwn(nextPatch, "appearanceTheme")) applyCurrentAppearanceTheme();
   setDaemonAuthToken(app.state.daemonOwnerToken);
-  saveState();
+  const persisted = saveState();
   emit("state", app.state);
+  return persisted;
 }
 
 export function setAppearanceTheme(value) {
@@ -582,6 +584,11 @@ function startDaemonHeartbeat(projectId = null) {
 }
 
 function notifyWidgetClosing() {
+  // Desktop daemon ownership is native process state. A renderer navigation,
+  // reload, WebView suspension, or page teardown must never stop it; only
+  // Tauri RunEvent::Exit closes exact native claims. Terminal 64 retains its
+  // historical widget-close behavior.
+  if (IS_DESKTOP_HOST) return;
   if (widgetCloseSent) return;
   widgetCloseSent = true;
   if (projectBrokerTimer) {
@@ -589,22 +596,7 @@ function notifyWidgetClosing() {
     projectBrokerTimer = null;
   }
   stopDaemonHeartbeat();
-  const endpoint = IS_DESKTOP_HOST ? "/manager-close" : "/widget-close";
-  const reason = IS_DESKTOP_HOST ? "desktop app closed" : "widget closed";
-  if (IS_DESKTOP_HOST) {
-    const closeTargets = new Map();
-    for (const session of Object.values(app.state.daemonSessions || {})) {
-      if (session?.base && session?.ownerToken) closeTargets.set(session.base, session.ownerToken);
-    }
-    for (const pending of pendingDesktopOwnershipByProject.values()) {
-      if (pending?.base && pending?.token) closeTargets.set(pending.base, pending.token);
-    }
-    for (const [base, token] of closeTargets) {
-      daemonLifecyclePost(endpoint, reason, true, { base, token });
-    }
-    return;
-  }
-  daemonLifecyclePost(endpoint, reason, true);
+  daemonLifecyclePost("/widget-close", "widget closed", true);
 }
 
 function activeProject() {
@@ -650,7 +642,7 @@ function legacyDaemonPatch(sessions, preferredProjectId = app.state.activeProjec
 }
 
 function setDesktopDaemonSession(projectId, session) {
-  if (!projectId) return;
+  if (!projectId) return Promise.resolve();
   const previous = app.state.daemonSessions?.[projectId] || null;
   const sessions = { ...(app.state.daemonSessions || {}) };
   if (session) sessions[projectId] = normalizeDaemonSession(session, projectById(projectId));
@@ -664,13 +656,13 @@ function setDesktopDaemonSession(projectId, session) {
   }
   const next = sessions[projectId];
   if (next?.base && next?.ownerToken) setDaemonAuthToken(next.ownerToken, next.base);
-  setState({ daemonSessions: sessions, ...legacyDaemonPatch(sessions, projectId) });
+  return setState({ daemonSessions: sessions, ...legacyDaemonPatch(sessions, projectId) });
 }
 
 function patchDesktopDaemonSession(projectId, patch) {
   const current = app.state.daemonSessions?.[projectId]
     || { project: projectById(projectId)?.path || null };
-  setDesktopDaemonSession(projectId, { ...current, ...patch });
+  return setDesktopDaemonSession(projectId, { ...current, ...patch });
 }
 
 function activeProjectPath() {
@@ -1130,7 +1122,7 @@ async function ensureDesktopDaemon(projectId, project) {
       return;
     }
 
-    setDesktopDaemonSession(projectId, {
+    await setDesktopDaemonSession(projectId, {
       project,
       canonicalProject: ownedCandidate.status.canonicalProject || ownedCandidate.info.project || project,
       pid: ownedCandidate.status.pid || null,
@@ -1486,7 +1478,7 @@ async function healthTickDesktop() {
         throw new Error("managed daemon identity changed");
       }
       if (session.ok !== true || session.error) {
-        patchDesktopDaemonSession(projectId, { ok: true, error: null });
+        await patchDesktopDaemonSession(projectId, { ok: true, error: null });
         emit("daemon:up", { projectId, project: project.path, base: session.base, info, host: HOST_KIND });
       }
     } catch (error) {
@@ -1560,6 +1552,7 @@ scheduleHealthTick();
 const $view = document.getElementById("view");
 const $tabs = document.querySelectorAll(".tab");
 const $daemonDot = document.getElementById("daemon-dot");
+const $projectsTab = document.getElementById("nav-projects");
 const $statusLeft = document.getElementById("status-left");
 const $statusRight = document.getElementById("status-right");
 document.documentElement.dataset.host = HOST_KIND;
@@ -1594,6 +1587,359 @@ function wireDesktopTitlebar() {
 
 wireDesktopTitlebar();
 
+const CONFLICT_BADGE_POLL_MS = 20_000;
+
+function wireConflictBadge() {
+  const badge = document.getElementById("conflicts-badge");
+  if (!badge) {
+    return {
+      refresh() {},
+      report() {},
+      invalidate() {},
+    };
+  }
+
+  const counts = new Map();
+  let refreshInFlight = false;
+  let refreshQueued = false;
+
+  const targets = () => servedProjectIds().map((projectId) => ({
+    projectId,
+    base: getDaemonBase(projectId),
+  }));
+
+  const syncTargets = () => {
+    const current = targets();
+    const currentIds = new Set(current.map(({ projectId }) => projectId));
+    for (const projectId of counts.keys()) {
+      if (!currentIds.has(projectId)) counts.delete(projectId);
+    }
+    for (const { projectId, base } of current) {
+      const previous = counts.get(projectId);
+      if (!previous || previous.base !== base) {
+        counts.set(projectId, {
+          base,
+          state: base ? "loading" : "unavailable",
+          count: null,
+        });
+      }
+    }
+    return current;
+  };
+
+  const render = () => {
+    const current = syncTargets();
+    if (!current.length) {
+      badge.hidden = true;
+      badge.textContent = "—";
+      badge.className = "badge badge-unknown sidenav-badge";
+      badge.title = "No projects are being served";
+      badge.setAttribute("aria-label", "Conflict count unavailable; no projects are being served");
+      return;
+    }
+
+    const entries = current.map(({ projectId }) => counts.get(projectId));
+    const known = entries.filter((entry) => entry?.state === "known");
+    const unknownCount = entries.length - known.length;
+    const total = known.reduce((sum, entry) => sum + entry.count, 0);
+    const projectLabel = `${current.length} served ${current.length === 1 ? "project" : "projects"}`;
+
+    badge.hidden = false;
+    badge.className = "badge sidenav-badge";
+    if (unknownCount === 0) {
+      badge.textContent = String(total);
+      badge.classList.toggle("badge-ok", total === 0);
+      badge.title = total === 0
+        ? `No unresolved conflicts across ${projectLabel}`
+        : `${total} unresolved conflict${total === 1 ? "" : "s"} across ${projectLabel}`;
+    } else if (total > 0) {
+      badge.textContent = `${total}+`;
+      badge.classList.add("badge-partial");
+      badge.title = `At least ${total} unresolved conflict${total === 1 ? "" : "s"}; ${unknownCount} ${unknownCount === 1 ? "project has" : "projects have"} not reported yet`;
+    } else {
+      badge.textContent = "—";
+      badge.classList.add("badge-unknown");
+      badge.title = `Conflict count unavailable for ${unknownCount} of ${projectLabel}`;
+    }
+    badge.setAttribute("aria-label", badge.title);
+  };
+
+  async function refresh() {
+    if (refreshInFlight) {
+      refreshQueued = true;
+      return;
+    }
+    refreshInFlight = true;
+    try {
+      do {
+        refreshQueued = false;
+        const current = syncTargets();
+        render();
+        await Promise.all(current.map(async ({ projectId, base }) => {
+          if (!base) return;
+          try {
+            const data = await daemonJson(base, "/resolve");
+            if (!servedProjectIds().includes(projectId) || getDaemonBase(projectId) !== base) return;
+            const conflicts = Array.isArray(data)
+              ? data
+              : (Array.isArray(data?.conflicts) ? data.conflicts : null);
+            if (!conflicts) throw new Error("invalid conflict response");
+            counts.set(projectId, { base, state: "known", count: conflicts.length });
+          } catch {
+            if (!servedProjectIds().includes(projectId) || getDaemonBase(projectId) !== base) return;
+            counts.set(projectId, { base, state: "unavailable", count: null });
+          }
+        }));
+        render();
+      } while (refreshQueued);
+    } finally {
+      refreshInFlight = false;
+    }
+  }
+
+  const report = (projectId, value) => {
+    const count = Number(value);
+    if (!servedProjectIds().includes(projectId) || !Number.isInteger(count) || count < 0) return;
+    const base = getDaemonBase(projectId);
+    if (!base) return;
+    counts.set(projectId, { base, state: "known", count });
+    render();
+  };
+
+  const invalidate = (projectId = null) => {
+    const current = syncTargets();
+    for (const target of current) {
+      if (projectId && target.projectId !== projectId) continue;
+      counts.set(target.projectId, {
+        base: target.base,
+        state: target.base ? "loading" : "unavailable",
+        count: null,
+      });
+    }
+    render();
+    void refresh();
+  };
+
+  setInterval(() => {
+    if (!document.hidden) void refresh();
+  }, CONFLICT_BADGE_POLL_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void refresh();
+  });
+
+  render();
+  return { refresh, report, invalidate };
+}
+
+const DESKTOP_UPDATE_RECHECK_MS = 6 * 60 * 60 * 1000;
+const DESKTOP_UPDATE_RETRY_MS = 5 * 60 * 1000;
+
+function wireDesktopUpdater() {
+  const button = document.getElementById("desktop-update");
+  const overlay = document.getElementById("desktop-update-confirm");
+  const description = document.getElementById("desktop-update-confirm-description");
+  const cancelButton = document.getElementById("desktop-update-cancel");
+  const proceedButton = document.getElementById("desktop-update-proceed");
+  const root = document.getElementById("root");
+  if (!button || !overlay || !description || !cancelButton || !proceedButton || !root
+      || !IS_DESKTOP_HOST || !host.supports.updates) return { check() {} };
+
+  let checking = false;
+  let installing = false;
+  let availableVersion = null;
+  let lastCheckedAt = 0;
+  let lastAttemptAt = 0;
+  let lastFocused = null;
+
+  const closeConfirmation = ({ restoreFocus = true } = {}) => {
+    if (overlay.hidden) return;
+    overlay.hidden = true;
+    root.inert = false;
+    if (restoreFocus && lastFocused && document.contains(lastFocused)) lastFocused.focus();
+    lastFocused = null;
+  };
+
+  const showConfirmation = (count) => {
+    const projects = count === 1 ? "the project currently being served" : `${count} projects currently being served`;
+    description.textContent = `Updating will stop Ro Sync and disconnect ${projects} from Roblox Studio. You can start them again after Ro Sync restarts.`;
+    lastFocused = document.activeElement;
+    root.inert = true;
+    overlay.hidden = false;
+    requestAnimationFrame(() => cancelButton.focus());
+  };
+
+  const renderAvailable = () => {
+    if (!availableVersion) {
+      button.hidden = true;
+      closeConfirmation({ restoreFocus: false });
+      return;
+    }
+    button.hidden = false;
+    button.disabled = installing;
+    button.setAttribute("aria-busy", installing ? "true" : "false");
+    button.title = installing
+      ? `Installing Ro Sync ${availableVersion}`
+      : `Download and install Ro Sync ${availableVersion}`;
+    button.querySelector("span").textContent = installing
+      ? "Updating…"
+      : `Update v${availableVersion.replace(/^v/i, "")}`;
+  };
+
+  async function check({ force = false } = {}) {
+    if (checking || installing || document.hidden) return;
+    if (!force && Date.now() - lastCheckedAt < DESKTOP_UPDATE_RECHECK_MS) return;
+    if (!force && Date.now() - lastAttemptAt < DESKTOP_UPDATE_RETRY_MS) return;
+    checking = true;
+    lastAttemptAt = Date.now();
+    try {
+      const result = await host.updateCheck();
+      lastCheckedAt = Date.now();
+      availableVersion = result?.configured && result?.available && result?.version
+        ? String(result.version)
+        : null;
+      renderAvailable();
+    } catch (error) {
+      console.warn("application update check failed", error);
+    } finally {
+      checking = false;
+    }
+  }
+
+  async function installAvailableUpdate() {
+    if (!availableVersion || installing) return;
+    installing = true;
+    renderAvailable();
+    try {
+      await host.updateInstall(availableVersion);
+    } catch (error) {
+      installing = false;
+      renderAvailable();
+      toast(`Update failed: ${error.message}`);
+    }
+  }
+
+  button.addEventListener("click", () => {
+    if (!availableVersion || installing) return;
+    const count = servedProjectIds().length;
+    if (count) showConfirmation(count);
+    else void installAvailableUpdate();
+  });
+  cancelButton.addEventListener("click", () => closeConfirmation());
+  proceedButton.addEventListener("click", () => {
+    closeConfirmation({ restoreFocus: false });
+    void installAvailableUpdate();
+  });
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) closeConfirmation();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (overlay.hidden || installing) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeConfirmation();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    if (event.shiftKey && document.activeElement === cancelButton) {
+      event.preventDefault();
+      proceedButton.focus();
+    } else if (!event.shiftKey && document.activeElement === proceedButton) {
+      event.preventDefault();
+      cancelButton.focus();
+    }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void check();
+  });
+  return { check };
+}
+
+function wireProjectsRootPrompt() {
+  const overlay = document.getElementById("projects-root-prompt");
+  const choose = document.getElementById("projects-root-choose");
+  const skip = document.getElementById("projects-root-skip");
+  const error = document.getElementById("projects-root-error");
+  const root = document.getElementById("root");
+  if (!overlay || !choose || !skip || !error || !root || !IS_DESKTOP_HOST) {
+    return { showIfNeeded() {} };
+  }
+
+  let lastFocused = null;
+  let choosing = false;
+  const focusable = [choose, skip];
+
+  const close = () => {
+    if (overlay.hidden || choosing) return;
+    overlay.hidden = true;
+    root.inert = false;
+    if (lastFocused && document.contains(lastFocused)) lastFocused.focus();
+    lastFocused = null;
+  };
+
+  const showIfNeeded = () => {
+    if (app.state.projectsRoot || !overlay.hidden) return;
+    lastFocused = document.activeElement;
+    error.hidden = true;
+    error.textContent = "";
+    root.inert = true;
+    overlay.hidden = false;
+    requestAnimationFrame(() => choose.focus());
+  };
+
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) close();
+  });
+  skip.addEventListener("click", close);
+  choose.addEventListener("click", async () => {
+    if (choosing) return;
+    choosing = true;
+    choose.disabled = true;
+    skip.disabled = true;
+    error.hidden = true;
+    try {
+      const path = String(await host.pickFolder("Choose Ro Sync projects folder") || "").trim();
+      if (!path) return;
+      setState({ projectsRoot: path });
+      choosing = false;
+      choose.disabled = false;
+      skip.disabled = false;
+      close();
+      toast("Projects folder saved");
+    } catch (pickError) {
+      error.textContent = pickError.message || String(pickError);
+      error.hidden = false;
+    } finally {
+      choosing = false;
+      choose.disabled = false;
+      skip.disabled = false;
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (overlay.hidden || choosing) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const current = focusable.indexOf(document.activeElement);
+    if (event.shiftKey && current <= 0) {
+      event.preventDefault();
+      focusable[focusable.length - 1].focus();
+    } else if (!event.shiftKey && current === focusable.length - 1) {
+      event.preventDefault();
+      focusable[0].focus();
+    }
+  });
+
+  return { showIfNeeded };
+}
+
+const conflictBadge = wireConflictBadge();
+const desktopUpdater = wireDesktopUpdater();
+const projectsRootPrompt = wireProjectsRootPrompt();
+
 const ROUTES = {
   projects: mountProjects,
   active: mountActive,
@@ -1607,6 +1953,7 @@ function setDaemonDot(kind, label) {
   $daemonDot.title = `Daemon: ${label}`;
   $statusRight.textContent = `daemon: ${label}`;
   document.getElementById("root").dataset.connection = kind;
+  refreshProjectsServingIndicator();
 }
 
 function refreshDesktopDaemonPresentation() {
@@ -1630,6 +1977,27 @@ function refreshDesktopDaemonPresentation() {
   } else {
     setDaemonDot("warn", `${pending || ids.length} ${ids.length === 1 ? "project" : "projects"} starting…`);
   }
+}
+
+function refreshProjectsServingIndicator() {
+  const count = servedProjectIds().length;
+  let state = "idle";
+  if (count) {
+    if (IS_DESKTOP_HOST) {
+      const sessions = servedProjectIds().map((id) => app.state.daemonSessions?.[id]);
+      state = sessions.some((session) => session?.ok === false)
+        ? "err"
+        : sessions.every((session) => session?.ok === true) ? "ok" : "warn";
+    } else {
+      const connection = document.getElementById("root").dataset.connection;
+      state = app.daemonOk ? "ok" : connection === "err" ? "err" : "warn";
+    }
+  }
+  const action = state === "ok" ? "serving" : state === "warn" ? "starting" : "needs attention";
+  const label = `${count} ${count === 1 ? "project" : "projects"} ${action}`;
+  document.getElementById("root").dataset.projectsServing = state;
+  $projectsTab.setAttribute("aria-label", count ? `Projects, ${label}` : "Projects");
+  $projectsTab.title = count ? label : "";
 }
 
 async function serveProject(projectId) {
@@ -1703,6 +2071,8 @@ function navigate(route) {
     serveProject,
     stopProject,
     restartProject,
+    reportConflictCount: conflictBadge.report,
+    invalidateConflictCount: conflictBadge.invalidate,
     setStatus,
     toast,
     onBus: on,
@@ -1728,17 +2098,22 @@ for (const [index, t] of [...$tabs].entries()) {
   });
 }
 
-window.addEventListener("pagehide", (event) => {
-  if (event && event.persisted) return;
-  notifyWidgetClosing();
-});
-window.addEventListener("beforeunload", notifyWidgetClosing);
+if (!IS_DESKTOP_HOST) {
+  window.addEventListener("pagehide", (event) => {
+    if (event && event.persisted) return;
+    notifyWidgetClosing();
+  });
+  window.addEventListener("beforeunload", notifyWidgetClosing);
+}
 
 // Re-render active view on daemon state changes (cheap).
 on("daemon:up", () => emit("view:refresh", app.currentView));
 on("daemon:down", () => emit("view:refresh", app.currentView));
 on("daemon:up", (event) => startDaemonHeartbeat(event?.projectId || null));
 on("daemon:down", (event) => stopDaemonHeartbeat(event?.projectId || null));
+on("daemon:up", (event) => conflictBadge.invalidate(event?.projectId || null));
+on("daemon:down", (event) => conflictBadge.invalidate(event?.projectId || null));
+on("conflict", (event) => conflictBadge.invalidate(event?.projectId || null));
 
 // Desktop treats activeProjectId as the focused project and serves the
 // independent servedProjectIds set. Terminal 64 retains its historical
@@ -1746,6 +2121,8 @@ on("daemon:down", (event) => stopDaemonHeartbeat(event?.projectId || null));
 let lastActiveProject = null;
 let lastServedProjects = new Set();
 on("state", () => {
+  refreshProjectsServingIndicator();
+  void conflictBadge.refresh();
   if (IS_DESKTOP_HOST) {
     const next = new Set(servedProjectIds());
     const newlyServed = [...next].filter((projectId) => !lastServedProjects.has(projectId));
@@ -1808,6 +2185,7 @@ onT64("t64:init", (payload) => {
     emit("state", app.state);
   }
   applyCurrentAppearanceTheme();
+  void conflictBadge.refresh();
 });
 onT64("t64:state", applyHostThemePayload);
 
@@ -1977,6 +2355,9 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
   // mounting a view so restored sessions never render a page in the wrong
   // preset and then flash to the chosen one.
   applyCurrentAppearanceTheme();
+  void conflictBadge.refresh();
+  projectsRootPrompt.showIfNeeded();
+  void desktopUpdater.check({ force: true });
   // Reap dead-PID sessions before we try to reuse any recorded port.
   if (!IS_DESKTOP_HOST) await pruneDeadSessions();
   // Signal readiness so host can send t64:init.

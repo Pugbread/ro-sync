@@ -2629,18 +2629,20 @@ fn apply_set_in_dir(
                 is_dir,
             }
         }
-        None if let Some((fragment, _)) = preferred_fragment => crate::fs_map::PathFragment {
-            fragment: fragment.to_string(),
-            is_dir: class == "Folder" || has_children,
-        },
-        None => instance_to_path(
-            &InstanceDescriptor {
-                class,
-                name,
-                has_children,
+        None => match preferred_fragment {
+            Some((fragment, _)) => crate::fs_map::PathFragment {
+                fragment: fragment.to_string(),
+                is_dir: class == "Folder" || has_children,
             },
-            &taken,
-        ),
+            None => instance_to_path(
+                &InstanceDescriptor {
+                    class,
+                    name,
+                    has_children,
+                },
+                &taken,
+            ),
+        },
     };
 
     let target = parent_dir.join(&frag.fragment);

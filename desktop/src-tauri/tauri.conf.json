@@ -22,8 +22,13 @@
         "fullscreen": false,
         "decorations": true,
         "titleBarStyle": "Overlay",
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 25
+        },
         "hiddenTitle": true,
         "transparent": false,
+        "backgroundThrottling": "disabled",
         "center": true
       }
     ],
@@ -52,6 +57,17 @@
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Pugbread/ro-sync/releases/latest/download/latest.json"
+      ],
+      "pubkey": "",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

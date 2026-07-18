@@ -19,10 +19,18 @@ Every installer and platform manifest has an adjacent `.sha256` file. The
 manifest records the exact Git commit plus hashes for the shared frontend,
 Studio plugin, command reference, Luau tools, and bundled `rosync` sidecar.
 
-Platform code signing and Tauri updater artifacts are intentionally disabled in
-the current release workflow. Until release signing identities are configured,
-macOS Gatekeeper and Windows SmartScreen may warn about downloaded installers.
-Ro Sync does not ship an auto-updater that bypasses those platform checks.
+Ro Sync checks the latest GitHub release when Desktop opens. If a newer signed
+release is available, an **Update** button appears in the titlebar. The update
+is downloaded, signature-verified, installed, and relaunched by Tauri. The
+button is hidden in source builds and release builds that do not embed an
+updater public key. If any projects are currently being served, Ro Sync asks
+for confirmation before updating because the restart disconnects those Studio
+sessions; when no projects are running, the update starts immediately.
+
+The updater signature is separate from platform code signing. Until Apple and
+Windows signing identities are configured, macOS Gatekeeper and Windows
+SmartScreen may still warn about a first install. Updater signatures do not
+replace the operating system's platform-signing checks.
 
 On macOS, choose project folders with **Projects → Add Project → Browse**.
 macOS may ask once for Files & Folders access when that project lives in
@@ -79,6 +87,64 @@ Create a local unsigned installer with:
 cd desktop
 npm run build -- --ci --no-sign
 ```
+
+## Release updater signing
+
+Before publishing the first updater-enabled tag, generate and securely archive
+one Tauri updater keypair:
+
+```sh
+cd desktop
+npx tauri signer generate -w ~/.tauri/ro-sync.key
+cd ..
+```
+
+Ro Sync deliberately ships with `desktop/updater-key.pin.json` in a
+`bootstrap-required` state. After generating the production key, calculate the
+fingerprint of its public half:
+
+```sh
+node scripts/check-updater-key-pin.mjs fingerprint ~/.tauri/ro-sync.key.pub
+```
+
+Review that fingerprint out of band, then change the pin file to `configured`
+and commit the printed SHA-256 as `publicKeySha256`. This is a one-time trust
+bootstrap, not a release-time substitution. Until it is complete, tagged
+releases fail closed with bootstrap instructions.
+
+Configure the private key contents as the `TAURI_SIGNING_PRIVATE_KEY` GitHub
+Actions secret, its password (when present) as
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, and the public key contents as the
+`ROSYNC_UPDATER_PUBLIC_KEY` repository variable. Never commit or share the
+private key. Losing it prevents existing installations from accepting future
+updates.
+
+Tagged releases fail closed when the public variable or private secret is
+missing, when the public key differs from the reviewed fingerprint, or when an
+artifact signature cannot be verified before `latest.json` is created. Key
+rotation therefore requires an explicit pin change plus a migration plan for
+already-installed clients; changing only the GitHub variable is rejected as a
+silent rotation.
+
+Pull-request CI exercises the signing, pin-validation, tamper-detection, and
+manifest-generation path with an ephemeral key. Run the same smoke test locally
+after `npm ci` in `desktop`:
+
+```sh
+cd desktop
+npm ci
+cd ..
+node scripts/smoke-updater-release.mjs
+```
+
+The ephemeral private key exists only in a temporary directory and is deleted
+when the test exits. Production private keys are never committed. Successful
+tagged releases publish a signed macOS app archive, signed Windows MSI and NSIS
+installers, and `latest.json` alongside the normal installers. Stable tags are
+explicitly marked as GitHub's latest release. Semver prerelease tags are marked
+as prereleases and never replace the stable `/releases/latest/` updater feed.
+Workflow-dispatch builds do not require signing credentials and do not create
+updater artifacts.
 
 ## What is bundled
 
