@@ -97,11 +97,12 @@ jobs:
           cp tools/luau/README.md tools/luau/LICENSE.txt "$bundle/tools/luau/"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # PowerShell Compress-Archive writes backslash entry names, which
+            # violates the zip spec and fails the release bundle verification;
+            # Windows' bundled bsdtar produces standard forward-slash entries.
+            archive_win="$(cygpath -w "$PWD/$archive")"
             bundle_win="$(cygpath -w "$bundle")"
-            archive_win="$(cygpath -w "$archive")"
-            BUNDLE_DIR="$bundle_win" ARCHIVE_PATH="$archive_win" \
-              powershell -NoProfile -NonInteractive -Command \
-                'Compress-Archive -Path "$env:BUNDLE_DIR\*" -DestinationPath $env:ARCHIVE_PATH -Force'
+            /c/Windows/System32/tar.exe -a -cf "$archive_win" -C "$bundle_win" daemon tools
           else
             archive_abs="$PWD/$archive"
             (cd "$bundle" && zip -q -r "$archive_abs" .)
