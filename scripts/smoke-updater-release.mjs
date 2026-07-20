@@ -52,7 +52,7 @@ function assertDefaultPinResolves(cwd) {
   });
   assert.notEqual(result.status, 0, "the checked-in pin must require a public key or bootstrap");
   assert.doesNotMatch(result.stderr, /ENOENT|no such file/i);
-  assert.match(result.stderr, /not bootstrapped|public key is required/i);
+  assert.match(result.stderr, /not bootstrapped|ROSYNC_UPDATER_PUBLIC_KEY is required/i);
 }
 
 try {
