@@ -89,6 +89,23 @@ pub fn collect_local_nodes(services: &[Value]) -> BTreeMap<String, DiffNode> {
     out
 }
 
+/// Index the emitted filesystem snapshot by the exact path keys used by the
+/// initial diff. The retained values let selective initial sync send a full
+/// disk node (including descendants) without reimplementing filesystem name,
+/// duplicate-sibling, or script-with-children mapping in the HTTP layer.
+pub fn collect_local_snapshot_values(services: &[Value]) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for service in services {
+        let Some(name) = service.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(children) = service.get("children").and_then(Value::as_array) {
+            collect_snapshot_value_children(children, name, &mut out);
+        }
+    }
+    out
+}
+
 pub fn collect_studio_tree_nodes(root: &Value) -> BTreeMap<String, DiffNode> {
     let mut out = BTreeMap::new();
     let is_data_model_root = root
@@ -239,6 +256,59 @@ fn collect_snapshot_children(
         taken.push(fragment.fragment.clone());
         let path = join_path(parent, &diff_segment_for_fragment(&fragment.fragment));
         collect_snapshot_node(child, &path, out);
+    }
+}
+
+fn collect_snapshot_value_children(
+    children: &[Value],
+    parent: &str,
+    out: &mut BTreeMap<String, Value>,
+) {
+    let mut taken = Vec::new();
+    let mut relevant = Vec::new();
+    for child in children {
+        let Some(name) = child.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(class) = child.get("class").and_then(Value::as_str) else {
+            continue;
+        };
+        if child
+            .get("avoidSync")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || !is_sync_class(class)
+        {
+            continue;
+        }
+        relevant.push((
+            sibling_sort_key(child, class, TreeFlavor::Snapshot),
+            child,
+            name,
+            class,
+        ));
+    }
+    relevant.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (_sort_key, child, name, class) in relevant {
+        let has_children = child
+            .get("children")
+            .and_then(Value::as_array)
+            .is_some_and(|children| !children.is_empty());
+        let fragment = instance_to_path(
+            &InstanceDescriptor {
+                class,
+                name,
+                has_children,
+            },
+            &taken,
+        );
+        taken.push(fragment.fragment.clone());
+        let path = join_path(parent, &diff_segment_for_fragment(&fragment.fragment));
+        out.insert(path.clone(), child.clone());
+        if let Some(grandchildren) = child.get("children").and_then(Value::as_array) {
+            collect_snapshot_value_children(grandchildren, &path, out);
+        }
     }
 }
 

@@ -41,8 +41,8 @@ local RO_SYNC_SETTINGS_IMAGE = "rbxassetid://128477924144442"
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "2.1.0"
-local PLUGIN_PROTOCOL_VERSION = 2
+local PLUGIN_VERSION_STRING = "2.2.0"
+local PLUGIN_PROTOCOL_VERSION = 3
 
 --------------------------------------------------------------------------------
 -- Playtest runtime agent
@@ -2607,7 +2607,40 @@ end
 
 local function applyOp(op)
 	local kind = op.op or op.type
-	if kind == "set" or kind == "replace" then
+	if kind == "ensure" then
+		if not rootSetAllowed(op) then
+			return
+		end
+		local parent
+		if op.path and #op.path > 0 then
+			parent = resolvePath(op.path)
+		else
+			parent = game
+		end
+		if not parent then
+			log("ensure: parent path not found")
+			return
+		end
+		if isAvoidSyncBlocked(parent) then
+			log("AvoidSync: ignoring ensure under " .. pathOf(parent))
+			return
+		end
+		local node = op.node
+		if type(node) ~= "table" or type(node.name) ~= "string" then
+			log("ensure: invalid node")
+			return
+		end
+		-- Selective initial sync may need a missing parent container to reach a
+		-- chosen descendant. Existing ancestors are deliberately untouched,
+		-- including class and Source, because the user did not stage them.
+		if parent:FindFirstChild(node.name) then
+			return
+		end
+		applyNode(parent, node, {
+			strict = false,
+			forcePrune = false,
+		})
+	elseif kind == "set" or kind == "replace" then
 		if not rootSetAllowed(op) then
 			return
 		end
@@ -2625,7 +2658,10 @@ local function applyOp(op)
 			log("AvoidSync: ignoring set under " .. pathOf(parent))
 			return
 		end
-		applyNode(parent, op.node, { strict = op.strict == true })
+		applyNode(parent, op.node, {
+			strict = op.strict == true,
+			forcePrune = op.forcePrune == true,
+		})
 	elseif kind == "delete" or kind == "remove" then
 		local target = resolvePath(op.path)
 		if target and target ~= game then
@@ -9516,6 +9552,27 @@ local function doPullPath(strictDisk: boolean?)
 	return true
 end
 
+local function doPullSelectedPaths(paths: any): boolean
+	if type(paths) ~= "table" or #paths == 0 then
+		return doPullPath(true)
+	end
+	log(string.format("initial-compare → selective pull: applying %d disk path(s) to Studio", #paths))
+	local ok, snap = httpJson("/snapshot/selective", "POST", {
+		paths = paths,
+		pluginProtocol = PLUGIN_PROTOCOL_VERSION,
+	})
+	if not reconnectState.desired or not busy then
+		return false
+	end
+	if not ok or type(snap) ~= "table" or type(snap.ops) ~= "table" then
+		log("selective snapshot err: " .. tostring(snap))
+		setPill("error", "selective snapshot failed")
+		return false
+	end
+	applySnapshot(snap)
+	return true
+end
+
 -- A daemon or Desktop broker may advertise the authorized project initializer.
 -- Keep this state near the connection UI that consumes it so the plugin's very
 -- large top-level chunk can reuse earlier compiler registers.
@@ -9595,7 +9652,7 @@ local function waitForDecision(choiceId, gen)
 				if decoded.pending == true then
 					-- keep polling
 				elseif decoded.choice then
-					return tostring(decoded.choice)
+					return tostring(decoded.choice), decoded.paths
 				end
 			end
 		end
@@ -9692,12 +9749,15 @@ runInitialCompare = function()
 		decisionGeneration += 1
 		local gen = decisionGeneration
 		task.spawn(function()
-			local choice = waitForDecision(choiceId, gen)
+			local choice, selectedDiskPaths = waitForDecision(choiceId, gen)
 			if gen ~= decisionGeneration then
 				return
 			end
 			if choice == "disk" then
-				if doPullPath(true) then
+				local pulled = if type(selectedDiskPaths) == "table"
+					then doPullSelectedPaths(selectedDiskPaths)
+					else doPullPath(true)
+				if pulled then
 					completeInitialCompare()
 				else
 					reconnectState.retryInitialCompare("strict snapshot pull failed")

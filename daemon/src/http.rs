@@ -12,7 +12,7 @@ use axum::{
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -85,6 +85,7 @@ pub fn router(state: AppState) -> Router {
             post(project_init).layer(DefaultBodyLimit::max(PROJECT_INIT_BODY)),
         )
         .route("/snapshot", get(snapshot))
+        .route("/snapshot/selective", post(selective_snapshot))
         .route("/push", post(push))
         .route("/poll", get(poll))
         .route("/events", get(events))
@@ -979,6 +980,19 @@ impl InitialComparison {
             && self.summary.changed_files == 0
             && self.summary.removed_files == 0
     }
+
+    fn divergent_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .new_files
+            .iter()
+            .map(|item| item.path.clone())
+            .chain(self.changed_files.iter().map(|item| item.path.clone()))
+            .chain(self.removed_files.iter().map(|item| item.path.clone()))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1075,6 +1089,14 @@ async fn initial_compare(
         disk_stats,
         studio_stats: body.studio_stats,
         choice: None,
+        allowed_disk_paths: comparison
+            .as_ref()
+            .map(InitialComparison::divergent_paths)
+            .unwrap_or_default(),
+        selected_disk_paths: None,
+        comparison: comparison
+            .as_ref()
+            .and_then(|report| serde_json::to_value(report).ok()),
     };
     {
         let mut slot = state.pending_initial.lock().unwrap();
@@ -1209,10 +1231,12 @@ async fn initial_decision(
 ) -> impl IntoResponse {
     let started = Instant::now();
     loop {
-        let choice = {
-            let mut slot = state.pending_initial.lock().unwrap();
-            match slot.as_mut() {
-                Some(p) if p.choice_id == params.choice_id => p.choice,
+        let decision = {
+            let slot = state.pending_initial.lock().unwrap();
+            match slot.as_ref() {
+                Some(p) if p.choice_id == params.choice_id => p
+                    .choice
+                    .map(|choice| (choice, p.selected_disk_paths.clone())),
                 _ => {
                     return Json(json!({
                         "choice": "stale",
@@ -1223,7 +1247,7 @@ async fn initial_decision(
             }
         };
 
-        if let Some(choice) = choice {
+        if let Some((choice, selected_disk_paths)) = decision {
             {
                 let mut slot = state.pending_initial.lock().unwrap();
                 if slot.as_ref().map(|p| p.choice_id.as_str()) == Some(params.choice_id.as_str()) {
@@ -1235,7 +1259,12 @@ async fn initial_decision(
                 Choice::Studio => "studio",
                 Choice::Cancel => "cancel",
             };
-            return Json(json!({ "choice": s })).into_response();
+            return match (choice, selected_disk_paths) {
+                (Choice::Disk, Some(paths)) => {
+                    Json(json!({ "choice": s, "paths": paths })).into_response()
+                }
+                _ => Json(json!({ "choice": s })).into_response(),
+            };
         }
 
         if started.elapsed() >= Duration::from_secs(60) {
@@ -1261,6 +1290,9 @@ async fn initial_choice_status(State(state): State<AppState>) -> Json<Value> {
         "diskStats": pending.disk_stats,
         "studioStats": pending.studio_stats,
         "choice": choice,
+        "comparisonPaths": pending.allowed_disk_paths,
+        "selectedPaths": pending.selected_disk_paths,
+        "comparison": pending.comparison,
     }))
 }
 
@@ -1269,6 +1301,30 @@ struct InitialChoiceBody {
     #[serde(rename = "choiceId")]
     choice_id: String,
     choice: String,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+}
+
+fn normalize_initial_disk_selection(
+    requested: Vec<String>,
+    allowed: &[String],
+) -> Result<Vec<String>, String> {
+    if requested.is_empty() {
+        return Err("choose at least one divergent path before finishing".into());
+    }
+    let allowed: HashSet<&str> = allowed.iter().map(String::as_str).collect();
+    let mut selected = Vec::with_capacity(requested.len());
+    for path in requested {
+        if path.is_empty() || !allowed.contains(path.as_str()) {
+            return Err(format!(
+                "path is not part of the current initial divergence: {path:?}"
+            ));
+        }
+        selected.push(path);
+    }
+    selected.sort();
+    selected.dedup();
+    Ok(selected)
 }
 
 async fn initial_choice(
@@ -1291,6 +1347,21 @@ async fn initial_choice(
         let mut slot = state.pending_initial.lock().unwrap();
         match slot.as_mut() {
             Some(p) if p.choice_id == body.choice_id => {
+                if choice != Choice::Disk && body.paths.is_some() {
+                    return Json(json!({
+                        "ok": false,
+                        "error": "selected paths are only valid for a disk-to-Studio choice",
+                    }));
+                }
+                p.selected_disk_paths = match body.paths {
+                    Some(paths) => {
+                        match normalize_initial_disk_selection(paths, &p.allowed_disk_paths) {
+                            Ok(paths) => Some(paths),
+                            Err(error) => return Json(json!({ "ok": false, "error": error })),
+                        }
+                    }
+                    None => None,
+                };
                 p.choice = Some(choice);
             }
             _ => {
@@ -1307,7 +1378,11 @@ async fn initial_choice(
         Choice::Studio => "studio",
         Choice::Cancel => "cancel",
     };
-    let evt = json!({ "type": "initial-choice-made", "choice": choice_str });
+    let evt = json!({
+        "type": "initial-choice-made",
+        "choiceId": body.choice_id,
+        "choice": choice_str,
+    });
     if let Ok(s) = serde_json::to_string(&evt) {
         let _ = state.events.send(s);
     }
@@ -1354,6 +1429,141 @@ async fn snapshot(
         "forcePrune": params.force_prune,
         "pluginConnected": plugin_connected,
     }))
+}
+
+#[derive(Deserialize)]
+struct SelectiveSnapshotBody {
+    paths: Vec<String>,
+    #[serde(rename = "pluginProtocol", default)]
+    plugin_protocol: Option<u64>,
+}
+
+fn compact_selected_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err("selective snapshot requires at least one path".into());
+    }
+    if paths.len() > 100_000 {
+        return Err("selective snapshot path count exceeds 100000".into());
+    }
+
+    let mut ordered = paths.to_vec();
+    ordered.sort_by(|left, right| {
+        left.split('/')
+            .count()
+            .cmp(&right.split('/').count())
+            .then_with(|| left.cmp(right))
+    });
+    ordered.dedup();
+
+    let mut compacted: Vec<String> = Vec::with_capacity(ordered.len());
+    for path in ordered {
+        if path.len() > 4096 {
+            return Err("selective snapshot path exceeds 4096 bytes".into());
+        }
+        let segments = path.split('/').collect::<Vec<_>>();
+        if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+            return Err(format!("invalid selective snapshot path: {path:?}"));
+        }
+        if !snapshot::SYNCED_SERVICES.contains(&segments[0]) {
+            return Err(format!(
+                "selective snapshot path is outside a synced service: {path}"
+            ));
+        }
+        if compacted.iter().any(|ancestor| {
+            path.len() > ancestor.len()
+                && path.starts_with(ancestor)
+                && path.as_bytes().get(ancestor.len()) == Some(&b'/')
+        }) {
+            continue;
+        }
+        compacted.push(path);
+    }
+    Ok(compacted)
+}
+
+fn shallow_snapshot_node(node: &Value) -> Value {
+    let mut node = node.clone();
+    if let Some(object) = node.as_object_mut() {
+        object.insert("properties".into(), Value::Object(Map::new()));
+        object.insert("children".into(), Value::Array(Vec::new()));
+    }
+    node
+}
+
+fn build_selective_snapshot(root: &Path, paths: &[String]) -> Result<Value, String> {
+    let selected_paths = compact_selected_paths(paths)?;
+    let services = snapshot::emit_services(root)
+        .map_err(|error| format!("selective snapshot scan {}: {error}", root.display()))?;
+    let disk_nodes = diff::collect_local_snapshot_values(&services);
+    let mut ops = Vec::new();
+    let mut emitted_ancestors = BTreeSet::new();
+
+    for path in &selected_paths {
+        let segments = path.split('/').map(str::to_string).collect::<Vec<_>>();
+        if let Some(node) = disk_nodes.get(path) {
+            // A selected child may live below a disk-only parent that does not
+            // exist in Studio yet. Create only the container shells required
+            // to reach it; empty properties ensure an unselected ancestor's
+            // script source is never overwritten as a side effect.
+            for depth in 2..segments.len() {
+                let ancestor_path = segments[..depth].join("/");
+                let Some(ancestor) = disk_nodes.get(&ancestor_path) else {
+                    continue;
+                };
+                if !emitted_ancestors.insert(ancestor_path) {
+                    continue;
+                }
+                ops.push(json!({
+                    "op": "ensure",
+                    "path": segments[..depth - 1].to_vec(),
+                    "node": shallow_snapshot_node(ancestor),
+                    "strict": false,
+                    "forcePrune": false,
+                }));
+            }
+            ops.push(json!({
+                "op": "set",
+                "path": segments[..segments.len() - 1].to_vec(),
+                "node": node,
+                "strict": true,
+                "forcePrune": true,
+            }));
+        } else {
+            // The selected path exists only in Studio. Applying the disk state
+            // therefore means removing that synced instance from Studio.
+            ops.push(json!({
+                "op": "delete",
+                "path": segments,
+                "forcePrune": true,
+            }));
+        }
+    }
+
+    Ok(json!({
+        "ops": ops,
+        "strict": true,
+        "forcePrune": true,
+        "selectedPaths": selected_paths,
+    }))
+}
+
+async fn selective_snapshot(
+    State(state): State<AppState>,
+    Json(body): Json<SelectiveSnapshotBody>,
+) -> Json<Value> {
+    if body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
+        return Json(json!({
+            "ok": false,
+            "error": format!(
+                "incompatible Studio plugin protocol; expected {}. Reinstall the Studio plugin.",
+                crate::ws::PLUGIN_PROTOCOL_VERSION
+            ),
+        }));
+    }
+    match build_selective_snapshot(state.canonical_project.as_path(), &body.paths) {
+        Ok(payload) => Json(payload),
+        Err(error) => Json(json!({ "ok": false, "error": error })),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6145,6 +6355,143 @@ mod tests {
         assert!(!json.contains("notes.md"));
         assert!(!json.contains("Plans"));
         assert!(!json.contains("Loose"));
+    }
+
+    #[tokio::test]
+    async fn initial_choice_status_replays_the_full_comparison() {
+        let project = TempDir::new("initial-choice-replay");
+        let state = test_state(&project, None);
+        *state.pending_initial.lock().unwrap() = Some(PendingInitial {
+            choice_id: "choice-replay".into(),
+            disk_stats: Stats {
+                script_count: 2,
+                instance_count: 3,
+            },
+            studio_stats: Stats {
+                script_count: 4,
+                instance_count: 5,
+            },
+            choice: None,
+            allowed_disk_paths: vec!["ReplicatedStorage/Config".into()],
+            selected_disk_paths: None,
+            comparison: Some(json!({
+                "summary": { "newFiles": 0, "changedFiles": 1, "removedFiles": 0 },
+                "newFiles": [],
+                "changedFiles": [{
+                    "path": "ReplicatedStorage/Config",
+                    "kind": "script",
+                    "localClass": "ModuleScript",
+                    "studioClass": "ModuleScript",
+                    "classChanged": false,
+                    "sourceChanged": true
+                }],
+                "removedFiles": []
+            })),
+        });
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/initial-choice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["pending"], true);
+        assert_eq!(body["choiceId"], "choice-replay");
+        assert_eq!(
+            body["comparison"]["changedFiles"][0]["path"],
+            "ReplicatedStorage/Config"
+        );
+    }
+
+    #[test]
+    fn selective_initial_snapshot_contains_only_chosen_disk_changes() {
+        let d = TempDir::new("initial-selective");
+        let feature = d.path().join("ReplicatedStorage").join("Feature");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(feature.join("Chosen.luau"), "return 'chosen'\n").unwrap();
+        std::fs::write(feature.join("Untouched.luau"), "return 'untouched'\n").unwrap();
+
+        let payload = build_selective_snapshot(
+            d.path(),
+            &[
+                "ReplicatedStorage/Feature/Chosen".into(),
+                "StarterGui/StudioOnly".into(),
+            ],
+        )
+        .unwrap();
+        let ops = payload["ops"].as_array().unwrap();
+
+        assert_eq!(ops.len(), 3, "one parent shell, one set, one delete");
+        let parent = ops
+            .iter()
+            .find(|op| op["node"]["name"] == "Feature")
+            .unwrap();
+        let chosen = ops
+            .iter()
+            .find(|op| op["node"]["name"] == "Chosen")
+            .unwrap();
+        let removed = ops.iter().find(|op| op["op"] == "delete").unwrap();
+        assert_eq!(parent["op"], "ensure");
+        assert_eq!(parent["node"]["children"], json!([]));
+        assert_eq!(parent["node"]["properties"], json!({}));
+        assert_eq!(chosen["node"]["name"], "Chosen");
+        assert_eq!(chosen["node"]["properties"]["Source"], "return 'chosen'\n");
+        assert_eq!(chosen["forcePrune"], true);
+        assert_eq!(removed["path"], json!(["StarterGui", "StudioOnly"]));
+        assert!(
+            !payload.to_string().contains("untouched"),
+            "an unselected sibling source must not cross into Studio"
+        );
+    }
+
+    #[test]
+    fn selective_initial_snapshot_parent_selection_subsumes_children() {
+        let d = TempDir::new("initial-selective-tree");
+        let feature = d.path().join("Workspace").join("Feature");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(feature.join("Child.server.luau"), "print('child')\n").unwrap();
+
+        let payload = build_selective_snapshot(
+            d.path(),
+            &["Workspace/Feature/Child".into(), "Workspace/Feature".into()],
+        )
+        .unwrap();
+        let ops = payload["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["node"]["name"], "Feature");
+        assert_eq!(ops[0]["node"]["children"][0]["name"], "Child");
+        assert_eq!(payload["selectedPaths"], json!(["Workspace/Feature"]));
+    }
+
+    #[test]
+    fn initial_disk_selection_rejects_paths_not_shown_by_the_compare() {
+        let allowed = vec![
+            "ReplicatedStorage/Config".to_string(),
+            "Workspace/Feature".to_string(),
+        ];
+        let selected = normalize_initial_disk_selection(
+            vec![
+                "Workspace/Feature".into(),
+                "ReplicatedStorage/Config".into(),
+                "Workspace/Feature".into(),
+            ],
+            &allowed,
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec!["ReplicatedStorage/Config", "Workspace/Feature"]
+        );
+        assert!(normalize_initial_disk_selection(vec![], &allowed).is_err());
+        assert!(
+            normalize_initial_disk_selection(vec!["Workspace/Other".into()], &allowed).is_err()
+        );
     }
 
     #[test]

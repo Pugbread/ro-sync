@@ -15,20 +15,21 @@ The Studio plugin first reads `/hello`, retains the process-local
 announces both the protocol version and capability:
 
 ```json
-{"type":"hello","clientId":"123456789","role":"plugin","protocol":2,"pluginCapability":"<64 hex characters>"}
+{"type":"hello","clientId":"123456789","role":"plugin","protocol":3,"pluginCapability":"<64 hex characters>"}
 ```
 
 The daemon rejects a missing/incompatible protocol or capability with a
-`shutdown` frame. Every socket sends exactly one hello using protocol 2;
+`shutdown` frame. Every socket sends exactly one hello using protocol 3;
 `plugin`, command-capable CLI/agent, and read-only widget/watch roles receive
 only the traffic appropriate to that role. The daemon replaces caller request
 IDs with private correlation IDs before routing them to Studio.
 Origin-bearing browser HTTP/WebSocket requests must also carry the owning
 widget's capability as `?widgetToken=...`; native loopback Studio/CLI clients
 do not send an Origin header.
-Protocol 2 corresponds to Studio plugin 2.1.0 and adds structured errors,
-capability discovery, artifact-backed capture, playtest runtime routing, and
-workflow transaction/precondition operations.
+Protocol 3 corresponds to Studio plugin 2.2.0 and adds selective initial
+Disk-to-Studio snapshots. It retains the structured errors, capability
+discovery, artifact-backed capture, playtest runtime routing, and workflow
+transaction/precondition operations introduced by protocol 2.
 
 ## Desktop-authorized project initialization
 
@@ -468,7 +469,7 @@ required completion record.
 
 The workflow schema is a CLI contract (`rosync run --file`), not a second wire
 format. The CLI validates all schema-v1 steps and references, opens one
-persistent WebSocket session, then maps each step onto ordinary protocol 2
+persistent WebSocket session, then maps each step onto ordinary protocol 3
 requests. Three operations add safe workflow semantics:
 
 - `inspect_ref` checks a live target and rejects mismatched `expectedClass` or

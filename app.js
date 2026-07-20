@@ -18,6 +18,7 @@ import { mountConflicts } from "./views/conflicts.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
+import { createLastEditedStore, projectMemoryKey } from "./views/last-edited.js";
 import { mergeProjectInitEvent } from "./project-init.js";
 import {
   canStopDesktopDaemon,
@@ -47,6 +48,17 @@ const APPEARANCE_CONTEXT = Object.freeze({
   isDesktop: IS_DESKTOP_HOST,
 });
 const DEFAULT_APPEARANCE_THEME = defaultAppearanceTheme(APPEARANCE_CONTEXT);
+
+// Per-project last-edited memory. The app-level stream feeds it from
+// sanitized sync-activity frames; the initial-divergence picker sorts by it.
+const lastEditedStore = createLastEditedStore({
+  stateGet: (key) => host.stateGet(key),
+  stateSet: (key, value) => host.stateSet(key, value),
+});
+window.addEventListener("pagehide", () => { void lastEditedStore.flush(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") void lastEditedStore.flush();
+});
 
 // ---------- State store ----------
 // Persisted shape:
@@ -2217,6 +2229,21 @@ const ENABLE_APP_REALTIME_STREAM = true;
 const appStreams = new Map();
 const RAW_OP_RE = /"type"\s*:\s*"op"/;
 
+async function replayPendingInitialChoice(projectId, base, event = {}) {
+  try {
+    const pending = await daemonJson(base, "/initial-choice");
+    if (!pending?.pending || pending.choice || !pending.choiceId) return;
+    emit("initial-choice-needed", {
+      ...pending,
+      projectId: projectId === "__single" ? app.state.activeProjectId : projectId,
+      projectPath: event.project || projectById(projectId)?.path || null,
+    });
+  } catch {
+    // The realtime stream will still deliver a newly-created decision. Replay
+    // is best-effort recovery for a decision broadcast before this UI attached.
+  }
+}
+
 // Op frames are intentionally skipped on the app-level stream so large file
 // bursts do not force the Terminal 64 host to JSON-parse every source payload.
 function shouldSkipRawAppFrame(raw) {
@@ -2236,9 +2263,19 @@ function openAppStream(event = {}) {
   if (!base) return;
   const previous = appStreams.get(projectId);
   if (previous) { try { previous.close(); } catch {} }
+  // Resolved lazily: in single-daemon mode the active project can change
+  // between frames, and last-edited stamps must land on the right project.
+  const resolveMemoryKey = () => {
+    const resolvedId = projectId === "__single" ? app.state.activeProjectId : projectId;
+    return projectMemoryKey(
+      event.project || projectById(resolvedId)?.path || null,
+      resolvedId,
+    );
+  };
   try {
     const stream = daemonWS(base, "/ws", {
       skipRaw: shouldSkipRawAppFrame,
+      open: () => { void replayPendingInitialChoice(projectId, base, event); },
       message: (data) => {
         if (!data || typeof data !== "object") return;
         const t = data.type;
@@ -2246,6 +2283,10 @@ function openAppStream(event = {}) {
         if (t === "op") {
           // Sync ops are applied by the plugin. The app-level stream only
           // exists for control events, so never turn op volume into a prompt.
+          return;
+        }
+        if (t === "sync-activity") {
+          lastEditedStore.record(resolveMemoryKey(), data);
           return;
         }
         // Transport-only frames — not surfaced to views.
@@ -2274,16 +2315,28 @@ function openAppStream(event = {}) {
       error: () => { /* daemonWS handles reconnect */ },
     });
     appStreams.set(projectId, stream);
+    void replayPendingInitialChoice(projectId, base, event);
   } catch (e) {
     console.warn("app WS failed", e);
   }
 }
 on("daemon:up", openAppStream);
 on("daemon:down", (event = {}) => {
-  const projectId = event.projectId || projectIdForPath(event.project) || "__single";
-  const stream = appStreams.get(projectId);
-  if (stream) { try { stream.close(); } catch {} }
-  appStreams.delete(projectId);
+  const projectId = event.projectId || projectIdForPath(event.project) || null;
+  if (projectId) {
+    const stream = appStreams.get(projectId);
+    if (stream) { try { stream.close(); } catch {} }
+    appStreams.delete(projectId);
+    return;
+  }
+  // Terminal 64 single-daemon flows emit daemon:down without a project
+  // identity, while streams are keyed by the project that was active when
+  // they opened. Only one daemon can exist there, so every remaining stream
+  // is stale — leaving one open lets it re-attach to the next daemon on the
+  // same port and attribute that project's frames (including last-edited
+  // stamps) to the old project.
+  for (const stream of appStreams.values()) { try { stream.close(); } catch {} }
+  appStreams.clear();
 });
 
 // ---------- Native Studio project-initialization broker ----------
@@ -2350,6 +2403,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 (async function boot() {
   void hydrateHostPresentation();
   await loadState();
+  await lastEditedStore.load();
   appearanceStateLoaded = true;
   // Appearance is persisted independently of the last route. Apply it before
   // mounting a view so restored sessions never render a page in the wrong
@@ -2371,6 +2425,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
     getDaemonBase,
     getState,
     toast,
+    lastEdited: lastEditedStore,
   });
   setDaemonDot("warn", "connecting…");
   await ensureDaemon();

@@ -105,22 +105,8 @@ export function mountSettings(root, api) {
       <h3>Project: <span id="pp-name">—</span></h3>
       <p style="color:var(--muted)">Stored in <code>ro-sync.json</code> at the project root. The daemon hot-reloads the file.</p>
       <div class="pp-grid">
-        <label>Initial sync priority
-          <select id="pp-priority">
-            <option value="Prompt">Prompt (ask me)</option>
-            <option value="Studio">Studio first (new Studio-created projects)</option>
-            <option value="ServerPrefer">Server prefer (Studio wins)</option>
-            <option value="FilesystemPrefer">Filesystem prefer (disk wins)</option>
-          </select>
-        </label>
         <label>Auto reconnect
           <select id="pp-reconnect">
-            <option value="on">on</option>
-            <option value="off">off</option>
-          </select>
-        </label>
-        <label>Display prompts
-          <select id="pp-prompts">
             <option value="on">on</option>
             <option value="off">off</option>
           </select>
@@ -252,9 +238,7 @@ export function mountSettings(root, api) {
 
   const $ppSection = root.querySelector("#sec-project");
   const $ppName = root.querySelector("#pp-name");
-  const $ppPriority = root.querySelector("#pp-priority");
   const $ppReconnect = root.querySelector("#pp-reconnect");
-  const $ppPrompts = root.querySelector("#pp-prompts");
   const $ppSave = root.querySelector("#pp-save");
   const $ppReset = root.querySelector("#pp-reset");
   const $ppMsg = root.querySelector("#pp-msg");
@@ -451,7 +435,7 @@ export function mountSettings(root, api) {
   }
 
   function defaultProjectSettings() {
-    return { InitialSyncPriority: "Prompt", AutoReconnect: "on", DisplayPrompts: "on" };
+    return { AutoReconnect: "on" };
   }
 
   function servedIds(state = api.getState()) {
@@ -554,18 +538,14 @@ export function mountSettings(root, api) {
     $ppSection.hidden = false;
     $ppName.textContent = proj.name || proj.path || "project";
     const cfg = { ...defaultProjectSettings(), ...(proj.settings || {}) };
-    $ppPriority.value = cfg.InitialSyncPriority;
     $ppReconnect.value = cfg.AutoReconnect;
-    $ppPrompts.value = cfg.DisplayPrompts;
   }
 
   async function saveProjectSettings() {
     const proj = activeProject();
     if (!proj) return;
     const cfg = {
-      InitialSyncPriority: $ppPriority.value,
       AutoReconnect: $ppReconnect.value,
-      DisplayPrompts: $ppPrompts.value,
     };
     // Persist on the project record.
     const s = api.getState();
@@ -585,6 +565,10 @@ export function mountSettings(root, api) {
       existing = {};
     }
     const merged = { ...existing, ...cfg };
+    // Initial mismatches are always interactive now. Remove legacy automatic
+    // source-priority settings when this project is next saved.
+    delete merged.InitialSyncPriority;
+    delete merged.DisplayPrompts;
     try {
       await writeFileViaExec(api, cfgPath, JSON.stringify(merged, null, 2) + "\n");
       $ppMsg.textContent = `Saved to ${cfgPath}`;
@@ -599,9 +583,7 @@ export function mountSettings(root, api) {
     const proj = activeProject();
     if (!proj) return;
     const cfg = { ...defaultProjectSettings(), ...(proj.settings || {}) };
-    $ppPriority.value = cfg.InitialSyncPriority;
     $ppReconnect.value = cfg.AutoReconnect;
-    $ppPrompts.value = cfg.DisplayPrompts;
     $ppMsg.textContent = "";
   }
 

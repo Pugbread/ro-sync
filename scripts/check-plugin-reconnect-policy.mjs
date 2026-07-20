@@ -119,4 +119,27 @@ assert.match(
   "explicit user disconnect and plugin unload must remain terminal",
 );
 
+assert.match(source, /local PLUGIN_VERSION_STRING = "2\.2\.0"/);
+assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 3/);
+assert.match(
+  source,
+  /return tostring\(decoded\.choice\), decoded\.paths/,
+  "the initial decision poll must retain the user's selective disk paths",
+);
+assert.match(
+  source,
+  /httpJson\("\/snapshot\/selective", "POST", \{/,
+  "selective initial sync must request the bounded disk snapshot endpoint",
+);
+
+const ensureBranch = source.slice(
+  source.indexOf('if kind == "ensure" then'),
+  source.indexOf('elseif kind == "set" or kind == "replace" then'),
+);
+assert.match(
+  ensureBranch,
+  /if parent:FindFirstChild\(node\.name\) then\s+return/,
+  "selective parent materialization must leave an existing unselected ancestor untouched",
+);
+
 console.log("Studio plugin reconnect policy checks passed");

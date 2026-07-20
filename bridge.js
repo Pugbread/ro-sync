@@ -524,7 +524,7 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
           type: "hello",
           clientId: "terminal64-widget",
           role: "watch",
-          protocol: 2,
+          protocol: 3,
         }));
       } catch {}
       if (handlers.open) { try { handlers.open(e); } catch (err) { console.error(err); } }

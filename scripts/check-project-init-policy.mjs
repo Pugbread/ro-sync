@@ -19,7 +19,7 @@ assert.equal(created.created, true);
 assert.equal(created.project.id, "p_race");
 assert.deepEqual(created.patch.servedProjectIds, ["p_race"]);
 assert.equal(created.patch.activeProjectId, "p_race");
-assert.equal(created.project.settings.InitialSyncPriority, "Studio");
+assert.equal(created.project.settings.InitialSyncPriority, undefined);
 assert.equal(created.project.creatorType, "Group");
 
 const genericDataModelName = mergeProjectInitEvent(

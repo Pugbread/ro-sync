@@ -782,13 +782,7 @@ fn write_project_config(project: &Path, values: &ProjectConfigWrite<'_>) -> Resu
     );
     config.entry("version").or_insert(json!(1));
     config
-        .entry("InitialSyncPriority")
-        .or_insert(Value::String("Studio".into()));
-    config
         .entry("AutoReconnect")
-        .or_insert(Value::String("on".into()));
-    config
-        .entry("DisplayPrompts")
         .or_insert(Value::String("on".into()));
 
     let mut bytes = serde_json::to_vec_pretty(&config)
@@ -1051,7 +1045,7 @@ mod tests {
         assert_eq!(value["placeIds"], json!(["1", "2"]));
         assert_eq!(value["placeName"], "Second Place");
         assert_eq!(value["creatorType"], "Group");
-        assert_eq!(value["InitialSyncPriority"], "Studio");
+        assert!(value.get("InitialSyncPriority").is_none());
     }
 
     #[test]

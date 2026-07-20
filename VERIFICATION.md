@@ -57,7 +57,7 @@ navigation, and daemon shutdown all remain responsive.
 
 | # | Scenario | Expected |
 | --- | --- | --- |
-| 15 | Run `rosync capabilities --project . --raw`. | Protocol 2, plugin 2.0.0, and explicit capture/playtest/runtime feature flags and limits are returned. |
+| 15 | Run `rosync capabilities --project . --raw`. | Protocol 3, plugin 2.2.0, and explicit capture/playtest/runtime feature flags and limits are returned. |
 | 16 | Run `rosync capture status --project . --raw` before authorization. | Status is read-only and no permission prompt appears. |
 | 17 | Run `rosync capture authorize`, then capture a custom `x,y,width,height` region and a resized output. | One explicit Studio prompt is shown; the CLI writes a verified PNG with matching dimensions, size, and SHA-256 metadata. |
 | 18 | Before screenshot authorization, run `rosync capture photo` for a viewport region and a focused target from each named view; repeat one focused capture through the `capture scene` alias. | No permission prompt appears; exact dimensions and valid RGBA/PNG metadata are returned, the target remains fully framed, and camera, UI, Lighting, and temporary-clone state are cleaned up after every success/failure. |

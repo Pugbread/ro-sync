@@ -9,7 +9,7 @@
     "rosync capabilities --project . --raw"
   ],
   "notes": [
-    "The protocol 2 / plugin 2.1.0 document reports feature flags for native instance clipboard copy/paste, screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.instanceClipboard` advertises `rosync copy`/`paste`. Photo feature flags and limits remain independent of Studio screenshot authorization.",
+    "The protocol 3 / plugin 2.2.0 document reports feature flags for selective initial Disk-to-Studio sync, native instance clipboard copy/paste, screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.instanceClipboard` advertises `rosync copy`/`paste`. Photo feature flags and limits remain independent of Studio screenshot authorization.",
     "Use this cheap read before relying on optional Studio APIs; Studio version and permission differences are reported instead of guessed.",
     "`--raw` prints the complete correlated response envelope for machine use."
   ]

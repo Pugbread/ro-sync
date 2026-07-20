@@ -61,9 +61,7 @@ export function mergeProjectInitEvent(state, event, makeId = defaultProjectId) {
       || null,
     initializedRequestId: cleanString(event?.requestId) || existing?.initializedRequestId || null,
     settings: {
-      InitialSyncPriority: "Studio",
       AutoReconnect: "on",
-      DisplayPrompts: "on",
       ...(existing?.settings || {}),
     },
     initializedFromStudio: true,

@@ -2,6 +2,7 @@
 //! `/initial-decision` (long-poll), and `/initial-choice` (plugin UI).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 
 use crate::fs_map::{classify_script_file, is_init_file, META_FILE};
@@ -35,6 +36,16 @@ pub struct PendingInitial {
     pub disk_stats: Stats,
     pub studio_stats: Stats,
     pub choice: Option<Choice>,
+    /// Every path reported by the compare that may be selected for a
+    /// disk-to-Studio transfer. Keeping this server-side prevents a stale or
+    /// forged modal from applying paths outside the divergence it displayed.
+    pub allowed_disk_paths: Vec<String>,
+    /// `None` preserves the legacy/full "Keep Disk" behavior. `Some` is the
+    /// explicit subset chosen in the two-pane divergence picker.
+    pub selected_disk_paths: Option<Vec<String>>,
+    /// Full compare payload retained while the decision is pending so a UI
+    /// that attaches after the broadcast can replay the same chooser.
+    pub comparison: Option<Value>,
 }
 
 /// Walk the project root and count tracked scripts + instances.

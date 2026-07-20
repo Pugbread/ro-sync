@@ -173,6 +173,7 @@ jobs:
           node scripts/check-platform-commands.mjs
           node scripts/check-project-path-policy.mjs
           node scripts/check-project-init-policy.mjs
+          node scripts/check-initial-selection.mjs
           node scripts/check-plugin-reconnect-policy.mjs
           node scripts/check-activity-format.mjs
           node scripts/check-theme-policy.mjs
