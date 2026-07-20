@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "state": "bootstrap-required",
+  "state": "configured",
   "algorithm": "sha256-ed25519-public-key",
-  "publicKeySha256": null
+  "publicKeySha256": "7bec008f49391d01c94d1e851c3f6d8bd7fe185d7b84e910b03d6a4bff196caa"
 }

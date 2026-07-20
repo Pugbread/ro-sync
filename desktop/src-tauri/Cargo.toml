@@ -1,6 +1,6 @@
 [package]
 name = "ro-sync-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "A secure native desktop host for Ro Sync"
 authors = ["Ro Sync contributors"]
 edition = "2021"
