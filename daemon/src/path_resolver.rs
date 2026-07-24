@@ -1,13 +1,14 @@
 //! `rosync path` — translate between Studio instance paths and Ro-Sync files.
 
 use crate::fs_map::{
-    classify_script_file, decode_name, encode_name, instance_to_path, is_init_file,
-    parse_disambiguated, path_to_instance_meta, InstanceDescriptor, META_FILE,
+    classify_script_file, decode_name, encode_name, is_init_file, parse_disambiguated,
+    path_to_instance_meta, InstanceDescriptor, PathFragmentAllocator, META_FILE,
 };
+use crate::fs_safety::{metadata_no_follow, validate_synced_path, PortableDirectoryIndex};
 use crate::snapshot::{SYNCED_SERVICES, TREE_JSON};
 use clap::ValueEnum;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,12 +95,16 @@ fn studio_to_fs(
         let fragment = child_fragment(project, &fs_path, parent, node)?;
         fs_path = fs_path.join(fragment);
     }
+    validate_synced_path(project, &fs_path, true)
+        .map_err(|error| format!("path: validate {}: {error}", fs_path.display()))?;
 
     Ok(ResolvedPath {
         input_kind,
         studio_path: segs,
         class: node_class(nodes[nodes.len() - 1]).unwrap_or("").to_string(),
-        fs_exists: fs_path.exists(),
+        fs_exists: metadata_no_follow(&fs_path)
+            .map_err(|error| format!("path: inspect {}: {error}", fs_path.display()))?
+            .is_some(),
         fs_path,
     })
 }
@@ -139,6 +144,8 @@ fn fs_to_studio(
             SYNCED_SERVICES.join(", ")
         ));
     }
+    validate_synced_path(project, &fs_path, true)
+        .map_err(|error| format!("path: validate {}: {error}", fs_path.display()))?;
 
     let mut studio_path = vec![service];
     let mut stopped_at_init = false;
@@ -157,7 +164,10 @@ fn fs_to_studio(
             break;
         }
 
-        let segment = if cur.exists() {
+        let segment = if metadata_no_follow(&cur)
+            .map_err(|error| format!("path: inspect {}: {error}", cur.display()))?
+            .is_some()
+        {
             let Some(inst) = path_to_instance_meta(&cur)
                 .map_err(|e| format!("path: inspect filesystem path {}: {e}", cur.display()))?
             else {
@@ -202,7 +212,9 @@ fn fs_to_studio(
         input_kind,
         studio_path,
         class: node_class(nodes[nodes.len() - 1]).unwrap_or("").to_string(),
-        fs_exists: fs_path.exists(),
+        fs_exists: metadata_no_follow(&fs_path)
+            .map_err(|error| format!("path: inspect {}: {error}", fs_path.display()))?
+            .is_some(),
         fs_path,
     })
 }
@@ -249,12 +261,13 @@ fn child_fragment(
     child_node: &Value,
 ) -> Result<String, String> {
     let name = node_name(child_node).ok_or_else(|| "path: tree node missing name".to_string())?;
-    if let Some(existing) = find_existing_child_fragment_by_name(parent_dir, name)? {
+    let existing = existing_fragment_index(parent_dir)?;
+    if let Some(existing) = unique_existing_fragment(parent_dir, name, &existing.by_name)? {
         return Ok(existing);
     }
 
-    let mut taken = existing_fragments(parent_dir)?;
-    let mut seen: HashSet<String> = taken.iter().cloned().collect();
+    let mut allocator =
+        PathFragmentAllocator::from_taken(existing.fragments.iter().map(String::as_str));
 
     let Some(children) = parent_node.get("children").and_then(|v| v.as_array()) else {
         return Err(format!(
@@ -273,89 +286,80 @@ fn child_fragment(
         let Some(sibling_name) = node_name(sibling) else {
             continue;
         };
-        if find_existing_child_fragment_by_name(parent_dir, sibling_name)?.is_some() {
+        if unique_existing_fragment(parent_dir, sibling_name, &existing.by_name)?.is_some() {
             continue;
         }
-        let fragment = instance_to_path(
-            &InstanceDescriptor {
-                class: node_class(sibling).unwrap_or(""),
-                name: sibling_name,
-                has_children: node_has_children(sibling),
-            },
-            &taken,
-        )
-        .fragment;
-        if seen.insert(fragment.clone()) {
-            taken.push(fragment);
-        }
+        allocator.allocate(&InstanceDescriptor {
+            class: node_class(sibling).unwrap_or(""),
+            name: sibling_name,
+            has_children: node_has_children(sibling),
+        });
     }
 
-    let fragment = instance_to_path(
-        &InstanceDescriptor {
-            class: node_class(child_node).unwrap_or(""),
-            name,
-            has_children: node_has_children(child_node),
-        },
-        &taken,
-    );
+    let fragment = allocator.allocate(&InstanceDescriptor {
+        class: node_class(child_node).unwrap_or(""),
+        name,
+        has_children: node_has_children(child_node),
+    });
 
     let path = parent_dir.join(&fragment.fragment);
-    if path.starts_with(project) {
-        Ok(fragment.fragment)
-    } else {
-        Err(format!(
-            "path: resolved path escaped project: {}",
-            path.display()
-        ))
-    }
+    validate_synced_path(project, &path, true)
+        .map_err(|error| format!("path: validate resolved path {}: {error}", path.display()))?;
+    Ok(fragment.fragment)
 }
 
-fn find_existing_child_fragment_by_name(dir: &Path, name: &str) -> Result<Option<String>, String> {
-    if !dir.is_dir() {
-        return Ok(None);
+struct ExistingFragmentIndex {
+    fragments: Vec<String>,
+    by_name: HashMap<String, Vec<String>>,
+}
+
+fn existing_fragment_index(dir: &Path) -> Result<ExistingFragmentIndex, String> {
+    let Some(metadata) = metadata_no_follow(dir)
+        .map_err(|error| format!("path: inspect {}: {error}", dir.display()))?
+    else {
+        return Ok(ExistingFragmentIndex {
+            fragments: Vec::new(),
+            by_name: HashMap::new(),
+        });
+    };
+    if !metadata.is_dir() {
+        return Err(format!("path: expected directory: {}", dir.display()));
     }
-    let mut found = Vec::new();
-    let iter = std::fs::read_dir(dir).map_err(|e| format!("path: read {}: {e}", dir.display()))?;
-    for entry in iter {
-        let entry = entry.map_err(|e| format!("path: read {}: {e}", dir.display()))?;
-        let fname = entry.file_name();
-        let Some(fname) = fname.to_str() else {
-            continue;
-        };
-        if fname == META_FILE {
+    let mut fragments = Vec::new();
+    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+    let index = PortableDirectoryIndex::read(dir)
+        .map_err(|error| format!("path: read {}: {error}", dir.display()))?;
+    for entry in index.entries() {
+        fragments.push(entry.fragment.clone());
+        if entry.fragment == META_FILE {
             continue;
         }
-        if let Some(inst) = path_to_instance_meta(&entry.path())
-            .map_err(|e| format!("path: inspect {}: {e}", entry.path().display()))?
+        if let Some(inst) = path_to_instance_meta(&entry.path)
+            .map_err(|e| format!("path: inspect {}: {e}", entry.path.display()))?
         {
-            if inst.name == name {
-                found.push(fname.to_string());
-            }
+            by_name
+                .entry(inst.name)
+                .or_default()
+                .push(entry.fragment.clone());
         }
     }
+    Ok(ExistingFragmentIndex { fragments, by_name })
+}
+
+fn unique_existing_fragment(
+    dir: &Path,
+    name: &str,
+    index: &HashMap<String, Vec<String>>,
+) -> Result<Option<String>, String> {
+    let found = index.get(name).map(Vec::as_slice).unwrap_or(&[]);
     match found.len() {
         0 => Ok(None),
-        1 => Ok(found.pop()),
+        1 => Ok(Some(found[0].clone())),
         _ => Err(format!(
             "path: filesystem path {} has multiple children named {name:?}; cannot choose one",
             dir.display()
         )),
     }
-}
-
-fn existing_fragments(dir: &Path) -> Result<Vec<String>, String> {
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    let iter = std::fs::read_dir(dir).map_err(|e| format!("path: read {}: {e}", dir.display()))?;
-    for entry in iter {
-        let entry = entry.map_err(|e| format!("path: read {}: {e}", dir.display()))?;
-        if let Some(name) = entry.file_name().to_str() {
-            out.push(name.to_string());
-        }
-    }
-    Ok(out)
 }
 
 fn is_syncable_child(node: &Value) -> bool {
@@ -445,18 +449,14 @@ fn resolve_fs_input(project: &Path, input: &str) -> Result<PathBuf, String> {
         project.join(raw)
     };
     let normalized = normalize_lexical(&joined);
-    if normalized.starts_with(project) {
-        Ok(normalized)
-    } else {
-        let project_canon = project.canonicalize().ok();
-        let path_canon = normalized.canonicalize().ok();
-        match (project_canon, path_canon) {
-            (Some(project_canon), Some(path_canon)) if path_canon.starts_with(&project_canon) => {
-                Ok(path_canon)
-            }
-            _ => Ok(normalized),
-        }
+    if !normalized.starts_with(project) {
+        return Err(format!(
+            "path: filesystem path {} is outside project {}",
+            normalized.display(),
+            project.display()
+        ));
     }
+    Ok(normalized)
 }
 
 fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
@@ -595,6 +595,40 @@ mod tests {
         assert_eq!(
             resolved.fs_path,
             d.path().join("ReplicatedStorage").join("Net")
+        );
+        assert!(!resolved.fs_exists);
+    }
+
+    #[test]
+    fn studio_path_resolves_across_tens_of_thousands_of_wide_siblings() {
+        const WIDTH: usize = 20_000;
+        let d = TempDir::new("studio-wide");
+        let children = (0..WIDTH)
+            .map(|index| {
+                json!({
+                    "class": "ModuleScript",
+                    "name": format!("Item{index:05}"),
+                    "children": []
+                })
+            })
+            .collect::<Vec<_>>();
+        let tree = json!([{
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "children": children
+        }]);
+
+        let resolved = resolve_with_tree(
+            d.path(),
+            &tree,
+            "ReplicatedStorage/Item19999",
+            PathInputKind::Studio,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.fs_path,
+            d.path().join("ReplicatedStorage").join("Item19999.luau")
         );
         assert!(!resolved.fs_exists);
     }

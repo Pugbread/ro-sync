@@ -7,7 +7,7 @@
 //
 // Wire framing: serde-tagged JSON over `Message::Text`.
 //   ClientMsg (tag "type", lowercase):
-//     {"type":"hello","clientId":"<string>","role":"plugin","protocol":3}
+//     {"type":"hello","clientId":"<string>","role":"plugin","protocol":5}
 //     {"type":"push","ops":[<plugin-shape op>, ...]}
 //     {"type":"ping"}   // server replies with pong
 //     {"type":"pong"}   // reply to server ping (no-op)
@@ -43,7 +43,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::http::{apply_push_ops, event_to_plugin_op, is_authorized_widget_browser_request};
 use crate::AppState;
 
-pub(crate) const PLUGIN_PROTOCOL_VERSION: u64 = 3;
+pub(crate) const PLUGIN_PROTOCOL_VERSION: u64 = 5;
 const PLUGIN_INBOUND_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Routing table for in-flight request/response pairs, keyed by a daemon-owned
@@ -2071,6 +2071,7 @@ mod tests {
             path: std::fs::canonicalize(&script_path).unwrap(),
             from: None,
             content: Some(b"print('hi')\n".to_vec()),
+            is_dir: Some(false),
         };
         h.state
             .events

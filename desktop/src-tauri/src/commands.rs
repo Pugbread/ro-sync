@@ -19,7 +19,10 @@ use wait_timeout::ChildExt;
 use crate::{
     resources::{display_path, resolve_with_tauri, ResourcePaths},
     secrets::SecretStore,
-    storage::{atomic_write, read_utf8_file, validate_project_file_path, MAX_PROJECT_FILE_BYTES},
+    storage::{
+        atomic_write, atomic_write_authorized, read_authorized_utf8_file, read_utf8_file,
+        validate_project_file_path, MAX_PROJECT_FILE_BYTES,
+    },
     AppState,
 };
 
@@ -238,8 +241,11 @@ pub(crate) fn read_project_file(
     path: String,
 ) -> Result<String, String> {
     let path = validate_project_file_path(&path)?;
-    crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &path)?;
-    read_utf8_file(&path, MAX_PROJECT_FILE_BYTES)
+    read_authorized_utf8_file(
+        &state.paths.authorized_roots_file,
+        &path,
+        MAX_PROJECT_FILE_BYTES,
+    )
 }
 
 #[tauri::command]
@@ -252,12 +258,16 @@ pub(crate) fn write_project_file(
         return Err("project file exceeds the size limit".into());
     }
     let path = validate_project_file_path(&path)?;
-    crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &path)?;
     let _guard = state
         .io_lock
         .lock()
         .map_err(|_| "application state lock is poisoned".to_string())?;
-    atomic_write(&path, content.as_bytes(), 0o644)
+    atomic_write_authorized(
+        &state.paths.authorized_roots_file,
+        &path,
+        content.as_bytes(),
+        0o644,
+    )
 }
 
 #[tauri::command]
@@ -328,12 +338,12 @@ pub(crate) fn open_path(
                 display_path(&requested)
             )
         })?;
-    } else if requested != plugin_directory(&app)? {
-        crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &requested)?;
     }
-    let path = requested
-        .canonicalize()
-        .map_err(|error| format!("could not resolve {}: {error}", display_path(&requested)))?;
+    let path = if requested == plugin_directory(&app)? {
+        crate::storage::canonicalize_physical_directory(&requested)?
+    } else {
+        crate::storage::resolve_authorized_path(&state.paths.authorized_roots_file, &requested)?
+    };
     app.opener()
         .open_path(display_path(&path), None::<&str>)
         .map_err(|error| format!("could not open {}: {error}", display_path(&path)))
@@ -395,7 +405,8 @@ pub(crate) async fn wally_install(
     state: State<'_, AppState>,
     cwd: String,
 ) -> Result<FixedCommandResult, String> {
-    let cwd = validate_existing_absolute_path(&cwd)?;
+    let cwd = validate_absolute_path(&cwd)?;
+    let cwd = crate::storage::resolve_authorized_path(&state.paths.authorized_roots_file, &cwd)?;
     if !cwd.is_dir() {
         return Err("Wally working directory must be a folder".into());
     }
@@ -405,8 +416,6 @@ pub(crate) async fn wally_install(
             display_path(&cwd)
         ));
     }
-    crate::storage::ensure_authorized_path(&state.paths.authorized_roots_file, &cwd)?;
-
     let home = app.path().home_dir().ok();
     let local_data = app.path().local_data_dir().ok();
     tauri::async_runtime::spawn_blocking(move || run_wally_install(cwd, home, local_data))
@@ -431,12 +440,6 @@ fn validate_text_resource(raw: &str) -> Result<PathBuf, String> {
         return Err("resource is not in the readable text allowlist".into());
     }
     Ok(path)
-}
-
-fn validate_existing_absolute_path(raw: &str) -> Result<PathBuf, String> {
-    let path = validate_absolute_path(raw)?;
-    path.canonicalize()
-        .map_err(|error| format!("could not resolve {}: {error}", display_path(&path)))
 }
 
 fn validate_absolute_path(raw: &str) -> Result<PathBuf, String> {

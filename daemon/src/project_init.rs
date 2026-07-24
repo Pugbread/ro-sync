@@ -10,7 +10,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::{project_config, snapshot};
+use crate::{fs_safety, project_config, snapshot};
 
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 const MAX_DIRECTORY_NAME_BYTES: usize = 72;
@@ -116,22 +116,7 @@ pub(crate) fn resolve_projects_root(path: &Path) -> Result<PathBuf, ProjectInitE
             "projects root must be an absolute path",
         ));
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        ProjectInitError::new(
-            "INVALID_PROJECTS_ROOT",
-            format!("inspect projects root {}: {error}", path.display()),
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ProjectInitError::new(
-            "INVALID_PROJECTS_ROOT",
-            format!(
-                "projects root must be an existing, non-symlink directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    fs::canonicalize(path).map_err(|error| {
+    fs_safety::stable_canonical_directory(path).map_err(|error| {
         ProjectInitError::new(
             "INVALID_PROJECTS_ROOT",
             format!("resolve projects root {}: {error}", path.display()),
@@ -162,9 +147,9 @@ pub(crate) fn initialize_project(
 
     for directory_name in &candidates {
         let candidate = root.join(directory_name);
-        match fs::symlink_metadata(&candidate) {
-            Ok(existing) => {
-                if existing.file_type().is_symlink() || !existing.is_dir() {
+        match fs_safety::metadata_no_follow(&candidate) {
+            Ok(Some(existing)) => {
+                if !existing.is_dir() {
                     continue;
                 }
                 if let Some(outcome) =
@@ -174,7 +159,11 @@ pub(crate) fn initialize_project(
                 }
                 continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(None) => {}
+            // A Unix link or any Windows reparse point occupies this candidate
+            // name. Treat it as an unrelated collision and try the deterministic
+            // suffix without ever resolving its target.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(error) => {
                 return Err(ProjectInitError::new(
                     "PROJECT_INIT_FAILED",
@@ -183,8 +172,40 @@ pub(crate) fn initialize_project(
             }
         }
 
+        let parent_guard = fs_safety::guard_descendant_parent_chain(&root, &candidate, true)
+            .map_err(|error| {
+                ProjectInitError::new(
+                    "PROJECT_INIT_FAILED",
+                    format!("guard project candidate {}: {error}", candidate.display()),
+                )
+            })?;
+        parent_guard.verify().map_err(|error| {
+            ProjectInitError::new(
+                "PROJECT_INIT_FAILED",
+                format!("verify project candidate {}: {error}", candidate.display()),
+            )
+        })?;
         match fs::create_dir(&candidate) {
             Ok(()) => {
+                parent_guard.verify().map_err(|error| {
+                    ProjectInitError::new(
+                        "PROJECT_INIT_FAILED",
+                        format!(
+                            "verify created project parent {}: {error}",
+                            candidate.display()
+                        ),
+                    )
+                })?;
+                let created_generation = fs_safety::directory_generation_no_follow(&candidate)
+                    .map_err(|error| {
+                        ProjectInitError::new(
+                            "PROJECT_INIT_FAILED",
+                            format!(
+                                "inspect created project directory {}: {error}",
+                                candidate.display()
+                            ),
+                        )
+                    })?;
                 let initialized = initialize_created_directory(
                     &root,
                     &candidate,
@@ -195,7 +216,7 @@ pub(crate) fn initialize_project(
                     // The directory was created by this request and has never
                     // been exposed as a successful project. Roll back only that
                     // exact direct child; never touch a pre-existing collision.
-                    let _ = fs::remove_dir_all(&candidate);
+                    rollback_created_project(&root, &candidate, &created_generation);
                 }
                 return initialized;
             }
@@ -234,13 +255,13 @@ fn initialize_created_directory(
     directory_name: &str,
     metadata: ProjectInitMetadata,
 ) -> Result<ProjectInitOutcome, ProjectInitError> {
-    let canonical = fs::canonicalize(candidate).map_err(|error| {
+    let canonical = direct_project_child(root, directory_name).map_err(|error| {
         ProjectInitError::new(
             "PROJECT_INIT_FAILED",
             format!("resolve new project {}: {error}", candidate.display()),
         )
     })?;
-    if canonical.parent() != Some(root) {
+    if canonical != candidate {
         return Err(ProjectInitError::new(
             "PROJECT_PATH_ESCAPE",
             "new project did not resolve to a direct child of the configured projects root",
@@ -291,6 +312,55 @@ fn initialize_created_directory(
     })
 }
 
+fn direct_project_child(root: &Path, directory_name: &str) -> std::io::Result<PathBuf> {
+    let relative = Path::new(directory_name);
+    if relative.components().count() != 1
+        || relative.file_name().and_then(|name| name.to_str()) != Some(directory_name)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "project directory name must be exactly one portable path component",
+        ));
+    }
+    let child = fs_safety::validate_descendant_no_follow(root, relative, false)?;
+    let guard = fs_safety::guard_descendant_directory_chain(root, &child)?;
+    guard.verify()?;
+    if child.parent() != Some(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "project directory is not a direct physical child of the projects root",
+        ));
+    }
+    Ok(child)
+}
+
+fn rollback_created_project(
+    root: &Path,
+    candidate: &Path,
+    created_generation: &fs_safety::FileGeneration,
+) {
+    let Some(directory_name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Ok(safe_candidate) = direct_project_child(root, directory_name) else {
+        return;
+    };
+    let Ok(current_generation) = fs_safety::directory_generation_no_follow(&safe_candidate) else {
+        return;
+    };
+    if current_generation.identity != created_generation.identity {
+        return;
+    }
+    let Ok(guard) = fs_safety::guard_descendant_parent_chain(root, &safe_candidate, false) else {
+        return;
+    };
+    if guard.verify().is_err() {
+        return;
+    }
+    let _ = fs::remove_dir_all(&safe_candidate);
+    let _ = guard.verify();
+}
+
 fn init_file_error(label: &str, error: std::io::Error) -> ProjectInitError {
     ProjectInitError::new(
         "PROJECT_INIT_FAILED",
@@ -318,27 +388,19 @@ fn find_existing_project(
         let Ok(entry) = entry else {
             continue;
         };
-        let candidate = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        let Some(directory_name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if file_type.is_symlink() || !file_type.is_dir() {
+        let Ok(candidate) = direct_project_child(root, &directory_name) else {
             continue;
-        }
+        };
         let Ok(Some(config)) = project_config::read_from_disk(&candidate) else {
             continue;
         };
         if config.game_id.as_deref() != Some(game_id) {
             continue;
         }
-        let Ok(canonical) = fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if canonical.parent() != Some(root) {
-            continue;
-        }
-        let directory_name = entry.file_name().to_string_lossy().into_owned();
-        return Ok(Some((canonical, directory_name)));
+        return Ok(Some((candidate, directory_name)));
     }
     Ok(None)
 }
@@ -349,10 +411,10 @@ fn merge_existing_project(
     directory_name: &str,
     metadata: ProjectInitMetadata,
 ) -> Result<Option<ProjectInitOutcome>, ProjectInitError> {
-    let Ok(canonical) = fs::canonicalize(candidate) else {
+    let Ok(canonical) = direct_project_child(root, directory_name) else {
         return Ok(None);
     };
-    if canonical.parent() != Some(root) {
+    if canonical != candidate {
         return Ok(None);
     }
     let Ok(Some(mut config)) = project_config::read_from_disk(&canonical) else {
@@ -790,6 +852,29 @@ mod tests {
                 .code(),
             "INVALID_PROJECTS_ROOT"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_linked_projects_root_before_project_creation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let physical = parent.path().join("physical-projects");
+        let linked = parent.path().join("linked-projects");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, &linked).unwrap();
+
+        let error = initialize_project(&linked, request("Race Stars", "123")).unwrap_err();
+        assert_eq!(error.code(), "INVALID_PROJECTS_ROOT");
+        assert!(!physical.join("race-stars").exists());
+    }
+
+    #[test]
+    fn project_root_policy_inherits_windows_reparse_detection() {
+        assert!(fs_safety::attributes_have_reparse_point(
+            fs_safety::WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        ));
     }
 
     #[test]

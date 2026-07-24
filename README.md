@@ -14,7 +14,7 @@
   <a href="https://github.com/Pugbread/ro-sync/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Pugbread/ro-sync/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/Pugbread/ro-sync/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Pugbread/ro-sync?display_name=tag&sort=semver" /></a>
   <img alt="Rust" src="https://img.shields.io/badge/engine-Rust-438af5" />
-  <img alt="Protocol" src="https://img.shields.io/badge/plugin_protocol-3-26364f" />
+  <img alt="Protocol" src="https://img.shields.io/badge/plugin_protocol-5-26364f" />
 </p>
 
 <p align="center">
@@ -47,6 +47,11 @@ keeps them from launching competing processes for one project.
 - **Safe filesystem sync** — only folders and Luau scripts round-trip; every
   other class stays Studio-authoritative. First-connect divergence always asks,
   and can transfer just the paths you choose.
+- **Large-project bootstrap** — first connect is stats-first and streams
+  source-free structure, script hashes, and Source parts in bounded,
+  per-service chunks instead of building one place-sized JSON document. Wide
+  filesystem event bursts reuse generation-fenced directory indexes rather
+  than rescanning a 25,000-entry parent for every event.
 - **Cross-project clipboard** — copy native instance trees from one connected
   project and paste them into another, references intact, one Undo.
 - **Native capture** — render isolated models, exact camera views, transparent
@@ -148,6 +153,52 @@ When both sides differ on first connect, Ro Sync always asks before writing:
 **Keep Studio** does one clean Studio→disk overwrite, while **Choose files**
 lets you move individual divergent paths into the Studio queue and leaves the
 rest untouched.
+
+Protocol 5 keeps first-connect memory bounded for projects with tens of
+thousands of instances. Structure requests contain at most 512 flat records
+and 512 KiB of encoded JSON; comparison hashes use at most 64 records per
+chunk, and script Sources travel separately in validated parts. Names and disk
+fragments are limited to 32 KiB, classes to 128 bytes, and retained encoded
+structure to 64 MiB per service / 128 MiB per transfer. Sources are limited to
+32 MiB per script, 64 MiB per service, and 128 MiB per transfer. The final
+decision is constant-size: the widget opens from aggregate counts, pages
+immutable stable-ID details in bounded responses, and submits selective IDs in
+replay-safe chunks instead of posting a place-sized path array.
+
+Live disk watching uses one no-follow, generation-fenced directory index per
+stable parent for a debounced batch. A wide batch is therefore proportional to
+the directory plus the events, rather than their product. Safe repeated events
+are coalesced, and rename chains such as `A → B → C` retain identity as one
+`A → C` operation. The watcher queue carries only bounded path metadata; Source
+text is loaded through a stable no-follow read immediately before delivery, one
+file at a time, with a 32-MiB limit. Raw filesystem ingress is nonblocking and
+bounded to four metadata batches. Overflow, backend errors, rename cycles,
+cross-boundary renames, swaps, competing destinations, oversized Sources, and
+other ambiguous batches enter a generation-tagged quarantine and request one
+explicit full resync. Recovery discards both raw and broadcast event tails
+before reconnecting, so stale destructive operations cannot escape the barrier.
+
+Studio→disk updates stage and revalidate each service before an atomic
+service-directory swap with rollback backup. Those filesystem swaps are
+per-service, so a failure in a later service does not undo an earlier successful
+swap. Every failure after the live directory moves to backup takes an explicit
+restore path. If a concurrent edit makes rollback unsafe, Ro Sync leaves the
+edited live tree untouched, retains and audits the recovery backup, and returns
+a terminal recovery-required receipt with ordered per-service restore/remove
+instructions. The plugin surfaces that receipt and stops reconnecting rather
+than replaying against uncertain disk state. Backups from completed transfers
+are explicitly classified by an exact canonical name plus a bounded,
+no-follow-validated completion marker, and retained for at most seven days and
+32 transactions. Partial/recovery, lookalike, replaced, or unproven backups are
+never automatically pruned.
+Disk→Studio updates validate and stage every service before one cancelable
+ChangeHistory recording applies the complete plan; any later failure rolls
+back the whole Studio transaction, and one Studio Undo reverses a successful
+pull. If both ChangeHistory cancellation and its single Undo fallback fail,
+sync stops terminally instead of claiming a rollback. Selective pulls can also
+remove only the authorized Studio-only generated paths. If Studio changes
+during a guarded scan or transfer, bootstrap abandons the stale view and
+restarts comparison.
 
 ## Capture
 

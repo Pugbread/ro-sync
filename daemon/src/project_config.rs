@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = "ro-sync.json";
 pub const CONFIG_VERSION: u32 = 1;
@@ -85,15 +85,43 @@ impl ProjectConfig {
     }
 }
 
-fn config_path(root: &Path) -> std::path::PathBuf {
-    root.join(CONFIG_FILE)
+fn validated_config_path(root: &Path, allow_missing: bool) -> io::Result<PathBuf> {
+    let canonical_root = crate::fs_safety::stable_canonical_directory(root)?;
+    crate::fs_safety::validate_descendant_no_follow(
+        &canonical_root,
+        Path::new(CONFIG_FILE),
+        allow_missing,
+    )
+}
+
+fn read_config_text(root: &Path) -> io::Result<Option<String>> {
+    let canonical_root = crate::fs_safety::stable_canonical_directory(root)?;
+    let path = crate::fs_safety::validate_descendant_no_follow(
+        &canonical_root,
+        Path::new(CONFIG_FILE),
+        true,
+    )?;
+    let guard = crate::fs_safety::guard_descendant_parent_chain(&canonical_root, &path, true)?;
+    guard.verify()?;
+    let Some(metadata) = crate::fs_safety::metadata_no_follow(&path)? else {
+        guard.verify()?;
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("project config is not a regular file: {}", path.display()),
+        ));
+    }
+    guard.verify()?;
+    let text = crate::fs_safety::read_to_string_no_follow(&path)?;
+    guard.verify()?;
+    Ok(Some(text))
 }
 
 /// Read the project config if present; otherwise write a default and return it.
 pub fn load_or_create(root: &Path) -> io::Result<ProjectConfig> {
-    let p = config_path(root);
-    if p.exists() {
-        let text = fs::read_to_string(&p)?;
+    if let Some(text) = read_config_text(root)? {
         return parse(root, &text);
     }
     let cfg = ProjectConfig::default_for(root);
@@ -102,21 +130,18 @@ pub fn load_or_create(root: &Path) -> io::Result<ProjectConfig> {
 }
 
 pub fn write(root: &Path, cfg: &ProjectConfig) -> io::Result<()> {
-    fs::create_dir_all(root)?;
     let text = serde_json::to_string_pretty(cfg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    write_text_replace(&config_path(root), &(text + "\n"))
+    let path = validated_config_path(root, true)?;
+    write_text_replace(root, &path, &(text + "\n"))
 }
 
 /// Re-parse `<root>/ro-sync.json` from disk. Returns `Ok(None)` if the file
 /// doesn't exist — callers should treat that as "no change" rather than an error.
 pub fn read_from_disk(root: &Path) -> io::Result<Option<ProjectConfig>> {
-    let p = config_path(root);
-    if !p.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&p)?;
-    Ok(Some(parse(root, &text)?))
+    read_config_text(root)?
+        .map(|text| parse(root, &text))
+        .transpose()
 }
 
 fn parse(root: &Path, text: &str) -> io::Result<ProjectConfig> {
@@ -128,7 +153,8 @@ fn parse(root: &Path, text: &str) -> io::Result<ProjectConfig> {
     Ok(cfg)
 }
 
-fn write_text_replace(path: &Path, text: &str) -> io::Result<()> {
+fn write_text_replace(root: &Path, path: &Path, text: &str) -> io::Result<()> {
+    let canonical_root = crate::fs_safety::stable_canonical_directory(root)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -139,27 +165,62 @@ fn write_text_replace(path: &Path, text: &str) -> io::Result<()> {
                 format!("invalid config path: {}", path.display()),
             )
         })?;
-    let tmp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = parent.join(format!(".{file_name}.{}-{nonce}.tmp", std::process::id()));
+    let _ = crate::fs_safety::validate_descendant_no_follow(
+        &canonical_root,
+        Path::new(tmp.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid config temp path")
+        })?),
+        true,
+    )?;
+    let guard = crate::fs_safety::guard_descendant_parent_chain(&canonical_root, path, true)?;
 
     let result = (|| {
+        guard.verify()?;
+        if let Some(metadata) = crate::fs_safety::metadata_no_follow(path)? {
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("project config is not a regular file: {}", path.display()),
+                ));
+            }
+        }
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&tmp)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
 
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
+        guard.verify()?;
+        let _ = crate::fs_safety::metadata_no_follow(path)?;
+        crate::lifecycle::replace_file_atomic(&tmp, path)?;
+        guard.verify()?;
+        let metadata = crate::fs_safety::require_metadata_no_follow(path)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "project config replacement is not a regular file: {}",
+                    path.display()
+                ),
+            ));
         }
-
-        fs::rename(&tmp, path)
+        Ok(())
     })();
 
-    if result.is_err() {
+    if result.is_err()
+        && guard.verify().is_ok()
+        && matches!(
+            crate::fs_safety::metadata_no_follow(&tmp),
+            Ok(Some(metadata)) if metadata.is_file()
+        )
+    {
         let _ = fs::remove_file(&tmp);
     }
     result
@@ -321,5 +382,25 @@ mod tests {
             Some("7".into()),
             Some(vec!["9".into()])
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_config_is_rejected_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new("linked-config-project");
+        let external = TempDir::new("linked-config-external");
+        let sentinel = external.path().join("sentinel.json");
+        fs::write(&sentinel, b"external sentinel\n").unwrap();
+        symlink(&sentinel, project.path().join(CONFIG_FILE)).unwrap();
+
+        let read_error = load_or_create(project.path()).unwrap_err();
+        assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
+
+        let config = ProjectConfig::default_for(project.path());
+        let write_error = write(project.path(), &config).unwrap_err();
+        assert_eq!(write_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external sentinel\n");
     }
 }

@@ -36,13 +36,18 @@ local PORT_RANGE_END = 7890
 local PROBE_TIMEOUT_SECONDS = 2
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
+local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
+-- Live point updates share the same bounded wire budget as protocol-5
+-- bootstrap chunks. Larger subtrees are recovered through a fresh streamed
+-- comparison instead of constructing an unbounded WebSocket frame.
+local LIVE_PUSH_MAX_BYTES = PROTOCOL_STREAM_MAX_BYTES
 local RO_SYNC_LOGO_IMAGE = "rbxassetid://134480165435830"
 local RO_SYNC_SETTINGS_IMAGE = "rbxassetid://128477924144442"
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "2.2.1"
-local PLUGIN_PROTOCOL_VERSION = 3
+local PLUGIN_VERSION_STRING = "2.4.0"
+local PLUGIN_PROTOCOL_VERSION = 5
 
 --------------------------------------------------------------------------------
 -- Playtest runtime agent
@@ -75,10 +80,7 @@ local function hostDataModelTypeName(): (string, string, boolean, boolean)
 	end
 	if inspectedConnections and canConnectToEdit then
 		local runService = game:GetService("RunService")
-		return if runService:IsServer() then "PlayServer" else "PlayClient",
-			name,
-			canConnectToEdit,
-			canConnectToTest
+		return if runService:IsServer() then "PlayServer" else "PlayClient", name, canConnectToEdit, canConnectToTest
 	end
 
 	-- HostDataModelType is unavailable in some Studio channels, so keep it as a
@@ -89,10 +91,7 @@ local function hostDataModelTypeName(): (string, string, boolean, boolean)
 
 	local runService = game:GetService("RunService")
 	if runService:IsRunning() then
-		return if runService:IsServer() then "PlayServer" else "PlayClient",
-			name,
-			canConnectToEdit,
-			canConnectToTest
+		return if runService:IsServer() then "PlayServer" else "PlayClient", name, canConnectToEdit, canConnectToTest
 	end
 	return "Edit", name, canConnectToEdit, canConnectToTest
 end
@@ -1886,14 +1885,20 @@ end
 -- one ALLOWED descendant. The real class stays in the live tree cache; on
 -- disk the pathway is just `Name/`. This lets users place a script anywhere
 -- inside Studio and still have it round-trip to a file.
-local isSyncable
 local function hasSyncableDescendant(inst)
 	if isAvoidSyncBlocked(inst) then
 		return false
 	end
-	for _, child in ipairs(inst:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] and isSyncable(child) then
-			return true
+	local stack = inst:GetChildren()
+	while #stack > 0 do
+		local child = table.remove(stack)
+		if not SUPPRESS_CLASSES[child.ClassName] and not hasAvoidSyncAttribute(child) then
+			if child:IsA("LuaSourceContainer") then
+				return true
+			end
+			for _, descendant in ipairs(child:GetChildren()) do
+				stack[#stack + 1] = descendant
+			end
 		end
 	end
 	return false
@@ -1901,7 +1906,7 @@ end
 
 -- True if an instance needs a presence on disk — either it's directly ALLOWED,
 -- or it's a pass-through container that has at least one ALLOWED descendant.
-isSyncable = function(inst)
+local function isSyncable(inst)
 	if isAvoidSyncBlocked(inst) then
 		return false
 	end
@@ -1956,36 +1961,94 @@ end
 -- recorded in `materializedContainers` so that a subsequent delete on the
 -- container still triggers a disk cleanup, even after its ALLOWED children
 -- have already fired their own Removing events.
-local serializeInstance
-serializeInstance = function(inst)
+local function serializeInstance(inst, shouldContinue)
 	if isAvoidSyncBlocked(inst) then
 		return nil
 	end
-	local allowed = ALLOWED_CLASSES[inst.ClassName] == true
-	if not allowed and not SUPPRESS_CLASSES[inst.ClassName] then
-		materializedContainers[inst] = true
-	end
-	local node = {
-		class = allowed and inst.ClassName or "Folder",
-		name = inst.Name,
-		properties = allowed and serializeProperties(inst) or {},
-		children = {},
+	local result = nil
+	local estimatedBytes = 0
+	local visited = 0
+	local stack = {
+		{
+			inst = inst,
+			entered = false,
+		},
 	}
-	for _, child in ipairs(inst:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] and not isAvoidSyncBlocked(child) and isSyncable(child) then
-			local childNode = serializeInstance(child)
-			if childNode then
-				table.insert(node.children, childNode)
+	while #stack > 0 do
+		local frame = stack[#stack]
+		if not frame.entered then
+			frame.entered = true
+			frame.nextChild = 1
+			frame.outputChildren = {}
+			frame.hasSyncableChild = false
+			visited += 1
+			if visited % 500 == 0 then
+				task.wait()
+				if shouldContinue and not shouldContinue() then
+					return nil, "cancelled"
+				end
+			end
+			if SUPPRESS_CLASSES[frame.inst.ClassName] or hasAvoidSyncAttribute(frame.inst) then
+				frame.children = {}
+				frame.suppressed = true
+			else
+				frame.children = frame.inst:GetChildren()
+			end
+		end
+
+		local child = frame.children[frame.nextChild]
+		if child then
+			frame.nextChild += 1
+			if not SUPPRESS_CLASSES[child.ClassName] then
+				stack[#stack + 1] = {
+					inst = child,
+					entered = false,
+				}
+			end
+		else
+			local isScript = frame.inst:IsA("LuaSourceContainer")
+			local syncable = not frame.suppressed and (isScript or frame.hasSyncableChild)
+			local node = nil
+			if syncable then
+				local allowed = ALLOWED_CLASSES[frame.inst.ClassName] == true
+				local properties = {}
+				if allowed and isScript then
+					local source = readScriptSource(frame.inst)
+					estimatedBytes += #source
+					if estimatedBytes > LIVE_PUSH_MAX_BYTES then
+						return nil, "oversized"
+					end
+					properties.Source = source
+				end
+				estimatedBytes += #frame.inst.Name + #frame.inst.ClassName + 16
+				if estimatedBytes > LIVE_PUSH_MAX_BYTES then
+					return nil, "oversized"
+				end
+				node = {
+					class = allowed and frame.inst.ClassName or "Folder",
+					name = frame.inst.Name,
+					properties = properties,
+					children = frame.outputChildren,
+				}
+				if frame.inst.ClassName == "Folder" or not allowed then
+					materializedContainers[frame.inst] = true
+				end
+			end
+			table.remove(stack)
+			local parent = stack[#stack]
+			if parent then
+				if node then
+					parent.outputChildren[#parent.outputChildren + 1] = node
+				end
+				if syncable then
+					parent.hasSyncableChild = true
+				end
+			else
+				result = node
 			end
 		end
 	end
-	if allowed and inst.ClassName == "Folder" and #node.children == 0 then
-		return nil
-	end
-	if inst.ClassName == "Folder" then
-		materializedContainers[inst] = true
-	end
-	return node
+	return result
 end
 
 local function avoidSyncMarker(inst)
@@ -1997,63 +2060,6 @@ local function avoidSyncMarker(inst)
 		children = {},
 		avoidSync = true,
 	}
-end
-
-local serializeSnapshotInstance
-serializeSnapshotInstance = function(inst)
-	if hasAvoidSyncAttribute(inst) then
-		return avoidSyncMarker(inst)
-	end
-	if isAvoidSyncBlocked(inst) then
-		return nil
-	end
-	local allowed = ALLOWED_CLASSES[inst.ClassName] == true
-	if not allowed and not SUPPRESS_CLASSES[inst.ClassName] then
-		materializedContainers[inst] = true
-	end
-	local node = {
-		class = allowed and inst.ClassName or "Folder",
-		name = inst.Name,
-		properties = allowed and serializeProperties(inst) or {},
-		children = {},
-	}
-	for _, child in ipairs(inst:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] and (hasAvoidSyncAttribute(child) or isSyncable(child)) then
-			local childNode = serializeSnapshotInstance(child)
-			if childNode then
-				table.insert(node.children, childNode)
-			end
-		end
-	end
-	if allowed and inst.ClassName == "Folder" and #node.children == 0 then
-		return nil
-	end
-	if inst.ClassName == "Folder" then
-		materializedContainers[inst] = true
-	end
-	return node
-end
-
--- Skeleton walker: records EVERY class's shape (class + name + children) with
--- no property values. The daemon keeps this as its live tree cache so external
--- tools (and the widget) know the full Studio tree, but the daemon never
--- attempts to round-trip non-ALLOWED classes.
-local function skeletonNode(inst)
-	local node = {
-		class = inst.ClassName,
-		name = inst.Name,
-		children = {},
-	}
-	if hasAvoidSyncAttribute(inst) then
-		node.avoidSync = true
-		return node
-	end
-	for _, child in ipairs(inst:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] then
-			table.insert(node.children, skeletonNode(child))
-		end
-	end
-	return node
 end
 
 --------------------------------------------------------------------------------
@@ -2082,8 +2088,12 @@ local function pathFromRoot(inst)
 	local segs = {}
 	local cur = inst
 	while cur and cur ~= game do
-		table.insert(segs, 1, cur.Name)
+		segs[#segs + 1] = cur.Name
 		cur = cur.Parent
+	end
+	for i = 1, math.floor(#segs / 2) do
+		local opposite = #segs - i + 1
+		segs[i], segs[opposite] = segs[opposite], segs[i]
 	end
 	return segs
 end
@@ -2108,32 +2118,180 @@ local function parseDisambiguatedSegment(seg: string): (string?, number?)
 	return base, n
 end
 
+local snapshotApplyState
 local PathHelpers = {}
 
 function PathHelpers.pathSegmentTaken(taken: { [string]: true }, candidate: string): boolean
 	return taken[string.lower(candidate)] == true
 end
 
-function PathHelpers.generatedPathSegmentForChild(child: Instance, taken: { [string]: true }): string
+function PathHelpers.generatedPathSegmentForChild(
+	child: Instance,
+	taken: { [string]: true },
+	nextOrdinals: { [string]: number }?
+): string
 	local base = child.Name
 	if not PathHelpers.pathSegmentTaken(taken, base) then
 		taken[string.lower(base)] = true
+		if nextOrdinals then
+			nextOrdinals[string.lower(base)] = 1
+		end
 		return base
 	end
-	for n = 1, 9999 do
+	local baseKey = string.lower(base)
+	local n = if nextOrdinals then nextOrdinals[baseKey] or 1 else 1
+	while true do
 		local candidate = string.format("%s [%d]", base, n)
 		if not PathHelpers.pathSegmentTaken(taken, candidate) then
 			taken[string.lower(candidate)] = true
+			if nextOrdinals then
+				nextOrdinals[baseKey] = n + 1
+			end
+			return candidate
+		end
+		n += 1
+	end
+end
+
+PathHelpers.windowsReserved = {
+	CON = true,
+	PRN = true,
+	AUX = true,
+	NUL = true,
+	COM1 = true,
+	COM2 = true,
+	COM3 = true,
+	COM4 = true,
+	COM5 = true,
+	COM6 = true,
+	COM7 = true,
+	COM8 = true,
+	COM9 = true,
+	LPT1 = true,
+	LPT2 = true,
+	LPT3 = true,
+	LPT4 = true,
+	LPT5 = true,
+	LPT6 = true,
+	LPT7 = true,
+	LPT8 = true,
+	LPT9 = true,
+	["CONIN$"] = true,
+	["CONOUT$"] = true,
+}
+
+function PathHelpers.encodeName(name: string): string
+	if name == "" then
+		return "%_"
+	end
+	local out = {}
+	for index = 1, #name do
+		local byte = string.byte(name, index)
+		local leadingDot = index == 1 and byte == 46
+		local leadingSpace = index == 1 and byte == 32
+		local trailingDotOrSpace = index == #name and (byte == 46 or byte == 32)
+		local unsafe = byte >= 128
+			or byte < 32
+			or byte == 37
+			or byte == 34
+			or byte == 42
+			or byte == 47
+			or byte == 58
+			or byte == 60
+			or byte == 62
+			or byte == 63
+			or byte == 92
+			or byte == 124
+		if leadingDot or leadingSpace or trailingDotOrSpace or unsafe then
+			out[#out + 1] = string.format("%%%02X", byte)
+		else
+			out[#out + 1] = string.char(byte)
+		end
+	end
+	local encoded = table.concat(out)
+	local reservedHead = string.upper(encoded:match("^([^.]+)") or encoded)
+	if PathHelpers.windowsReserved[reservedHead] and #encoded > 0 then
+		encoded = string.format("%%%02X", string.byte(encoded, 1)) .. encoded:sub(2)
+	end
+	-- A literal Roblox suffix in the generated ordinal grammar must not alias
+	-- the allocator's own `<Name> [N]` lookup segment.
+	local prefix, ordinal = encoded:match("^(.-) %[(%d+)%]$")
+	if prefix and ordinal then
+		encoded = prefix .. " %5B" .. ordinal .. "%5D"
+	end
+	return encoded
+end
+
+function PathHelpers.scriptSuffix(className: string): string
+	if className == "Script" then
+		return ".server.luau"
+	elseif className == "LocalScript" then
+		return ".client.luau"
+	elseif className == "ModuleScript" then
+		return ".luau"
+	end
+	return ""
+end
+
+function PathHelpers.stripScriptSuffix(fragment: string): string
+	local suffixes = {
+		".server.luau",
+		".client.luau",
+		".server.lua",
+		".client.lua",
+		".luau",
+		".lua",
+	}
+	for _, suffix in ipairs(suffixes) do
+		if fragment:sub(-#suffix) == suffix then
+			return fragment:sub(1, #fragment - #suffix)
+		end
+	end
+	return fragment
+end
+
+function PathHelpers.lookupSegmentForPhysicalFragment(fragment: string, isDirectory: boolean): string
+	return if isDirectory then fragment else PathHelpers.stripScriptSuffix(fragment)
+end
+
+function PathHelpers.sortKeyWithName(key: string?, name: string, mappedClass: string): string
+	local signature = mappedClass
+	if type(key) == "string" then
+		local first = string.find(key, "\0", 1, true)
+		local second = first and string.find(key, "\0", first + 1, true) or nil
+		local third = second and string.find(key, "\0", second + 1, true) or nil
+		if third then
+			signature = string.sub(key, third + 1)
+		end
+	end
+	return table.concat({
+		string.lower(name),
+		name,
+		mappedClass,
+		signature,
+	}, "\0")
+end
+
+function PathHelpers.allocatePhysicalFragment(state, name: string, className: string, isDirectory: boolean): string
+	local encoded = PathHelpers.encodeName(name)
+	local extension = if isDirectory then "" else PathHelpers.scriptSuffix(className)
+	local base = encoded .. extension
+	local baseKey = string.lower(base)
+	if not state.taken[baseKey] then
+		state.taken[baseKey] = true
+		state.nextOrdinal[baseKey] = state.nextOrdinal[baseKey] or 1
+		return base
+	end
+	local ordinal = state.nextOrdinal[baseKey] or 1
+	while true do
+		local candidate = string.format("%s [%d]%s", encoded, ordinal, extension)
+		ordinal += 1
+		if not state.taken[string.lower(candidate)] then
+			state.taken[string.lower(candidate)] = true
+			state.nextOrdinal[baseKey] = ordinal
 			return candidate
 		end
 	end
-	local count = 0
-	for _ in pairs(taken) do
-		count += 1
-	end
-	local fallback = string.format("%s__%d", base, count)
-	taken[string.lower(fallback)] = true
-	return fallback
 end
 
 function PathHelpers.mappedSyncClass(inst: Instance): string
@@ -2143,52 +2301,12 @@ function PathHelpers.mappedSyncClass(inst: Instance): string
 	return "Folder"
 end
 
-function PathHelpers.syncRelevantSignature(inst: Instance, mappedClass: string): string
-	local parts = { mappedClass }
-	local childKeys = {}
-	for _, child in ipairs(inst:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] and not isAvoidSyncBlocked(child) and isSyncable(child) then
-			table.insert(childKeys, PathHelpers.syncPathSiblingSortKey(child))
-		end
-	end
-	table.sort(childKeys)
-	for _, key in ipairs(childKeys) do
-		table.insert(parts, key)
-	end
-	return table.concat(parts, "\0")
-end
-
-function PathHelpers.syncPathSiblingSortKey(inst: Instance): string
-	local mappedClass = PathHelpers.mappedSyncClass(inst)
-	return table.concat({
-		string.lower(inst.Name),
-		inst.Name,
-		mappedClass,
-		PathHelpers.syncRelevantSignature(inst, mappedClass),
-	}, "\0")
-end
-
-function PathHelpers.findGeneratedPathChild(parent: Instance, seg: string): Instance?
-	local children = {}
-	for _, child in ipairs(parent:GetChildren()) do
-		if not SUPPRESS_CLASSES[child.ClassName] and not isAvoidSyncBlocked(child) and isSyncable(child) then
-			table.insert(children, {
-				key = PathHelpers.syncPathSiblingSortKey(child),
-				child = child,
-			})
-		end
-	end
-	table.sort(children, function(a, b)
-		return a.key < b.key
-	end)
-	local taken = {}
-	for _, entry in ipairs(children) do
-		local child = entry.child
-		if PathHelpers.generatedPathSegmentForChild(child, taken) == seg then
-			return child
-		end
-	end
-	return nil
+function PathHelpers.findGeneratedPathChild(parent: Instance, seg: string, ctx): Instance?
+	ctx = ctx or snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	local siblings = snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx)
+	return siblings.byLookupSegment[seg]
 end
 
 function PathHelpers.findRawDisambiguatedChild(parent: Instance, seg: string): Instance?
@@ -2225,6 +2343,9 @@ local function pathStartsWith(path: { string }, prefix: { string }?): boolean
 end
 
 local function isGeneratedDiskRoot(inst): boolean
+	if not wallyRootSegments or #wallyRootSegments == 0 then
+		return false
+	end
 	return pathStartsWith(pathFromRoot(inst), wallyRootSegments)
 end
 
@@ -2246,6 +2367,42 @@ local function resolvePath(path)
 		end
 		if not nxt then
 			nxt = PathHelpers.findDisambiguatedChild(cur, seg)
+		end
+		if not nxt then
+			return nil
+		end
+		cur = nxt
+	end
+	return cur
+end
+
+local function resolveGeneratedPath(path, ctx)
+	if type(path) ~= "table" then
+		return nil
+	end
+	local cur = game
+	ctx = ctx or snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	for _, seg in ipairs(path) do
+		local nxt
+		if cur == game then
+			local ok, svc = pcall(function()
+				return game:GetService(seg)
+			end)
+			if ok and svc then
+				nxt = svc
+			else
+				nxt = PathHelpers.findGeneratedPathChild(cur, seg, ctx)
+					or PathHelpers.findRawDisambiguatedChild(cur, seg)
+					or cur:FindFirstChild(seg)
+			end
+		else
+			-- Diff/selective paths use generated duplicate suffixes. Resolve
+			-- that identity before a literal same-name Roblox child.
+			nxt = PathHelpers.findGeneratedPathChild(cur, seg, ctx)
+				or PathHelpers.findRawDisambiguatedChild(cur, seg)
+				or cur:FindFirstChild(seg)
 		end
 		if not nxt then
 			return nil
@@ -2295,10 +2452,12 @@ local function isEchoing(): boolean
 end
 
 local function normalizeSourceForCompare(source: string): string
-	if not source:find("\r", 1, true) then
+	if not source:find("\r\n", 1, true) then
 		return source
 	end
-	return (source:gsub("\r\n", "\n"):gsub("\r", "\n"))
+	-- The wire contract normalizes CRLF only. A lone CR is Source content,
+	-- not an alternate newline spelling, and must never compare equal to LF.
+	return (source:gsub("\r\n", "\n"))
 end
 
 local function sourcesMatchForApply(currentSource: string, newSource: string): boolean
@@ -2323,9 +2482,15 @@ local function applyScriptSource(inst, newSource: string, suppressStudioEcho: bo
 		return false
 	end
 	local ok, err = pcall(function()
-		ScriptEditorService:UpdateSourceAsync(inst, function(_old)
-			return newSource
-		end)
+		snapshotApplyState.runInternalWrite(function()
+			ScriptEditorService:UpdateSourceAsync(inst, function(_old)
+				return newSource
+			end)
+		end, {
+			instance = inst,
+			source = true,
+			sourceValue = newSource,
+		})
 	end)
 	if suppressEcho then
 		lastRemoteApplyClock = os.clock()
@@ -2354,10 +2519,10 @@ local function queueScriptSourceWrite(queue, inst, newSource: string): boolean
 	return true
 end
 
-local function flushScriptSourceWrites(queue): number
+local function flushScriptSourceWrites(queue, shouldContinue): (number, number)
 	local total = #queue
 	if total == 0 then
-		return 0
+		return 0, 0
 	end
 
 	local nextIndex = 0
@@ -2368,6 +2533,9 @@ local function flushScriptSourceWrites(queue): number
 	for _ = 1, workers do
 		task.spawn(function()
 			while true do
+				if shouldContinue and not shouldContinue() then
+					break
+				end
 				nextIndex += 1
 				local job = queue[nextIndex]
 				if not job then
@@ -2386,7 +2554,7 @@ local function flushScriptSourceWrites(queue): number
 		task.wait()
 	end
 
-	return applied
+	return applied, total - applied
 end
 
 -- Source is the only property we round-trip. Scripts get rewritten via
@@ -2411,14 +2579,15 @@ end
 -- Count descendants cheaply; short-circuits at `cap` to avoid walking huge trees.
 local function countDescendants(inst, cap: number): number
 	local n = 0
-	for _, child in ipairs(inst:GetChildren()) do
+	local stack = inst:GetChildren()
+	while #stack > 0 do
+		local child = table.remove(stack)
 		n += 1
 		if n >= cap then
 			return n
 		end
-		n += countDescendants(child, cap - n)
-		if n >= cap then
-			return n
+		for _, descendant in ipairs(child:GetChildren()) do
+			stack[#stack + 1] = descendant
 		end
 	end
 	return n
@@ -2461,123 +2630,986 @@ local function canSafelyDestroy(inst: Instance, allowDescendants: boolean?): (bo
 	return true, ""
 end
 
-local function shouldStrictPruneChild(child: Instance, wanted: { [string]: boolean }): boolean
-	if wanted[child.Name] then
-		return false
+-- Disk snapshots can contain tens of thousands of nodes and duplicate Roblox
+-- sibling names. Keep the implementation behind one table (this top-level
+-- chunk is close to Luau's register limit), use explicit DFS frames, and match
+-- children by Instance identity rather than repeatedly calling FindFirstChild.
+snapshotApplyState = {
+	stepsPerCheck = 64,
+	sliceSeconds = 0.01,
+	diskPathCache = setmetatable({}, { __mode = "k" }),
+	activeMutationGuard = nil,
+}
+
+function snapshotApplyState.runInternalWrite(callback, expectedMutation)
+	-- A streamed pull keeps a mutation guard installed while UpdateSourceAsync
+	-- may yield. Scope suppression to the exact Instance/event being authored;
+	-- a process-global depth flag would hide unrelated user edits during that
+	-- yield and could incorrectly commit over them.
+	local guard = snapshotApplyState.activeMutationGuard
+	if guard and expectedMutation and guard.pushExpectedMutation then
+		guard.pushExpectedMutation(expectedMutation)
 	end
-	if not ALLOWED_CLASSES[child.ClassName] then
-		return false
+	local packed = table.pack(pcall(callback))
+	if guard and expectedMutation and guard.popExpectedMutation then
+		guard.popExpectedMutation(expectedMutation)
 	end
-	if child:IsA("LuaSourceContainer") then
-		return true
+	if not packed[1] then
+		error(packed[2], 0)
 	end
-	if child.ClassName == "Folder" then
-		return hasSyncableDescendant(child)
-	end
-	return false
+	return table.unpack(packed, 2, packed.n)
 end
 
-local function applyNode(parent, node, opts)
-	if isAvoidSyncBlocked(parent) then
-		log("AvoidSync: skipping disk apply under " .. pathOf(parent))
+function snapshotApplyState.clearDiskPathSubtree(root: Instance)
+	local stack = { root }
+	while #stack > 0 do
+		local current = table.remove(stack)
+		snapshotApplyState.diskPathCache[current] = nil
+		for _, child in ipairs(current:GetChildren()) do
+			stack[#stack + 1] = child
+		end
+	end
+end
+
+function snapshotApplyState.seedDiskPathAncestry(inst: Instance, diskPath)
+	if type(diskPath) ~= "table" then
+		return
+	end
+	local current = inst
+	local depth = #diskPath
+	while current and current ~= game and depth >= 1 do
+		local prefix = {}
+		for index = 1, depth do
+			prefix[index] = diskPath[index]
+		end
+		snapshotApplyState.diskPathCache[current] = prefix
+		current = current.Parent
+		depth -= 1
+	end
+end
+
+function snapshotApplyState.newContext(opts)
+	return {
+		steps = 0,
+		lastYield = os.clock(),
+		shouldContinue = opts and opts.shouldContinue,
+		claimedInstances = (opts and opts.claimedInstances) or {},
+		avoidSyncCarriers = {},
+		avoidSyncBoundaries = {},
+		syncableInstances = {},
+		directoryInstances = {},
+		sortKeys = {},
+		indexedServices = {},
+		useAvoidSyncIndex = opts and opts.indexAvoidSyncCarriers == true,
+	}
+end
+
+function snapshotApplyState.nodeOptions(shared, strict, forcePrune)
+	local opts = {
+		strict = strict == true,
+		forcePrune = forcePrune == true,
+	}
+	if shared then
+		opts.sourceWrites = shared.sourceWrites
+		opts.shouldContinue = shared.shouldContinue
+		opts.claimedInstances = shared.claimedInstances
+		opts._applyContext = shared._applyContext
+		opts.indexAvoidSyncCarriers = shared.indexAvoidSyncCarriers
+	end
+	return opts
+end
+
+function snapshotApplyState.checkpoint(ctx)
+	ctx.steps += 1
+	if ctx.steps % snapshotApplyState.stepsPerCheck ~= 0 then
+		return
+	end
+
+	lastRemoteApplyClock = os.clock()
+	if ctx.shouldContinue and not ctx.shouldContinue() then
+		error("snapshot apply cancelled", 0)
+	end
+	if os.clock() - ctx.lastYield >= snapshotApplyState.sliceSeconds then
+		task.wait()
+		lastRemoteApplyClock = os.clock()
+		ctx.lastYield = os.clock()
+		if ctx.shouldContinue and not ctx.shouldContinue() then
+			error("snapshot apply cancelled", 0)
+		end
+	end
+end
+
+function snapshotApplyState.takeCandidate(listState, used, claimed)
+	if not listState then
 		return nil
 	end
-	-- Hard safety gate: only the four classes ro-sync is designed to
-	-- round-trip ever get Instance.new()'d from disk-sourced payloads.
-	-- Receiving anything else is a daemon/schema bug — log and bail before we
-	-- can destroy an existing Studio instance to replace it with a stub.
-	if not ALLOWED_CLASSES[node.class] then
-		log(
-			string.format(
-				"SAFETY: skipping non-synced class %s at %s/%s",
-				tostring(node.class),
-				pathOf(parent),
-				tostring(node.name)
-			)
-		)
-		return nil
+	while listState.next <= #listState.items do
+		local candidate = listState.items[listState.next]
+		listState.next += 1
+		if not used[candidate] and not claimed[candidate] then
+			used[candidate] = true
+			return candidate
+		end
 	end
-	local existing = parent:FindFirstChild(node.name)
-	if existing and isAvoidSyncBlocked(existing) then
-		log("AvoidSync: skipping disk apply for " .. pathOf(existing))
-		return existing
+	return nil
+end
+
+function snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
+	local service = parent
+	while service and service.Parent ~= game do
+		service = service.Parent
 	end
-	local inst
-	if existing and existing.ClassName == node.class then
-		inst = existing
-	elseif existing and node.class == "Folder" and not ALLOWED_CLASSES[existing.ClassName] then
-		-- Pass-through container: disk emits `class="Folder"` for any directory,
-		-- but the Studio-side instance here is Studio-authoritative (a Model,
-		-- Part, Tool, BoolValue, ...). Never replace it — treat it as the
-		-- container for the incoming children. Its real class stays untouched.
-		inst = existing
-	else
-		if existing then
-			local safe, reason = canSafelyDestroy(existing, opts and opts.forcePrune == true)
-			if not safe then
-				log(
-					string.format(
-						"SAFETY: refusing to destroy %s (%s → %s) — %s. Keeping existing, skipping new.",
-						pathOf(existing),
-						existing.ClassName,
-						tostring(node.class),
-						reason
-					)
-				)
-				-- Keep the existing instance and walk its children into the
-				-- incoming node's children, so we don't nuke a subtree just
-				-- because the top of it has a class mismatch (e.g. a service
-				-- that disk briefly reported as a Folder).
-				inst = existing
+	if not service or ctx.indexedServices[service] then
+		return
+	end
+	ctx.indexedServices[service] = true
+
+	local stack = {
+		{
+			inst = service,
+			entered = false,
+			hasSyncableChild = false,
+			hasAvoidSyncChild = false,
+			projectionChildKeys = {},
+		},
+	}
+	while #stack > 0 do
+		snapshotApplyState.checkpoint(ctx)
+		local frame = stack[#stack]
+		if not frame.entered then
+			if SUPPRESS_CLASSES[frame.inst.ClassName] then
+				table.remove(stack)
+			elseif hasAvoidSyncAttribute(frame.inst) then
+				ctx.avoidSyncBoundaries[frame.inst] = true
+				if not frame.inst:IsA("LuaSourceContainer") or #frame.inst:GetChildren() > 0 then
+					ctx.directoryInstances[frame.inst] = true
+				end
+				local mappedClass = PathHelpers.mappedSyncClass(frame.inst)
+				ctx.sortKeys[frame.inst] = table.concat({
+					string.lower(frame.inst.Name),
+					frame.inst.Name,
+					mappedClass,
+					mappedClass,
+				}, "\0")
+				table.remove(stack)
+				local ancestor = stack[#stack]
+				if ancestor then
+					ancestor.hasAvoidSyncChild = true
+					ancestor.projectionChildKeys[#ancestor.projectionChildKeys + 1] = ctx.sortKeys[frame.inst]
+				end
 			else
-				existing:Destroy()
+				frame.entered = true
+				frame.children = frame.inst:GetChildren()
+				frame.nextChild = 1
 			end
-		end
-		if not inst then
-			local ok, created = pcall(function()
-				return Instance.new(node.class)
-			end)
-			if not ok then
-				log("unknown class: " .. tostring(node.class))
-				return nil
-			end
-			inst = created
-			inst.Name = node.name
-			inst.Parent = parent
-		end
-	end
-	applyProperties(inst, node.properties, opts)
-	local wanted = {}
-	for _, c in ipairs(node.children or {}) do
-		wanted[c.name] = true
-		applyNode(inst, c, opts)
-	end
-	if opts and opts.strict then
-		for _, child in ipairs(inst:GetChildren()) do
-			-- Strict pruning only removes script sources, plus Folder containers
-			-- that still lead to script sources. Bare Studio folders are
-			-- explorer-only and must not be destroyed just because disk lacks
-			-- a matching directory.
-			if shouldStrictPruneChild(child, wanted) then
-				local safe, reason = canSafelyDestroy(child, opts and opts.forcePrune == true)
-				if safe then
-					child:Destroy()
-				else
-					log(string.format("SAFETY: strict-mode destroy skipped for %s — %s", pathOf(child), reason))
+		else
+			local child = frame.children[frame.nextChild]
+			if child then
+				frame.nextChild += 1
+				stack[#stack + 1] = {
+					inst = child,
+					entered = false,
+					hasSyncableChild = false,
+					hasAvoidSyncChild = false,
+					projectionChildKeys = {},
+				}
+			else
+				local syncable = frame.inst:IsA("LuaSourceContainer") or frame.hasSyncableChild
+				local hasProjectedChild = frame.hasSyncableChild or frame.hasAvoidSyncChild
+				if syncable then
+					ctx.syncableInstances[frame.inst] = true
+				elseif frame.inst ~= service and frame.hasAvoidSyncChild then
+					ctx.avoidSyncCarriers[frame.inst] = true
+				end
+				if
+					frame.inst ~= service
+					and (not frame.inst:IsA("LuaSourceContainer") or hasProjectedChild)
+					and (syncable or frame.hasAvoidSyncChild)
+				then
+					ctx.directoryInstances[frame.inst] = true
+				end
+				if frame.inst ~= service and (syncable or frame.hasAvoidSyncChild) then
+					table.sort(frame.projectionChildKeys)
+					local mappedClass = PathHelpers.mappedSyncClass(frame.inst)
+					local signature = { mappedClass }
+					for _, key in ipairs(frame.projectionChildKeys) do
+						signature[#signature + 1] = key
+					end
+					ctx.sortKeys[frame.inst] = table.concat({
+						string.lower(frame.inst.Name),
+						frame.inst.Name,
+						mappedClass,
+						table.concat(signature, "\0"),
+					}, "\0")
+				end
+				local carriesAvoidSync = frame.hasAvoidSyncChild
+				table.remove(stack)
+				local ancestor = stack[#stack]
+				if ancestor then
+					if syncable then
+						ancestor.hasSyncableChild = true
+					end
+					if carriesAvoidSync then
+						ancestor.hasAvoidSyncChild = true
+					end
+					local sortKey = ctx.sortKeys[frame.inst]
+					if sortKey then
+						ancestor.projectionChildKeys[#ancestor.projectionChildKeys + 1] = sortKey
+					end
 				end
 			end
 		end
 	end
-	return inst
 end
 
-local function applyClassChange(op)
+function snapshotApplyState.projectedCandidateInfo(child, ctx)
+	local boundary = ctx.avoidSyncBoundaries[child] == true or hasAvoidSyncAttribute(child)
+	local carrier = ctx.avoidSyncCarriers[child] == true
+	local syncable = ctx.syncableInstances[child] == true
+	local directory = ctx.directoryInstances[child] == true
+	if not ctx.useAvoidSyncIndex then
+		local hasProjectedChild = false
+		if not boundary then
+			for _, descendant in ipairs(child:GetChildren()) do
+				if hasAvoidSyncAttribute(descendant) or isSyncable(descendant) then
+					hasProjectedChild = true
+					break
+				end
+			end
+		end
+		syncable = child:IsA("LuaSourceContainer") or hasProjectedChild
+		carrier = not syncable and hasProjectedChild
+		directory = (not child:IsA("LuaSourceContainer") or hasProjectedChild) and (syncable or carrier)
+	end
+	if not boundary and not carrier and not syncable then
+		return nil
+	end
+
+	local mappedClass = PathHelpers.mappedSyncClass(child)
+	return {
+		mappedClass = mappedClass,
+		-- AvoidSync markers intentionally omit their descendants. The daemon
+		-- reserves a leaf first for ignored scripts, then the alternate
+		-- directory shape. Folder/carrier projections are always directories.
+		directory = if boundary and SCRIPT_CLASSES[mappedClass] then false else directory,
+		boundary = boundary,
+		reserved = boundary or carrier,
+		key = ctx.sortKeys[child] or PathHelpers.sortKeyWithName(nil, child.Name, mappedClass),
+	}
+end
+
+function snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx, override)
+	if ctx.useAvoidSyncIndex then
+		snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
+	end
+	local projectionEntries = {}
+	for childIndex, child in ipairs(parent:GetChildren()) do
+		snapshotApplyState.checkpoint(ctx)
+		if not SUPPRESS_CLASSES[child.ClassName] then
+			local projection = snapshotApplyState.projectedCandidateInfo(child, ctx)
+			if projection then
+				local projectedName = child.Name
+				if override and override.instance == child then
+					projectedName = override.name or projectedName
+					if type(override.directory) == "boolean" then
+						projection.directory = override.directory
+					end
+					if type(override.key) == "string" then
+						projection.key = override.key
+					elseif projectedName ~= child.Name then
+						projection.key =
+							PathHelpers.sortKeyWithName(projection.key, projectedName, projection.mappedClass)
+					end
+				end
+				projectionEntries[#projectionEntries + 1] = {
+					child = child,
+					name = projectedName,
+					projection = projection,
+					reserved = projection.reserved,
+					key = projection.key,
+					index = childIndex,
+				}
+			end
+		end
+	end
+	table.sort(projectionEntries, function(left, right)
+		if left.reserved ~= right.reserved then
+			return left.reserved
+		end
+		if left.key ~= right.key then
+			return left.key < right.key
+		end
+		-- Rust's stable sibling sort retains the Studio GetChildren order for
+		-- indistinguishable leaves. Lua's table.sort is not stable, so make the
+		-- same tie-break explicit.
+		return left.index < right.index
+	end)
+
+	local allocator = {
+		taken = {},
+		nextOrdinal = {},
+	}
+	local logicalAllocator = {
+		taken = {},
+		nextOrdinal = {},
+	}
+	local byFragment = {}
+	local byInstance = {}
+	local byLookupSegment = {}
+	for _, entry in ipairs(projectionEntries) do
+		local projection = entry.projection
+		local fragment =
+			PathHelpers.allocatePhysicalFragment(allocator, entry.name, projection.mappedClass, projection.directory)
+		byFragment[string.lower(fragment)] = entry.child
+		local logicalSegment = PathHelpers.allocatePhysicalFragment(logicalAllocator, entry.name, "Folder", true)
+		byLookupSegment[logicalSegment] = entry.child
+		byInstance[entry.child] = {
+			fragment = fragment,
+			isDirectory = projection.directory,
+		}
+		if projection.boundary and SCRIPT_CLASSES[projection.mappedClass] then
+			local alternate = PathHelpers.allocatePhysicalFragment(
+				allocator,
+				entry.name,
+				projection.mappedClass,
+				not projection.directory
+			)
+			byFragment[string.lower(alternate)] = entry.child
+		end
+	end
+	local parentDiskPath = snapshotApplyState.diskPathCache[parent]
+	if parentDiskPath and not override then
+		for _, entry in ipairs(projectionEntries) do
+			local cached = snapshotApplyState.diskPathCache[entry.child]
+			local sameParent = cached and #cached == #parentDiskPath + 1
+			if sameParent then
+				for index, fragment in ipairs(parentDiskPath) do
+					if cached[index] ~= fragment then
+						sameParent = false
+						break
+					end
+				end
+			end
+			if sameParent then
+				local fragment = cached[#cached]
+				byFragment[string.lower(fragment)] = entry.child
+				byInstance[entry.child] = {
+					fragment = fragment,
+					isDirectory = entry.projection.directory,
+				}
+			end
+		end
+	end
+	return {
+		byFragment = byFragment,
+		byInstance = byInstance,
+		byLookupSegment = byLookupSegment,
+	}
+end
+
+function snapshotApplyState.resolveDiskPath(diskPath, ctx): Instance?
+	if type(diskPath) ~= "table" or type(diskPath[1]) ~= "string" or not WATCHED_SET[diskPath[1]] then
+		return nil
+	end
+	local ok, current = pcall(function()
+		return game:GetService(diskPath[1])
+	end)
+	if not ok or not current then
+		return nil
+	end
+	local resolvedPath = { diskPath[1] }
+	snapshotApplyState.diskPathCache[current] = resolvedPath
+	ctx = ctx or snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	ctx.useAvoidSyncIndex = true
+	for index = 2, #diskPath do
+		local fragment = diskPath[index]
+		if type(fragment) ~= "string" then
+			return nil
+		end
+		local siblings = snapshotApplyState.buildPhysicalSiblingIndex(current, ctx)
+		current = siblings.byFragment[string.lower(fragment)]
+		if not current then
+			return nil
+		end
+		resolvedPath = table.clone(resolvedPath)
+		resolvedPath[#resolvedPath + 1] = fragment
+		snapshotApplyState.diskPathCache[current] = resolvedPath
+	end
+	return current
+end
+
+function snapshotApplyState.resolveDiskParent(diskPath, ctx): Instance?
+	if type(diskPath) ~= "table" or #diskPath <= 1 then
+		return nil
+	end
+	local parentDiskPath = {}
+	for index = 1, #diskPath - 1 do
+		parentDiskPath[index] = diskPath[index]
+	end
+	return snapshotApplyState.resolveDiskPath(parentDiskPath, ctx)
+end
+
+function snapshotApplyState.diskPathForInstance(inst: Instance): { string }?
+	local cached = snapshotApplyState.diskPathCache[inst]
+	if cached then
+		return table.clone(cached)
+	end
+	local ancestry = {}
+	local current = inst
+	while current and current.Parent ~= game do
+		ancestry[#ancestry + 1] = current
+		current = current.Parent
+	end
+	if not current or not WATCHED_SET[current.Name] then
+		return nil
+	end
+	local path = { current.Name }
+	snapshotApplyState.diskPathCache[current] = table.clone(path)
+	local ctx = snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	for index = #ancestry, 1, -1 do
+		local child = ancestry[index]
+		local childCached = snapshotApplyState.diskPathCache[child]
+		if childCached then
+			path = table.clone(childCached)
+		else
+			local siblings = snapshotApplyState.buildPhysicalSiblingIndex(current, ctx)
+			local placement = siblings.byInstance[child]
+			if not placement then
+				return nil
+			end
+			for sibling, siblingPlacement in pairs(siblings.byInstance) do
+				if not snapshotApplyState.diskPathCache[sibling] then
+					local siblingPath = table.clone(path)
+					siblingPath[#siblingPath + 1] = siblingPlacement.fragment
+					snapshotApplyState.diskPathCache[sibling] = siblingPath
+				end
+			end
+			path = table.clone(path)
+			path[#path + 1] = placement.fragment
+		end
+		current = child
+	end
+	return path
+end
+
+function snapshotApplyState.diskPathForInstanceShape(inst: Instance, isDirectory: boolean): { string }?
+	local parent = inst.Parent
+	if not parent or parent == game then
+		return nil
+	end
+	local parentPath = snapshotApplyState.diskPathForInstance(parent)
+	if not parentPath then
+		return nil
+	end
+	local mappedClass = PathHelpers.mappedSyncClass(inst)
+	local ctx = snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	local siblings = snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx)
+	local currentPath = snapshotApplyState.diskPathCache[inst]
+	local currentFragment = currentPath and currentPath[#currentPath] or nil
+	if not currentFragment then
+		local placement = siblings.byInstance[inst]
+		currentFragment = placement and placement.fragment or nil
+	end
+	if not currentFragment then
+		return nil
+	end
+	local taken = {}
+	for fragmentKey, sibling in pairs(siblings.byFragment) do
+		if sibling ~= inst then
+			taken[fragmentKey] = true
+		end
+	end
+	local stem = if SCRIPT_CLASSES[mappedClass] then PathHelpers.stripScriptSuffix(currentFragment) else currentFragment
+	local preferred = stem .. (if isDirectory then "" else PathHelpers.scriptSuffix(mappedClass))
+	local fragment
+	if not taken[string.lower(preferred)] then
+		fragment = preferred
+	else
+		-- Preserve every existing sibling identity. Only if the transitioning
+		-- script's matching stem/ordinal is occupied do we allocate a new free
+		-- shape against the current physical fragments.
+		fragment = PathHelpers.allocatePhysicalFragment({
+			taken = taken,
+			nextOrdinal = {},
+		}, inst.Name, mappedClass, isDirectory)
+	end
+	local path = table.clone(parentPath)
+	path[#path + 1] = fragment
+	return path
+end
+
+function snapshotApplyState.seedDiskPathsForService(service: Instance)
+	local servicePath = { service.Name }
+	snapshotApplyState.diskPathCache[service] = servicePath
+	local ctx = snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	local stack = {
+		{
+			parent = service,
+			path = servicePath,
+		},
+	}
+	while #stack > 0 do
+		snapshotApplyState.checkpoint(ctx)
+		local frame = table.remove(stack)
+		-- An empty override disables stale cache overlays while retaining the
+		-- exact allocator used for the just-pushed guarded Studio snapshot.
+		local siblings = snapshotApplyState.buildPhysicalSiblingIndex(frame.parent, ctx, {})
+		for child, placement in pairs(siblings.byInstance) do
+			local childPath = table.clone(frame.path)
+			childPath[#childPath + 1] = placement.fragment
+			snapshotApplyState.diskPathCache[child] = childPath
+			if placement.isDirectory then
+				stack[#stack + 1] = {
+					parent = child,
+					path = childPath,
+				}
+			end
+		end
+	end
+end
+
+function snapshotApplyState.buildAssignments(parent, nodes, ctx)
+	local buckets = {}
+	for _, child in ipairs(parent:GetChildren()) do
+		snapshotApplyState.checkpoint(ctx)
+		if not SUPPRESS_CLASSES[child.ClassName] then
+			local bucket = buckets[child.Name]
+			if not bucket then
+				bucket = {
+					byClass = {},
+					allowed = { items = {}, next = 1 },
+					passThrough = { items = {}, next = 1 },
+					boundaries = { items = {}, next = 1 },
+				}
+				buckets[child.Name] = bucket
+			end
+			local classList = bucket.byClass[child.ClassName]
+			if not classList then
+				classList = { items = {}, next = 1 }
+				bucket.byClass[child.ClassName] = classList
+			end
+			classList.items[#classList.items + 1] = child
+			if ALLOWED_CLASSES[child.ClassName] then
+				bucket.allowed.items[#bucket.allowed.items + 1] = child
+			else
+				bucket.passThrough.items[#bucket.passThrough.items + 1] = child
+			end
+			if (ctx.useAvoidSyncIndex and ctx.avoidSyncBoundaries[child]) or hasAvoidSyncAttribute(child) then
+				bucket.boundaries.items[#bucket.boundaries.items + 1] = child
+			end
+		end
+	end
+
+	local hasExactFragments = false
+	for _, node in ipairs(nodes) do
+		if type(node) == "table" and type(node.diskFragment) == "string" then
+			hasExactFragments = true
+			break
+		end
+	end
+	if hasExactFragments and not ctx.useAvoidSyncIndex then
+		ctx.useAvoidSyncIndex = true
+		snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
+	end
+	local physical = if hasExactFragments then snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx) else nil
+	local assignments = {}
+	local used = {}
+	-- Exact physical identities are assigned as a batch before any fallback.
+	-- This prevents a stale same-name disk node from consuming an AvoidSync
+	-- reservation that a later exact sibling owns.
+	for index, node in ipairs(nodes) do
+		snapshotApplyState.checkpoint(ctx)
+		local fragment = type(node) == "table" and node.diskFragment or nil
+		local candidate = if type(fragment) == "string" and physical
+			then physical.byFragment[string.lower(fragment)]
+			else nil
+		if candidate and (used[candidate] or ctx.claimedInstances[candidate]) then
+			candidate = nil
+		end
+		if candidate then
+			used[candidate] = true
+		end
+		assignments[index] = {
+			node = node,
+			candidate = candidate,
+			hasExactIdentity = type(fragment) == "string",
+		}
+	end
+
+	for _, assignment in ipairs(assignments) do
+		if assignment.candidate then
+			continue
+		end
+		local node = assignment.node
+		local name = type(node) == "table" and node.name or nil
+		local className = type(node) == "table" and node.class or nil
+		local bucket = type(name) == "string" and buckets[name] or nil
+		local candidate = nil
+		if assignment.hasExactIdentity and bucket then
+			-- If an ignored boundary's portable shape/class changed while it
+			-- was hidden, it still consumes one same-logical-name disk node.
+			-- Exact matches above always win before this safety fallback.
+			candidate = snapshotApplyState.takeCandidate(bucket.boundaries, used, ctx.claimedInstances)
+		elseif bucket then
+			candidate = snapshotApplyState.takeCandidate(bucket.byClass[className], used, ctx.claimedInstances)
+			if not candidate and className == "Folder" then
+				-- A disk Folder may be the projection of a Studio-owned Model,
+				-- Part, Tool, or other pass-through container.
+				candidate = snapshotApplyState.takeCandidate(bucket.passThrough, used, ctx.claimedInstances)
+			end
+			if not candidate then
+				-- Class changes are only legal for one of the four synced
+				-- classes. Never replace a Studio-authoritative instance merely
+				-- because it shares a name with a disk script.
+				candidate = snapshotApplyState.takeCandidate(bucket.allowed, used, ctx.claimedInstances)
+			end
+		end
+		assignment.candidate = candidate
+	end
+	return assignments
+end
+
+function snapshotApplyState.createInstance(parent, node, ctx)
+	local ok, created = pcall(function()
+		return Instance.new(node.class)
+	end)
+	if not ok then
+		error("unknown class: " .. tostring(node.class), 0)
+	end
+	created.Name = node.name
+	lastRemoteApplyClock = os.clock()
+	snapshotApplyState.runInternalWrite(function()
+		created.Parent = parent
+	end, {
+		instance = created,
+		parent = true,
+		structure = true,
+		structureSubtree = true,
+	})
+	snapshotApplyState.checkpoint(ctx)
+	return created
+end
+
+function snapshotApplyState.prepareInstance(parent, assignment, opts, ctx)
+	local node = assignment.node
+	if type(node) ~= "table" or type(node.name) ~= "string" or not ALLOWED_CLASSES[node.class] then
+		error(
+			string.format(
+				"invalid snapshot node %s/%s (%s)",
+				pathOf(parent),
+				tostring(type(node) == "table" and node.name or "?"),
+				tostring(type(node) == "table" and node.class or "?")
+			),
+			0
+		)
+	end
+	if node.children ~= nil and type(node.children) ~= "table" then
+		error("invalid children for snapshot node " .. pathOf(parent) .. "/" .. node.name, 0)
+	end
+
+	local existing = assignment.candidate
+	local existingBlocked = existing
+		and (
+			(ctx.useAvoidSyncIndex and ctx.avoidSyncBoundaries[existing])
+			or hasAvoidSyncAttribute(existing)
+			or (not ctx.useAvoidSyncIndex and isAvoidSyncBlocked(existing))
+		)
+	if existingBlocked then
+		ctx.claimedInstances[existing] = true
+		if type(node.diskFragment) == "string" then
+			local parentDiskPath = snapshotApplyState.diskPathCache[parent]
+			if parentDiskPath then
+				local diskPath = table.clone(parentDiskPath)
+				diskPath[#diskPath + 1] = node.diskFragment
+				snapshotApplyState.diskPathCache[existing] = diskPath
+			end
+		end
+		log("AvoidSync: skipping disk apply for " .. pathOf(existing))
+		return existing, true
+	end
+	local inst = nil
+	local applyNodeProperties = true
+	if existing and existing.ClassName == node.class then
+		inst = existing
+		if ctx.avoidSyncCarriers[existing] then
+			applyNodeProperties = false
+		end
+	elseif existing and node.class == "Folder" and not ALLOWED_CLASSES[existing.ClassName] then
+		inst = existing
+	elseif existing then
+		-- Preserve children across a synced class change. In particular, never
+		-- let choosing Disk indirectly destroy Studio-authoritative descendants.
+		-- An AvoidSync descendant also protects the ancestor's identity because
+		-- moving that descendant would change the ignored path.
+		if ctx.avoidSyncCarriers[existing] then
+			log(
+				string.format(
+					"AvoidSync: preserving carrier %s during class change %s → %s",
+					pathOf(existing),
+					existing.ClassName,
+					tostring(node.class)
+				)
+			)
+			inst = existing
+			applyNodeProperties = false
+		else
+			local replacement = snapshotApplyState.createInstance(parent, node, ctx)
+			for _, child in ipairs(existing:GetChildren()) do
+				lastRemoteApplyClock = os.clock()
+				snapshotApplyState.runInternalWrite(function()
+					child.Parent = replacement
+				end, {
+					instance = child,
+					parent = true,
+					structure = true,
+					structureSubtree = true,
+				})
+				snapshotApplyState.checkpoint(ctx)
+			end
+			lastRemoteApplyClock = os.clock()
+			snapshotApplyState.runInternalWrite(function()
+				existing:Destroy()
+			end, {
+				instance = existing,
+				parent = true,
+				structure = true,
+				structureSubtree = true,
+			})
+			inst = replacement
+		end
+	else
+		inst = snapshotApplyState.createInstance(parent, node, ctx)
+	end
+
+	ctx.claimedInstances[inst] = true
+	if type(node.diskFragment) == "string" then
+		local parentDiskPath = snapshotApplyState.diskPathCache[parent]
+		if parentDiskPath then
+			local diskPath = table.clone(parentDiskPath)
+			diskPath[#diskPath + 1] = node.diskFragment
+			snapshotApplyState.diskPathCache[inst] = diskPath
+		end
+	end
+	if applyNodeProperties then
+		applyProperties(inst, node.properties, opts)
+	end
+	return inst, false
+end
+
+-- Remove only the synchronized projection below unmatched children. Models,
+-- Parts, UI, other Studio-owned containers, bare explorer Folders, and
+-- AvoidSync carriers survive a strict Disk pull.
+function snapshotApplyState.pruneUnkept(parent, keptInstances, ctx)
+	local roots = {}
+	local children = parent:GetChildren()
+	for index = #children, 1, -1 do
+		local child = children[index]
+		if not keptInstances[child] then
+			roots[#roots + 1] = child
+		end
+	end
+	-- A synthetic parent keeps top-level siblings from being mistaken for one
+	-- another's ancestor when a child frame is popped.
+	local stack = {
+		{
+			synthetic = true,
+			entered = true,
+			children = roots,
+			nextChild = 1,
+			childProjection = false,
+			protected = false,
+		},
+	}
+
+	while #stack > 0 do
+		snapshotApplyState.checkpoint(ctx)
+		local frame = stack[#stack]
+		if not frame.entered then
+			local blocked = (ctx.useAvoidSyncIndex and ctx.avoidSyncBoundaries[frame.inst])
+				or hasAvoidSyncAttribute(frame.inst)
+				or (not ctx.useAvoidSyncIndex and isAvoidSyncBlocked(frame.inst))
+			if blocked or SUPPRESS_CLASSES[frame.inst.ClassName] then
+				local protected = blocked == true
+				table.remove(stack)
+				local ancestor = stack[#stack]
+				if ancestor and protected then
+					ancestor.protected = true
+				end
+			else
+				frame.entered = true
+				frame.children = frame.inst:GetChildren()
+				frame.nextChild = 1
+			end
+		else
+			local child = frame.children[frame.nextChild]
+			if child then
+				frame.nextChild += 1
+				stack[#stack + 1] = {
+					inst = child,
+					entered = false,
+					childProjection = false,
+					protected = false,
+				}
+			else
+				if frame.synthetic then
+					table.remove(stack)
+				else
+					local inst = frame.inst
+					local isScript = inst:IsA("LuaSourceContainer")
+					local projectionRemoved = isScript or frame.childProjection
+					local protected = frame.protected
+					if isScript and not protected then
+						local targetParent = inst.Parent
+						if targetParent then
+							-- Children left at this point are Studio-authoritative or
+							-- projection-irrelevant. Move them out before deleting
+							-- the stale synchronized script.
+							for _, remaining in ipairs(inst:GetChildren()) do
+								lastRemoteApplyClock = os.clock()
+								snapshotApplyState.runInternalWrite(function()
+									remaining.Parent = targetParent
+								end, {
+									instance = remaining,
+									parent = true,
+									structure = true,
+									structureSubtree = true,
+								})
+								snapshotApplyState.checkpoint(ctx)
+							end
+							lastRemoteApplyClock = os.clock()
+							snapshotApplyState.runInternalWrite(function()
+								inst:Destroy()
+							end, {
+								instance = inst,
+								parent = true,
+								structure = true,
+								structureSubtree = true,
+							})
+						end
+					elseif
+						inst.ClassName == "Folder"
+						and frame.childProjection
+						and not protected
+						and #inst:GetChildren() == 0
+					then
+						lastRemoteApplyClock = os.clock()
+						snapshotApplyState.runInternalWrite(function()
+							inst:Destroy()
+						end, {
+							instance = inst,
+							parent = true,
+							structure = true,
+							structureSubtree = true,
+						})
+					end
+
+					table.remove(stack)
+					local ancestor = stack[#stack]
+					if ancestor then
+						if projectionRemoved then
+							ancestor.childProjection = true
+						end
+						if protected then
+							ancestor.protected = true
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+function snapshotApplyState.runChildren(parent, nodes, opts, pruneRoot): { Instance }
+	if isAvoidSyncBlocked(parent) then
+		log("AvoidSync: skipping disk apply under " .. pathOf(parent))
+		return {}
+	end
+	if type(nodes) ~= "table" then
+		error("snapshot children must be an array", 0)
+	end
+
+	opts = opts or {}
+	local ctx = opts._applyContext
+	if not ctx then
+		ctx = snapshotApplyState.newContext(opts)
+		opts._applyContext = ctx
+	end
+	if opts.indexAvoidSyncCarriers then
+		snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
+	end
+	local results = {}
+	local stack = {
+		{
+			parent = parent,
+			nodes = nodes,
+			pruneParent = pruneRoot == true,
+			prepared = false,
+		},
+	}
+
+	while #stack > 0 do
+		snapshotApplyState.checkpoint(ctx)
+		local frame = stack[#stack]
+		if not frame.prepared then
+			frame.assignments = snapshotApplyState.buildAssignments(frame.parent, frame.nodes, ctx)
+			frame.keptInstances = {}
+			frame.nextAssignment = 1
+			frame.prepared = true
+		end
+
+		local assignment = frame.assignments[frame.nextAssignment]
+		if assignment then
+			local assignmentIndex = frame.nextAssignment
+			frame.nextAssignment += 1
+			local inst, skipChildren = snapshotApplyState.prepareInstance(frame.parent, assignment, opts, ctx)
+			frame.keptInstances[inst] = true
+			if #stack == 1 then
+				results[assignmentIndex] = inst
+			end
+			if not skipChildren then
+				stack[#stack + 1] = {
+					parent = inst,
+					nodes = assignment.node.children or {},
+					pruneParent = true,
+					prepared = false,
+				}
+			end
+		else
+			if opts.strict and frame.pruneParent then
+				snapshotApplyState.pruneUnkept(frame.parent, frame.keptInstances, ctx)
+			end
+			table.remove(stack)
+		end
+	end
+	return results
+end
+
+local function applyNode(parent, node, opts)
+	local results = snapshotApplyState.runChildren(parent, { node }, opts, false)
+	return results[1]
+end
+
+local function applyClassChange(op, applyOpts, opContext)
 	local newClass = tostring(op.class or "")
 	if not SCRIPT_CLASSES[newClass] then
 		log("class_change: unsupported class " .. newClass)
 		return
 	end
-	local target = resolvePath(op.path)
+	local sourceDiskPath = if type(op.fromDiskPath) == "table"
+		then op.fromDiskPath
+		elseif type(op.diskPath) == "table" then op.diskPath
+		else nil
+	local target = if sourceDiskPath
+		then snapshotApplyState.resolveDiskPath(sourceDiskPath, opContext)
+		else resolveGeneratedPath(op.path, opContext)
 	if not target or target == game then
 		return
 	end
@@ -2588,9 +3620,13 @@ local function applyClassChange(op)
 	local toPath = type(op.to) == "table" and op.to or op.path
 	local newName = toPath[#toPath] or target.Name
 	local newParent = target.Parent
-	local newParentPath = parentPath(toPath)
-	if newParentPath then
-		local resolvedParent = resolvePath(newParentPath)
+	local destinationDiskPath = if type(op.toDiskPath) == "table" then op.toDiskPath else nil
+	local resultingDiskPath = destinationDiskPath or sourceDiskPath
+	local newParentPath = if destinationDiskPath then nil else parentPath(toPath)
+	if destinationDiskPath or newParentPath then
+		local resolvedParent = if destinationDiskPath
+			then snapshotApplyState.resolveDiskParent(destinationDiskPath, opContext)
+			else resolveGeneratedPath(newParentPath, opContext)
 		if resolvedParent then
 			newParent = resolvedParent
 		end
@@ -2605,7 +3641,11 @@ local function applyClassChange(op)
 		if target.Name ~= newName then
 			target.Name = newName
 		end
-		applyProperties(target, op.properties, nil)
+		applyProperties(target, op.properties, applyOpts)
+		snapshotApplyState.clearDiskPathSubtree(target)
+		if resultingDiskPath then
+			snapshotApplyState.diskPathCache[target] = table.clone(resultingDiskPath)
+		end
 		return
 	end
 	if not target:IsA("LuaSourceContainer") and target.ClassName ~= "Folder" then
@@ -2626,19 +3666,55 @@ local function applyClassChange(op)
 	for _, child in ipairs(target:GetChildren()) do
 		child.Parent = replacement
 	end
-	applyProperties(replacement, op.properties, nil)
+	applyProperties(replacement, op.properties, applyOpts)
 	target:Destroy()
+	snapshotApplyState.clearDiskPathSubtree(replacement)
+	if resultingDiskPath then
+		snapshotApplyState.diskPathCache[replacement] = table.clone(resultingDiskPath)
+	end
 end
 
-local function applyOp(op)
+local function applyOp(op, sharedApplyOpts)
 	local kind = op.op or op.type
+	local opContext = sharedApplyOpts and sharedApplyOpts._applyContext or nil
+	if
+		not opContext
+		and (type(op.diskPath) == "table" or type(op.fromDiskPath) == "table" or type(op.toDiskPath) == "table")
+	then
+		opContext = snapshotApplyState.newContext({
+			indexAvoidSyncCarriers = true,
+		})
+	end
+	local generatedTarget = nil
+	if type(op.targetPath) == "table" then
+		generatedTarget = resolveGeneratedPath(op.targetPath, opContext)
+		if generatedTarget and type(op.diskPath) == "table" then
+			-- Selective snapshots can reference legacy/noncanonical physical
+			-- fragments that are not derivable from current Studio shape alone.
+			-- The daemon's exact generated target seeds that identity before
+			-- buildAssignments consumes the node.
+			snapshotApplyState.seedDiskPathAncestry(generatedTarget, op.diskPath)
+		end
+	end
+	if sharedApplyOpts and sharedApplyOpts._applyContext then
+		snapshotApplyState.checkpoint(sharedApplyOpts._applyContext)
+	end
 	if kind == "ensure" then
 		if not rootSetAllowed(op) then
 			return
 		end
 		local parent
-		if op.path and #op.path > 0 then
-			parent = resolvePath(op.path)
+		if generatedTarget and generatedTarget.Parent then
+			parent = generatedTarget.Parent
+		elseif type(op.diskPath) == "table" then
+			parent = snapshotApplyState.resolveDiskParent(op.diskPath, opContext)
+			if not parent and type(op.targetPath) == "table" then
+				parent = resolveGeneratedPath(parentPath(op.targetPath), opContext)
+			end
+		elseif op.path and #op.path > 0 then
+			parent = if op.pathMode == "generated"
+				then resolveGeneratedPath(op.path, opContext)
+				else resolvePath(op.path)
 		else
 			parent = game
 		end
@@ -2658,20 +3734,32 @@ local function applyOp(op)
 		-- Selective initial sync may need a missing parent container to reach a
 		-- chosen descendant. Existing ancestors are deliberately untouched,
 		-- including class and Source, because the user did not stage them.
-		if parent:FindFirstChild(node.name) then
+		local nodeOpts = snapshotApplyState.nodeOptions(sharedApplyOpts, false, false)
+		if not nodeOpts._applyContext then
+			nodeOpts._applyContext = snapshotApplyState.newContext(nodeOpts)
+		end
+		local assignment = snapshotApplyState.buildAssignments(parent, { node }, nodeOpts._applyContext)[1]
+		if assignment and assignment.candidate then
+			nodeOpts._applyContext.claimedInstances[assignment.candidate] = true
 			return
 		end
-		applyNode(parent, node, {
-			strict = false,
-			forcePrune = false,
-		})
+		applyNode(parent, node, nodeOpts)
 	elseif kind == "set" or kind == "replace" then
 		if not rootSetAllowed(op) then
 			return
 		end
 		local parent
-		if op.path and #op.path > 0 then
-			parent = resolvePath(op.path)
+		if generatedTarget and generatedTarget.Parent then
+			parent = generatedTarget.Parent
+		elseif type(op.diskPath) == "table" then
+			parent = snapshotApplyState.resolveDiskParent(op.diskPath, opContext)
+			if not parent and type(op.targetPath) == "table" then
+				parent = resolveGeneratedPath(parentPath(op.targetPath), opContext)
+			end
+		elseif op.path and #op.path > 0 then
+			parent = if op.pathMode == "generated"
+				then resolveGeneratedPath(op.path, opContext)
+				else resolvePath(op.path)
 		else
 			parent = game
 		end
@@ -2683,12 +3771,19 @@ local function applyOp(op)
 			log("AvoidSync: ignoring set under " .. pathOf(parent))
 			return
 		end
-		applyNode(parent, op.node, {
-			strict = op.strict == true,
-			forcePrune = op.forcePrune == true,
-		})
+		if type(op.diskPath) == "table" and type(op.node) == "table" and type(op.node.diskFragment) ~= "string" then
+			op.node.diskFragment = op.diskPath[#op.diskPath]
+			op.node.diskFragmentIsDir = op.diskFragmentIsDir
+		end
+		applyNode(
+			parent,
+			op.node,
+			snapshotApplyState.nodeOptions(sharedApplyOpts, op.strict == true, op.forcePrune == true)
+		)
 	elseif kind == "delete" or kind == "remove" then
-		local target = resolvePath(op.path)
+		local target = if type(op.diskPath) == "table"
+			then snapshotApplyState.resolveDiskPath(op.diskPath, opContext)
+			else resolveGeneratedPath(op.path, opContext)
 		if target and target ~= game then
 			if isAvoidSyncBlocked(target) then
 				log("AvoidSync: ignoring delete for " .. pathOf(target))
@@ -2708,7 +3803,9 @@ local function applyOp(op)
 			end
 		end
 	elseif kind == "update" then
-		local target = resolvePath(op.path)
+		local target = if type(op.diskPath) == "table"
+			then snapshotApplyState.resolveDiskPath(op.diskPath, opContext)
+			else resolveGeneratedPath(op.path, opContext)
 		if not target then
 			return
 		end
@@ -2721,15 +3818,20 @@ local function applyOp(op)
 		-- property is Studio-authoritative and must not be applied here.
 		local props = op.properties
 		if type(props) == "table" and props.Source ~= nil and target:IsA("LuaSourceContainer") then
-			if not writeScriptSource(target, tostring(props.Source or "")) then
+			local source = tostring(props.Source or "")
+			if sharedApplyOpts and sharedApplyOpts.sourceWrites then
+				queueScriptSourceWrite(sharedApplyOpts.sourceWrites, target, source)
+			elseif not writeScriptSource(target, source) then
 				error("source update was not applied for " .. pathOf(target))
 			end
 		end
 	elseif kind == "class_change" then
-		applyClassChange(op)
+		applyClassChange(op, sharedApplyOpts, opContext)
 	elseif kind == "rename" then
 		if type(op.from) == "table" and type(op.to) == "table" then
-			local target = resolvePath(op.from)
+			local target = if type(op.fromDiskPath) == "table"
+				then snapshotApplyState.resolveDiskPath(op.fromDiskPath, opContext)
+				else resolveGeneratedPath(op.from, opContext)
 			if not target or target == game then
 				return
 			end
@@ -2740,9 +3842,12 @@ local function applyOp(op)
 
 			local toPath = op.to
 			local newName = toPath[#toPath]
-			local newParentPath = parentPath(toPath)
-			if newParentPath then
-				local newParent = resolvePath(newParentPath)
+			local destinationDiskPath = if type(op.toDiskPath) == "table" then op.toDiskPath else nil
+			local newParentPath = if destinationDiskPath then nil else parentPath(toPath)
+			if destinationDiskPath or newParentPath then
+				local newParent = if destinationDiskPath
+					then snapshotApplyState.resolveDiskParent(destinationDiskPath, opContext)
+					else resolveGeneratedPath(newParentPath, opContext)
 				if newParent and isAvoidSyncBlocked(newParent) then
 					log("AvoidSync: ignoring rename into " .. pathOf(newParent))
 					return
@@ -2754,28 +3859,44 @@ local function applyOp(op)
 			if newName and target.Name ~= newName then
 				target.Name = newName
 			end
+			snapshotApplyState.clearDiskPathSubtree(target)
+			if destinationDiskPath then
+				snapshotApplyState.diskPathCache[target] = table.clone(destinationDiskPath)
+			end
 		else
-			local target = resolvePath(op.path)
+			local target = if type(op.diskPath) == "table"
+				then snapshotApplyState.resolveDiskPath(op.diskPath, opContext)
+				else resolveGeneratedPath(op.path, opContext)
 			if target and op.name and not isAvoidSyncBlocked(target) then
 				target.Name = op.name
+				snapshotApplyState.clearDiskPathSubtree(target)
 			end
 		end
 	elseif kind == "move" then
-		local target = resolvePath(op.from)
+		local target = if type(op.fromDiskPath) == "table"
+			then snapshotApplyState.resolveDiskPath(op.fromDiskPath, opContext)
+			else resolveGeneratedPath(op.from, opContext)
 		local destination = type(op.to) == "table" and op.to or nil
-		local destinationParent = destination and parentPath(destination) or nil
-		local newParent = destinationParent and resolvePath(destinationParent) or nil
+		local destinationDiskPath = if type(op.toDiskPath) == "table" then op.toDiskPath else nil
+		local destinationParent = if destinationDiskPath
+			then snapshotApplyState.resolveDiskParent(destinationDiskPath, opContext)
+			elseif destination then resolveGeneratedPath(parentPath(destination), opContext)
+			else nil
 		if
 			target
 			and destination
-			and newParent
+			and destinationParent
 			and not isAvoidSyncBlocked(target)
-			and not isAvoidSyncBlocked(newParent)
+			and not isAvoidSyncBlocked(destinationParent)
 		then
-			target.Parent = newParent
+			target.Parent = destinationParent
 			local newName = destination[#destination]
 			if newName and target.Name ~= newName then
 				target.Name = newName
+			end
+			snapshotApplyState.clearDiskPathSubtree(target)
+			if destinationDiskPath then
+				snapshotApplyState.diskPathCache[target] = table.clone(destinationDiskPath)
 			end
 		end
 	else
@@ -2805,28 +3926,94 @@ local function summarizeOps(ops): string
 	return table.concat(parts, ",")
 end
 
-local function applyOps(ops)
+local function applyOps(ops, shouldContinue): boolean
 	if not ops or #ops == 0 then
-		return
+		return true
 	end
-	setWaypoint("Ro Sync: before " .. summarizeOps(ops))
+	if shouldContinue and not shouldContinue() then
+		return false
+	end
+	local label = "Ro Sync: " .. summarizeOps(ops)
+	local recordingOk, recordingId = pcall(function()
+		return ChangeHistoryService:TryBeginRecording(label, label)
+	end)
+	if not recordingOk or recordingId == nil then
+		log("applyOps error: Studio refused to begin a rollback-safe recording")
+		return false
+	end
 	lastRemoteApplyClock = os.clock()
 	local ok, err = pcall(function()
+		local sourceWrites = {}
+		local applyOpts = {
+			sourceWrites = sourceWrites,
+			shouldContinue = shouldContinue,
+			claimedInstances = {},
+			indexAvoidSyncCarriers = true,
+		}
+		applyOpts._applyContext = snapshotApplyState.newContext(applyOpts)
 		for _, op in ipairs(ops) do
-			applyOp(op)
+			if shouldContinue and not shouldContinue() then
+				error("live operation apply cancelled", 0)
+			end
+			snapshotApplyState.checkpoint(applyOpts._applyContext)
+			applyOp(op, applyOpts)
+		end
+		if #sourceWrites > 0 then
+			local _, failedSources = flushScriptSourceWrites(sourceWrites, shouldContinue)
+			if failedSources > 0 then
+				error(string.format("%d live Source write(s) failed or were cancelled", failedSources), 0)
+			end
+		end
+		if shouldContinue and not shouldContinue() then
+			error("live operation apply cancelled", 0)
 		end
 	end)
 	lastRemoteApplyClock = os.clock()
+	if ok then
+		local finishOk, finishErr = pcall(function()
+			snapshotApplyState.runInternalWrite(function()
+				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Commit)
+			end, {
+				recording = true,
+			})
+		end)
+		if not finishOk then
+			ok = false
+			err = "change-history commit failed: " .. tostring(finishErr)
+		end
+	end
 	if not ok then
 		log("applyOps error: " .. tostring(err))
+		local cancelOk = pcall(function()
+			snapshotApplyState.runInternalWrite(function()
+				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Cancel)
+			end, {
+				recording = true,
+			})
+		end)
+		if not cancelOk then
+			pcall(function()
+				ChangeHistoryService:Undo()
+			end)
+		end
+		for _, serviceName in ipairs(WATCHED_SERVICES) do
+			local serviceOk, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if serviceOk and service then
+				snapshotApplyState.clearDiskPathSubtree(service)
+			end
+		end
+		return false
 	end
-	setWaypoint("Ro Sync: " .. summarizeOps(ops))
+	return true
 end
 
 local function sourceAckForAppliedOp(op)
 	local kind = op.op or op.type
 	local expected
 	local path
+	local diskPath
 	if kind == "set" or kind == "replace" then
 		local node = op.node
 		if type(node) ~= "table" or type(node.properties) ~= "table" or node.properties.Source == nil then
@@ -2838,18 +4025,24 @@ local function sourceAckForAppliedOp(op)
 			table.insert(path, segment)
 		end
 		table.insert(path, tostring(node.name or ""))
+		diskPath = type(op.diskPath) == "table" and op.diskPath or nil
 	elseif kind == "update" then
 		if type(op.properties) ~= "table" or op.properties.Source == nil then
 			return nil
 		end
 		expected = tostring(op.properties.Source or "")
 		path = op.path
+		diskPath = type(op.diskPath) == "table" and op.diskPath or nil
 	elseif kind == "class_change" then
 		if type(op.properties) ~= "table" or op.properties.Source == nil then
 			return nil
 		end
 		expected = tostring(op.properties.Source or "")
 		path = type(op.to) == "table" and op.to or op.path
+		diskPath = if type(op.toDiskPath) == "table"
+			then op.toDiskPath
+			elseif type(op.diskPath) == "table" then op.diskPath
+			else nil
 	else
 		return nil
 	end
@@ -2857,7 +4050,14 @@ local function sourceAckForAppliedOp(op)
 	if type(path) ~= "table" then
 		return nil
 	end
-	local target = resolvePath(path)
+	local target = if diskPath
+		then snapshotApplyState.resolveDiskPath(
+			diskPath,
+			snapshotApplyState.newContext({
+				indexAvoidSyncCarriers = true,
+			})
+		)
+		else resolveGeneratedPath(path)
 	if not target or not target:IsA("LuaSourceContainer") then
 		return nil
 	end
@@ -2865,80 +4065,86 @@ local function sourceAckForAppliedOp(op)
 	if not sourcesMatchForApply(actual, expected) then
 		return nil
 	end
-	return {
+	local ack = {
 		op = "update",
 		path = path,
 		properties = { Source = actual },
 	}
+	if diskPath then
+		ack.diskPath = diskPath
+	end
+	return ack
 end
 
-local function applySnapshot(snap)
+local function applySnapshot(snap, shouldContinue): (boolean, string?)
 	-- Apply a full snapshot payload returned by /snapshot.
 	setWaypoint("Ro Sync: before snapshot")
 	lastRemoteApplyClock = os.clock()
 	local ok, err = pcall(function()
+		local sourceWrites = {}
+		local applyOpts = {
+			strict = snap and snap.strict == true,
+			forcePrune = snap and snap.forcePrune == true,
+			sourceWrites = sourceWrites,
+			shouldContinue = shouldContinue,
+			claimedInstances = {},
+			indexAvoidSyncCarriers = true,
+		}
+		applyOpts._applyContext = snapshotApplyState.newContext(applyOpts)
 		if snap and snap.services then
-			local strict = snap.strict == true
-			local forcePrune = snap.forcePrune == true
-			local sourceWrites = {}
-			local applyOpts = {
-				strict = strict,
-				forcePrune = forcePrune,
-				sourceWrites = sourceWrites,
-			}
-			for _, node in ipairs(snap.services) do
-				local svc = game:GetService(node.name)
-				if svc then
-					-- ALLOWED whitelist rejects non-ALLOWED (top-level services
-					-- aren't ALLOWED). Services already exist, so apply each
-					-- child directly into the resolved service.
-					local wanted = {}
-					for _, child in ipairs(node.children or {}) do
-						wanted[child.name] = true
-						applyNode(svc, child, applyOpts)
-					end
-					if strict then
-						for _, existing in ipairs(svc:GetChildren()) do
-							if shouldStrictPruneChild(existing, wanted) then
-								local safe, reason = canSafelyDestroy(existing, forcePrune)
-								if safe then
-									existing:Destroy()
-								else
-									log(
-										string.format(
-											"SAFETY: strict-mode destroy skipped for %s — %s",
-											pathOf(existing),
-											reason
-										)
-									)
-								end
-							end
-						end
-					end
-				end
+			if type(snap.services) ~= "table" then
+				error("snapshot services must be an array", 0)
 			end
-			if #sourceWrites > 0 then
-				local appliedSources = flushScriptSourceWrites(sourceWrites)
-				log(
-					string.format(
-						"snapshot source writes: %d/%d applied with %d workers",
-						appliedSources,
-						#sourceWrites,
-						math.min(SOURCE_WRITE_CONCURRENCY, #sourceWrites)
-					)
-				)
+			for _, node in ipairs(snap.services) do
+				if
+					type(node) ~= "table"
+					or type(node.name) ~= "string"
+					or not WATCHED_SET[node.name]
+					or type(node.children) ~= "table"
+				then
+					error("snapshot contains an invalid service node", 0)
+				end
+				local svc = game:GetService(node.name)
+				snapshotApplyState.diskPathCache[svc] = { node.name }
+				-- Services already exist and are outside the four-class
+				-- whitelist, so reconcile their children as one identity-aware
+				-- batch. This is what keeps duplicate names distinct.
+				snapshotApplyState.runChildren(svc, node.children, applyOpts, true)
 			end
 		elseif snap and snap.ops then
+			if type(snap.ops) ~= "table" then
+				error("snapshot ops must be an array", 0)
+			end
 			for _, op in ipairs(snap.ops) do
-				applyOp(op)
+				applyOp(op, applyOpts)
+			end
+		else
+			error("snapshot payload has neither services nor ops", 0)
+		end
+
+		if #sourceWrites > 0 then
+			local appliedSources, failedSources = flushScriptSourceWrites(sourceWrites, shouldContinue)
+			log(
+				string.format(
+					"snapshot source writes: %d/%d applied with %d workers",
+					appliedSources,
+					#sourceWrites,
+					math.min(SOURCE_WRITE_CONCURRENCY, #sourceWrites)
+				)
+			)
+			if failedSources > 0 then
+				error(string.format("%d snapshot source write(s) failed or were cancelled", failedSources), 0)
 			end
 		end
 	end)
 	lastRemoteApplyClock = os.clock()
 	if not ok then
 		log("applySnapshot error: " .. tostring(err))
+		setWaypoint("Ro Sync: snapshot incomplete")
+		return false, tostring(err)
 	end
 	setWaypoint("Ro Sync: snapshot applied")
+	return true, nil
 end
 
 --------------------------------------------------------------------------------
@@ -2977,6 +4183,7 @@ local reconnectState = {
 -- after any established transport gap. The real function assignment happens
 -- further down.
 local runInitialCompare: () -> ()
+local disconnectHooks
 
 -- Strip NULs and replace invalid UTF-8 bytes with the Unicode replacement
 -- char (EF BF BD). JSONEncode rejects either. We keep valid UTF-8 intact.
@@ -3085,16 +4292,21 @@ local function sanitizeJson(v, depth)
 	return nil
 end
 
-local function httpRequestTo(url, method, body)
+local function httpRequestTo(url, method, body, internalJsonSafe)
 	local req = {
 		Url = url,
 		Method = method or "GET",
 		Headers = { ["Content-Type"] = "application/json" },
 	}
 	if body ~= nil then
-		local clean = sanitizeJson(body)
+		-- Snapshot/bootstrap payloads are assembled exclusively from primitive
+		-- schema fields by this plugin. Let those trusted internal callers skip
+		-- sanitizeJson's full-tree copy: on a large service that otherwise
+		-- doubles peak memory and adds another traversal before JSONEncode.
+		-- Every general remote/audit caller keeps the sanitized default.
+		local value = if internalJsonSafe == true then body else sanitizeJson(body)
 		local encOk, enc = pcall(function()
-			return HttpService:JSONEncode(clean)
+			return HttpService:JSONEncode(value)
 		end)
 		if not encOk then
 			return false, "JSONEncode failed: " .. tostring(enc)
@@ -3110,12 +4322,12 @@ local function httpRequestTo(url, method, body)
 	return true, resp
 end
 
-local function httpRequest(path, method, body)
-	return httpRequestTo(baseUrl .. path, method, body)
+local function httpRequest(path, method, body, internalJsonSafe)
+	return httpRequestTo(baseUrl .. path, method, body, internalJsonSafe)
 end
 
-local function httpJson(path, method, body)
-	local ok, resp = httpRequest(path, method, body)
+local function httpJson(path, method, body, internalJsonSafe, maxResponseBytes)
+	local ok, resp = httpRequest(path, method, body, internalJsonSafe)
 	if not ok then
 		return false, resp
 	end
@@ -3124,6 +4336,9 @@ local function httpJson(path, method, body)
 	end
 	if resp.Body == nil or resp.Body == "" then
 		return true, nil
+	end
+	if maxResponseBytes and #resp.Body > maxResponseBytes then
+		return false, string.format("response exceeds %d bytes", maxResponseBytes)
 	end
 	local decoded
 	local decOk, err = pcall(function()
@@ -3143,13 +4358,104 @@ local pendingOps = {}
 local pushPending = false
 local pendingEditorSourceByScript: { [Instance]: { source: string, serial: number } } = {}
 local EDITOR_SOURCE_DEBOUNCE = 0.35
-local markTreeDirty
+-- Group scale-related helpers/state behind one top-level register. This file is
+-- intentionally close to Luau's 200-register chunk limit.
+local scaleState = {
+	avoidSyncRoots = {},
+	avoidSyncPathsDirty = false,
+	avoidSyncPushPending = false,
+	avoidSyncPushInFlight = false,
+	avoidSyncRevision = 0,
+	avoidSyncTrackingPaused = false,
+	avoidSyncPushDebounce = 0.25,
+	hookYieldEvery = 750,
+	studioScanYieldEvery = 500,
+	structureChunkRecords = 512,
+	compareHashChunkRecords = 64,
+	sourcePartChunkRecords = 64,
+	deleteChunkRecords = 512,
+	sourceChunkBytes = 64 * 1024,
+	maxStreamRequestBytes = PROTOCOL_STREAM_MAX_BYTES,
+	maxStreamNodes = 1_000_000,
+	maxStreamDepth = 256,
+	maxScriptSourceBytes = 32 * 1024 * 1024,
+	maxRecoveryReceiptStringBytes = 64 * 1024,
+	-- Detached pull staging is intentionally bounded independently from the
+	-- per-script wire limit. Atomic all-service commit retains every staged
+	-- service until the authenticated terminal response arrives.
+	maxStagedSourceBytesPerService = 64 * 1024 * 1024,
+	maxStagedSourceBytesTotal = 128 * 1024 * 1024,
+	emptyConnectionBucket = table.freeze({}),
+	itemChangedAvailable = false,
+	hookGeneration = 0,
+	liveResyncPending = false,
+	trackedInstanceCount = 0,
+	trackedConnectionCount = 0,
+	lastKnownParent = {},
+}
 local flushPush
 
-local function prependPendingOps(ops)
-	for i = #ops, 1, -1 do
-		table.insert(pendingOps, 1, ops[i])
+scaleState.preflightLiveOp = function(op, shouldContinue): (string?, string?)
+	-- Reject an oversized/cyclic value tree before sanitizeJson duplicates it.
+	-- This is deliberately iterative so a huge pass-through subtree cannot
+	-- overflow the Luau stack or monopolize Studio's UI thread.
+	local estimated = 32
+	local visited = 0
+	local seen = {}
+	local stack = { { value = op, depth = 0 } }
+	while #stack > 0 do
+		local entry = table.remove(stack)
+		local value = entry.value
+		local valueType = typeof(value)
+		if valueType == "table" then
+			if seen[value] then
+				return nil, "live operation contains a cyclic/shared table"
+			end
+			if entry.depth > 128 then
+				return nil, "live operation exceeds the JSON depth limit"
+			end
+			seen[value] = true
+			estimated += 2
+			for key, child in pairs(value) do
+				estimated += if type(key) == "string" then #key + 4 else 2
+				stack[#stack + 1] = {
+					value = child,
+					depth = entry.depth + 1,
+				}
+			end
+		elseif valueType == "string" then
+			estimated += #value + 2
+		elseif valueType == "number" then
+			estimated += 24
+		elseif valueType == "boolean" then
+			estimated += 5
+		elseif valueType ~= "nil" then
+			return nil, "live operation contains a non-JSON value"
+		end
+		if estimated > LIVE_PUSH_MAX_BYTES then
+			return nil, "live operation exceeds the 512 KiB frame limit"
+		end
+		visited += 1
+		if visited % scaleState.studioScanYieldEvery == 0 then
+			task.wait()
+			if shouldContinue and not shouldContinue() then
+				return nil, "cancelled"
+			end
+		end
 	end
+
+	local clean = sanitizeJson(op)
+	local encodedOk, encoded = pcall(function()
+		return HttpService:JSONEncode(clean)
+	end)
+	if not encodedOk then
+		return nil, "JSONEncode failed: " .. tostring(encoded)
+	end
+	-- Account for the fixed envelope plus a comma in a multi-op batch.
+	if #encoded + 32 > LIVE_PUSH_MAX_BYTES then
+		return nil, "live operation exceeds the 512 KiB frame limit"
+	end
+	return encoded, nil
 end
 
 local function schedulePushRetry(delaySeconds: number?)
@@ -3182,33 +4488,100 @@ flushPush = function()
 	end
 	local ops = pendingOps
 	pendingOps = {}
-	local msg = { type = "push", ops = ops }
-	local clean = sanitizeJson(msg)
-	local encOk, enc = pcall(function()
-		return HttpService:JSONEncode(clean)
-	end)
-	if not encOk then
-		log("push encode fail: " .. tostring(enc))
+	local generation = wsGeneration
+	local function shouldContinue()
+		return reconnectState.desired
+			and connected
+			and generation == wsGeneration
+			and ws == client
+			and not scaleState.liveResyncPending
+	end
+
+	-- Preflight every operation before sending the first frame. If one Source
+	-- or subtree cannot fit, no prefix is sent; the bounded bootstrap stream
+	-- becomes the sole source of truth.
+	for index, op in ipairs(ops) do
+		local preflightEncoded, encodeErr = scaleState.preflightLiveOp(op, shouldContinue)
+		if not preflightEncoded then
+			if encodeErr ~= "cancelled" and shouldContinue() then
+				scaleState.requestControlledLiveResync(
+					string.format("live operation %d requires streamed resync: %s", index, tostring(encodeErr))
+				)
+			end
+			return
+		end
+	end
+	if not shouldContinue() then
 		return
 	end
-	local sendOk, sendErr = pcall(function()
-		client:Send(enc)
-	end)
-	if not sendOk then
-		prependPendingOps(ops)
-		log(string.format("push err: %s (%d op(s) requeued)", tostring(sendErr), #ops))
-		if ws == client then
-			ws = nil
+
+	local prefix = '{"type":"push","ops":['
+	local suffix = "]}"
+	local batch = {}
+	local batchBytes = #prefix + #suffix
+	for index, op in ipairs(ops) do
+		-- Re-encode only the current bounded frame after the discard-only
+		-- preflight pass. Retaining every encoded operation here would turn a
+		-- large burst into another whole-project-sized memory spike.
+		local encoded, encodeErr = scaleState.preflightLiveOp(op, shouldContinue)
+		if not encoded then
+			if encodeErr ~= "cancelled" and shouldContinue() then
+				scaleState.requestControlledLiveResync(
+					string.format("live operation %d changed during bounded encoding: %s", index, tostring(encodeErr))
+				)
+			end
+			return
 		end
-		pcall(function()
-			client:Close()
+		local separatorBytes = if #batch == 0 then 0 else 1
+		if #batch > 0 and batchBytes + separatorBytes + #encoded > LIVE_PUSH_MAX_BYTES then
+			local frame = prefix .. table.concat(batch, ",") .. suffix
+			local sendOk, sendErr = pcall(function()
+				client:Send(frame)
+			end)
+			if not sendOk then
+				if shouldContinue() then
+					scaleState.requestControlledLiveResync("bounded live push failed: " .. tostring(sendErr))
+				end
+				return
+			end
+			batch = {}
+			batchBytes = #prefix + #suffix
+			if not shouldContinue() then
+				return
+			end
+		end
+		batch[#batch + 1] = encoded
+		batchBytes += (if #batch == 1 then 0 else 1) + #encoded
+		if index % scaleState.structureChunkRecords == 0 then
+			task.wait()
+			if not shouldContinue() then
+				return
+			end
+		end
+	end
+	if #batch > 0 then
+		local frame = prefix .. table.concat(batch, ",") .. suffix
+		local sendOk, sendErr = pcall(function()
+			client:Send(frame)
 		end)
-		schedulePushRetry(0.5)
+		if not sendOk and shouldContinue() then
+			scaleState.requestControlledLiveResync("bounded live push failed: " .. tostring(sendErr))
+		end
 	end
 end
 
 local function queueOp(op)
 	if isEchoing() then
+		return
+	end
+	local generation = wsGeneration
+	local _, preflightErr = scaleState.preflightLiveOp(op, function()
+		return reconnectState.desired and connected and generation == wsGeneration and not scaleState.liveResyncPending
+	end)
+	if preflightErr then
+		if preflightErr ~= "cancelled" and connected and generation == wsGeneration then
+			scaleState.requestControlledLiveResync("live update requires streamed resync: " .. tostring(preflightErr))
+		end
 		return
 	end
 	table.insert(pendingOps, op)
@@ -3222,12 +4595,16 @@ local function queueOp(op)
 end
 
 local function queueScriptUpdateOp(inst: Instance, source: string)
-	markTreeDirty()
-	queueOp({
+	local op = {
 		op = "update",
 		path = pathFromRoot(inst),
 		properties = { Source = source },
-	})
+	}
+	local diskPath = snapshotApplyState.diskPathForInstance(inst)
+	if diskPath then
+		op.diskPath = diskPath
+	end
+	queueOp(op)
 end
 
 local function scriptFromDocument(document): Instance?
@@ -3295,57 +4672,94 @@ local function queueEditorSourceChanged(scriptInst: Instance, source: string)
 end
 
 --------------------------------------------------------------------------------
--- Tree skeleton push (Studio -> daemon live tree cache)
+-- AvoidSync path push (Studio -> daemon)
 --------------------------------------------------------------------------------
--- Payload can be hundreds of KB on a moderately-sized place (every Instance
--- under every watched service), so we use HTTP POST instead of piling it into
--- the WebSocket (which has smaller frame limits and shares a backpressure
--- budget with per-op traffic).
+-- The daemon only consumed full tree snapshots to recover AvoidSync prefixes.
+-- Track those roots directly so a source edit or ordinary Explorer mutation
+-- does not serialize every Instance in the place.
 
-local TREE_PUSH_DEBOUNCE = 0.5
-local treeDirty = false
-local treePushPending = false
-
-local function collectTreeSkeleton()
-	local services = {}
-	for _, name in ipairs(WATCHED_SERVICES) do
-		local ok, svc = pcall(function()
-			return game:GetService(name)
-		end)
-		if ok and svc then
-			table.insert(services, skeletonNode(svc))
+scaleState.avoidSyncPathAffectedBy = function(inst: Instance): boolean
+	for root in pairs(scaleState.avoidSyncRoots) do
+		local current = root
+		while current and current ~= game do
+			if current == inst then
+				return true
+			end
+			current = current.Parent
 		end
 	end
-	return services
+	return false
 end
 
-local function pushTreeSkeleton()
-	if not treeDirty then
+scaleState.collectAvoidSyncPaths = function(): { { string } }
+	local keyed = {}
+	for root in pairs(scaleState.avoidSyncRoots) do
+		if hasAvoidSyncAttribute(root) then
+			local path = pathFromRoot(root)
+			if WATCHED_SET[path[1]] then
+				keyed[#keyed + 1] = {
+					key = table.concat(path, "\0"),
+					path = path,
+				}
+			else
+				scaleState.avoidSyncRoots[root] = nil
+			end
+		else
+			scaleState.avoidSyncRoots[root] = nil
+		end
+	end
+	table.sort(keyed, function(left, right)
+		return left.key < right.key
+	end)
+	local paths = {}
+	for _, entry in ipairs(keyed) do
+		paths[#paths + 1] = entry.path
+	end
+	return paths
+end
+
+scaleState.pushAvoidSyncPaths = function()
+	if not scaleState.avoidSyncPathsDirty or not connected or scaleState.avoidSyncPushInFlight then
 		return
 	end
-	if not connected then
-		return
-	end
-	local ok, err = httpJson("/tree", "POST", collectTreeSkeleton())
+	scaleState.avoidSyncPushInFlight = true
+	local revision = scaleState.avoidSyncRevision
+	local paths = scaleState.collectAvoidSyncPaths()
+	local ok, err = httpJson("/tree", "POST", {
+		version = 2,
+		avoidSyncPaths = paths,
+	})
+	scaleState.avoidSyncPushInFlight = false
 	if ok then
-		treeDirty = false
+		if scaleState.avoidSyncRevision == revision then
+			scaleState.avoidSyncPathsDirty = false
+		end
+		log(string.format("AvoidSync index: %d root path(s)", #paths))
 	else
-		-- Leave treeDirty set so the next mark/tick retries; the daemon is
-		-- likely restarting or the socket is mid-flap. Don't spam the log —
-		-- reconnect path will log its own failure context.
-		log("tree push err: " .. tostring(err))
+		log("AvoidSync path push err: " .. tostring(err))
+	end
+	if scaleState.avoidSyncPathsDirty and connected and not scaleState.avoidSyncPushPending then
+		scaleState.avoidSyncPushPending = true
+		task.delay(scaleState.avoidSyncPushDebounce, function()
+			scaleState.avoidSyncPushPending = false
+			scaleState.pushAvoidSyncPaths()
+		end)
 	end
 end
 
-markTreeDirty = function()
-	treeDirty = true
-	if treePushPending then
+scaleState.markAvoidSyncPathsDirty = function()
+	if scaleState.avoidSyncTrackingPaused then
 		return
 	end
-	treePushPending = true
-	task.delay(TREE_PUSH_DEBOUNCE, function()
-		treePushPending = false
-		pushTreeSkeleton()
+	scaleState.avoidSyncRevision += 1
+	scaleState.avoidSyncPathsDirty = true
+	if scaleState.avoidSyncPushPending or scaleState.avoidSyncPushInFlight then
+		return
+	end
+	scaleState.avoidSyncPushPending = true
+	task.delay(scaleState.avoidSyncPushDebounce, function()
+		scaleState.avoidSyncPushPending = false
+		scaleState.pushAvoidSyncPaths()
 	end)
 end
 
@@ -3353,23 +4767,24 @@ end
 -- Hooks
 --------------------------------------------------------------------------------
 
--- Per-instance connection table (Argon Watcher.luau style). Each instance
--- carries its own Changed / ChildAdded / ChildRemoved connections. When an
--- instance is removed we walk its subtree and disconnect everything — this
--- prevents connection leaks under rapid add/remove event storms and keeps
--- signal fan-out proportional to live descendants rather than historical ones.
-local connections: { [Instance]: { RBXScriptConnection } } = {}
+-- Per-instance property connections plus service-level descendant connections.
+-- ChildAdded/ChildRemoved on every Instance cost two extra signals per object;
+-- service DescendantAdded/DescendantRemoving preserve the same coverage with a
+-- fixed number of structural signals. A single DataModel.ItemChanged signal
+-- covers property edits when available; scoped per-instance signals are kept
+-- only as a compatibility fallback.
+local connections: { [Instance]: any } = {}
 local serviceConnections: { RBXScriptConnection } = {}
--- Name at the time we first connected the instance. When Changed fires for
--- "Name", the instance already holds the new name and pathFromRoot would
+local activeConnectionSet: { [Instance]: true } = {}
+local avoidAttributeConnectionSet: { [Instance]: true } = {}
+local baseConnectionSet: { [Instance]: true } = {}
+local lastAvoidSyncValue = setmetatable({} :: { [Instance]: boolean }, { __mode = "k" })
+-- Name at the time we first connected the instance. When the Name signal fires,
+-- the instance already holds the new name and pathFromRoot would
 -- reconstruct the new path — useless for telling the daemon *which* file to
 -- rename. Tracking the prior name here lets us emit a `rename` op with the
 -- correct old path + new name.
 local lastKnownName: { [Instance]: string } = {}
--- Full path captured while the instance is still parented. Roblox fires
--- ChildRemoved after Parent becomes nil, so recomputing the path in that
--- callback loses the service/ancestor chain and silently drops delete ops.
-local lastKnownPath: { [Instance]: { string } } = {}
 -- `materializedContainers` is declared near the top of the file alongside
 -- `serializeInstance`, which writes to it as a side effect during bootstrap.
 
@@ -3385,55 +4800,6 @@ local connectTree
 local disconnectInstance
 local disconnectTree
 
-local function refreshKnownPaths(inst)
-	lastKnownPath[inst] = pathFromRoot(inst)
-	for _, child in ipairs(inst:GetChildren()) do
-		refreshKnownPaths(child)
-	end
-end
-
--- Walk `inst` and its descendants; record every directory-backed container,
--- since emitting a `set` implicitly materializes those paths on disk.
-local function recordMaterializedContainers(inst)
-	if SUPPRESS_CLASSES[inst.ClassName] then
-		return
-	end
-	if isAvoidSyncBlocked(inst) then
-		return
-	end
-	if inst.ClassName == "Folder" or not ALLOWED_CLASSES[inst.ClassName] then
-		materializedContainers[inst] = true
-	end
-	for _, child in ipairs(inst:GetChildren()) do
-		recordMaterializedContainers(child)
-	end
-end
-
--- Hooks are installed only after the initial disk/Studio decision. A disk-win
--- bootstrap can therefore create a whole Folder/script tree before ChildAdded
--- is being observed. Seed the materialization cache from that existing tree so
--- deleting its top-level Folder later still removes the disk subtree. This is
--- a bottom-up walk instead of calling isSyncable for every live instance; large
--- places commonly contain many Studio-authoritative descendants, and the
--- bottom-up form keeps hook installation linear in the size of the DataModel.
-local function seedExistingMaterializedContainers(inst): boolean
-	if SUPPRESS_CLASSES[inst.ClassName] or isAvoidSyncBlocked(inst) then
-		return false
-	end
-
-	local hasScript = inst:IsA("LuaSourceContainer")
-	for _, child in ipairs(inst:GetChildren()) do
-		if seedExistingMaterializedContainers(child) then
-			hasScript = true
-		end
-	end
-
-	if hasScript and (inst.ClassName == "Folder" or not ALLOWED_CLASSES[inst.ClassName]) then
-		materializedContainers[inst] = true
-	end
-	return hasScript
-end
-
 local function recordMaterializedAncestors(inst)
 	local current = inst
 	while current and current.Parent and current.Parent ~= game do
@@ -3442,9 +4808,93 @@ local function recordMaterializedAncestors(inst)
 		end
 		if current.ClassName == "Folder" or not ALLOWED_CLASSES[current.ClassName] then
 			materializedContainers[current] = true
+			connectInstance(current, false, true)
 		end
 		current = current.Parent
 	end
+end
+
+scaleState.pathForParent = function(parent: Instance?, name: string): { string }?
+	if not parent then
+		return nil
+	end
+	local path = pathFromRoot(parent)
+	if #path == 0 or not WATCHED_SET[path[1]] then
+		return nil
+	end
+	path[#path + 1] = name
+	return path
+end
+
+scaleState.decorateSetIdentity = function(inst: Instance, node, op, diskPath)
+	local exactPath = diskPath or snapshotApplyState.diskPathForInstance(inst)
+	if not exactPath or type(node) ~= "table" then
+		return
+	end
+	node.diskFragment = exactPath[#exactPath]
+	node.diskFragmentIsDir = node.class == "Folder" or (type(node.children) == "table" and #node.children > 0)
+	op.diskPath = exactPath
+end
+
+scaleState.queueRepresentationSet = function(inst: Instance, node, fromDiskPath, toDiskPath)
+	if not inst.Parent or type(node) ~= "table" or not fromDiskPath or not toDiskPath then
+		return
+	end
+	local op = {
+		op = "set",
+		path = pathFromRoot(inst.Parent),
+		fromDiskPath = fromDiskPath,
+		diskPath = toDiskPath,
+		node = node,
+	}
+	node.diskFragment = toDiskPath[#toDiskPath]
+	node.diskFragmentIsDir = node.class == "Folder" or (type(node.children) == "table" and #node.children > 0)
+	snapshotApplyState.diskPathCache[inst] = table.clone(toDiskPath)
+	queueOp(op)
+end
+
+scaleState.clearDiskPathCache = function(root: Instance)
+	snapshotApplyState.clearDiskPathSubtree(root)
+end
+
+scaleState.nearestScriptAncestor = function(parent: Instance?): Instance?
+	local current = parent
+	while current and current ~= game do
+		if current:IsA("LuaSourceContainer") then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+scaleState.syncExcludedAt = function(inst: Instance, parent: Instance?, path: { string }?): boolean
+	if SUPPRESS_CLASSES[inst.ClassName] or hasAvoidSyncAttribute(inst) then
+		return true
+	end
+	local current = parent
+	while current and current ~= game do
+		if SUPPRESS_CLASSES[current.ClassName] or hasAvoidSyncAttribute(current) then
+			return true
+		end
+		current = current.Parent
+	end
+	return pathStartsWith(path or {}, wallyRootSegments)
+end
+
+scaleState.serializeLiveInstance = function(inst: Instance)
+	local generation = wsGeneration
+	local function shouldContinue()
+		return reconnectState.desired
+			and (connected or busy)
+			and generation == wsGeneration
+			and not scaleState.liveResyncPending
+	end
+	local node, serializeErr = serializeInstance(inst, shouldContinue)
+	if not node and serializeErr == "oversized" and shouldContinue() then
+		scaleState.requestControlledLiveResync("large Studio subtree requires the bounded bootstrap stream")
+	end
+	return node
 end
 
 onDescendantAdded = function(inst)
@@ -3455,27 +4905,45 @@ onDescendantAdded = function(inst)
 		return
 	end
 	if isAvoidSyncBlocked(inst) then
-		markTreeDirty()
 		return
 	end
 	if isGeneratedDiskRoot(inst) then
-		markTreeDirty()
 		return
 	end
 	if SUPPRESS_CLASSES[inst.ClassName] then
 		return
 	end
-	-- Any Studio-side addition — synced OR Studio-authoritative — changes the
-	-- skeleton. Mark dirty so pushTreeSkeleton picks it up on the next tick.
-	markTreeDirty()
 	-- Emit a `set` for:
 	--   (a) ALLOWED classes directly, or
 	--   (b) non-ALLOWED classes that already have ALLOWED descendants (e.g. a
 	--       Part being reparented into Workspace with a Script already inside
 	--       it — we need the pass-through directory to materialize at once).
 	-- A bare non-ALLOWED with no syncable descendants is live-tree-only.
-	if not isSyncable(inst) then
+	local node = scaleState.serializeLiveInstance(inst)
+	if not node then
 		return
+	end
+	local representationParent = inst.Parent
+	while
+		representationParent
+		and representationParent ~= game
+		and not representationParent:IsA("LuaSourceContainer")
+	do
+		representationParent = representationParent.Parent
+	end
+	if representationParent and representationParent:IsA("LuaSourceContainer") then
+		local parentNode = scaleState.serializeLiveInstance(representationParent)
+		if parentNode and type(parentNode.children) == "table" and #parentNode.children == 1 then
+			local oldDiskPath = snapshotApplyState.diskPathCache[representationParent]
+				or snapshotApplyState.diskPathForInstanceShape(representationParent, false)
+			local newDiskPath = snapshotApplyState.diskPathForInstanceShape(representationParent, true)
+			if oldDiskPath and newDiskPath and table.concat(oldDiskPath, "\0") ~= table.concat(newDiskPath, "\0") then
+				-- A leaf script is a file, so its first projected child cannot
+				-- be written below it until the daemon atomically migrates the
+				-- parent to a script-with-children directory.
+				scaleState.queueRepresentationSet(representationParent, parentNode, oldDiskPath, newDiskPath)
+			end
+		end
 	end
 	-- When a script is added directly inside an existing pass-through Part,
 	-- this fires with `inst = Script` whose parent is the Part. The Part's
@@ -3483,27 +4951,29 @@ onDescendantAdded = function(inst)
 	-- script file — but we still mark the Part as materialized so a later
 	-- Removing on the Part emits a cleanup delete.
 	recordMaterializedAncestors(inst.Parent)
-	recordMaterializedContainers(inst)
-	queueOp({
+	snapshotApplyState.diskPathCache[inst] = nil
+	local setOp = {
 		op = "set",
 		path = pathFromRoot(inst.Parent),
-		node = serializeInstance(inst),
-	})
+		node = node,
+	}
+	scaleState.decorateSetIdentity(inst, node, setOp)
+	queueOp(setOp)
 end
 
 onDescendantRemoving = function(inst)
 	if isEchoing() then
 		return
 	end
-	local path = lastKnownPath[inst]
+	-- DescendantRemoving fires before the instance is unparented, so the old
+	-- path is available on demand and does not need to be cached for every node.
+	local path = pathFromRoot(inst)
 	if not path or not WATCHED_SET[path[1]] then
 		return
 	end
 	if isAvoidSyncBlocked(inst) then
-		markTreeDirty()
 		return
 	end
-	markTreeDirty()
 	if isGeneratedDiskRoot(inst) then
 		return
 	end
@@ -3512,19 +4982,199 @@ onDescendantRemoving = function(inst)
 	-- already been detached and `hasSyncableDescendant` returns false. Use
 	-- the `materializedContainers` record to recover: if we ever emitted this
 	-- instance as a directory on disk, emit a cleanup delete regardless.
-	local syncable = isSyncable(inst) or materializedContainers[inst] == true
+	local syncable = materializedContainers[inst] == true or isSyncable(inst)
 	materializedContainers[inst] = nil
 	if not syncable then
 		return
 	end
+	local diskPath = snapshotApplyState.diskPathForInstance(inst)
 	log(string.format("delete: %s", table.concat(path, "/")))
-	queueOp({
+	local deleteOp = {
 		op = "delete",
 		path = path,
-	})
+	}
+	if diskPath then
+		deleteOp.diskPath = diskPath
+	end
+	queueOp(deleteOp)
+
+	local representationParent = inst.Parent
+	while
+		representationParent
+		and representationParent ~= game
+		and not representationParent:IsA("LuaSourceContainer")
+	do
+		representationParent = representationParent.Parent
+	end
+	if representationParent and representationParent:IsA("LuaSourceContainer") then
+		local parentNode = scaleState.serializeLiveInstance(representationParent)
+		if parentNode and type(parentNode.children) == "table" and #parentNode.children == 1 then
+			local oldParentDiskPath = snapshotApplyState.diskPathCache[representationParent]
+				or snapshotApplyState.diskPathForInstanceShape(representationParent, true)
+			task.defer(function()
+				if
+					isEchoing()
+					or not representationParent.Parent
+					or not isUnderWatched(representationParent)
+					or isAvoidSyncBlocked(representationParent)
+					or isGeneratedDiskRoot(representationParent)
+				then
+					return
+				end
+				local leafNode = scaleState.serializeLiveInstance(representationParent)
+				if not leafNode or type(leafNode.children) ~= "table" or #leafNode.children ~= 0 then
+					return
+				end
+				local leafDiskPath = snapshotApplyState.diskPathForInstanceShape(representationParent, false)
+				if
+					oldParentDiskPath
+					and leafDiskPath
+					and table.concat(oldParentDiskPath, "\0") ~= table.concat(leafDiskPath, "\0")
+				then
+					-- Delete the last child first, then atomically collapse the
+					-- now-empty directory back to the leaf script file.
+					scaleState.queueRepresentationSet(representationParent, leafNode, oldParentDiskPath, leafDiskPath)
+				end
+			end)
+		end
+	end
+end
+
+scaleState.onParentChanged = function(inst: Instance)
+	local oldParent = scaleState.lastKnownParent[inst]
+	local newParent = inst.Parent
+	local oldDiskPath = snapshotApplyState.diskPathCache[inst]
+	scaleState.lastKnownParent[inst] = newParent
+	if oldParent == newParent then
+		return
+	end
+	if scaleState.avoidSyncPathAffectedBy(inst) then
+		scaleState.markAvoidSyncPathsDirty()
+	end
+	if isEchoing() then
+		return
+	end
+
+	local name = lastKnownName[inst] or inst.Name
+	local oldPath = scaleState.pathForParent(oldParent, name)
+	local newPath = if newParent then pathFromRoot(inst) else nil
+	-- Service-level descendant signals cover entering/leaving a service, but
+	-- Roblox does not fire them for a reparent that stays under the same
+	-- service. Handle exactly that missing case here.
+	if not oldPath or not newPath or not WATCHED_SET[newPath[1]] or oldPath[1] ~= newPath[1] then
+		return
+	end
+
+	local oldExcluded = scaleState.syncExcludedAt(inst, oldParent, oldPath)
+	local newExcluded = scaleState.syncExcludedAt(inst, newParent, newPath)
+	if oldExcluded and newExcluded then
+		return
+	end
+	if oldExcluded then
+		onDescendantAdded(inst)
+		connectTree(inst)
+		return
+	end
+	if newExcluded then
+		if inst:IsA("LuaSourceContainer") or materializedContainers[inst] == true then
+			log(string.format("delete after reparent into excluded subtree: %s", table.concat(oldPath, "/")))
+			local deleteOp = {
+				op = "delete",
+				path = oldPath,
+			}
+			if oldDiskPath then
+				deleteOp.diskPath = oldDiskPath
+			end
+			queueOp(deleteOp)
+		end
+		return
+	end
+	if materializedContainers[inst] ~= true and not isSyncable(inst) then
+		return
+	end
+
+	local oldRepresentationParent = scaleState.nearestScriptAncestor(oldParent)
+	local newRepresentationParent = scaleState.nearestScriptAncestor(newParent)
+	local destinationMigrated = false
+	if newRepresentationParent and newRepresentationParent ~= oldRepresentationParent then
+		local parentNode = scaleState.serializeLiveInstance(newRepresentationParent)
+		if parentNode and type(parentNode.children) == "table" and #parentNode.children == 1 then
+			local oldParentDiskPath = snapshotApplyState.diskPathCache[newRepresentationParent]
+				or snapshotApplyState.diskPathForInstanceShape(newRepresentationParent, false)
+			local newParentDiskPath = snapshotApplyState.diskPathForInstanceShape(newRepresentationParent, true)
+			if
+				oldParentDiskPath
+				and newParentDiskPath
+				and table.concat(oldParentDiskPath, "\0") ~= table.concat(newParentDiskPath, "\0")
+			then
+				scaleState.queueRepresentationSet(
+					newRepresentationParent,
+					parentNode,
+					oldParentDiskPath,
+					newParentDiskPath
+				)
+				destinationMigrated = true
+			end
+		end
+	end
+
+	recordMaterializedAncestors(newParent)
+	scaleState.clearDiskPathCache(inst)
+	local newDiskPath = snapshotApplyState.diskPathForInstance(inst)
+	if destinationMigrated then
+		-- The destination migration serialized the moved subtree while making
+		-- the leaf parent traversable. Remove the old exact copy instead of
+		-- asking the daemon to move onto the newly materialized target.
+		local deleteOp = {
+			op = "delete",
+			path = oldPath,
+		}
+		if oldDiskPath then
+			deleteOp.diskPath = oldDiskPath
+		end
+		queueOp(deleteOp)
+	else
+		log(string.format("move: %s → %s", table.concat(oldPath, "/"), table.concat(newPath, "/")))
+		local moveOp = {
+			op = "move",
+			from = oldPath,
+			to = newPath,
+		}
+		if oldDiskPath and newDiskPath then
+			moveOp.fromDiskPath = oldDiskPath
+			moveOp.toDiskPath = newDiskPath
+		end
+		queueOp(moveOp)
+	end
+
+	if oldRepresentationParent and oldRepresentationParent ~= newRepresentationParent then
+		local leafNode = scaleState.serializeLiveInstance(oldRepresentationParent)
+		if leafNode and type(leafNode.children) == "table" and #leafNode.children == 0 then
+			local oldParentDiskPath = snapshotApplyState.diskPathCache[oldRepresentationParent]
+				or snapshotApplyState.diskPathForInstanceShape(oldRepresentationParent, true)
+			local leafDiskPath = snapshotApplyState.diskPathForInstanceShape(oldRepresentationParent, false)
+			if
+				oldParentDiskPath
+				and leafDiskPath
+				and table.concat(oldParentDiskPath, "\0") ~= table.concat(leafDiskPath, "\0")
+			then
+				scaleState.queueRepresentationSet(oldRepresentationParent, leafNode, oldParentDiskPath, leafDiskPath)
+			end
+		end
+	end
 end
 
 onChanged = function(inst, prop)
+	local previousName = nil
+	if prop == "Name" then
+		previousName = lastKnownName[inst] or inst.Name
+		-- Echoed disk renames still advance the cache; otherwise the next
+		-- Studio rename would target a stale filesystem path.
+		lastKnownName[inst] = inst.Name
+		if scaleState.avoidSyncPathAffectedBy(inst) then
+			scaleState.markAvoidSyncPathsDirty()
+		end
+	end
 	if isEchoing() then
 		return
 	end
@@ -3535,48 +5185,40 @@ onChanged = function(inst, prop)
 		return
 	end
 	if isAvoidSyncBlocked(inst) then
-		if prop == "Name" then
-			markTreeDirty()
-		end
-		return
-	end
-	-- Parent changes are observed via ChildAdded/ChildRemoved on the
-	-- surrounding instances; emitting here would double-report moves.
-	if prop == "Parent" then
 		return
 	end
 	if prop == "Name" then
-		-- Renames affect every live-tree consumer, not just the synced files.
-		markTreeDirty()
 		-- Non-syncable instances don't exist on disk, so there's no file to
-		-- rename — the live-tree push above is all the daemon needs.
-		if not isSyncable(inst) then
-			lastKnownName[inst] = inst.Name
-			refreshKnownPaths(inst)
+		-- rename.
+		if materializedContainers[inst] ~= true and not isSyncable(inst) then
 			return
 		end
 		-- Dedicated rename op: daemon needs the OLD path to locate the file
 		-- it has to rename. pathFromRoot(inst) already reflects the new name
 		-- because Changed fires after the assignment, so we reconstruct the
 		-- old path from the cached last-known name.
-		local oldName = lastKnownName[inst] or inst.Name
-		local oldPath = lastKnownPath[inst]
-		lastKnownName[inst] = inst.Name
-		if not oldPath then
-			local parentPath = inst.Parent and pathFromRoot(inst.Parent) or {}
-			oldPath = {}
-			for i, s in ipairs(parentPath) do
-				oldPath[i] = s
-			end
-			table.insert(oldPath, oldName)
+		local oldName = previousName or inst.Name
+		local oldDiskPath = snapshotApplyState.diskPathCache[inst]
+		local parentPath = inst.Parent and pathFromRoot(inst.Parent) or {}
+		local oldPath = {}
+		for i, segment in ipairs(parentPath) do
+			oldPath[i] = segment
 		end
-		refreshKnownPaths(inst)
+		oldPath[#oldPath + 1] = oldName
+		scaleState.clearDiskPathCache(inst)
+		local newDiskPath = snapshotApplyState.diskPathForInstance(inst)
 		log(string.format("rename: %s → %s (path depth %d)", oldName, inst.Name, #oldPath))
-		queueOp({
+		local renameOp = {
 			op = "rename",
 			path = oldPath,
 			name = inst.Name,
-		})
+		}
+		if oldDiskPath and newDiskPath then
+			renameOp.diskPath = oldDiskPath
+			renameOp.fromDiskPath = oldDiskPath
+			renameOp.toDiskPath = newDiskPath
+		end
+		queueOp(renameOp)
 		return
 	end
 	if prop == "Source" and inst:IsA("LuaSourceContainer") then
@@ -3589,24 +5231,36 @@ onChanged = function(inst, prop)
 end
 
 onAvoidSyncChanged = function(inst)
+	local current = hasAvoidSyncAttribute(inst)
+	lastAvoidSyncValue[inst] = current
 	if isEchoing() then
 		return
 	end
 	if not isUnderWatched(inst) then
 		return
 	end
-	markTreeDirty()
-	if hasAvoidSyncAttribute(inst) then
+	if current then
+		scaleState.avoidSyncRoots[inst] = true
+		scaleState.markAvoidSyncPathsDirty()
 		log("AvoidSync: ignoring " .. pathOf(inst))
 		return
 	end
+	scaleState.avoidSyncRoots[inst] = nil
+	scaleState.markAvoidSyncPathsDirty()
 	connectTree(inst)
-	if isSyncable(inst) and inst.Parent then
-		queueOp({
+	if inst.Parent then
+		local node = scaleState.serializeLiveInstance(inst)
+		if not node then
+			return
+		end
+		scaleState.clearDiskPathCache(inst)
+		local setOp = {
 			op = "set",
 			path = pathFromRoot(inst.Parent),
-			node = serializeInstance(inst),
-		})
+			node = node,
+		}
+		scaleState.decorateSetIdentity(inst, node, setOp)
+		queueOp(setOp)
 	end
 end
 
@@ -3620,131 +5274,399 @@ disconnectInstance = function(inst)
 			c:Disconnect()
 		end)
 	end
+	scaleState.trackedConnectionCount = math.max(0, scaleState.trackedConnectionCount - #bucket)
+	scaleState.trackedInstanceCount = math.max(0, scaleState.trackedInstanceCount - 1)
 	connections[inst] = nil
+	activeConnectionSet[inst] = nil
+	avoidAttributeConnectionSet[inst] = nil
+	baseConnectionSet[inst] = nil
+	lastAvoidSyncValue[inst] = nil
 	lastKnownName[inst] = nil
-	lastKnownPath[inst] = nil
+	scaleState.lastKnownParent[inst] = nil
 	materializedContainers[inst] = nil
+	if scaleState.avoidSyncRoots[inst] then
+		scaleState.avoidSyncRoots[inst] = nil
+		scaleState.markAvoidSyncPathsDirty()
+	end
 end
 
 disconnectTree = function(inst)
-	for _, child in ipairs(inst:GetChildren()) do
-		disconnectTree(child)
-	end
-	disconnectInstance(inst)
-end
-
-connectInstance = function(inst)
-	if connections[inst] then
-		return
-	end
-	if SUPPRESS_CLASSES[inst.ClassName] then
-		return
-	end
-	local bucket: { RBXScriptConnection } = {}
-	connections[inst] = bucket
-	lastKnownName[inst] = inst.Name
-	lastKnownPath[inst] = pathFromRoot(inst)
-	table.insert(
-		bucket,
-		inst.Changed:Connect(function(prop)
-			onChanged(inst, prop)
-		end)
-	)
-	table.insert(
-		bucket,
-		inst:GetAttributeChangedSignal(AVOID_SYNC_ATTRIBUTE):Connect(function()
-			onAvoidSyncChanged(inst)
-		end)
-	)
-	table.insert(
-		bucket,
-		inst.ChildAdded:Connect(function(child)
-			onDescendantAdded(child)
-			connectTree(child)
-		end)
-	)
-	table.insert(
-		bucket,
-		inst.ChildRemoved:Connect(function(child)
-			onDescendantRemoving(child)
-			disconnectTree(child)
-		end)
-	)
-end
-
-connectTree = function(inst)
-	if isGeneratedDiskRoot(inst) then
-		return
-	end
-	connectInstance(inst)
-	if isAvoidSyncBlocked(inst) then
-		return
-	end
-	for _, child in ipairs(inst:GetChildren()) do
-		connectTree(child)
+	local stack = { inst }
+	while #stack > 0 do
+		local current = table.remove(stack)
+		for _, child in ipairs(current:GetChildren()) do
+			stack[#stack + 1] = child
+		end
+		disconnectInstance(current)
 	end
 end
 
-local function disconnectHooks()
+connectInstance = function(inst, excluded, relevant)
+	local bucket = connections[inst]
+	if not bucket then
+		bucket = scaleState.emptyConnectionBucket
+		connections[inst] = bucket
+		scaleState.trackedInstanceCount += 1
+		scaleState.lastKnownParent[inst] = inst.Parent
+		lastKnownName[inst] = inst.Name
+		lastAvoidSyncValue[inst] = hasAvoidSyncAttribute(inst)
+	end
+
+	-- ItemChanged is one DataModel-wide property signal. When Studio exposes
+	-- it, keep only lightweight identity metadata per Instance instead of
+	-- allocating Parent/Name/Source/attribute RBXScriptConnections tens of
+	-- thousands of times.
+	if scaleState.itemChangedAvailable then
+		if hasAvoidSyncAttribute(inst) then
+			scaleState.avoidSyncRoots[inst] = true
+			scaleState.markAvoidSyncPathsDirty()
+		end
+		return
+	end
+
+	-- Fallback Studio channels lack ItemChanged. Parent/Name/Source signals are
+	-- still needed only for scripts and projected/materialized ancestors.
+	-- AvoidSync itself is covered by one generation-scoped scanner below,
+	-- avoiding an attribute RBXScriptConnection on every Instance.
+	if not relevant then
+		return
+	end
+	if bucket == scaleState.emptyConnectionBucket then
+		bucket = {}
+		connections[inst] = bucket
+	end
+	if not baseConnectionSet[inst] then
+		table.insert(
+			bucket,
+			inst:GetPropertyChangedSignal("Parent"):Connect(function()
+				scaleState.onParentChanged(inst)
+			end)
+		)
+		scaleState.trackedConnectionCount += 1
+		table.insert(
+			bucket,
+			inst:GetPropertyChangedSignal("Name"):Connect(function()
+				onChanged(inst, "Name")
+			end)
+		)
+		scaleState.trackedConnectionCount += 1
+		baseConnectionSet[inst] = true
+	end
+
+	if excluded or activeConnectionSet[inst] then
+		if hasAvoidSyncAttribute(inst) then
+			scaleState.avoidSyncRoots[inst] = true
+			scaleState.markAvoidSyncPathsDirty()
+		end
+		return
+	end
+
+	activeConnectionSet[inst] = true
+	if inst:IsA("LuaSourceContainer") then
+		table.insert(
+			bucket,
+			inst:GetPropertyChangedSignal("Source"):Connect(function()
+				onChanged(inst, "Source")
+			end)
+		)
+		scaleState.trackedConnectionCount += 1
+	end
+	if hasAvoidSyncAttribute(inst) then
+		scaleState.avoidSyncRoots[inst] = true
+		scaleState.markAvoidSyncPathsDirty()
+	end
+end
+
+scaleState.generatedPrefixState = function(inst: Instance): (number, boolean)
+	if not wallyRootSegments or #wallyRootSegments == 0 then
+		return -1, false
+	end
+	local path = pathFromRoot(inst)
+	local prefixLength = #wallyRootSegments
+	local comparable = math.min(#path, prefixLength)
+	for i = 1, comparable do
+		if path[i] ~= wallyRootSegments[i] then
+			return -1, false
+		end
+	end
+	return comparable, #path >= prefixLength
+end
+
+-- One iterative pass installs property hooks and seeds materialized containers.
+-- Inherited AvoidSync and generated-root state travel down the stack, avoiding
+-- an ancestor walk for every Instance.
+connectTree = function(inst, progress, shouldContinue): boolean
+	if shouldContinue and not shouldContinue() then
+		return false
+	end
+	local prefixDepth, generated = scaleState.generatedPrefixState(inst)
+	local initialPath = pathFromRoot(inst)
+	local initialExcluded = generated or scaleState.syncExcludedAt(inst, inst.Parent, initialPath)
+	local meter = progress or { visited = 0 }
+	local stack = {
+		{
+			inst = inst,
+			entered = false,
+			prefixDepth = prefixDepth,
+			excluded = initialExcluded,
+		},
+	}
+	while #stack > 0 do
+		local frame = stack[#stack]
+		if not frame.entered then
+			frame.entered = true
+			frame.nextChild = 1
+			frame.hasScript = false
+			frame.blocked = frame.excluded
+				or SUPPRESS_CLASSES[frame.inst.ClassName] == true
+				or hasAvoidSyncAttribute(frame.inst)
+			connectInstance(frame.inst, frame.blocked, frame.blocked or frame.inst:IsA("LuaSourceContainer"))
+			meter.visited += 1
+			if meter.visited % scaleState.hookYieldEvery == 0 then
+				task.wait()
+				if shouldContinue and not shouldContinue() then
+					return false
+				end
+			end
+			frame.hasScript = not frame.blocked and frame.inst:IsA("LuaSourceContainer")
+			-- Walk excluded descendants too, but install only their lightweight
+			-- Parent/Name hooks. This preserves moves out of ignored trees and
+			-- keeps nested AvoidSync paths current after an excluded rename.
+			frame.children = frame.inst:GetChildren()
+		end
+
+		local child = frame.children[frame.nextChild]
+		if child then
+			frame.nextChild += 1
+			local childPrefixDepth = -1
+			local childGenerated = false
+			if frame.prefixDepth >= 0 and wallyRootSegments then
+				local expected = frame.prefixDepth + 1
+				if wallyRootSegments[expected] == child.Name then
+					childPrefixDepth = expected
+					childGenerated = expected >= #wallyRootSegments
+				end
+			end
+			stack[#stack + 1] = {
+				inst = child,
+				entered = false,
+				prefixDepth = childPrefixDepth,
+				excluded = frame.blocked or childGenerated,
+			}
+		else
+			if frame.hasScript and (frame.inst.ClassName == "Folder" or not ALLOWED_CLASSES[frame.inst.ClassName]) then
+				materializedContainers[frame.inst] = true
+			end
+			if frame.hasScript then
+				connectInstance(frame.inst, frame.blocked, true)
+			end
+			table.remove(stack)
+			local parent = stack[#stack]
+			if parent and frame.hasScript then
+				parent.hasScript = true
+			end
+		end
+	end
+	return not shouldContinue or shouldContinue()
+end
+
+disconnectHooks = function()
+	local previousPause = scaleState.avoidSyncTrackingPaused
+	scaleState.avoidSyncTrackingPaused = true
+	scaleState.hookGeneration += 1
 	for _, c in ipairs(serviceConnections) do
 		pcall(function()
 			c:Disconnect()
 		end)
 	end
 	serviceConnections = {}
+	scaleState.itemChangedAvailable = false
 	pendingEditorSourceByScript = {}
-	for inst, _ in pairs(connections) do
+	while next(connections) do
+		local inst = next(connections)
 		disconnectInstance(inst)
 	end
 	connections = {}
+	table.clear(activeConnectionSet)
+	table.clear(avoidAttributeConnectionSet)
+	table.clear(baseConnectionSet)
+	table.clear(lastAvoidSyncValue)
+	table.clear(scaleState.lastKnownParent)
+	table.clear(scaleState.avoidSyncRoots)
+	scaleState.avoidSyncTrackingPaused = previousPause
 end
 
-local function hookService(svc)
-	-- The service itself is a root — connect its descendants individually so
-	-- each can be torn down on removal. We skip the service's own Changed
-	-- signal (its properties aren't part of the sync surface).
-	-- Seed first: a disk-win initial bootstrap may have created this tree before
-	-- hooks existed, so there were no ChildAdded callbacks to populate the
-	-- materialized-container delete cache.
-	seedExistingMaterializedContainers(svc)
-	table.insert(
-		serviceConnections,
-		svc.ChildAdded:Connect(function(child)
-			if isGeneratedDiskRoot(child) then
-				markTreeDirty()
-				return
-			end
-			onDescendantAdded(child)
-			connectTree(child)
+scaleState.requestControlledLiveResync = function(reason)
+	if scaleState.liveResyncPending or not reconnectState.desired then
+		return
+	end
+	scaleState.liveResyncPending = true
+	log("live sync: " .. tostring(reason) .. " — restarting with bounded initial comparison")
+	pendingOps = {}
+	pushPending = false
+	disconnectHooks()
+	connected = false
+	busy = true
+	reconnectState.pluginCapability = nil
+	reconnectState.comparedCapability = nil
+	wsGeneration += 1
+	local client = ws
+	ws = nil
+	if client then
+		pcall(function()
+			client:Close()
 		end)
-	)
-	table.insert(
-		serviceConnections,
-		svc.ChildRemoved:Connect(function(child)
-			if isGeneratedDiskRoot(child) then
-				markTreeDirty()
-				return
-			end
-			onDescendantRemoving(child)
-			disconnectTree(child)
-		end)
-	)
-	for _, child in ipairs(svc:GetChildren()) do
-		connectTree(child)
+	end
+	setPill("connecting")
+	if type(reconnectState.retryInitialCompare) == "function" then
+		reconnectState.retryInitialCompare(reason)
 	end
 end
 
-local function installHooks()
+scaleState.startAvoidSyncFallbackScanner = function()
+	if scaleState.itemChangedAvailable then
+		return
+	end
+	local generation = scaleState.hookGeneration
+	task.spawn(function()
+		while
+			reconnectState.desired
+			and (busy or connected)
+			and generation == scaleState.hookGeneration
+			and not scaleState.itemChangedAvailable
+		do
+			local visited = 0
+			for inst in pairs(connections) do
+				if generation ~= scaleState.hookGeneration or not reconnectState.desired then
+					return
+				end
+				local current = hasAvoidSyncAttribute(inst)
+				if current ~= (lastAvoidSyncValue[inst] == true) then
+					onAvoidSyncChanged(inst)
+				end
+				visited += 1
+				if visited % scaleState.hookYieldEvery == 0 then
+					task.wait()
+					if
+						generation ~= scaleState.hookGeneration
+						or not reconnectState.desired
+						or (not busy and not connected)
+					then
+						return
+					end
+				end
+			end
+			task.wait(0.5)
+		end
+	end)
+end
+
+local function hookService(svc, progress, shouldContinue): boolean
+	-- The service itself is a root — connect its descendants individually so
+	-- each can be torn down on removal. Structural events are service-wide.
+	table.insert(
+		serviceConnections,
+		svc.DescendantAdded:Connect(function(descendant)
+			if connections[descendant] then
+				return
+			end
+			-- A subtree add produces one event per descendant. Walk to the
+			-- highest untracked ancestor so the subtree is connected/emitted once.
+			local root = descendant
+			local parent = root.Parent
+			while parent and parent ~= svc and not connections[parent] do
+				root = parent
+				parent = root.Parent
+			end
+			if connections[root] then
+				return
+			end
+			onDescendantAdded(root)
+			connectTree(root)
+		end)
+	)
+	table.insert(
+		serviceConnections,
+		svc.DescendantRemoving:Connect(function(descendant)
+			if not connections[descendant] then
+				return
+			end
+			onDescendantRemoving(descendant)
+			disconnectTree(descendant)
+		end)
+	)
+	for _, child in ipairs(svc:GetChildren()) do
+		if not connectTree(child, progress, shouldContinue) then
+			return false
+		end
+	end
+	return not shouldContinue or shouldContinue()
+end
+
+local function installHooks(shouldContinue): boolean
+	scaleState.avoidSyncTrackingPaused = true
 	disconnectHooks()
+	table.clear(scaleState.avoidSyncRoots)
+	if shouldContinue and not shouldContinue() then
+		scaleState.avoidSyncTrackingPaused = false
+		disconnectHooks()
+		return false
+	end
+	local itemChangedOk, itemChangedConnection = pcall(function()
+		return game.ItemChanged:Connect(function(item, descriptor)
+			if typeof(item) ~= "Instance" or not isUnderWatched(item) then
+				return
+			end
+			local propertyName = if type(descriptor) == "string" then descriptor else nil
+			if not propertyName and descriptor then
+				pcall(function()
+					propertyName = descriptor.Name
+				end)
+			end
+			if propertyName == "Parent" then
+				scaleState.onParentChanged(item)
+			elseif propertyName == "Name" then
+				onChanged(item, "Name")
+			elseif propertyName == "Source" and item:IsA("LuaSourceContainer") then
+				onChanged(item, "Source")
+			elseif type(propertyName) == "string" and string.find(propertyName, "Attributes", 1, true) == 1 then
+				local current = hasAvoidSyncAttribute(item)
+				local previous = lastAvoidSyncValue[item] == true
+				lastAvoidSyncValue[item] = current
+				if current ~= previous then
+					onAvoidSyncChanged(item)
+				end
+			end
+		end)
+	end)
+	if itemChangedOk and itemChangedConnection then
+		scaleState.itemChangedAvailable = true
+		table.insert(serviceConnections, itemChangedConnection)
+	end
+	local progress = { visited = 0 }
 	for _, name in ipairs(WATCHED_SERVICES) do
+		if shouldContinue and not shouldContinue() then
+			scaleState.avoidSyncTrackingPaused = false
+			disconnectHooks()
+			return false
+		end
 		local ok, svc = pcall(function()
 			return game:GetService(name)
 		end)
 		if ok and svc then
-			hookService(svc)
+			if not hookService(svc, progress, shouldContinue) then
+				scaleState.avoidSyncTrackingPaused = false
+				disconnectHooks()
+				return false
+			end
 		else
 			log("skip service: " .. name)
 		end
+	end
+	if shouldContinue and not shouldContinue() then
+		scaleState.avoidSyncTrackingPaused = false
+		disconnectHooks()
+		return false
 	end
 	if ScriptEditorService then
 		table.insert(
@@ -3774,77 +5696,565 @@ local function installHooks()
 			end)
 		)
 	end
+	scaleState.avoidSyncTrackingPaused = false
+	scaleState.startAvoidSyncFallbackScanner()
+	scaleState.markAvoidSyncPathsDirty()
+	log(
+		string.format(
+			"hooks indexed: %d instance(s), %d property connection(s)",
+			scaleState.trackedInstanceCount,
+			scaleState.trackedConnectionCount
+		)
+	)
+	if shouldContinue and not shouldContinue() then
+		disconnectHooks()
+		return false
+	end
+	return true
 end
 
 --------------------------------------------------------------------------------
--- Studio stats (for initial-compare)
+-- Studio snapshot + stats (single bottom-up pass for initial-compare)
 --------------------------------------------------------------------------------
 
--- Initial-compare stats are now only a legacy/empty-side signal; the daemon
--- uses the Studio snapshot for real local-vs-Studio differences. We count what
--- will actually be materialized on disk:
--- ALLOWED classes plus pass-through containers (non-ALLOWED instances that
--- have an ALLOWED descendant). Parts / Models with no scripts underneath are
--- Studio-authoritative (live-tree only) and don't count.
-local function countSyncableSubtree(inst)
-	if SUPPRESS_CLASSES[inst.ClassName] then
-		return 0, 0, false
+scaleState.beginStudioScanGuard = function(opts)
+	local guard = {
+		dirty = false,
+		reason = nil,
+		connections = {},
+		expectedMutations = {},
+	}
+	guard.pushExpectedMutation = function(expected)
+		guard.expectedMutations[#guard.expectedMutations + 1] = expected
 	end
-	local isScript = inst:IsA("LuaSourceContainer")
-	local kidsInst, kidsScript, kidsHasScript = 0, 0, false
-	for _, child in ipairs(inst:GetChildren()) do
-		local ci, cs, ch = countSyncableSubtree(child)
-		kidsInst += ci
-		kidsScript += cs
-		if ch then
-			kidsHasScript = true
+	guard.popExpectedMutation = function(expected)
+		local top = #guard.expectedMutations
+		if guard.expectedMutations[top] == expected then
+			table.remove(guard.expectedMutations)
+			return
 		end
-	end
-	local subtreeHasScript = isScript or kidsHasScript
-	local selfCountable = ALLOWED_CLASSES[inst.ClassName] == true or subtreeHasScript
-	if selfCountable then
-		return kidsInst + 1, kidsScript + (isScript and 1 or 0), subtreeHasScript
-	end
-	return kidsInst, kidsScript, subtreeHasScript
-end
-
-local function collectStudioStats()
-	local scriptCount = 0
-	local instanceCount = 0
-	for _, name in ipairs(WATCHED_SERVICES) do
-		local ok, svc = pcall(function()
-			return game:GetService(name)
-		end)
-		if ok and svc then
-			for _, child in ipairs(svc:GetChildren()) do
-				local ci, cs = countSyncableSubtree(child)
-				instanceCount += ci
-				scriptCount += cs
+		for index = top, 1, -1 do
+			if guard.expectedMutations[index] == expected then
+				table.remove(guard.expectedMutations, index)
+				return
 			end
 		end
 	end
-	return { scriptCount = scriptCount, instanceCount = instanceCount }
-end
+	local function isExpected(item, eventKind, eventValue)
+		for index = #guard.expectedMutations, 1, -1 do
+			local expected = guard.expectedMutations[index]
+			if eventKind == "recording" and expected.recording == true then
+				return true
+			end
+			if typeof(item) == "Instance" and typeof(expected.instance) == "Instance" then
+				local exact = item == expected.instance
+				local inExpectedSubtree = false
+				if not exact and expected.structureSubtree == true then
+					pcall(function()
+						inExpectedSubtree = item:IsDescendantOf(expected.instance)
+					end)
+				end
+				if
+					(eventKind == "structure" and expected.structure == true and (exact or inExpectedSubtree))
+					or (eventKind == "Parent" and expected.parent == true and exact)
+					or (eventKind == "Name" and expected.name == true and exact)
+					or (
+						eventKind == "Source"
+						and expected.source == true
+						and exact
+						and type(eventValue) == "string"
+						and sourcesMatchForApply(eventValue, expected.sourceValue)
+					)
+				then
+					return true
+				end
+			end
+		end
+		return false
+	end
+	local function markDirty(reason, item, eventKind, eventValue)
+		if isExpected(item, eventKind, eventValue) then
+			return
+		end
+		guard.dirty = true
+		guard.reason = guard.reason or reason
+	end
+	local function addConnection(connection)
+		if connection then
+			guard.connections[#guard.connections + 1] = connection
+		end
+	end
 
--- Snapshot for /push bootstrap. serializeInstance emits ALLOWED classes
--- directly and non-ALLOWED classes as pass-through Folders when they lead to
--- at least one script. A service whose descendants are entirely non-syncable
--- still emits a node with an empty children[] — the daemon treats that as a
--- no-op and doesn't materialize the service directory on disk.
-local function collectSnapshot()
-	local services = {}
+	-- Structural changes are available as one pair of signals per service.
 	for _, name in ipairs(WATCHED_SERVICES) do
-		local ok, svc = pcall(function()
+		local ok, service = pcall(function()
 			return game:GetService(name)
 		end)
-		if ok and svc then
-			local node = serializeSnapshotInstance(svc)
-			if node then
-				table.insert(services, node)
+		if ok and service then
+			addConnection(service.DescendantAdded:Connect(function(item)
+				markDirty("structure added", item, "structure")
+			end))
+			addConnection(service.DescendantRemoving:Connect(function(item)
+				markDirty("structure removed", item, "structure")
+			end))
+		end
+	end
+
+	-- ItemChanged is a single DataModel-wide property signal in Studio. Keep
+	-- fallbacks below because some Studio channels do not expose it to plugins.
+	local itemChangedOk, itemChangedConnection = pcall(function()
+		return game.ItemChanged:Connect(function(item, descriptor)
+			local propertyName = if type(descriptor) == "string" then descriptor else nil
+			if not propertyName and descriptor then
+				pcall(function()
+					propertyName = descriptor.Name
+				end)
+			end
+			local snapshotRelevant = propertyName == "Name"
+				or propertyName == "Source"
+				or propertyName == "Parent"
+				or (type(propertyName) == "string" and string.find(propertyName, "Attributes", 1, true) == 1)
+			if snapshotRelevant and typeof(item) == "Instance" and isUnderWatched(item) then
+				local propertyValue = if propertyName == "Source" then readScriptSource(item) else nil
+				markDirty("snapshot property changed", item, propertyName, propertyValue)
+			end
+		end)
+	end)
+	if itemChangedOk then
+		addConnection(itemChangedConnection)
+	end
+	if ScriptEditorService then
+		addConnection(ScriptEditorService.TextDocumentDidChange:Connect(function(document)
+			local scriptInst = scriptFromDocument(document)
+			if scriptInst and isUnderWatched(scriptInst) then
+				markDirty("script source changed", scriptInst, "Source", sourceFromDocument(document, scriptInst))
+			end
+		end))
+	end
+	if not itemChangedOk then
+		local recordingOk, recordingConnection = pcall(function()
+			return ChangeHistoryService.OnRecordingFinished:Connect(function()
+				markDirty("Studio recording finished", nil, "recording")
+			end)
+		end)
+		if recordingOk then
+			addConnection(recordingConnection)
+		end
+	end
+	return guard
+end
+
+scaleState.disconnectStudioScanGuard = function(guard)
+	if not guard then
+		return
+	end
+	for _, connection in ipairs(guard.connections or {}) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	guard.connections = {}
+end
+
+scaleState.finishStudioScanFrame = function(frame, stats)
+	if frame.suppressed then
+		return nil, false
+	end
+	if frame.avoidMarker then
+		return avoidSyncMarker(frame.inst), false
+	end
+
+	local isScript = frame.inst:IsA("LuaSourceContainer")
+	local syncable = isScript or frame.hasSyncableChild == true
+	local carriesAvoidSync = not syncable and #frame.outputChildren > 0
+	if not frame.serviceRoot and not syncable and not carriesAvoidSync then
+		return nil, false
+	end
+
+	local allowed = ALLOWED_CLASSES[frame.inst.ClassName] == true
+	if carriesAvoidSync and not frame.serviceRoot then
+		local carrier = {
+			class = "Folder",
+			name = frame.inst.Name,
+			properties = {},
+			children = frame.outputChildren,
+			avoidSyncCarrier = true,
+		}
+		return carrier, false
+	end
+	local node = {
+		class = allowed and frame.inst.ClassName or "Folder",
+		name = frame.inst.Name,
+		properties = allowed and serializeProperties(frame.inst) or {},
+		children = frame.outputChildren,
+	}
+	if not frame.serviceRoot then
+		stats.instanceCount += 1
+		if isScript then
+			stats.scriptCount += 1
+		end
+	end
+	if frame.inst.ClassName == "Folder" or not allowed then
+		materializedContainers[frame.inst] = true
+	end
+	return node, syncable
+end
+
+scaleState.scanStudioService = function(service: Instance, stats, progress)
+	local rootNode = nil
+	local stack = {
+		{
+			inst = service,
+			serviceRoot = true,
+			entered = false,
+		},
+	}
+	while #stack > 0 do
+		local frame = stack[#stack]
+		if not frame.entered then
+			frame.entered = true
+			frame.nextChild = 1
+			frame.outputChildren = {}
+			frame.hasSyncableChild = false
+			progress.visited += 1
+			if progress.visited % scaleState.studioScanYieldEvery == 0 then
+				task.wait()
+			end
+			if SUPPRESS_CLASSES[frame.inst.ClassName] then
+				frame.suppressed = true
+				frame.children = {}
+			elseif hasAvoidSyncAttribute(frame.inst) then
+				frame.avoidMarker = true
+				frame.children = {}
+			else
+				frame.children = frame.inst:GetChildren()
+			end
+		end
+
+		local child = frame.children[frame.nextChild]
+		if child then
+			frame.nextChild += 1
+			if not SUPPRESS_CLASSES[child.ClassName] then
+				stack[#stack + 1] = {
+					inst = child,
+					serviceRoot = false,
+					entered = false,
+				}
+			end
+		else
+			local node, syncable = scaleState.finishStudioScanFrame(frame, stats)
+			table.remove(stack)
+			local parent = stack[#stack]
+			if parent then
+				if node then
+					parent.outputChildren[#parent.outputChildren + 1] = node
+				end
+				if syncable then
+					parent.hasSyncableChild = true
+				end
+			else
+				rootNode = node
 			end
 		end
 	end
-	return services
+	return rootNode
+end
+
+scaleState.scanStudioServiceStats = function(service: Instance, stats, progress, projectionInfo)
+	local stack = {
+		{
+			inst = service,
+			serviceRoot = true,
+			entered = false,
+			childIndex = 0,
+		},
+	}
+	while #stack > 0 do
+		local frame = stack[#stack]
+		if not frame.entered then
+			frame.entered = true
+			frame.nextChild = 1
+			frame.hasSyncableChild = false
+			frame.hasAvoidSyncChild = false
+			frame.projectedChildCount = 0
+			progress.visited += 1
+			if progress.visited % scaleState.studioScanYieldEvery == 0 then
+				task.wait()
+			end
+			if SUPPRESS_CLASSES[frame.inst.ClassName] then
+				frame.children = {}
+				frame.suppressed = true
+			elseif hasAvoidSyncAttribute(frame.inst) then
+				frame.children = {}
+				frame.avoidMarker = true
+				frame.actualHasChildren = #frame.inst:GetChildren() > 0
+			else
+				frame.children = frame.inst:GetChildren()
+			end
+		end
+
+		local child = frame.children[frame.nextChild]
+		if child then
+			local childIndex = frame.nextChild
+			frame.nextChild += 1
+			stack[#stack + 1] = {
+				inst = child,
+				serviceRoot = false,
+				entered = false,
+				childIndex = childIndex,
+			}
+		else
+			local projected = false
+			local syncable = false
+			local carriesAvoidSync = false
+			if frame.avoidMarker then
+				projected = true
+				carriesAvoidSync = true
+				scaleState.avoidSyncRoots[frame.inst] = true
+				local mappedClass = if ALLOWED_CLASSES[frame.inst.ClassName] then frame.inst.ClassName else "Folder"
+				projectionInfo[frame.inst] = {
+					class = mappedClass,
+					avoidSync = true,
+					avoidSyncCarrier = false,
+					childCount = 0,
+					-- Folder projections always have directory shape on disk,
+					-- even when the ignored reservation is currently empty.
+					hasChildren = mappedClass == "Folder" or frame.actualHasChildren == true,
+					childIndex = frame.childIndex,
+				}
+			elseif not frame.suppressed then
+				local isScript = frame.inst:IsA("LuaSourceContainer")
+				syncable = isScript or frame.hasSyncableChild
+				local carrier = not syncable and frame.hasAvoidSyncChild
+				projected = frame.serviceRoot or syncable or carrier
+				carriesAvoidSync = frame.hasAvoidSyncChild
+				if projected then
+					local mappedClass = if carrier
+						then "Folder"
+						elseif frame.serviceRoot then frame.inst.ClassName
+						elseif ALLOWED_CLASSES[frame.inst.ClassName] then frame.inst.ClassName
+						else "Folder"
+					projectionInfo[frame.inst] = {
+						class = mappedClass,
+						avoidSync = false,
+						avoidSyncCarrier = carrier,
+						childCount = frame.projectedChildCount,
+						hasChildren = frame.projectedChildCount > 0,
+						childIndex = frame.childIndex,
+					}
+				end
+				if syncable and not frame.serviceRoot then
+					stats.instanceCount += 1
+					if isScript then
+						stats.scriptCount += 1
+					end
+				end
+			end
+			table.remove(stack)
+			local parent = stack[#stack]
+			if parent then
+				if projected then
+					parent.projectedChildCount += 1
+				end
+				if syncable then
+					parent.hasSyncableChild = true
+				end
+				if carriesAvoidSync then
+					parent.hasAvoidSyncChild = true
+				end
+			end
+		end
+	end
+end
+
+scaleState.collectStudioStatsWithGuard = function(guard)
+	local stats = { scriptCount = 0, instanceCount = 0 }
+	local progress = { visited = 0 }
+	local projectionInfo = setmetatable({}, { __mode = "k" })
+	if guard then
+		guard.projectionInfo = projectionInfo
+	end
+	for _, name in ipairs(WATCHED_SERVICES) do
+		local ok, service = pcall(function()
+			return game:GetService(name)
+		end)
+		if ok and service then
+			scaleState.scanStudioServiceStats(service, stats, progress, projectionInfo)
+		end
+		if guard and guard.dirty then
+			break
+		end
+	end
+	return stats, progress
+end
+
+-- Protocol 5 emits source-free, parent-linked records directly from the
+-- projection index. It never materializes a nested service table, and keeps
+-- each JSON request bounded even when one service owns the whole project.
+scaleState.streamStudioServiceStructure = function(service: Instance, guard, sendChunk)
+	local projectionInfo = guard and guard.projectionInfo
+	if type(projectionInfo) ~= "table" or not projectionInfo[service] then
+		return nil, "Studio projection index is unavailable"
+	end
+	local records = {}
+	local sourceInstances = {}
+	local nextId = 0
+	local chunkIndex = 0
+	local function flush(finalChunk)
+		local chunk = records
+		records = {}
+		local ok, err, nextChunkIndex = sendChunk(chunkIndex, finalChunk, chunk)
+		if not ok then
+			return false, err
+		end
+		chunkIndex = if type(nextChunkIndex) == "number" then nextChunkIndex else chunkIndex + 1
+		return true
+	end
+	local stack = {
+		{
+			inst = service,
+			parentId = nil,
+			childIndex = 0,
+			depth = 0,
+			entered = false,
+		},
+	}
+	while #stack > 0 do
+		if guard and guard.dirty then
+			return nil, "Studio changed during streamed structure scan"
+		end
+		local frame = stack[#stack]
+		if not frame.entered then
+			if frame.depth > scaleState.maxStreamDepth then
+				return nil,
+					string.format(
+						"Studio projection exceeds the supported depth of %d instances",
+						scaleState.maxStreamDepth
+					)
+			end
+			if nextId >= scaleState.maxStreamNodes then
+				return nil,
+					string.format(
+						"Studio projection exceeds the supported limit of %d instances",
+						scaleState.maxStreamNodes
+					)
+			end
+			frame.entered = true
+			frame.id = nextId
+			nextId += 1
+			if nextId % scaleState.studioScanYieldEvery == 0 then
+				task.wait()
+				if guard and guard.dirty then
+					return nil, "Studio changed during streamed structure scan"
+				end
+			end
+			local info = projectionInfo[frame.inst]
+			if not info then
+				return nil, "Studio projection changed while streaming"
+			end
+			if #records >= scaleState.structureChunkRecords then
+				local ok, err = flush(false)
+				if not ok then
+					return nil, err
+				end
+			end
+			records[#records + 1] = {
+				id = frame.id,
+				parentId = frame.parentId,
+				childIndex = frame.childIndex,
+				childCount = info.childCount,
+				hasChildren = info.hasChildren == true,
+				name = frame.inst.Name,
+				class = info.class,
+				avoidSync = info.avoidSync == true,
+				avoidSyncCarrier = info.avoidSyncCarrier == true,
+			}
+			if frame.inst:IsA("LuaSourceContainer") and not info.avoidSync and not info.avoidSyncCarrier then
+				sourceInstances[#sourceInstances + 1] = {
+					id = frame.id,
+					inst = frame.inst,
+				}
+			end
+			frame.children = {}
+			for _, child in ipairs(frame.inst:GetChildren()) do
+				if projectionInfo[child] then
+					frame.children[#frame.children + 1] = child
+				end
+			end
+			frame.nextChild = 1
+		end
+		local child = frame.children[frame.nextChild]
+		if child then
+			local childIndex = frame.nextChild - 1
+			frame.nextChild += 1
+			stack[#stack + 1] = {
+				inst = child,
+				parentId = frame.id,
+				childIndex = childIndex,
+				depth = frame.depth + 1,
+				entered = false,
+			}
+		else
+			table.remove(stack)
+		end
+	end
+	local ok, err = flush(true)
+	if not ok then
+		return nil, err
+	end
+	return sourceInstances, nil
+end
+
+scaleState.normalizedSourceHash = function(inst: Instance): string
+	local source = readScriptSource(inst)
+	if string.find(source, "\r\n", 1, true) then
+		source = string.gsub(source, "\r\n", "\n")
+	end
+	return sha256Hex(source)
+end
+
+scaleState.collectStudioState = function()
+	local attempt = 0
+	while true do
+		attempt += 1
+		local guard = scaleState.beginStudioScanGuard()
+		local started = os.clock()
+		local stats = { scriptCount = 0, instanceCount = 0 }
+		local progress = { visited = 0 }
+		local services = {}
+		for _, name in ipairs(WATCHED_SERVICES) do
+			local ok, service = pcall(function()
+				return game:GetService(name)
+			end)
+			if ok and service then
+				local node = scaleState.scanStudioService(service, stats, progress)
+				if node then
+					services[#services + 1] = node
+				end
+			end
+		end
+		if not guard.dirty then
+			log(
+				string.format(
+					"Studio scan: %d visited, %d synced path(s), %d script(s), %.2fs%s",
+					progress.visited,
+					stats.instanceCount,
+					stats.scriptCount,
+					os.clock() - started,
+					attempt > 1 and string.format(" (%d attempts)", attempt) or ""
+				)
+			)
+			return stats, services, guard
+		end
+		scaleState.disconnectStudioScanGuard(guard)
+		log(
+			string.format(
+				"Studio changed during snapshot (%s); retrying coherent scan",
+				tostring(guard.reason or "unknown change")
+			)
+		)
+		task.wait()
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -9339,13 +11749,26 @@ local function wsLoop(gen)
 					if kind == "op" then
 						-- Daemon wraps the op under msg.op (nested, per Agent 1).
 						if type(msg.op) == "table" then
-							applyOps({ msg.op })
-							-- Echo the source Studio actually accepted. The daemon uses
-							-- this as the acknowledgement that advances its conflict
-							-- baseline; failed UpdateSourceAsync calls produce no ack.
-							local ack = sourceAckForAppliedOp(msg.op)
-							if ack then
-								wsSend(client, { type = "push", ops = { ack } })
+							local function shouldContinueApply()
+								return reconnectState.desired
+									and connected
+									and not closed
+									and gen == wsGeneration
+									and ws == client
+							end
+							if applyOps({ msg.op }, shouldContinueApply) and shouldContinueApply() then
+								-- Echo the source Studio actually accepted. The daemon uses
+								-- this as the acknowledgement that advances its conflict
+								-- baseline; failed/cancelled writes produce no ack.
+								local ack = sourceAckForAppliedOp(msg.op)
+								if ack then
+									wsSend(client, { type = "push", ops = { ack } })
+								end
+							elseif shouldContinueApply() then
+								recoveryContext = "live filesystem operation failed or was cancelled"
+								pcall(function()
+									client:Close()
+								end)
 							end
 						else
 							log("ws: op frame missing nested op payload")
@@ -9545,12 +11968,40 @@ reconnectState.retryInitialCompare = function(context)
 	end)
 end
 
-local function startHooksAndWs()
+local function startHooksAndWs(): boolean
 	if not reconnectState.desired or not busy then
-		return
+		return false
 	end
-	installHooks()
+	local installGeneration = wsGeneration
+	local function shouldContinueInstall()
+		return reconnectState.desired and busy and installGeneration == wsGeneration
+	end
+	if not installHooks(shouldContinueInstall) or not shouldContinueInstall() then
+		-- installHooks can yield for very large places. A click-to-cancel or
+		-- generation change must tear down every partially installed signal
+		-- before this path is ever allowed to publish connected=true.
+		disconnectHooks()
+		pendingOps = {}
+		pushPending = false
+		return false
+	end
+	local scanGuard = scaleState.activeScanGuard
+	if scanGuard and scanGuard.dirty then
+		-- A mutation on a not-yet-hooked branch may have happened while the
+		-- time-sliced install was running. Tear down and compare a fresh view.
+		disconnectHooks()
+		pendingOps = {}
+		pushPending = false
+		return false
+	end
+	if not shouldContinueInstall() then
+		disconnectHooks()
+		pendingOps = {}
+		pushPending = false
+		return false
+	end
 	reconnectState.compareRetryPending = false
+	scaleState.liveResyncPending = false
 	connected = true
 	busy = false
 	wsGeneration += 1
@@ -9561,110 +12012,1645 @@ local function startHooksAndWs()
 	task.spawn(function()
 		wsLoop(gen)
 	end)
-	-- Seed the daemon's live tree cache with the current Studio skeleton. Spawned so the HTTP
-	-- POST doesn't block the hook-installation path. Subsequent updates are
-	-- debounced through markTreeDirty from onDescendantAdded/Removing/Changed.
-	treeDirty = true
-	task.spawn(pushTreeSkeleton)
-end
-
-local function doPushPath(strictStudio: boolean?)
-	log("initial-compare → push: sending Studio snapshot")
-	local services = collectSnapshot()
-	local strict = strictStudio == true
-
-	-- Push one service per HTTP call. A monolithic bootstrap body of N
-	-- services could easily exceed Studio's 30s RequestAsync timeout on a
-	-- big project; if that timed out mid-write the daemon could end up with
-	-- a partially-written disk, which then (on a later pull) could try to
-	-- re-parent Studio services as Folders. Splitting per-service keeps
-	-- every call small, and any one failure only costs that service.
-	local okCount, skipCount = 0, 0
-	local firstErr = nil
-	for _, svc in ipairs(services) do
-		if not reconnectState.desired or not busy then
-			return false
-		end
-		local svcName = (svc and svc.name) or "?"
-		local encOk, encErr = pcall(function()
-			return HttpService:JSONEncode(svc)
-		end)
-		if not encOk then
-			log(string.format("  ✗ %s — cannot encode (%s); skipping", svcName, tostring(encErr):sub(1, 200)))
-			skipCount += 1
-		else
-			local ok, err = httpJson("/push", "POST", {
-				bootstrap = true,
-				strict = strict,
-				forcePrune = strict,
-				pluginProtocol = PLUGIN_PROTOCOL_VERSION,
-				services = { svc },
-			})
-			if not reconnectState.desired or not busy then
-				return false
-			end
-			if ok then
-				okCount += 1
-			else
-				skipCount += 1
-				firstErr = firstErr or tostring(err)
-				log(string.format("  ✗ %s — push err: %s", svcName, tostring(err):sub(1, 200)))
-			end
-		end
-	end
-
-	if okCount == 0 or firstErr ~= nil then
-		setPill("error", "push failed")
-		log(
-			string.format(
-				"bootstrap incomplete: %d/%d services pushed (first err: %s)",
-				okCount,
-				#services,
-				tostring(firstErr):sub(1, 200)
-			)
-		)
-		return false
-	end
-
-	log(string.format("bootstrap done: %d/%d services pushed (%d skipped)", okCount, #services, skipCount))
+	-- Always seed (including an empty list) so a restarted daemon cannot retain
+	-- stale AvoidSync prefixes. This payload scales with ignored roots, not place size.
+	scaleState.avoidSyncPathsDirty = true
+	task.spawn(scaleState.pushAvoidSyncPaths)
 	return true
 end
 
-local function doPullPath(strictDisk: boolean?)
-	log("initial-compare → pull: applying disk snapshot to Studio")
-	local snapshotPath = strictDisk == true and "/snapshot?strict=true&forcePrune=true" or "/snapshot"
-	local ok, snap = httpJson(snapshotPath, "GET")
-	if not reconnectState.desired or not busy then
-		return false
+local function doPushPath(strictStudio: boolean?, scanGuard)
+	log("initial-compare → push: streaming bounded Studio structure + Sources")
+	local strict = strictStudio == true
+	local streamId = HttpService:GenerateGUID(false)
+	local cursor = {
+		service = WATCHED_SERVICES[1],
+		phase = "structure",
+		chunk = 0,
+	}
+	local totalRecords = 0
+	local totalSources = 0
+
+	local function shouldContinue()
+		return reconnectState.desired and busy and (not scanGuard or not scanGuard.dirty)
 	end
-	if not ok then
-		log("snapshot err: " .. tostring(snap))
+
+	local function encodedSize(body): (number?, string?)
+		local ok, encoded = pcall(function()
+			return HttpService:JSONEncode(body)
+		end)
+		if not ok then
+			return nil, "JSONEncode failed: " .. tostring(encoded)
+		end
+		return #encoded, nil
+	end
+
+	local function validatePartialReceipt(response): (boolean, string?)
+		local allowedFields = {
+			ok = true,
+			action = true,
+			streamId = true,
+			error = true,
+			failedService = true,
+			recoveryRequired = true,
+			backups = true,
+			committedServices = true,
+		}
+		for field in pairs(response) do
+			if allowedFields[field] ~= true then
+				return false, "partial receipt contains an unexpected field"
+			end
+		end
+		if
+			response.ok ~= false
+			or response.action ~= "partial"
+			or response.recoveryRequired ~= true
+			or response.streamId ~= streamId
+		then
+			return false, "partial receipt identity flags do not match this push stream"
+		end
+		if
+			type(response.error) ~= "string"
+			or response.error == ""
+			or #response.error > scaleState.maxRecoveryReceiptStringBytes
+			or string.find(response.error, "\0", 1, true)
+		then
+			return false, "partial receipt error string is missing or exceeds bounds"
+		end
+		if type(response.failedService) ~= "string" or not WATCHED_SET[response.failedService] then
+			return false, "partial receipt failedService is not a watched service"
+		end
+		if
+			type(response.backups) ~= "table"
+			or #response.backups > #WATCHED_SERVICES
+			or type(response.committedServices) ~= "table"
+			or #response.committedServices > #WATCHED_SERVICES
+		then
+			return false, "partial receipt recovery arrays exceed service bounds"
+		end
+
+		local backupSeen = {}
+		for index in pairs(response.backups) do
+			if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > #response.backups then
+				return false, "partial receipt backups must be a dense array"
+			end
+		end
+		for index = 1, #response.backups do
+			local backup = response.backups[index]
+			if
+				type(backup) ~= "string"
+				or backup == ""
+				or #backup > scaleState.maxRecoveryReceiptStringBytes
+				or string.find(backup, "\0", 1, true)
+				or backupSeen[backup]
+			then
+				return false, "partial receipt backup path is invalid, duplicate, or exceeds bounds"
+			end
+			backupSeen[backup] = true
+		end
+
+		local committedBackupCount = 0
+		for index in pairs(response.committedServices) do
+			if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > #response.committedServices then
+				return false, "partial receipt committedServices must be a dense array"
+			end
+		end
+		for index = 1, #response.committedServices do
+			local entry = response.committedServices[index]
+			if type(entry) ~= "table" then
+				return false, "partial receipt committed service entry is not an object"
+			end
+			for field in pairs(entry) do
+				if field ~= "service" and field ~= "created" and field ~= "backup" and field ~= "recoveryAction" then
+					return false, "partial receipt committed service entry contains an unexpected field"
+				end
+			end
+			if
+				entry.service ~= WATCHED_SERVICES[index]
+				or type(entry.created) ~= "boolean"
+				or type(entry.recoveryAction) ~= "string"
+			then
+				return false, "partial receipt committedServices is not a watched-service prefix"
+			end
+			if entry.created then
+				if entry.backup ~= nil or entry.recoveryAction ~= "removeCreatedService" then
+					return false, "created committed service must require removeCreatedService without a backup"
+				end
+			else
+				if
+					type(entry.backup) ~= "string"
+					or entry.backup == ""
+					or #entry.backup > scaleState.maxRecoveryReceiptStringBytes
+					or string.find(entry.backup, "\0", 1, true)
+					or entry.recoveryAction ~= "restoreBackup"
+				then
+					return false, "replaced committed service must require restoreBackup with a bounded backup"
+				end
+				committedBackupCount += 1
+				if response.backups[committedBackupCount] ~= entry.backup then
+					return false, "partial receipt backups do not match committed restore paths in order"
+				end
+			end
+		end
+		if response.failedService ~= WATCHED_SERVICES[#response.committedServices + 1] then
+			return false, "partial receipt failedService does not follow its committed service prefix"
+		end
+		if #response.backups < committedBackupCount or #response.backups > committedBackupCount + 1 then
+			return false, "partial receipt may retain at most one extra backup for failedService"
+		end
+		return true, nil
+	end
+
+	local function stopForPartialReceipt(response, label): string
+		local recoveryLines = {}
+		local committedBackupCount = 0
+		for _, entry in ipairs(response.committedServices) do
+			if entry.recoveryAction == "restoreBackup" then
+				committedBackupCount += 1
+				recoveryLines[#recoveryLines + 1] = string.format("Restore %s from: %s", entry.service, entry.backup)
+				log(string.format("push recovery restore %s from: %s", entry.service, entry.backup))
+			else
+				recoveryLines[#recoveryLines + 1] =
+					string.format("Remove newly created service directory: %s", entry.service)
+				log(string.format("push recovery remove-created-service: %s", entry.service))
+			end
+		end
+		if #response.backups == committedBackupCount + 1 then
+			local failedBackup = response.backups[#response.backups]
+			recoveryLines[#recoveryLines + 1] = string.format(
+				"Restore failed service %s from retained backup: %s",
+				response.failedService,
+				failedBackup
+			)
+			log(string.format("push recovery restore failed service %s from: %s", response.failedService, failedBackup))
+		end
+		if #recoveryLines == 0 then
+			recoveryLines[1] = "(preserve the project and inspect .rosync-backups before making further changes)"
+		end
+		local fatalMessage = string.format(
+			"Disk push stopped after a partial daemon commit during %s.\n"
+				.. "Failed service: %s\nError: %s\nRequired recovery actions:\n%s",
+			label,
+			response.failedService,
+			response.error,
+			table.concat(recoveryLines, "\n")
+		)
+		reconnectState.stopTerminal(fatalMessage)
+		return fatalMessage
+	end
+
+	local function postExact(body, label)
+		local bodyBytes, encodeErr = encodedSize(body)
+		if not bodyBytes then
+			return nil, encodeErr
+		end
+		if bodyBytes > scaleState.maxStreamRequestBytes then
+			return nil,
+				string.format(
+					"%s encodes to %d bytes; stream request maximum is %d",
+					label,
+					bodyBytes,
+					scaleState.maxStreamRequestBytes
+				)
+		end
+		local lastErr = nil
+		for attempt = 1, 2 do
+			local ok, response = httpJson("/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES)
+			local attemptErr = nil
+			if
+				ok
+				and type(response) == "table"
+				and response.ok == false
+				and response.action == "partial"
+				and response.recoveryRequired == true
+				and response.streamId == streamId
+			then
+				local validPartial, partialErr = validatePartialReceipt(response)
+				if validPartial then
+					-- This exact request may be replayed by the daemon, but a
+					-- valid partial receipt is already terminal. Surface every
+					-- bounded recovery path and never retry this HTTP chunk.
+					return nil, stopForPartialReceipt(response, label)
+				end
+				attemptErr = "malformed matching partial receipt: " .. tostring(partialErr)
+			end
+			if not shouldContinue() then
+				return nil, "Studio push cancelled or changed"
+			end
+			if ok and type(response) == "table" and response.ok == true and response.streamId == streamId then
+				return response, nil
+			end
+			if not attemptErr and ok and type(response) == "table" then
+				attemptErr = tostring(response.error or "daemon rejected stream chunk")
+			elseif not attemptErr then
+				attemptErr = tostring(response)
+			end
+			lastErr = attemptErr
+			if attempt < 2 then
+				log(string.format("  ↻ %s — exact retry (%s)", label, lastErr:sub(1, 150)))
+				task.wait(0.15)
+			end
+		end
+		return nil, lastErr or "stream request failed"
+	end
+
+	local function acceptAdvance(response, serviceName, phase, chunkIndex, finalChunk): (boolean, string?)
+		local serviceIndex = table.find(WATCHED_SERVICES, serviceName)
+		if not serviceIndex then
+			return false, "push response referenced an unknown service"
+		end
+		if response.action == "complete" then
+			if response.phase ~= nil or response.nextService ~= nil or response.nextChunk ~= nil then
+				return false, "push terminal response mixed action and cursor coordinates"
+			end
+			local validTerminal = serviceIndex == #WATCHED_SERVICES
+				and ((phase == "sources" and finalChunk) or phase == "diskRevalidate")
+			if not validTerminal then
+				return false, "daemon completed the push stream before final disk revalidation"
+			end
+			cursor.service = nil
+			cursor.phase = "complete"
+			cursor.chunk = 0
+			return true, nil
+		end
+		if response.action ~= nil then
+			return false, "push response carried an unknown terminal action"
+		end
+
+		local expectedService = serviceName
+		local expectedPhase = phase
+		local expectedChunk = chunkIndex + 1
+		local alternatePhase = nil
+		local alternateService = serviceName
+		local alternateChunk = 0
+		if phase == "structure" and finalChunk then
+			expectedPhase = "sources"
+			expectedChunk = 0
+			alternatePhase = "diskFence"
+		elseif phase == "diskFence" then
+			alternatePhase = "sources"
+		elseif phase == "sources" and finalChunk then
+			alternatePhase = "diskRevalidate"
+			if serviceIndex < #WATCHED_SERVICES then
+				expectedService = WATCHED_SERVICES[serviceIndex + 1]
+				expectedPhase = "structure"
+				expectedChunk = 0
+			else
+				expectedPhase = "complete"
+				expectedChunk = 0
+			end
+		elseif phase == "diskRevalidate" then
+			if serviceIndex < #WATCHED_SERVICES then
+				alternateService = WATCHED_SERVICES[serviceIndex + 1]
+				alternatePhase = "structure"
+			end
+		end
+		local exactExpected = response.nextService == expectedService
+			and response.phase == expectedPhase
+			and response.nextChunk == expectedChunk
+		local exactAlternate = alternatePhase ~= nil
+			and response.nextService == alternateService
+			and response.phase == alternatePhase
+			and response.nextChunk == alternateChunk
+		if exactExpected and expectedPhase == "complete" then
+			return false, "push stream requires the sole explicit terminal action"
+		end
+		if not exactExpected and not exactAlternate then
+			return false, string.format("out-of-order push response after %s/%s/%d", serviceName, phase, chunkIndex)
+		end
+		if exactAlternate then
+			cursor.service = alternateService
+			cursor.phase = alternatePhase
+			cursor.chunk = alternateChunk
+		else
+			cursor.service = expectedService
+			cursor.phase = expectedPhase
+			cursor.chunk = expectedChunk
+		end
+		if response.nextService ~= expectedService and response.nextService ~= alternateService then
+			return false, "push response changed service outside an allowed continuation"
+		end
+		return true, nil
+	end
+
+	local function sendBody(body, label): (boolean, string?)
+		if cursor.service ~= body.service or cursor.phase ~= body.phase or cursor.chunk ~= body.chunkIndex then
+			return false, "plugin push cursor advanced out of order"
+		end
+		local response, requestErr = postExact(body, label)
+		if not response then
+			return false, requestErr
+		end
+		return acceptAdvance(response, body.service, body.phase, body.chunkIndex, body.finalChunk == true)
+	end
+
+	local function makeBody(serviceName, phase, chunkIndex, finalChunk)
+		return {
+			pluginProtocol = PLUGIN_PROTOCOL_VERSION,
+			streamId = streamId,
+			service = serviceName,
+			phase = phase,
+			chunkIndex = chunkIndex,
+			finalChunk = finalChunk,
+			strict = strict,
+		}
+	end
+
+	local function utf8ChunkEnd(source, offset, budget): number?
+		local stop = math.min(#source, offset + budget)
+		while stop > offset and stop < #source do
+			local nextByte = string.byte(source, stop + 1)
+			if nextByte and nextByte >= 0x80 and nextByte < 0xC0 then
+				stop -= 1
+			else
+				break
+			end
+		end
+		return if stop > offset or offset == #source then stop else nil
+	end
+
+	local function drainContinuation(phase, targetPhase): (boolean, string?)
+		while cursor.phase == phase do
+			if not shouldContinue() then
+				return false, "Studio changed during daemon disk continuation"
+			end
+			local body = makeBody(cursor.service, phase, cursor.chunk, false)
+			body.records = {}
+			body.sources = {}
+			local sent, sendErr =
+				sendBody(body, string.format("%s %s tick %d", tostring(cursor.service), phase, body.chunkIndex))
+			if not sent then
+				return false, sendErr
+			end
+		end
+		if cursor.phase ~= targetPhase then
+			return false, string.format("daemon did not advance %s to %s", phase, targetPhase)
+		end
+		return true, nil
+	end
+
+	for serviceIndex, serviceName in ipairs(WATCHED_SERVICES) do
+		if not shouldContinue() then
+			return false
+		end
+		if cursor.service ~= serviceName or cursor.phase ~= "structure" or cursor.chunk ~= 0 then
+			log("push stream cursor did not begin the expected service")
+			return false
+		end
+		local serviceOk, service = pcall(function()
+			return game:GetService(serviceName)
+		end)
+		if not serviceOk or not service then
+			log("push stream could not read service " .. serviceName)
+			return false
+		end
+
+		local sourceInstances, structureErr = scaleState.streamStudioServiceStructure(
+			service,
+			scanGuard,
+			function(_suggestedChunkIndex, finalChunk, records)
+				local recordIndex = 1
+				while recordIndex <= #records do
+					local take = math.min(scaleState.structureChunkRecords, #records - recordIndex + 1)
+					local body = nil
+					while take >= 1 do
+						local batch = {}
+						for offset = 0, take - 1 do
+							batch[#batch + 1] = records[recordIndex + offset]
+						end
+						local finishesInput = recordIndex + take - 1 == #records
+						local candidate = makeBody(serviceName, "structure", cursor.chunk, finalChunk and finishesInput)
+						candidate.records = batch
+						local bytes = encodedSize(candidate)
+						if bytes and bytes <= scaleState.maxStreamRequestBytes then
+							body = candidate
+							break
+						end
+						take = math.floor(take / 2)
+					end
+					if not body then
+						return false, "one Studio structure record exceeds the bounded request limit"
+					end
+					local sent, sendErr =
+						sendBody(body, string.format("%s structure chunk %d", serviceName, body.chunkIndex))
+					if not sent then
+						return false, sendErr
+					end
+					totalRecords += #body.records
+					recordIndex += #body.records
+				end
+				return true, nil, cursor.chunk
+			end
+		)
+		if not sourceInstances then
+			log(string.format("push %s structure failed: %s", serviceName, tostring(structureErr):sub(1, 200)))
+			return false
+		end
+		if cursor.phase == "diskFence" then
+			local drained, drainErr = drainContinuation("diskFence", "sources")
+			if not drained then
+				log("push disk fence failed: " .. tostring(drainErr))
+				return false
+			end
+		end
+		if cursor.service ~= serviceName or cursor.phase ~= "sources" or cursor.chunk ~= 0 then
+			log("daemon did not advance push stream to Sources")
+			return false
+		end
+
+		if #sourceInstances == 0 then
+			local body = makeBody(serviceName, "sources", 0, true)
+			body.sources = {}
+			local sent, sendErr = sendBody(body, string.format("%s empty Sources", serviceName))
+			if not sent then
+				log("push source stream failed: " .. tostring(sendErr))
+				return false
+			end
+		else
+			for sourceIndex, sourceEntry in ipairs(sourceInstances) do
+				if not shouldContinue() then
+					return false
+				end
+				local source = readScriptSource(sourceEntry.inst)
+				if #source > scaleState.maxScriptSourceBytes then
+					log(
+						string.format(
+							"push Source %s is %d bytes; maximum is %d",
+							pathOf(sourceEntry.inst),
+							#source,
+							scaleState.maxScriptSourceBytes
+						)
+					)
+					return false
+				end
+				local sourceHash = sha256Hex(source)
+				local offset = 0
+				local partIndex = 0
+				repeat
+					local budget = math.min(scaleState.sourceChunkBytes, math.max(0, #source - offset))
+					local body = nil
+					while budget >= 0 do
+						local stop = utf8ChunkEnd(source, offset, budget)
+						if not stop then
+							return false
+						end
+						local finalPart = stop == #source
+						local finalChunk = finalPart and sourceIndex == #sourceInstances
+						local candidate = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
+						candidate.sources = {
+							{
+								id = sourceEntry.id,
+								partIndex = partIndex,
+								offset = offset,
+								totalBytes = #source,
+								data = string.sub(source, offset + 1, stop),
+								finalPart = finalPart,
+								sha256 = sourceHash,
+							},
+						}
+						local bytes = encodedSize(candidate)
+						if bytes and bytes <= scaleState.maxStreamRequestBytes then
+							body = candidate
+							break
+						end
+						if budget == 0 then
+							break
+						end
+						budget = math.floor(budget / 2)
+					end
+					if not body then
+						log("push Source contains invalid UTF-8 or cannot fit one bounded request")
+						return false
+					end
+					local part = body.sources[1]
+					local sent, sendErr =
+						sendBody(body, string.format("%s Source %d part %d", serviceName, sourceEntry.id, partIndex))
+					if not sent then
+						log("push source stream failed: " .. tostring(sendErr))
+						return false
+					end
+					offset += #part.data
+					partIndex += 1
+					if partIndex % 8 == 0 then
+						task.wait()
+					end
+				until offset == #source and partIndex > 0
+				totalSources += 1
+			end
+		end
+
+		if cursor.phase == "diskRevalidate" then
+			local targetPhase = if serviceIndex < #WATCHED_SERVICES then "structure" else "complete"
+			local drained, drainErr = drainContinuation("diskRevalidate", targetPhase)
+			if not drained then
+				log("push disk revalidation failed: " .. tostring(drainErr))
+				return false
+			end
+		end
+
+		if serviceIndex < #WATCHED_SERVICES then
+			if
+				cursor.service ~= WATCHED_SERVICES[serviceIndex + 1]
+				or cursor.phase ~= "structure"
+				or cursor.chunk ~= 0
+			then
+				log("daemon advanced push stream to an unexpected service")
+				return false
+			end
+		elseif cursor.phase ~= "complete" then
+			log("daemon did not finalize the push stream")
+			return false
+		end
+		snapshotApplyState.seedDiskPathsForService(service)
+	end
+
+	log(
+		string.format(
+			"bootstrap stream done: %d structure record(s), %d Source(s), %d service(s)",
+			totalRecords,
+			totalSources,
+			#WATCHED_SERVICES
+		)
+	)
+	return shouldContinue() and cursor.phase == "complete"
+end
+
+local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?, selectionChoiceId: string?)
+	log("initial-compare → pull: streaming bounded disk structure + Sources")
+	local pullGeneration = wsGeneration
+	local selective = selectiveSelectedCount ~= nil
+	local strict = strictDisk == true and not selective
+	if selective then
+		if
+			type(selectiveSelectedCount) ~= "number"
+			or selectiveSelectedCount <= 0
+			or selectiveSelectedCount % 1 ~= 0
+			or selectiveSelectedCount > scaleState.maxStreamNodes
+		then
+			log("selective snapshot stream has an invalid authorized selectedCount")
+			return false
+		end
+		if type(selectionChoiceId) ~= "string" or selectionChoiceId == "" then
+			log("selective snapshot stream is missing its authorized choiceId")
+			return false
+		end
+	end
+	local requestId = HttpService:GenerateGUID(false)
+	local streamId = nil
+	local mutationGuard = scaleState.beginStudioScanGuard()
+	snapshotApplyState.activeMutationGuard = mutationGuard
+	local serviceState = nil
+	local stagedServiceStates = {}
+	local totalStagedSourceBytes = 0
+
+	local function shouldContinue()
+		return reconnectState.desired and busy and pullGeneration == wsGeneration and not mutationGuard.dirty
+	end
+
+	local function disposeGuard()
+		scaleState.disconnectStudioScanGuard(mutationGuard)
+		if snapshotApplyState.activeMutationGuard == mutationGuard then
+			snapshotApplyState.activeMutationGuard = nil
+		end
+		for _, state in ipairs(stagedServiceStates) do
+			if state.stagingRoot then
+				state.stagingRoot:Destroy()
+				state.stagingRoot = nil
+			end
+		end
+	end
+
+	local function postExact(body, label)
+		local encodedOk, encoded = pcall(function()
+			return HttpService:JSONEncode(body)
+		end)
+		if not encodedOk then
+			return nil, "JSONEncode failed: " .. tostring(encoded)
+		end
+		if #encoded > scaleState.maxStreamRequestBytes then
+			return nil, string.format("%s request exceeds %d bytes", label, scaleState.maxStreamRequestBytes)
+		end
+		local lastErr = nil
+		for attempt = 1, 2 do
+			local ok, raw = httpRequest("/snapshot/stream", "POST", body, true)
+			if not shouldContinue() then
+				return nil, mutationGuard.reason or "disk stream cancelled"
+			end
+			if ok and raw.Success then
+				if #(raw.Body or "") > scaleState.maxStreamRequestBytes then
+					return nil, string.format("%s response exceeds %d bytes", label, scaleState.maxStreamRequestBytes)
+				end
+				local decodeOk, decoded = pcall(function()
+					return HttpService:JSONDecode(raw.Body or "")
+				end)
+				if decodeOk and type(decoded) == "table" and decoded.ok == true then
+					return decoded, nil
+				end
+				lastErr = if decodeOk
+					then tostring(type(decoded) == "table" and decoded.error or "invalid stream response")
+					else "decode: " .. tostring(decoded)
+			elseif ok then
+				lastErr = string.format("HTTP %d %s", raw.StatusCode, raw.StatusMessage or "")
+			else
+				lastErr = tostring(raw)
+			end
+			if attempt < 2 then
+				log(string.format("  ↻ %s — exact retry (%s)", label, tostring(lastErr):sub(1, 150)))
+				task.wait(0.15)
+			end
+		end
+		return nil, lastErr or "snapshot stream request failed"
+	end
+
+	local function integer(value): number?
+		if type(value) ~= "number" or value < 0 or value % 1 ~= 0 then
+			return nil
+		end
+		return value
+	end
+
+	local function validateStructureChunk(state, records, finalChunk): (boolean, string?)
+		if type(records) ~= "table" or #records > scaleState.structureChunkRecords then
+			return false, "disk structure chunk is missing or exceeds 512 records"
+		end
+		if #records == 0 then
+			return false, "disk structure chunks may not be empty"
+		end
+		for _, record in ipairs(records) do
+			if type(record) ~= "table" then
+				return false, "disk structure record is not an object"
+			end
+			for field in pairs(record) do
+				if
+					field ~= "id"
+					and field ~= "parentId"
+					and field ~= "childIndex"
+					and field ~= "childCount"
+					and field ~= "hasChildren"
+					and field ~= "name"
+					and field ~= "class"
+					and field ~= "avoidSync"
+					and field ~= "avoidSyncCarrier"
+					and field ~= "diskFragment"
+					and field ~= "diskFragmentIsDir"
+					and field ~= "sourceIncluded"
+				then
+					return false, "disk structure record contains an unexpected field"
+				end
+			end
+			local id = integer(record.id)
+			local childIndex = integer(record.childIndex)
+			local childCount = integer(record.childCount)
+			if id ~= #state.records or not childIndex or not childCount then
+				return false, "disk structure IDs/counts are not dense non-negative integers"
+			end
+			if id >= scaleState.maxStreamNodes then
+				return false, string.format("disk structure exceeds %d nodes", scaleState.maxStreamNodes)
+			end
+			if type(record.name) ~= "string" or string.find(record.name, "\0", 1, true) then
+				return false, "disk structure record has an invalid name"
+			end
+			if type(record.class) ~= "string" then
+				return false, "disk structure record has no class"
+			end
+			if
+				type(record.hasChildren) ~= "boolean"
+				or type(record.avoidSync) ~= "boolean"
+				or type(record.avoidSyncCarrier) ~= "boolean"
+				or (record.sourceIncluded ~= nil and type(record.sourceIncluded) ~= "boolean")
+			then
+				return false, "disk structure flags must be booleans"
+			end
+			if record.sourceIncluded ~= nil and not SCRIPT_CLASSES[record.class] then
+				return false, "sourceIncluded is only valid on script records"
+			end
+			if id == 0 then
+				if
+					record.parentId ~= nil
+					or childIndex ~= 0
+					or record.name ~= state.serviceName
+					or record.class ~= state.serviceName
+					or record.avoidSync ~= false
+					or record.avoidSyncCarrier ~= false
+					or record.sourceIncluded ~= nil
+					or record.diskFragment ~= nil
+					or record.diskFragmentIsDir ~= nil
+				then
+					return false, "disk structure root does not match its service"
+				end
+				state.depths[1] = 0
+				state.preorderStack[1] = 0
+			else
+				if not ALLOWED_CLASSES[record.class] then
+					return false, "disk structure contains an unsupported class"
+				end
+				while #state.preorderStack > 0 do
+					local topId = state.preorderStack[#state.preorderStack]
+					local top = state.records[topId + 1]
+					if state.observedChildren[topId + 1] == tonumber(top.childCount) then
+						table.remove(state.preorderStack)
+					else
+						break
+					end
+				end
+				local parentId = integer(record.parentId)
+				local expectedParent = state.preorderStack[#state.preorderStack]
+				if parentId == nil or parentId ~= expectedParent then
+					return false, "disk structure is not dense depth-first preorder"
+				end
+				local parentObserved = state.observedChildren[parentId + 1] or 0
+				if childIndex ~= parentObserved then
+					return false, "disk structure childIndex values are not contiguous"
+				end
+				state.observedChildren[parentId + 1] = parentObserved + 1
+				local depth = (state.depths[parentId + 1] or 0) + 1
+				if depth > scaleState.maxStreamDepth then
+					return false, string.format("disk structure exceeds depth %d", scaleState.maxStreamDepth)
+				end
+				state.depths[id + 1] = depth
+				if type(record.diskFragment) ~= "string" or type(record.diskFragmentIsDir) ~= "boolean" then
+					return false, "disk structure record is missing exact fragment identity"
+				end
+				local expectedDirectory = record.class == "Folder" or record.hasChildren == true
+				if record.diskFragmentIsDir ~= expectedDirectory then
+					return false, "disk fragment shape does not match its projected node"
+				end
+				state.preorderStack[#state.preorderStack + 1] = id
+			end
+			if record.avoidSync == true and record.avoidSyncCarrier == true then
+				return false, "disk structure record cannot be both AvoidSync boundary and carrier"
+			end
+			if record.avoidSync == true and childCount ~= 0 then
+				return false, "disk AvoidSync boundary must omit descendants"
+			end
+			if record.avoidSyncCarrier == true and record.class ~= "Folder" then
+				return false, "disk AvoidSync carrier must project as Folder"
+			end
+			local expectedHasChildren = id == 0 or childCount > 0 or record.class == "Folder"
+			if record.hasChildren ~= expectedHasChildren then
+				return false, "disk hasChildren does not match projected shape"
+			end
+			state.records[#state.records + 1] = record
+			state.observedChildren[id + 1] = state.observedChildren[id + 1] or 0
+		end
+		if finalChunk then
+			while #state.preorderStack > 0 do
+				local topId = state.preorderStack[#state.preorderStack]
+				local top = state.records[topId + 1]
+				if state.observedChildren[topId + 1] ~= tonumber(top.childCount) then
+					return false, "disk structure ended before all declared children arrived"
+				end
+				table.remove(state.preorderStack)
+			end
+			if #state.records == 0 then
+				return false, "disk structure did not include its service root"
+			end
+		end
+		return true, nil
+	end
+
+	local function stageStructure(state): (boolean, string?)
+		local ok, err = pcall(function()
+			local stagingRoot = Instance.new("Folder")
+			stagingRoot.Name = state.serviceName
+			state.stagingRoot = stagingRoot
+			state.stagedInstances = { stagingRoot }
+			state.childrenByParent = {}
+			state.sourceIds = {}
+			state.sourceDigests = {}
+			state.sourceNormalizedDigests = {}
+			state.nextSource = 1
+
+			for id = 1, #state.records - 1 do
+				local record = state.records[id + 1]
+				local parentId = tonumber(record.parentId)
+				local children = state.childrenByParent[parentId + 1]
+				if not children then
+					children = {}
+					state.childrenByParent[parentId + 1] = children
+				end
+				children[#children + 1] = record
+				if
+					SCRIPT_CLASSES[record.class]
+					and record.avoidSync ~= true
+					and record.avoidSyncCarrier ~= true
+					and record.sourceIncluded ~= false
+				then
+					state.sourceIds[#state.sourceIds + 1] = id
+				end
+				local parent = state.stagedInstances[parentId + 1]
+				if not parent then
+					error("detached staging parent is missing", 0)
+				end
+				local staged = Instance.new(record.class)
+				staged.Name = record.name
+				staged.Parent = parent
+				state.stagedInstances[id + 1] = staged
+				if id % scaleState.studioScanYieldEvery == 0 then
+					task.wait()
+					if not shouldContinue() then
+						error("detached snapshot staging cancelled", 0)
+					end
+				end
+			end
+		end)
+		if not ok then
+			if state.stagingRoot then
+				state.stagingRoot:Destroy()
+				state.stagingRoot = nil
+			end
+			return false, tostring(err)
+		end
+		return true, nil
+	end
+
+	local function acceptSources(state, sources, finalChunk): (boolean, string?)
+		if type(sources) ~= "table" or #sources > scaleState.sourcePartChunkRecords then
+			return false, "disk source chunk is missing its sources array"
+		end
+		if #sources == 0 and not finalChunk then
+			-- Empty non-final chunks are exact-cursor fence ticks while the
+			-- daemon captures or revalidates its disk fingerprint. They are only
+			-- legal before the first Source or after every Source; accepting one
+			-- in the middle of a script/sequence would hide a stalled stream.
+			local beforeFirstSource = state.activeSource == nil and state.nextSource == 1
+			local afterEverySource = state.activeSource == nil and state.nextSource > #state.sourceIds
+			if not beforeFirstSource and not afterEverySource then
+				return false, "disk Source fence tick arrived between ordinary Source parts"
+			end
+			return true, nil
+		end
+		for partNumber, part in ipairs(sources) do
+			if type(part) ~= "table" or type(part.data) ~= "string" then
+				return false, "disk source part is malformed"
+			end
+			for field in pairs(part) do
+				if
+					field ~= "id"
+					and field ~= "partIndex"
+					and field ~= "offset"
+					and field ~= "totalBytes"
+					and field ~= "data"
+					and field ~= "finalPart"
+					and field ~= "sha256"
+				then
+					return false, "disk source part contains an unexpected field"
+				end
+			end
+			local id = integer(part.id)
+			local partIndex = integer(part.partIndex)
+			local offset = integer(part.offset)
+			local totalBytes = integer(part.totalBytes)
+			local digest = tostring(part.sha256 or "")
+			if
+				not id
+				or not partIndex
+				or not offset
+				or not totalBytes
+				or #part.data > scaleState.sourceChunkBytes
+				or totalBytes > scaleState.maxScriptSourceBytes
+				or (#part.data == 0 and totalBytes > 0)
+				or type(part.finalPart) ~= "boolean"
+				or not string.match(digest, "^[0-9a-f]+$")
+				or #digest ~= 64
+			then
+				return false, "disk source part exceeds bounds or has invalid metadata"
+			end
+			if not state.activeSource then
+				local expectedId = state.sourceIds[state.nextSource]
+				if id ~= expectedId or partIndex ~= 0 or offset ~= 0 then
+					return false, "disk source stream started out of order"
+				end
+				if state.stagedSourceBytes + totalBytes > scaleState.maxStagedSourceBytesPerService then
+					return false,
+						string.format(
+							"disk Source staging for %s exceeds the %d-byte per-service limit",
+							state.serviceName,
+							scaleState.maxStagedSourceBytesPerService
+						)
+				end
+				if totalStagedSourceBytes + totalBytes > scaleState.maxStagedSourceBytesTotal then
+					return false,
+						string.format(
+							"disk Source staging exceeds the %d-byte all-service limit",
+							scaleState.maxStagedSourceBytesTotal
+						)
+				end
+				state.stagedSourceBytes += totalBytes
+				totalStagedSourceBytes += totalBytes
+				state.activeSource = {
+					id = id,
+					nextPart = 0,
+					offset = 0,
+					totalBytes = totalBytes,
+					sha256 = digest,
+					parts = {},
+				}
+			end
+			local active = state.activeSource
+			if
+				id ~= active.id
+				or partIndex ~= active.nextPart
+				or offset ~= active.offset
+				or totalBytes ~= active.totalBytes
+				or digest ~= active.sha256
+				or offset + #part.data > totalBytes
+			then
+				return false, "disk source stream changed identity or offset mid-script"
+			end
+			local reachesEnd = offset + #part.data == totalBytes
+			if (part.finalPart == true) ~= reachesEnd then
+				return false, "disk source finalPart does not match totalBytes"
+			end
+			active.parts[#active.parts + 1] = part.data
+			active.offset += #part.data
+			active.nextPart += 1
+			if reachesEnd then
+				local source = table.concat(active.parts)
+				if #source ~= totalBytes or sha256Hex(source) ~= digest then
+					return false, "disk source SHA-256 validation failed"
+				end
+				local record = state.records[id + 1]
+				local inst = state.stagedInstances[id + 1]
+				if not inst or not inst:IsA("LuaSourceContainer") or not record or inst.ClassName ~= record.class then
+					return false, "detached source target does not match streamed structure"
+				end
+				local stagedOk = pcall(function()
+					inst.Source = source
+				end)
+				if not stagedOk or not sourcesMatchForApply(readScriptSource(inst), source) then
+					return false, "detached staging rejected streamed Source"
+				end
+				state.sourceDigests[id + 1] = digest
+				state.sourceNormalizedDigests[id + 1] = sha256Hex(normalizeSourceForCompare(source))
+				state.activeSource = nil
+				state.nextSource += 1
+			end
+			if partNumber % scaleState.sourcePartChunkRecords == 0 then
+				task.wait()
+				if not shouldContinue() then
+					return false, mutationGuard.reason or "disk Source validation cancelled"
+				end
+			end
+		end
+		if finalChunk then
+			if state.activeSource or state.nextSource <= #state.sourceIds then
+				return false, "disk source phase ended before every script validated"
+			end
+		end
+		return true, nil
+	end
+
+	local function acceptDeletes(state, deletes, finalChunk): (boolean, string?)
+		if type(deletes) ~= "table" or #deletes > scaleState.deleteChunkRecords then
+			return false, "disk delete chunk is missing or exceeds 512 records"
+		end
+		-- An empty non-final chunk is an authenticated continuation tick while
+		-- the daemon re-hashes the exact disk generation in the background.
+		-- It advances only the already-validated stream cursor and never opens
+		-- a ChangeHistory recording or mutates live Studio state.
+		for deleteIndex in pairs(deletes) do
+			if type(deleteIndex) ~= "number" or deleteIndex % 1 ~= 0 or deleteIndex < 1 or deleteIndex > #deletes then
+				return false, "disk delete chunk must be a dense array"
+			end
+		end
+		for deleteIndex, deletion in ipairs(deletes) do
+			if type(deletion) ~= "table" then
+				return false, "disk delete record is not an object"
+			end
+			for field in pairs(deletion) do
+				if field ~= "path" and field ~= "pathMode" then
+					return false, "disk delete record contains an unexpected field"
+				end
+			end
+			local path = deletion.path
+			if
+				deletion.pathMode ~= "generated"
+				or type(path) ~= "table"
+				or #path < 2
+				or #path > scaleState.maxStreamDepth + 1
+				or path[1] ~= state.serviceName
+			then
+				return false, "disk delete path is not a generated path below its service"
+			end
+			for pathIndex, segment in ipairs(path) do
+				if
+					type(segment) ~= "string"
+					or segment == ""
+					or string.find(segment, "\0", 1, true)
+					or (pathIndex == 1 and segment ~= state.serviceName)
+				then
+					return false, "disk delete path contains an invalid segment"
+				end
+			end
+			for pathIndex in pairs(path) do
+				if type(pathIndex) ~= "number" or pathIndex % 1 ~= 0 or pathIndex < 1 or pathIndex > #path then
+					return false, "disk delete path must be a dense segment array"
+				end
+			end
+			local deleteKey = table.concat(path, "\0")
+			if state.deleteKeys[deleteKey] then
+				return false, "disk delete stream repeated a generated path"
+			end
+			state.deleteKeys[deleteKey] = true
+			state.deletes[#state.deletes + 1] = table.clone(path)
+			if #state.deletes > scaleState.maxStreamNodes then
+				return false, string.format("disk delete stream exceeds %d paths", scaleState.maxStreamNodes)
+			end
+			if deleteIndex % scaleState.deleteChunkRecords == 0 then
+				task.wait()
+				if not shouldContinue() then
+					return false, mutationGuard.reason or "disk delete validation cancelled"
+				end
+			end
+		end
+		return true, nil
+	end
+
+	local function buildSelectiveDeletePlan(state, service): (any?, string?)
+		if #state.deletes == 0 then
+			return {
+				groups = {},
+				targetCount = 0,
+			}, nil
+		end
+
+		-- Resolve every generated ordinal against the same unchanged Studio
+		-- projection. Deleting as paths are resolved would renumber duplicate
+		-- siblings (A [2] becomes A [1]) and can miss or delete the wrong target.
+		-- Cache each parent's projection once so a 25k-wide selected delete is
+		-- linear after one sibling sort instead of rebuilding it 25k times.
+		local resolveContext = snapshotApplyState.newContext({
+			shouldContinue = shouldContinue,
+			indexAvoidSyncCarriers = true,
+		})
+		local siblingIndexes = {}
+		local resolvedTargets = {}
+		local entries = {}
+		local groups = {}
+		local groupsByParent = {}
+		local ok, err = pcall(function()
+			for _, deletePath in ipairs(state.deletes) do
+				snapshotApplyState.checkpoint(resolveContext)
+				local target = service
+				for pathIndex = 2, #deletePath do
+					local siblings = siblingIndexes[target]
+					if not siblings then
+						siblings = snapshotApplyState.buildPhysicalSiblingIndex(target, resolveContext)
+						siblingIndexes[target] = siblings
+					end
+					target = siblings.byLookupSegment[deletePath[pathIndex]]
+					if not target then
+						break
+					end
+				end
+				-- A target may already be absent by the time the authorized
+				-- choice is redeemed. Preserve the old idempotent no-op behavior.
+				if target then
+					if target == service then
+						error("selective delete resolved to its service root", 0)
+					end
+					if resolvedTargets[target] then
+						error("selective delete paths resolve to the same Studio target", 0)
+					end
+					resolvedTargets[target] = true
+					entries[#entries + 1] = {
+						target = target,
+					}
+				end
+			end
+
+			-- Reject ancestor/descendant target pairs before any live mutation.
+			-- A parent prune already owns its selected subtree; accepting both
+			-- paths makes the result order-dependent and invalidates child groups.
+			for _, entry in ipairs(entries) do
+				local ancestor = entry.target.Parent
+				while ancestor and ancestor ~= service do
+					if resolvedTargets[ancestor] then
+						error("selective delete targets overlap by ancestry", 0)
+					end
+					ancestor = ancestor.Parent
+				end
+				if ancestor ~= service then
+					error("selective delete target escaped its service", 0)
+				end
+			end
+
+			for _, entry in ipairs(entries) do
+				local parent = entry.target.Parent
+				if not parent then
+					error("selective delete target lost its parent during planning", 0)
+				end
+				local group = groupsByParent[parent]
+				if not group then
+					group = {
+						parent = parent,
+						targets = {},
+					}
+					groupsByParent[parent] = group
+					groups[#groups + 1] = group
+				end
+				group.targets[entry.target] = true
+			end
+		end)
+		if not ok then
+			return nil, tostring(err)
+		end
+		if not shouldContinue() then
+			return nil, mutationGuard.reason or "Studio changed during selective delete planning"
+		end
+		return {
+			groups = groups,
+			targetCount = #entries,
+		}, nil
+	end
+
+	local function cancelRecording(recordingId)
+		local cancelled, cancelErr = pcall(function()
+			snapshotApplyState.runInternalWrite(function()
+				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Cancel)
+			end, {
+				recording = true,
+			})
+		end)
+		if cancelled then
+			return {
+				ok = true,
+				method = "cancel",
+			}
+		end
+		-- Cancel normally performs the rollback itself. One Undo is the
+		-- last-resort fallback for Studio channels where finishing Cancel
+		-- errors. Preserve both errors so a double failure can halt sync
+		-- without falsely claiming the all-service mutation was rolled back.
+		local undone, undoErr = pcall(function()
+			ChangeHistoryService:Undo()
+		end)
+		return {
+			ok = undone,
+			method = if undone then "undo" else nil,
+			cancelError = tostring(cancelErr),
+			undoError = if undone then nil else tostring(undoErr),
+		}
+	end
+
+	local function applyStagedService(state, service, deletePlan)
+		if not shouldContinue() then
+			error(mutationGuard.reason or "Studio changed before streamed commit", 0)
+		end
+		state.instances = { service }
+		state.skipped = {}
+		snapshotApplyState.diskPathCache[service] = { state.serviceName }
+		local applyOpts = {
+			strict = false,
+			forcePrune = false,
+			shouldContinue = shouldContinue,
+			claimedInstances = {},
+			indexAvoidSyncCarriers = true,
+		}
+		applyOpts._applyContext = snapshotApplyState.newContext(applyOpts)
+		state.applyContext = applyOpts._applyContext
+
+		for parentId = 0, #state.records - 1 do
+			snapshotApplyState.checkpoint(state.applyContext)
+			local children = state.childrenByParent[parentId + 1]
+			if children and #children > 0 then
+				if state.skipped[parentId + 1] then
+					for _, record in ipairs(children) do
+						state.skipped[tonumber(record.id) + 1] = true
+					end
+				else
+					local parent = state.instances[parentId + 1]
+					if not parent then
+						error("streamed commit parent Instance is missing", 0)
+					end
+					local nodes = {}
+					for _, record in ipairs(children) do
+						nodes[#nodes + 1] = {
+							class = record.class,
+							name = record.name,
+							properties = {},
+							children = {},
+							-- Exact fragments select existing identities; newly
+							-- created Instances still use the Roblox name/class.
+							diskFragment = record.diskFragment,
+							diskFragmentIsDir = record.diskFragmentIsDir,
+							_streamId = record.id,
+						}
+					end
+					local assignments = snapshotApplyState.buildAssignments(parent, nodes, state.applyContext)
+					for _, assignment in ipairs(assignments) do
+						local inst, skipChildren =
+							snapshotApplyState.prepareInstance(parent, assignment, applyOpts, state.applyContext)
+						local id = tonumber(assignment.node._streamId)
+						state.instances[id + 1] = inst
+						state.skipped[id + 1] = skipChildren == true
+					end
+				end
+			end
+		end
+
+		for _, id in ipairs(state.sourceIds) do
+			snapshotApplyState.checkpoint(state.applyContext)
+			if not state.skipped[id + 1] then
+				local staged = state.stagedInstances[id + 1]
+				local target = state.instances[id + 1]
+				local source = readScriptSource(staged)
+				if
+					sha256Hex(source) ~= state.sourceDigests[id + 1]
+					and sha256Hex(normalizeSourceForCompare(source)) ~= state.sourceNormalizedDigests[id + 1]
+				then
+					error("detached Source changed before commit", 0)
+				end
+				if not target or not target:IsA("LuaSourceContainer") or not writeScriptSource(target, source) then
+					error("ScriptEditorService rejected streamed Source commit", 0)
+				end
+				local readback = readScriptSource(target)
+				local rawReadbackMatches = sha256Hex(readback) == state.sourceDigests[id + 1]
+				local normalizedReadbackMatches = sha256Hex(normalizeSourceForCompare(readback))
+					== state.sourceNormalizedDigests[id + 1]
+				if not rawReadbackMatches and not normalizedReadbackMatches then
+					error("streamed Source readback SHA-256 did not match the wire contract", 0)
+				end
+			end
+		end
+
+		for _, group in ipairs(deletePlan.groups) do
+			snapshotApplyState.checkpoint(state.applyContext)
+			for target in pairs(group.targets) do
+				if state.applyContext.claimedInstances[target] then
+					error("selective delete overlaps a streamed disk structure target", 0)
+				end
+				if target.Parent ~= group.parent then
+					error("selective delete target changed after immutable planning", 0)
+				end
+			end
+			local kept = {}
+			local deleteCount = 0
+			for _, sibling in ipairs(group.parent:GetChildren()) do
+				if not group.targets[sibling] then
+					kept[sibling] = true
+				elseif isAvoidSyncBlocked(sibling) then
+					kept[sibling] = true
+					log("AvoidSync: preserving authorized delete target " .. pathOf(sibling))
+				else
+					deleteCount += 1
+				end
+			end
+			if deleteCount > 0 then
+				-- One parent-level prune removes the entire immutable target
+				-- set without renumbering duplicate siblings between paths.
+				-- Unselected siblings and Studio-authoritative/AvoidSync
+				-- descendants survive.
+				snapshotApplyState.pruneUnkept(group.parent, kept, state.applyContext)
+			end
+		end
+
+		if strict then
+			-- Destructive pruning is the final operation, after every staged
+			-- Source was length/hash validated and applied successfully.
+			for parentId = #state.records - 1, 0, -1 do
+				snapshotApplyState.checkpoint(state.applyContext)
+				if not state.skipped[parentId + 1] then
+					local parent = state.instances[parentId + 1]
+					if parent then
+						local kept = {}
+						for _, record in ipairs(state.childrenByParent[parentId + 1] or {}) do
+							local child = state.instances[tonumber(record.id) + 1]
+							if child then
+								kept[child] = true
+							end
+						end
+						snapshotApplyState.pruneUnkept(parent, kept, state.applyContext)
+					end
+				end
+			end
+		end
+		if not shouldContinue() then
+			error(mutationGuard.reason or "Studio changed during streamed commit", 0)
+		end
+	end
+
+	local function commitAllServices(states): (boolean, string?)
+		if not shouldContinue() then
+			return false, mutationGuard.reason or "Studio changed before streamed commit"
+		end
+		-- Resolve every service and every selective delete against one
+		-- unchanged live generation before opening the single recording.
+		local plans = {}
+		for _, state in ipairs(states) do
+			local serviceOk, service = pcall(function()
+				return game:GetService(state.serviceName)
+			end)
+			if not serviceOk or not service then
+				return false, "streamed snapshot service is unavailable"
+			end
+			local deletePlan, deletePlanErr = buildSelectiveDeletePlan(state, service)
+			if not deletePlan then
+				return false, "selective delete planning failed: " .. tostring(deletePlanErr)
+			end
+			plans[#plans + 1] = {
+				state = state,
+				service = service,
+				deletePlan = deletePlan,
+			}
+		end
+		if not shouldContinue() then
+			return false, mutationGuard.reason or "Studio changed before streamed commit"
+		end
+		local label = "Ro Sync: streamed snapshot"
+		local recordingOk, recordingId = pcall(function()
+			return ChangeHistoryService:TryBeginRecording(label, label)
+		end)
+		if not recordingOk or recordingId == nil then
+			return false, "Studio refused to begin all-service streamed snapshot recording"
+		end
+		local committed, commitErr = pcall(function()
+			for _, plan in ipairs(plans) do
+				applyStagedService(plan.state, plan.service, plan.deletePlan)
+			end
+			if not shouldContinue() then
+				error(mutationGuard.reason or "Studio changed during all-service commit", 0)
+			end
+		end)
+		lastRemoteApplyClock = os.clock()
+		if committed then
+			local finishOk, finishErr = pcall(function()
+				snapshotApplyState.runInternalWrite(function()
+					ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Commit)
+				end, {
+					recording = true,
+				})
+			end)
+			if not finishOk then
+				committed = false
+				commitErr = "change-history commit failed: " .. tostring(finishErr)
+			end
+		end
+		if not committed then
+			local rollback = cancelRecording(recordingId)
+			for _, plan in ipairs(plans) do
+				snapshotApplyState.clearDiskPathSubtree(plan.service)
+			end
+			if not rollback.ok then
+				local fatalMessage = string.format(
+					"FATAL: all-service streamed snapshot may be partially applied; "
+						.. "ChangeHistory Cancel failed (%s) and fallback Undo failed (%s). "
+						.. "Original commit error: %s",
+					tostring(rollback.cancelError),
+					tostring(rollback.undoError),
+					tostring(commitErr)
+				)
+				reconnectState.stopTerminal(fatalMessage)
+				return false, fatalMessage
+			end
+			local fallbackDetail = if rollback.method == "undo"
+				then " after ChangeHistory Cancel failed (" .. tostring(rollback.cancelError) .. ")"
+				else ""
+			return false,
+				string.format(
+					"all-service streamed snapshot commit rolled back via %s%s: %s",
+					tostring(rollback.method),
+					fallbackDetail,
+					tostring(commitErr)
+				)
+		end
+		return true, nil
+	end
+
+	local startBody = {
+		pluginProtocol = PLUGIN_PROTOCOL_VERSION,
+		requestId = requestId,
+		phase = "start",
+		strict = strict,
+		avoidSyncPaths = scaleState.collectAvoidSyncPaths(),
+	}
+	if selective then
+		startBody.choiceId = selectionChoiceId
+	end
+	local response, startErr = postExact(startBody, "snapshot stream start")
+	if not response then
+		disposeGuard()
+		log("snapshot stream start failed: " .. tostring(startErr))
 		setPill("error", "snapshot failed")
 		return false
 	end
-	applySnapshot(snap)
-	return true
+	streamId = response.streamId
+	if type(streamId) ~= "string" or streamId == "" then
+		disposeGuard()
+		log("snapshot stream omitted its streamId")
+		return false
+	end
+
+	local expectedServiceIndex = 1
+	local expectedService = WATCHED_SERVICES[expectedServiceIndex]
+	local expectedPhase = "diskPrepare"
+	local expectedChunk = 0
+	local allowDiskPrepareReady = false
+	while true do
+		local responseChunk = integer(response.chunkIndex)
+		local exactCoordinate = response.service == expectedService
+			and response.phase == expectedPhase
+			and responseChunk == expectedChunk
+		local diskPrepareReady = allowDiskPrepareReady
+			and expectedPhase == "diskPrepare"
+			and response.service == expectedService
+			and response.phase == "structure"
+			and responseChunk == 0
+		if
+			response.streamId ~= streamId
+			or (not exactCoordinate and not diskPrepareReady)
+			or type(response.finalChunk) ~= "boolean"
+		then
+			disposeGuard()
+			log("snapshot stream response was stale or out of order")
+			return false
+		end
+		if diskPrepareReady then
+			expectedPhase = "structure"
+			expectedChunk = 0
+			allowDiskPrepareReady = false
+		end
+		if not shouldContinue() then
+			disposeGuard()
+			log("snapshot stream aborted: " .. tostring(mutationGuard.reason or "cancelled"))
+			return false
+		end
+		local terminalPhase = if selective then "deletes" else "sources"
+		local terminalResponse = expectedServiceIndex == #WATCHED_SERVICES
+			and expectedPhase == terminalPhase
+			and response.finalChunk == true
+		if
+			(terminalResponse and response.action ~= "complete") or (not terminalResponse and response.action ~= nil)
+		then
+			disposeGuard()
+			log("snapshot stream response carried a malformed or premature terminal action")
+			return false
+		end
+
+		if expectedPhase == "diskPrepare" then
+			if
+				response.finalChunk ~= false
+				or response.records ~= nil
+				or response.sources ~= nil
+				or response.deletes ~= nil
+			then
+				disposeGuard()
+				log("snapshot disk preparation response carried a payload or final marker")
+				return false
+			end
+			expectedChunk += 1
+		elseif expectedPhase == "structure" then
+			if response.sources ~= nil or response.deletes ~= nil then
+				disposeGuard()
+				log("snapshot structure response mixed payload phases")
+				return false
+			end
+			if expectedChunk == 0 then
+				serviceState = {
+					serviceName = expectedService,
+					records = {},
+					depths = {},
+					observedChildren = {},
+					preorderStack = {},
+					deletes = {},
+					deleteKeys = {},
+					stagedSourceBytes = 0,
+				}
+				stagedServiceStates[#stagedServiceStates + 1] = serviceState
+			end
+			local valid, structureErr =
+				validateStructureChunk(serviceState, response.records, response.finalChunk == true)
+			if not valid then
+				disposeGuard()
+				log("snapshot structure rejected: " .. tostring(structureErr))
+				return false
+			end
+			if response.finalChunk then
+				local staged, stageErr = stageStructure(serviceState)
+				if not staged then
+					disposeGuard()
+					log("snapshot structure staging failed: " .. tostring(stageErr))
+					return false
+				end
+				expectedPhase = "sources"
+				expectedChunk = 0
+			else
+				expectedChunk += 1
+			end
+		elseif expectedPhase == "sources" then
+			if response.records ~= nil or response.deletes ~= nil then
+				disposeGuard()
+				log("snapshot Source response mixed payload phases")
+				return false
+			end
+			local valid, sourceErr = acceptSources(serviceState, response.sources, response.finalChunk == true)
+			if not valid then
+				disposeGuard()
+				log("snapshot Source rejected: " .. tostring(sourceErr))
+				return false
+			end
+			if response.finalChunk then
+				if selective then
+					expectedPhase = "deletes"
+					expectedChunk = 0
+				else
+					if terminalResponse then
+						-- No live service is touched before the sole authenticated
+						-- terminal response. One recording makes the entire pull
+						-- atomic across every watched service.
+						local committed, commitErr = commitAllServices(stagedServiceStates)
+						if not committed then
+							disposeGuard()
+							log("snapshot all-service commit failed: " .. tostring(commitErr))
+							return false
+						end
+						break
+					end
+					expectedServiceIndex += 1
+					expectedService = WATCHED_SERVICES[expectedServiceIndex]
+					expectedPhase = "diskPrepare"
+					expectedChunk = 0
+					serviceState = nil
+				end
+			else
+				expectedChunk += 1
+			end
+		elseif expectedPhase == "deletes" and selective then
+			if response.records ~= nil or response.sources ~= nil then
+				disposeGuard()
+				log("snapshot delete response mixed payload phases")
+				return false
+			end
+			local valid, deleteErr = acceptDeletes(serviceState, response.deletes, response.finalChunk == true)
+			if not valid then
+				disposeGuard()
+				log("snapshot delete response rejected: " .. tostring(deleteErr))
+				return false
+			end
+			if response.finalChunk then
+				if terminalResponse then
+					local committed, commitErr = commitAllServices(stagedServiceStates)
+					if not committed then
+						disposeGuard()
+						log("snapshot all-service commit failed: " .. tostring(commitErr))
+						return false
+					end
+					break
+				end
+				expectedServiceIndex += 1
+				expectedService = WATCHED_SERVICES[expectedServiceIndex]
+				expectedPhase = "diskPrepare"
+				expectedChunk = 0
+				serviceState = nil
+			else
+				expectedChunk += 1
+			end
+		else
+			disposeGuard()
+			log("snapshot stream entered an unsupported payload phase")
+			return false
+		end
+
+		local nextBody = {
+			pluginProtocol = PLUGIN_PROTOCOL_VERSION,
+			requestId = requestId,
+			streamId = streamId,
+			service = expectedService,
+			phase = expectedPhase,
+			chunkIndex = expectedChunk,
+		}
+		allowDiskPrepareReady = expectedPhase == "diskPrepare"
+		local nextResponse, nextErr =
+			postExact(nextBody, string.format("%s %s chunk %d", expectedService, expectedPhase, expectedChunk))
+		if not nextResponse then
+			disposeGuard()
+			log("snapshot stream fetch failed: " .. tostring(nextErr))
+			return false
+		end
+		response = nextResponse
+	end
+
+	disposeGuard()
+	return shouldContinue()
 end
 
-local function doPullSelectedPaths(paths: any): boolean
-	if type(paths) ~= "table" or #paths == 0 then
-		return doPullPath(true)
-	end
-	log(string.format("initial-compare → selective pull: applying %d disk path(s) to Studio", #paths))
-	local ok, snap = httpJson("/snapshot/selective", "POST", {
-		paths = paths,
-		pluginProtocol = PLUGIN_PROTOCOL_VERSION,
-	})
-	if not reconnectState.desired or not busy then
+local function doPullSelectedChoice(selectedCount: any, choiceId: string?): boolean
+	if
+		type(selectedCount) ~= "number"
+		or selectedCount <= 0
+		or selectedCount % 1 ~= 0
+		or selectedCount > scaleState.maxStreamNodes
+	then
+		log("initial-compare → selective pull rejected an invalid selectedCount")
 		return false
 	end
-	if not ok or type(snap) ~= "table" or type(snap.ops) ~= "table" then
-		log("selective snapshot err: " .. tostring(snap))
-		setPill("error", "selective snapshot failed")
+	if type(choiceId) ~= "string" or choiceId == "" then
+		log("initial-compare → selective pull rejected a missing choiceId")
 		return false
 	end
-	applySnapshot(snap)
-	return true
+	log(string.format("initial-compare → selective pull: streaming %d server-authorized disk path(s)", selectedCount))
+	return doPullPath(true, selectedCount, choiceId)
 end
 
 -- A daemon or Desktop broker may advertise the authorized project initializer.
@@ -9738,16 +13724,55 @@ local function waitForDecision(choiceId, gen)
 				task.wait(2)
 			end
 		else
+			if #(resp.Body or "") > PROTOCOL_STREAM_MAX_BYTES then
+				log("decision response exceeded the 512 KiB protocol limit")
+				return "malformed"
+			end
 			local decoded
 			local decOk = pcall(function()
 				decoded = HttpService:JSONDecode(resp.Body or "")
 			end)
-			if decOk and decoded then
-				if decoded.pending == true then
+			if decOk and type(decoded) == "table" then
+				if decoded.paths ~= nil then
+					log("decision response rejected obsolete paths payload")
+					return "malformed"
+				elseif decoded.pending == true then
+					if decoded.selective ~= nil or decoded.selectedCount ~= nil then
+						log("pending decision response contained premature disk selection metadata")
+						return "malformed"
+					end
 					-- keep polling
 				elseif decoded.choice then
-					return tostring(decoded.choice), decoded.paths
+					local choice = tostring(decoded.choice)
+					local hasSelective = decoded.selective ~= nil
+					local hasSelectedCount = decoded.selectedCount ~= nil
+					if choice == "disk" and decoded.selective == true then
+						local selectedCount = decoded.selectedCount
+						if
+							type(selectedCount) ~= "number"
+							or selectedCount <= 0
+							or selectedCount % 1 ~= 0
+							or selectedCount > scaleState.maxStreamNodes
+						then
+							log("decision response rejected invalid selective selectedCount")
+							return "malformed"
+						end
+						return choice, true, selectedCount
+					elseif choice == "disk" then
+						if hasSelective or hasSelectedCount then
+							log("decision response rejected malformed full-disk selection metadata")
+							return "malformed"
+						end
+						return choice, false, nil
+					elseif hasSelective or hasSelectedCount then
+						log("decision response attached disk selection metadata to a non-disk choice")
+						return "malformed"
+					end
+					return choice, false, nil
 				end
+			elseif decOk then
+				log("decision response was not a JSON object")
+				return "malformed"
 			end
 		end
 	end
@@ -9788,35 +13813,451 @@ end
 runInitialCompare = function()
 	local compareGeneration = wsGeneration
 	local compareCapability = reconnectState.pluginCapability
-	local function completeInitialCompare()
+	local scanGuard = nil
+
+	local function disposeScanGuard()
+		if scanGuard then
+			scaleState.disconnectStudioScanGuard(scanGuard)
+			scanGuard = nil
+		end
+	end
+
+	local function restartForMutation(context)
+		local reason = scanGuard and scanGuard.reason or "Studio changed"
+		disposeScanGuard()
 		if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
 			return
 		end
-		reconnectState.comparedCapability = compareCapability
-		startHooksAndWs()
+		log(string.format("%s (%s); restarting initial compare", context, tostring(reason)))
+		task.defer(runInitialCompare)
 	end
-	local studioStats = collectStudioStats()
-	local studioSnapshot = collectSnapshot()
+
+	local function scanBecameDirty(context): boolean
+		if scanGuard and scanGuard.dirty then
+			restartForMutation(context)
+			return true
+		end
+		return false
+	end
+
+	local function completeInitialCompare()
+		if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+			disposeScanGuard()
+			return
+		end
+		if scanBecameDirty("Studio changed before hooks were ready") then
+			return
+		end
+		reconnectState.comparedCapability = compareCapability
+		scaleState.activeScanGuard = scanGuard
+		if startHooksAndWs() then
+			disposeScanGuard()
+		else
+			restartForMutation("Studio changed while hooks were being installed")
+		end
+		scaleState.activeScanGuard = nil
+	end
+
+	scanGuard = scaleState.beginStudioScanGuard()
+	local statsStarted = os.clock()
+	local studioStats, statsProgress = scaleState.collectStudioStatsWithGuard(scanGuard)
 	if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+		disposeScanGuard()
 		return
 	end
-	log("initial-compare: comparing synced paths")
+	if scanBecameDirty("Studio changed during stats scan") then
+		return
+	end
+	log(
+		string.format(
+			"Studio stats: %d visited, %d synced path(s), %d script(s), %.2fs",
+			statsProgress.visited,
+			studioStats.instanceCount,
+			studioStats.scriptCount,
+			os.clock() - statsStarted
+		)
+	)
+	-- Stats-first lets a brand-new empty project choose `push` without ever
+	-- serializing every Source into one place-sized comparison body.
+	log("initial-compare: checking project stats")
 	local ok, resp = httpJson("/initial-compare", "POST", {
 		studioStats = studioStats,
-		studioSnapshot = studioSnapshot,
+		studioSnapshot = {},
 		pluginProtocol = PLUGIN_PROTOCOL_VERSION,
-	})
+	}, nil, PROTOCOL_STREAM_MAX_BYTES)
 	if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+		disposeScanGuard()
 		return
 	end
 	if not ok then
+		disposeScanGuard()
 		log("initial-compare err: " .. tostring(resp))
 		reconnectState.retryInitialCompare(resp)
 		return
 	end
 	if type(resp) ~= "table" or not resp.action then
+		disposeScanGuard()
 		log("initial-compare: malformed response")
 		reconnectState.stopTerminal("daemon returned a malformed initial-compare response")
+		return
+	end
+	if tostring(resp.action) == "compare" then
+		if scanBecameDirty("Studio changed before streamed comparison") then
+			return
+		end
+		local compareId = if type(resp.compareId) == "string" then resp.compareId else nil
+		local advertisedServices = resp.services
+		local validSession = compareId ~= nil
+			and compareId ~= ""
+			and type(advertisedServices) == "table"
+			and #advertisedServices == #WATCHED_SERVICES
+		for index, serviceName in ipairs(WATCHED_SERVICES) do
+			if not validSession or advertisedServices[index] ~= serviceName then
+				validSession = false
+				break
+			end
+		end
+		if not validSession or resp.nextService ~= advertisedServices[1] then
+			disposeScanGuard()
+			log("initial-compare: daemon returned an invalid streamed comparison session")
+			reconnectState.retryInitialCompare("invalid streamed comparison session")
+			return
+		end
+
+		if resp.phase ~= "structure" or tonumber(resp.nextChunk) ~= 0 then
+			disposeScanGuard()
+			reconnectState.retryInitialCompare("daemon did not start the flat structure stream")
+			return
+		end
+
+		log("initial-compare: streaming bounded structure + script hashes")
+		local snapshotStarted = os.clock()
+		local streamedRecords = 0
+		local function makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
+			return {
+				studioStats = studioStats,
+				studioSnapshot = {},
+				pluginProtocol = PLUGIN_PROTOCOL_VERSION,
+				compareId = compareId,
+				service = serviceName,
+				phase = phase,
+				chunkIndex = chunkIndex,
+				finalChunk = finalChunk,
+				records = records or {},
+				hashes = hashes or {},
+			}
+		end
+		local function encodedCompareBodySize(requestBody): (number?, string?)
+			local encodedOk, encoded = pcall(function()
+				return HttpService:JSONEncode(requestBody)
+			end)
+			if not encodedOk then
+				return nil, "comparison JSONEncode failed: " .. tostring(encoded)
+			end
+			return #encoded, nil
+		end
+		local function postCompareChunk(serviceName, phase, chunkIndex, finalChunk, records, hashes)
+			local requestBody = makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
+			local bodyBytes, encodeErr = encodedCompareBodySize(requestBody)
+			if not bodyBytes then
+				return false, encodeErr
+			end
+			if bodyBytes > scaleState.maxStreamRequestBytes then
+				return false,
+					string.format(
+						"comparison %s/%s/%d encodes to %d bytes; maximum is %d",
+						serviceName,
+						phase,
+						chunkIndex,
+						bodyBytes,
+						scaleState.maxStreamRequestBytes
+					)
+			end
+			local lastErr = nil
+			for attempt = 1, 2 do
+				local requestOk, nextResp =
+					httpJson("/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES)
+				if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
+					return false, "comparison cancelled"
+				end
+				if scanGuard.dirty then
+					return false, "Studio changed during streamed comparison"
+				end
+				if requestOk and type(nextResp) == "table" and nextResp.ok ~= false and nextResp.action then
+					resp = nextResp
+					return true, nil
+				end
+				if requestOk and type(nextResp) == "table" then
+					lastErr = tostring(nextResp.error or "daemon rejected comparison chunk")
+				else
+					lastErr = tostring(nextResp)
+				end
+				if attempt < 2 then
+					log(
+						string.format(
+							"  ↻ %s %s chunk %d — retrying (%s)",
+							serviceName,
+							phase,
+							chunkIndex,
+							lastErr:sub(1, 140)
+						)
+					)
+					task.wait(0.15)
+				end
+			end
+			return false, lastErr or "streamed comparison chunk failed"
+		end
+
+		for index, serviceName in ipairs(advertisedServices) do
+			if
+				type(resp) ~= "table"
+				or tostring(resp.action) ~= "compare"
+				or resp.compareId ~= compareId
+				or resp.nextService ~= serviceName
+				or resp.phase ~= "structure"
+				or tonumber(resp.nextChunk) ~= 0
+			then
+				disposeScanGuard()
+				log("initial-compare: streamed comparison response was stale or out of order")
+				reconnectState.retryInitialCompare("stale or out-of-order streamed comparison")
+				return
+			end
+			if scanBecameDirty("Studio changed during streamed comparison") then
+				return
+			end
+
+			local serviceOk, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if not serviceOk or not service then
+				disposeScanGuard()
+				reconnectState.retryInitialCompare("could not read Studio service " .. tostring(serviceName))
+				return
+			end
+			local sourceInstances, streamErr = scaleState.streamStudioServiceStructure(
+				service,
+				scanGuard,
+				function(_suggestedChunkIndex, finalChunk, records)
+					local recordIndex = 1
+					while recordIndex <= #records do
+						local chunkIndex = tonumber(resp.nextChunk)
+						if
+							tostring(resp.action) ~= "compare"
+							or resp.compareId ~= compareId
+							or resp.nextService ~= serviceName
+							or resp.phase ~= "structure"
+							or not chunkIndex
+						then
+							return false, "daemon advanced the structure stream out of order"
+						end
+						local take = math.min(scaleState.structureChunkRecords, #records - recordIndex + 1)
+						local batch = nil
+						local finishesInput = false
+						while take >= 1 do
+							local candidateBatch = {}
+							for offset = 0, take - 1 do
+								candidateBatch[#candidateBatch + 1] = records[recordIndex + offset]
+							end
+							finishesInput = recordIndex + take - 1 == #records
+							local candidate = makeCompareBody(
+								serviceName,
+								"structure",
+								chunkIndex,
+								finalChunk and finishesInput,
+								candidateBatch,
+								{}
+							)
+							local bytes = encodedCompareBodySize(candidate)
+							if bytes and bytes <= scaleState.maxStreamRequestBytes then
+								batch = candidateBatch
+								break
+							end
+							take = math.floor(take / 2)
+						end
+						if not batch then
+							return false,
+								"one Studio comparison structure record exceeds the bounded 512 KiB request limit"
+						end
+						local sendsFinalChunk = finalChunk and finishesInput
+						local sent, sendErr =
+							postCompareChunk(serviceName, "structure", chunkIndex, sendsFinalChunk, batch, {})
+						if not sent then
+							return false, sendErr
+						end
+						streamedRecords += #batch
+						recordIndex += #batch
+						if not sendsFinalChunk then
+							if
+								tostring(resp.action) ~= "compare"
+								or resp.compareId ~= compareId
+								or resp.nextService ~= serviceName
+								or resp.phase ~= "structure"
+								or tonumber(resp.nextChunk) ~= chunkIndex + 1
+							then
+								return false, "daemon did not acknowledge the exact comparison structure cursor"
+							end
+						end
+					end
+					return true, nil, tonumber(resp.nextChunk)
+				end
+			)
+			if not sourceInstances then
+				disposeScanGuard()
+				log(
+					string.format(
+						"initial-compare: %s structure stream failed: %s",
+						serviceName,
+						tostring(streamErr):sub(1, 200)
+					)
+				)
+				reconnectState.retryInitialCompare(streamErr or "streamed comparison failed")
+				return
+			end
+			if
+				tostring(resp.action) ~= "compare"
+				or resp.compareId ~= compareId
+				or resp.nextService ~= serviceName
+				or resp.phase ~= "diskPrepare"
+				or tonumber(resp.nextChunk) ~= 0
+			then
+				disposeScanGuard()
+				reconnectState.retryInitialCompare("daemon did not start bounded disk preparation")
+				return
+			end
+			local preparePolls = 0
+			while resp.phase == "diskPrepare" do
+				local prepareChunk = tonumber(resp.nextChunk)
+				if
+					tostring(resp.action) ~= "compare"
+					or resp.compareId ~= compareId
+					or resp.nextService ~= serviceName
+					or not prepareChunk
+					or prepareChunk < 0
+					or prepareChunk % 1 ~= 0
+				then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare("daemon advanced disk preparation out of order")
+					return
+				end
+				local prepared, prepareErr = postCompareChunk(serviceName, "diskPrepare", prepareChunk, false, {}, {})
+				if not prepared then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare(prepareErr or "disk preparation continuation failed")
+					return
+				end
+				preparePolls += 1
+				if resp.phase == "diskPrepare" then
+					if
+						tostring(resp.action) ~= "compare"
+						or resp.compareId ~= compareId
+						or resp.nextService ~= serviceName
+						or tonumber(resp.nextChunk) ~= prepareChunk + 1
+					then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare(
+							"daemon did not acknowledge the exact disk preparation cursor"
+						)
+						return
+					end
+					if preparePolls % 20 == 0 then
+						log(
+							string.format(
+								"  … %s disk preparation (%d continuation ticks)",
+								serviceName,
+								preparePolls
+							)
+						)
+					end
+					task.wait(0.05)
+				elseif
+					tostring(resp.action) ~= "compare"
+					or resp.compareId ~= compareId
+					or resp.nextService ~= serviceName
+					or resp.phase ~= "hashes"
+					or tonumber(resp.nextChunk) ~= 0
+				then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare("daemon disk preparation did not advance to script hashes")
+					return
+				end
+			end
+			if resp.nextService ~= serviceName or resp.phase ~= "hashes" or tonumber(resp.nextChunk) ~= 0 then
+				disposeScanGuard()
+				reconnectState.retryInitialCompare("daemon did not start the script hash stream")
+				return
+			end
+
+			local sourceIndex = 1
+			local hashChunkIndex = 0
+			repeat
+				local hashes = {}
+				while sourceIndex <= #sourceInstances and #hashes < scaleState.compareHashChunkRecords do
+					local sourceEntry = sourceInstances[sourceIndex]
+					hashes[#hashes + 1] = {
+						id = sourceEntry.id,
+						sha256 = scaleState.normalizedSourceHash(sourceEntry.inst),
+					}
+					sourceIndex += 1
+					if sourceIndex % scaleState.compareHashChunkRecords == 0 then
+						task.wait()
+						if scanGuard.dirty then
+							disposeScanGuard()
+							reconnectState.retryInitialCompare("Studio changed while hashing scripts")
+							return
+						end
+					end
+				end
+				local finalHashChunk = sourceIndex > #sourceInstances
+				if
+					resp.nextService ~= serviceName
+					or resp.phase ~= "hashes"
+					or tonumber(resp.nextChunk) ~= hashChunkIndex
+				then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare("daemon advanced the hash stream out of order")
+					return
+				end
+				local hashOk, hashErr =
+					postCompareChunk(serviceName, "hashes", hashChunkIndex, finalHashChunk, {}, hashes)
+				if not hashOk then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare(hashErr or "script hash stream failed")
+					return
+				end
+				hashChunkIndex += 1
+			until sourceIndex > #sourceInstances
+
+			local nextService = advertisedServices[index + 1]
+			if nextService then
+				if
+					tostring(resp.action) ~= "compare"
+					or resp.compareId ~= compareId
+					or resp.nextService ~= nextService
+					or resp.phase ~= "structure"
+					or tonumber(resp.nextChunk) ~= 0
+				then
+					disposeScanGuard()
+					log("initial-compare: daemon advanced the comparison session out of order")
+					reconnectState.retryInitialCompare("out-of-order streamed comparison response")
+					return
+				end
+			elseif tostring(resp.action) == "compare" or not resp.action then
+				disposeScanGuard()
+				log("initial-compare: daemon did not finalize the streamed comparison")
+				reconnectState.retryInitialCompare("streamed comparison did not finalize")
+				return
+			end
+		end
+		log(
+			string.format(
+				"Studio comparison stream: %d record(s), %d service(s), %.2fs",
+				streamedRecords,
+				#advertisedServices,
+				os.clock() - snapshotStarted
+			)
+		)
+	end
+	if scanBecameDirty("Studio changed during snapshot comparison") then
 		return
 	end
 	local action = tostring(resp.action)
@@ -9826,13 +14267,24 @@ runInitialCompare = function()
 		log("initial-compare: already in sync, skipping decision modal")
 		completeInitialCompare()
 	elseif action == "push" then
-		if doPushPath() then
+		-- Empty-disk bootstrap streams one service at a time.
+		if doPushPath(nil, scanGuard) then
 			completeInitialCompare()
+		elseif scanBecameDirty("Studio changed during snapshot push") then
+			return
 		else
+			disposeScanGuard()
 			reconnectState.retryInitialCompare("snapshot push failed")
 		end
 	elseif action == "pull" then
+		-- Disk application intentionally mutates Studio; stop the consistency
+		-- guard before applying it so our own writes do not look like user edits.
+		disposeScanGuard()
 		if doPullPath() then
+			-- The pull's own mutations are complete. Guard the time-sliced hook
+			-- install so a user edit in an as-yet-unhooked service cannot slip
+			-- through the handoff.
+			scanGuard = scaleState.beginStudioScanGuard()
 			completeInitialCompare()
 		else
 			reconnectState.retryInitialCompare("snapshot pull failed")
@@ -9843,40 +14295,62 @@ runInitialCompare = function()
 		decisionGeneration += 1
 		local gen = decisionGeneration
 		task.spawn(function()
-			local choice, selectedDiskPaths = waitForDecision(choiceId, gen)
+			local choice, selectiveDiskChoice, selectedDiskCount = waitForDecision(choiceId, gen)
 			if gen ~= decisionGeneration then
+				disposeScanGuard()
+				return
+			end
+			if choice == "malformed" then
+				disposeScanGuard()
+				log("decision: malformed daemon response")
+				disconnect("malformed initial decision")
+				return
+			end
+			if scanBecameDirty("Studio changed while the overwrite choice was open") then
 				return
 			end
 			if choice == "disk" then
-				local pulled = if type(selectedDiskPaths) == "table"
-					then doPullSelectedPaths(selectedDiskPaths)
+				disposeScanGuard()
+				local pulled = if selectiveDiskChoice == true
+					then doPullSelectedChoice(selectedDiskCount, tostring(choiceId))
 					else doPullPath(true)
 				if pulled then
+					scanGuard = scaleState.beginStudioScanGuard()
 					completeInitialCompare()
 				else
 					reconnectState.retryInitialCompare("strict snapshot pull failed")
 				end
 			elseif choice == "studio" then
-				if doPushPath(true) then
+				-- The guard keeps the tree coherent while the modal is open;
+				-- rescan and push one service at a time without retaining the
+				-- comparison Sources.
+				if doPushPath(true, scanGuard) then
 					completeInitialCompare()
+				elseif scanBecameDirty("Studio changed during strict snapshot push") then
+					return
 				else
+					disposeScanGuard()
 					reconnectState.retryInitialCompare("strict snapshot push failed")
 				end
 			elseif choice == "cancel" then
+				disposeScanGuard()
 				log("decision: cancel")
 				disconnect("cancelled by user")
 			elseif choice == "stale" then
+				disposeScanGuard()
 				log("decision: stale choice; restarting initial compare")
 				busy = true
 				setPill("connecting")
 				setBanner(nil)
 				runInitialCompare()
 			else
+				disposeScanGuard()
 				log("decision: unknown/aborted")
 				disconnect("decision aborted")
 			end
 		end)
 	else
+		disposeScanGuard()
 		log("initial-compare: unknown action " .. action)
 		reconnectState.stopTerminal("daemon returned an unknown initial-compare action: " .. action)
 	end
@@ -10396,6 +14870,8 @@ startConnect = function()
 						return
 					end
 				end
+				-- `node` and `requestBody` leave scope at the end of this
+				-- iteration, before the next service's Source tree is scanned.
 			end
 			-- Try to extract port from URL for label
 			chosenPort = chosenUrl:match(":(%d+)") or "?"

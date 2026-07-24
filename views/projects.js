@@ -969,12 +969,14 @@ export function mountProjects(root, api) {
         continue;
       }
       try {
-        const info = await daemonJson(base, "/snapshot");
+        // Project cards only need daemon/plugin health. Avoid `/snapshot`
+        // here: it serializes the complete filesystem projection and made a
+        // simple status refresh scale with the size of the entire place.
+        const info = await daemonJson(base, "/hello");
         snapshotByProject.set(p.id, {
           ok: true,
-          label: info.summary || "synced",
-          lastSync: info.lastSync,
-          dupeGroups: countDupeGroups(info),
+          label: info.pluginConnected ? "Studio connected" : "Waiting for Studio",
+          dupeGroups: 0,
         });
       } catch (e) {
         snapshotByProject.set(p.id, { ok: false, label: e.message });
@@ -1385,26 +1387,6 @@ function pluginStatusLabel(isActive, daemonOk, st) {
   if (!daemonOk) return "Daemon offline";
   if (st.kind === "ok") return "Daemon reachable";
   return "Waiting for daemon…";
-}
-function countDupeGroups(tree) {
-  if (!tree || typeof tree !== "object") return 0;
-  const SUFFIX_RE = /\s\[\d+\]$/;
-  let groups = 0;
-  function visit(node) {
-    if (!node || typeof node !== "object") return;
-    const kids = Array.isArray(node) ? node
-      : Array.isArray(node.children) ? node.children
-      : Array.isArray(node.services) ? node.services
-      : null;
-    if (kids) {
-      if (kids.some((c) => c && typeof c.name === "string" && SUFFIX_RE.test(c.name))) {
-        groups++;
-      }
-      for (const c of kids) visit(c);
-    }
-  }
-  visit(tree);
-  return groups;
 }
 function plusSVG() {
   return '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">' +

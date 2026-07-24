@@ -7,14 +7,22 @@
 //! plugin's responsibility and should be inspected through live CLI reads.
 
 use crate::fs_map::{
-    is_init_file, parse_init_file, parse_plain_init_file, path_to_instance_meta, ScriptClass,
-    META_FILE,
+    is_init_file, parse_init_file, parse_plain_init_file, path_to_instance_meta, PathInstance,
+    ScriptClass, META_FILE,
+};
+use crate::fs_safety::{
+    file_generation_no_follow, metadata_no_follow, read_to_string_no_follow,
+    resolve_rojo_path_no_follow, validate_rojo_project_directory, validate_service_path,
+    PortableDirectoryIndex, SafeEntryKind,
 };
 use crate::project_config;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 pub const RO_SYNC_MD: &str = "ro-sync.md";
 pub const CLAUDE_MD: &str = "CLAUDE.md";
@@ -106,16 +114,43 @@ const DEFAULT_WALLY_FOLDER: &str = "ReplicatedStorage/Packages";
 
 /// Top-level services mirrored under the project root. Order drives the
 /// on-disk service sort for the snapshot response.
-pub const SYNCED_SERVICES: &[&str] = &[
-    "ReplicatedStorage",
-    "ServerScriptService",
-    "StarterPlayer",
-    "StarterGui",
-    "Workspace",
-    "ReplicatedFirst",
-    "ServerStorage",
-    "Lighting",
-];
+pub use crate::fs_safety::SYNCED_SERVICES;
+const MAX_EMITTED_INSTANCE_DEPTH: usize = 48;
+pub const MAX_FLAT_INSTANCE_DEPTH: usize = 256;
+
+/// Source-free, parent-linked snapshot record used by protocol 5 streams.
+///
+/// IDs are dense preorder ordinals within one service. `child_index` retains
+/// Studio/disk sibling order before the daemon's deterministic projection sort,
+/// while `child_count` lets the receiver validate that no record was omitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlatSnapshotRecord {
+    pub id: u64,
+    pub parent_id: Option<u64>,
+    pub child_index: u32,
+    pub child_count: u32,
+    #[serde(default)]
+    pub has_children: bool,
+    pub name: String,
+    pub class: String,
+    #[serde(default)]
+    pub avoid_sync: bool,
+    #[serde(default)]
+    pub avoid_sync_carrier: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_fragment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_fragment_is_dir: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_included: Option<bool>,
+}
+
+#[derive(Debug)]
+pub struct FlatDiskService {
+    pub records: Vec<FlatSnapshotRecord>,
+    pub source_paths: HashMap<u64, PathBuf>,
+}
 
 #[allow(clippy::useless_concat)]
 const RO_SYNC_MD_TEMPLATE: &str = concat!(
@@ -562,7 +597,7 @@ rosync find-attr --project . --name Color --value \
 
 ## 6f. Capability discovery and screenshots
 
-Protocol 3 / plugin 2.2.0 exposes optional Studio features explicitly. Check
+Protocol 5 / plugin 2.4.0 exposes optional Studio features explicitly. Check
 them before choosing capture or playtest commands:
 
 ```
@@ -1080,6 +1115,154 @@ impl RoSyncDocRefresh {
     }
 }
 
+fn validated_project_tool_path(
+    root: &Path,
+    path: &Path,
+    allow_missing: bool,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let canonical_root = crate::fs_safety::stable_canonical_directory(root)?;
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root)
+            .or_else(|_| path.strip_prefix(&canonical_root))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "project tooling path {} is outside {}",
+                        path.display(),
+                        canonical_root.display()
+                    ),
+                )
+            })?
+    } else {
+        path
+    };
+    let validated =
+        crate::fs_safety::validate_descendant_no_follow(&canonical_root, relative, allow_missing)?;
+    Ok((canonical_root, validated))
+}
+
+pub(crate) fn project_tool_file_exists(root: &Path, path: &Path) -> io::Result<bool> {
+    let (canonical_root, validated) = validated_project_tool_path(root, path, true)?;
+    let guard = crate::fs_safety::guard_descendant_parent_chain(&canonical_root, &validated, true)?;
+    guard.verify()?;
+    let metadata = crate::fs_safety::metadata_no_follow(&validated)?;
+    guard.verify()?;
+    match metadata {
+        None => Ok(false),
+        Some(metadata) if metadata.is_file() => Ok(true),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "project tooling path is not a regular file: {}",
+                validated.display()
+            ),
+        )),
+    }
+}
+
+pub(crate) fn read_project_tool_text(root: &Path, path: &Path) -> io::Result<Option<String>> {
+    let (canonical_root, validated) = validated_project_tool_path(root, path, true)?;
+    let guard = crate::fs_safety::guard_descendant_parent_chain(&canonical_root, &validated, true)?;
+    guard.verify()?;
+    let Some(metadata) = crate::fs_safety::metadata_no_follow(&validated)? else {
+        guard.verify()?;
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "project tooling path is not a regular file: {}",
+                validated.display()
+            ),
+        ));
+    }
+    guard.verify()?;
+    let text = crate::fs_safety::read_to_string_no_follow(&validated)?;
+    guard.verify()?;
+    Ok(Some(text))
+}
+
+fn write_project_tool_text(root: &Path, path: &Path, text: &str) -> io::Result<()> {
+    let (canonical_root, initial_target) = validated_project_tool_path(root, path, true)?;
+    let parent = initial_target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("project tooling path has no parent: {}", path.display()),
+        )
+    })?;
+    crate::fs_safety::ensure_descendant_directory_chain(&canonical_root, parent)?;
+    let (_, target) = validated_project_tool_path(&canonical_root, &initial_target, true)?;
+    let guard = crate::fs_safety::guard_descendant_parent_chain(&canonical_root, &target, true)?;
+    let existing = crate::fs_safety::metadata_no_follow(&target)?;
+    if existing
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_file())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "project tooling path is not a regular file: {}",
+                target.display()
+            ),
+        ));
+    }
+
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid tooling filename"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary =
+        target.with_file_name(format!(".{file_name}.{}-{nonce}.tmp", std::process::id()));
+    let _ = validated_project_tool_path(&canonical_root, &temporary, true)?;
+
+    let result = (|| {
+        guard.verify()?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if let Some(metadata) = existing {
+            fs::set_permissions(&temporary, metadata.permissions())?;
+        }
+
+        guard.verify()?;
+        let _ = crate::fs_safety::metadata_no_follow(&target)?;
+        crate::lifecycle::replace_file_atomic(&temporary, &target)?;
+        guard.verify()?;
+        let metadata = crate::fs_safety::require_metadata_no_follow(&target)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "project tooling replacement is not a regular file: {}",
+                    target.display()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+
+    if result.is_err()
+        && guard.verify().is_ok()
+        && matches!(
+            crate::fs_safety::metadata_no_follow(&temporary),
+            Ok(Some(metadata)) if metadata.is_file()
+        )
+    {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Write `ro-sync.md` at the root if it doesn't already exist. Existing
 /// unmarked user files are left alone; generated-looking legacy files can be
 /// upgraded to the current marked template.
@@ -1095,15 +1278,13 @@ pub fn refresh_ro_sync_md(root: &Path) -> io::Result<RoSyncDocRefresh> {
 }
 
 fn refresh_ro_sync_md_impl(root: &Path, explicit_refresh: bool) -> io::Result<RoSyncDocRefresh> {
-    fs::create_dir_all(root)?;
     let p = root.join(RO_SYNC_MD);
-    if p.exists() {
-        let existing = fs::read_to_string(&p)?;
+    if let Some(existing) = read_project_tool_text(root, &p)? {
         if let Some(merged) = merge_ro_sync_generated_block(&existing) {
             if merged == existing {
                 return Ok(RoSyncDocRefresh::Unchanged);
             }
-            fs::write(&p, merged)?;
+            write_project_tool_text(root, &p, &merged)?;
             return Ok(RoSyncDocRefresh::Updated);
         }
         if looks_like_legacy_generated_ro_sync_md(&existing)
@@ -1112,7 +1293,7 @@ fn refresh_ro_sync_md_impl(root: &Path, explicit_refresh: bool) -> io::Result<Ro
             if existing == RO_SYNC_MD_TEMPLATE {
                 return Ok(RoSyncDocRefresh::Unchanged);
             }
-            fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
+            write_project_tool_text(root, &p, RO_SYNC_MD_TEMPLATE)?;
             return Ok(RoSyncDocRefresh::Updated);
         }
         if explicit_refresh && !looks_like_legacy_generated_ro_sync_md(&existing) {
@@ -1120,7 +1301,7 @@ fn refresh_ro_sync_md_impl(root: &Path, explicit_refresh: bool) -> io::Result<Ro
         }
         return Ok(RoSyncDocRefresh::Unchanged);
     }
-    fs::write(&p, RO_SYNC_MD_TEMPLATE)?;
+    write_project_tool_text(root, &p, RO_SYNC_MD_TEMPLATE)?;
     Ok(RoSyncDocRefresh::Created)
 }
 
@@ -1181,16 +1362,14 @@ fn ro_sync_generated_block() -> &'static str {
 ///
 /// Returns `true` when the file was created or modified.
 pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let p = root.join(CLAUDE_MD);
-    if !p.exists() {
-        fs::write(&p, CLAUDE_MD_TEMPLATE)?;
+    let Some(existing) = read_project_tool_text(root, &p)? else {
+        write_project_tool_text(root, &p, CLAUDE_MD_TEMPLATE)?;
         return Ok(true);
-    }
-    let existing = fs::read_to_string(&p)?;
+    };
     let migrated = replace_bare_ro_sync_imports_with_agents(&existing);
     if migrated != existing {
-        fs::write(&p, migrated)?;
+        write_project_tool_text(root, &p, &migrated)?;
         return Ok(true);
     }
     if claude_md_imports_agents(&existing) {
@@ -1205,7 +1384,7 @@ pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     }
     merged.push_str(AGENTS_IMPORT_LINE);
     merged.push('\n');
-    fs::write(&p, merged)?;
+    write_project_tool_text(root, &p, &merged)?;
     Ok(true)
 }
 
@@ -1217,7 +1396,6 @@ pub fn write_claude_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
 ///
 /// Returns `true` when any Codex-facing file was created or modified.
 pub fn write_codex_context_if_missing_or_merge(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let mut changed = false;
     changed |= write_codex_config_if_missing_or_merge(root)?;
     changed |= write_agents_md_if_missing_or_merge(root)?;
@@ -1231,7 +1409,6 @@ pub fn write_codex_context_if_missing_or_merge(root: &Path) -> io::Result<bool> 
 /// `.stylua.toml` is only created when missing, and `aftman.toml` is merged
 /// only when the `[tools]` table does not already define `stylua`.
 pub fn write_project_tooling_if_missing_or_merge(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let mut changed = false;
     changed |= write_stylua_toml_if_missing(root)?;
     changed |= write_aftman_stylua_if_missing_or_merge(root)?;
@@ -1241,51 +1418,42 @@ pub fn write_project_tooling_if_missing_or_merge(root: &Path) -> io::Result<bool
 }
 
 pub fn write_stylua_toml_if_missing(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let p = root.join(STYLUA_TOML);
-    if p.exists() {
+    if project_tool_file_exists(root, &p)? {
         return Ok(false);
     }
-    fs::write(&p, STYLUA_TOML_TEMPLATE)?;
+    write_project_tool_text(root, &p, STYLUA_TOML_TEMPLATE)?;
     Ok(true)
 }
 
 pub fn write_aftman_stylua_if_missing_or_merge(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let p = root.join(AFTMAN_TOML);
-    if !p.exists() {
-        fs::write(&p, AFTMAN_TOML_TEMPLATE)?;
+    let Some(existing) = read_project_tool_text(root, &p)? else {
+        write_project_tool_text(root, &p, AFTMAN_TOML_TEMPLATE)?;
         return Ok(true);
-    }
-
-    let existing = fs::read_to_string(&p)?;
+    };
     let merged = merge_aftman_stylua_tool(&existing)?;
     if merged == existing {
         return Ok(false);
     }
-    fs::write(&p, merged)?;
+    write_project_tool_text(root, &p, &merged)?;
     Ok(true)
 }
 
 pub fn write_roblox_definitions_if_missing_or_update(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let p = root.join(ROBLOX_DEFINITIONS_PATH);
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if p.exists() && fs::read_to_string(&p)? == ROBLOX_GLOBAL_TYPES {
+    if read_project_tool_text(root, &p)?.as_deref() == Some(ROBLOX_GLOBAL_TYPES) {
         return Ok(false);
     }
-    fs::write(&p, ROBLOX_GLOBAL_TYPES)?;
+    write_project_tool_text(root, &p, ROBLOX_GLOBAL_TYPES)?;
     Ok(true)
 }
 
 pub fn write_luaurc_if_missing_or_cleanup(root: &Path) -> io::Result<bool> {
-    fs::create_dir_all(root)?;
     let p = root.join(LUAURC);
-    let existed = p.exists();
-    let mut config = if existed {
-        let existing = fs::read_to_string(&p)?;
+    let existing = read_project_tool_text(root, &p)?;
+    let existed = existing.is_some();
+    let mut config = if let Some(existing) = existing {
         serde_json::from_str::<Value>(&existing).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1326,7 +1494,7 @@ pub fn write_luaurc_if_missing_or_cleanup(root: &Path) -> io::Result<bool> {
 
     let text = serde_json::to_string_pretty(&config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&p, format!("{text}\n"))?;
+    write_project_tool_text(root, &p, &format!("{text}\n"))?;
     Ok(true)
 }
 
@@ -1380,51 +1548,46 @@ fn merge_aftman_stylua_tool(existing: &str) -> io::Result<String> {
 }
 
 pub fn write_codex_config_if_missing_or_merge(root: &Path) -> io::Result<bool> {
-    let dir = root.join(CODEX_DIR);
-    fs::create_dir_all(&dir)?;
-    let p = dir.join(CODEX_CONFIG_TOML);
+    let p = root.join(CODEX_DIR).join(CODEX_CONFIG_TOML);
     let desired_line = codex_project_doc_fallback_line();
-    if !p.exists() {
-        fs::write(&p, format!("{desired_line}\n"))?;
+    let Some(existing) = read_project_tool_text(root, &p)? else {
+        write_project_tool_text(root, &p, &format!("{desired_line}\n"))?;
         return Ok(true);
-    }
-
-    let existing = fs::read_to_string(&p)?;
+    };
     let merged = merge_codex_project_doc_fallbacks(&existing);
     if merged == existing {
         return Ok(false);
     }
-    fs::write(&p, merged)?;
+    write_project_tool_text(root, &p, &merged)?;
     Ok(true)
 }
 
 pub fn write_agents_md_if_missing_or_merge(root: &Path) -> io::Result<bool> {
     let p = root.join(AGENTS_MD);
-    let block = codex_agents_block(root);
-    let next = if !p.exists() {
-        format!(
+    let block = codex_agents_block(root)?;
+    let existing = read_project_tool_text(root, &p)?;
+    let next = match existing.as_deref() {
+        None => format!(
             "# Agent project memory\n\nThis file is maintained by Ro Sync. Codex reads AGENTS.md directly; Claude Code reads CLAUDE.md, which imports this file.\n\n{block}"
-        )
-    } else {
-        let existing = fs::read_to_string(&p)?;
-        merge_generated_block(&existing, &block)
+        ),
+        Some(existing) => merge_generated_block(existing, &block),
     };
 
-    if p.exists() && fs::read_to_string(&p)? == next {
+    if existing.as_deref() == Some(next.as_str()) {
         return Ok(false);
     }
-    fs::write(&p, next)?;
+    write_project_tool_text(root, &p, &next)?;
     Ok(true)
 }
 
-fn codex_agents_block(root: &Path) -> String {
-    let mut ro_sync_sections = read_doc_variants(root, RO_SYNC_DOC_VARIANTS);
+fn codex_agents_block(root: &Path) -> io::Result<String> {
+    let mut ro_sync_sections = read_doc_variants(root, RO_SYNC_DOC_VARIANTS)?;
     if ro_sync_sections.is_empty() {
         ro_sync_sections.push((RO_SYNC_MD.to_string(), RO_SYNC_MD_TEMPLATE.into()));
     }
     let ro_sync = format_doc_sections(ro_sync_sections);
-    let wally = wally_agents_section(root).unwrap_or_default();
-    format!(
+    let wally = wally_agents_section(root)?.unwrap_or_default();
+    Ok(format!(
         "{CODEX_CONTEXT_START}\n\
          # Ro Sync Codex Context\n\n\
          The section between these markers is regenerated by Ro Sync. Put durable project-specific Codex notes outside the markers.\n\n\
@@ -1432,11 +1595,11 @@ fn codex_agents_block(root: &Path) -> String {
          {ro_sync}\n\
          {wally}\
          {CODEX_CONTEXT_END}\n"
-    )
+    ))
 }
 
-fn wally_agents_section(root: &Path) -> Option<String> {
-    let cfg = project_config::read_from_disk(root).ok().flatten();
+fn wally_agents_section(root: &Path) -> io::Result<Option<String>> {
+    let cfg = project_config::read_from_disk(root)?;
     let mut parts = Vec::new();
 
     if let Some(cfg) = cfg.as_ref() {
@@ -1448,8 +1611,7 @@ fn wally_agents_section(root: &Path) -> Option<String> {
         {
             let folder = cfg.wally_folder.as_deref().unwrap_or(DEFAULT_WALLY_FOLDER);
             let wally_path = wally_toml_path_for_folder(root, folder);
-            let file_text = fs::read_to_string(&wally_path)
-                .ok()
+            let file_text = read_project_tool_text(root, &wally_path)?
                 .or_else(|| cfg.wally_file.clone())
                 .filter(|text| !text.trim().is_empty());
 
@@ -1471,7 +1633,7 @@ fn wally_agents_section(root: &Path) -> Option<String> {
 
     if parts.is_empty() {
         for path in fallback_wally_toml_candidates(root) {
-            let Ok(text) = fs::read_to_string(&path) else {
+            let Some(text) = read_project_tool_text(root, &path)? else {
                 continue;
             };
             if text.trim().is_empty() {
@@ -1483,13 +1645,13 @@ fn wally_agents_section(root: &Path) -> Option<String> {
     }
 
     if parts.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(format!(
+    Ok(Some(format!(
         "\n## Wally Package Context\n\nRo Sync detected Wally package configuration for this project. Keep this in mind when resolving `Packages` requires or dependency-owned diagnostics.\n\n{}\n",
         parts.join("\n")
-    ))
+    )))
 }
 
 fn format_wally_file_section(root: &Path, path: &Path, text: &str) -> String {
@@ -1528,18 +1690,44 @@ fn relative_label(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn read_doc_variants(root: &Path, names: &[&str]) -> Vec<(String, String)> {
+fn read_doc_variants(root: &Path, names: &[&str]) -> io::Result<Vec<(String, String)>> {
+    let canonical_root = crate::fs_safety::stable_canonical_directory(root)?;
+    let index = PortableDirectoryIndex::read_raw(&canonical_root)?;
     let mut docs = Vec::new();
     for name in names {
-        let Ok(text) = fs::read_to_string(root.join(name)) else {
+        if let Some(link) = index.exact_link(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "refusing linked/reparse project document: {}",
+                    link.path.display()
+                ),
+            ));
+        }
+        let Some(entry) = index.exact(name) else {
             continue;
         };
+        if entry.kind != SafeEntryKind::File {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "project document is not a regular file: {}",
+                    entry.path.display()
+                ),
+            ));
+        }
+        let text = read_project_tool_text(&canonical_root, &entry.path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("project document disappeared: {}", entry.path.display()),
+            )
+        })?;
         if docs.iter().any(|(_, existing)| existing == &text) {
             continue;
         }
         docs.push(((*name).to_string(), text));
     }
-    docs
+    Ok(docs)
 }
 
 fn format_doc_sections(sections: Vec<(String, String)>) -> String {
@@ -1721,53 +1909,328 @@ fn replace_bare_ro_sync_imports_with_agents(contents: &str) -> String {
 pub fn emit_services(root: &Path) -> io::Result<Vec<Value>> {
     let mut services = Vec::new();
     for svc in SYNCED_SERVICES {
-        let svc_dir = root.join(svc);
-        if !svc_dir.is_dir() {
+        let service_path = validate_service_path(root, svc, true)?;
+        if metadata_no_follow(&service_path)?.is_none() {
             continue;
         }
-        let children = walk_children(&svc_dir, false)?;
-        services.push(json!({
-            "class": svc,
-            "name": svc,
-            "properties": {},
-            "children": children,
-        }));
+        services.push(emit_service(root, svc)?);
     }
     Ok(services)
 }
 
-fn walk_children(dir: &Path, parent_is_script: bool) -> io::Result<Vec<Value>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let e = entry?;
-        let fname = e.file_name();
-        let Some(name_str) = fname.to_str() else {
+/// Emit one complete service projection. Unlike [`emit_services`], this also
+/// returns an empty service node when its directory is absent so a strict,
+/// per-service disk pull can prune stale Studio projection state.
+pub fn emit_service(root: &Path, service: &str) -> io::Result<Value> {
+    if !SYNCED_SERVICES.contains(&service) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported synced service: {service}"),
+        ));
+    }
+    let service_dir = validate_service_path(root, service, true)?;
+    let children = if metadata_no_follow(&service_dir)?.is_some() {
+        validate_rojo_project_directory(&service_dir)?;
+        walk_children(&service_dir, false)?
+    } else {
+        Vec::new()
+    };
+    Ok(json!({
+        "class": service,
+        "name": service,
+        "properties": {},
+        "children": children,
+    }))
+}
+
+/// Emit one service as bounded-stream metadata without reading any script
+/// Source bytes. Source file paths are returned separately so callers can hash
+/// or segment one script at a time.
+pub fn emit_flat_service(root: &Path, service: &str) -> io::Result<FlatDiskService> {
+    if !SYNCED_SERVICES.contains(&service) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported synced service: {service}"),
+        ));
+    }
+    let mut state = FlatDiskService {
+        records: vec![FlatSnapshotRecord {
+            id: 0,
+            parent_id: None,
+            child_index: 0,
+            child_count: 0,
+            has_children: true,
+            name: service.to_string(),
+            class: service.to_string(),
+            avoid_sync: false,
+            avoid_sync_carrier: false,
+            disk_fragment: None,
+            disk_fragment_is_dir: None,
+            source_included: None,
+        }],
+        source_paths: HashMap::new(),
+    };
+    let service_dir = validate_service_path(root, service, true)?;
+    if metadata_no_follow(&service_dir)?.is_some() {
+        validate_rojo_project_directory(&service_dir)?;
+        let children = collect_flat_disk_children(&service_dir, false, 1)?;
+        state.records[0].child_count = u32::try_from(children.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot service has more than u32::MAX direct children",
+            )
+        })?;
+        for (child_index, child) in children.into_iter().enumerate() {
+            flatten_disk_node(child, 0, child_index, &mut state)?;
+        }
+    }
+    Ok(state)
+}
+
+struct FlatDiskCandidate {
+    effective_path: PathBuf,
+    instance: PathInstance,
+    name: String,
+    disk_fragment: String,
+    disk_fragment_is_dir: bool,
+}
+
+struct PendingFlatDiskNode {
+    candidate: FlatDiskCandidate,
+    children: Vec<PendingFlatDiskNode>,
+}
+
+fn flat_disk_candidate(path: &Path) -> io::Result<Option<FlatDiskCandidate>> {
+    let Some(source_fragment) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    if source_fragment == META_FILE {
+        return Ok(None);
+    }
+
+    let Some(path_metadata) = metadata_no_follow(path)? else {
+        return Ok(None);
+    };
+    let path_is_dir = path_metadata.is_dir();
+    let mut effective_path = path.to_path_buf();
+    let mut name_override = None;
+    if path_is_dir {
+        if let Some(target) = default_project_path(path)? {
+            let target_is_own_init = target.parent() == Some(path)
+                && target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_init_file);
+            if !target_is_own_init && metadata_no_follow(&target)?.is_some() {
+                name_override = path_to_instance_meta(path)?
+                    .map(|instance| instance.name)
+                    .or_else(|| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string)
+                    });
+                effective_path = target;
+            }
+        }
+    }
+
+    let Some(instance) = path_to_instance_meta(&effective_path)? else {
+        return Ok(None);
+    };
+    if instance.class == "Folder" && crate::fs_map::is_empty_plain_folder(&effective_path)? {
+        return Ok(None);
+    }
+    if instance.class != "Folder"
+        && !matches!(
+            instance.class.as_str(),
+            "Script" | "LocalScript" | "ModuleScript"
+        )
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(FlatDiskCandidate {
+        effective_path,
+        name: name_override.unwrap_or_else(|| instance.name.clone()),
+        disk_fragment: source_fragment,
+        disk_fragment_is_dir: path_is_dir,
+        instance,
+    }))
+}
+
+fn collect_flat_disk_children(
+    dir: &Path,
+    parent_is_script: bool,
+    depth: usize,
+) -> io::Result<Vec<PendingFlatDiskNode>> {
+    if depth > MAX_FLAT_INSTANCE_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "flat snapshot tree depth exceeds the supported limit of {MAX_FLAT_INSTANCE_DEPTH} instances at {}",
+                dir.display()
+            ),
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    for entry in PortableDirectoryIndex::read(dir)?.entries() {
+        if parent_is_script && is_init_file(&entry.fragment) {
             continue;
+        }
+        if let Some(candidate) = flat_disk_candidate(&entry.path)? {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.disk_fragment.cmp(&right.disk_fragment))
+    });
+    let mut nodes = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let children = if candidate.instance.is_dir {
+            collect_flat_disk_children(
+                &candidate.effective_path,
+                candidate.instance.is_script_with_children,
+                depth + 1,
+            )?
+        } else {
+            Vec::new()
         };
-        if name_str == META_FILE {
+        // Plain folders only project when at least one descendant projects.
+        // Files such as notes.md and assets are intentionally invisible.
+        if candidate.instance.class == "Folder" && children.is_empty() {
+            continue;
+        }
+        nodes.push(PendingFlatDiskNode {
+            candidate,
+            children,
+        });
+    }
+    Ok(nodes)
+}
+
+fn flatten_disk_node(
+    node: PendingFlatDiskNode,
+    parent_id: u64,
+    child_index: usize,
+    state: &mut FlatDiskService,
+) -> io::Result<u64> {
+    let id = u64::try_from(state.records.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot contains more than u64::MAX instances",
+        )
+    })?;
+    let child_count = u32::try_from(node.children.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot parent has more than u32::MAX children",
+        )
+    })?;
+    let is_script = matches!(
+        node.candidate.instance.class.as_str(),
+        "Script" | "LocalScript" | "ModuleScript"
+    );
+    state.records.push(FlatSnapshotRecord {
+        id,
+        parent_id: Some(parent_id),
+        child_index: u32::try_from(child_index).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot parent has more than u32::MAX children",
+            )
+        })?,
+        child_count,
+        has_children: node.candidate.instance.is_dir,
+        name: node.candidate.name,
+        class: node.candidate.instance.class.clone(),
+        avoid_sync: false,
+        avoid_sync_carrier: false,
+        disk_fragment: Some(node.candidate.disk_fragment),
+        disk_fragment_is_dir: Some(node.candidate.disk_fragment_is_dir),
+        source_included: None,
+    });
+    if is_script {
+        let source_path = if node.candidate.instance.is_script_with_children {
+            find_init_source_path(
+                &node.candidate.effective_path,
+                node.candidate.instance.script_class,
+            )?
+        } else {
+            node.candidate.effective_path.clone()
+        };
+        state.source_paths.insert(id, source_path);
+    }
+    for (index, child) in node.children.into_iter().enumerate() {
+        flatten_disk_node(child, id, index, state)?;
+    }
+    Ok(id)
+}
+
+fn walk_children(dir: &Path, parent_is_script: bool) -> io::Result<Vec<Value>> {
+    walk_children_at_depth(dir, parent_is_script, 1)
+}
+
+fn walk_children_at_depth(
+    dir: &Path,
+    parent_is_script: bool,
+    depth: usize,
+) -> io::Result<Vec<Value>> {
+    if depth > MAX_EMITTED_INSTANCE_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "snapshot tree depth exceeds the supported limit of {MAX_EMITTED_INSTANCE_DEPTH} instances at {}",
+                dir.display()
+            ),
+        ));
+    }
+    let mut out = Vec::new();
+    for entry in PortableDirectoryIndex::read(dir)?.entries() {
+        if entry.fragment == META_FILE {
             continue;
         }
         // The script-with-children init file describes the parent, not a child.
-        if parent_is_script && is_init_file(name_str) {
+        if parent_is_script && is_init_file(&entry.fragment) {
             continue;
         }
-        let p = e.path();
-        if let Some(node) = build_whitelisted_node(&p)? {
+        if let Some(node) = build_whitelisted_node(&entry.path, depth)? {
             out.push(node);
         }
     }
     out.sort_by(|a, b| {
         let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        an.cmp(bn)
+        let af = a.get("diskFragment").and_then(Value::as_str).unwrap_or("");
+        let bf = b.get("diskFragment").and_then(Value::as_str).unwrap_or("");
+        an.cmp(bn).then_with(|| af.cmp(bf))
     });
     Ok(out)
 }
 
-fn build_whitelisted_node(path: &Path) -> io::Result<Option<Value>> {
-    if path.is_dir() {
+fn build_whitelisted_node(path: &Path, depth: usize) -> io::Result<Option<Value>> {
+    let source_fragment = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    let Some(path_metadata) = metadata_no_follow(path)? else {
+        return Ok(None);
+    };
+    let path_is_dir = path_metadata.is_dir();
+    if path_is_dir {
         if let Some(target) = default_project_path(path)? {
-            if target.exists() {
+            let target_is_own_init = target.parent() == Some(path)
+                && target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_init_file);
+            if !target_is_own_init && metadata_no_follow(&target)?.is_some() {
                 let name = path_to_instance_meta(path)?
                     .map(|inst| inst.name)
                     .or_else(|| {
@@ -1775,17 +2238,29 @@ fn build_whitelisted_node(path: &Path) -> io::Result<Option<Value>> {
                             .and_then(|name| name.to_str())
                             .map(|name| name.to_string())
                     });
-                return build_whitelisted_node_at(&target, name);
+                return build_whitelisted_node_at(
+                    &target,
+                    name,
+                    source_fragment.map(|fragment| (fragment, true)),
+                    depth,
+                );
             }
         }
     }
 
-    build_whitelisted_node_at(path, None)
+    build_whitelisted_node_at(
+        path,
+        None,
+        source_fragment.map(|fragment| (fragment, path_is_dir)),
+        depth,
+    )
 }
 
 fn build_whitelisted_node_at(
     path: &Path,
     name_override: Option<String>,
+    disk_fragment_override: Option<(String, bool)>,
+    depth: usize,
 ) -> io::Result<Option<Value>> {
     let Some(inst) = path_to_instance_meta(path)? else {
         return Ok(None);
@@ -1807,35 +2282,57 @@ fn build_whitelisted_node_at(
         let source = if inst.is_script_with_children {
             read_init_source(path, inst.script_class)?
         } else {
-            fs::read_to_string(path)?
+            file_generation_no_follow(path).map_err(io::Error::other)?;
+            read_to_string_no_follow(path)?
         };
         props.insert("Source".to_string(), Value::String(source));
     }
 
     let children = if inst.is_dir {
-        walk_children(path, inst.is_script_with_children)?
+        walk_children_at_depth(path, inst.is_script_with_children, depth + 1)?
     } else {
         Vec::new()
     };
     if is_folder && children.is_empty() {
         return Ok(None);
     }
+    let (disk_fragment, disk_fragment_is_dir) = disk_fragment_override.unwrap_or_else(|| {
+        (
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            inst.is_dir,
+        )
+    });
 
     Ok(Some(json!({
         "class": inst.class,
         "name": name_override.unwrap_or(inst.name),
+        "diskFragment": disk_fragment,
+        "diskFragmentIsDir": disk_fragment_is_dir,
         "properties": Value::Object(props),
         "children": children,
     })))
 }
 
 fn default_project_path(dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
-    let project_file = dir.join(ROJO_PROJECT_FILE);
-    if !project_file.is_file() {
+    let index = PortableDirectoryIndex::read(dir)?;
+    let Some(project_entry) = index.exact(ROJO_PROJECT_FILE) else {
         return Ok(None);
+    };
+    if project_entry.kind != SafeEntryKind::File {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Rojo project marker is not a regular file: {}",
+                project_entry.path.display()
+            ),
+        ));
     }
 
-    let text = fs::read_to_string(project_file)?;
+    file_generation_no_follow(&project_entry.path).map_err(io::Error::other)?;
+    let text = read_to_string_no_follow(&project_entry.path)?;
     let value: Value = serde_json::from_str(&text).map_err(io::Error::other)?;
     let Some(path) = value
         .get("tree")
@@ -1845,54 +2342,26 @@ fn default_project_path(dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
         return Ok(None);
     };
 
-    let Some(relative_path) = safe_rojo_relative_path(path) else {
-        return Ok(None);
-    };
-
-    Ok(Some(dir.join(relative_path)))
-}
-
-fn safe_rojo_relative_path(path: &str) -> Option<std::path::PathBuf> {
-    if path.is_empty() || Path::new(path).is_absolute() || looks_like_windows_rooted_path(path) {
-        return None;
-    }
-
-    let mut out = std::path::PathBuf::new();
-    for segment in path.split(['/', '\\']) {
-        if segment.is_empty() || segment == ".." {
-            return None;
-        }
-        if segment != "." {
-            out.push(segment);
-        }
-    }
-    Some(out)
-}
-
-fn looks_like_windows_rooted_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-        || path.starts_with('\\')
-        || path.starts_with("//")
+    Ok(Some(resolve_rojo_path_no_follow(dir, path, true)?))
 }
 
 /// Read the `init (...).luau` file inside a script-with-children directory.
 /// Returns an error when the directory or source cannot be read. Treating an
 /// unreadable script as empty can later push destructive empty Source text.
 fn read_init_source(dir: &Path, sc: Option<ScriptClass>) -> io::Result<String> {
-    let iter = fs::read_dir(dir)?;
-    for entry in iter {
-        let entry = entry?;
-        let fname = entry.file_name();
-        let Some(name_str) = fname.to_str() else {
-            continue;
-        };
-        let class = parse_init_file(name_str)
+    let path = find_init_source_path(dir, sc)?;
+    file_generation_no_follow(&path).map_err(io::Error::other)?;
+    read_to_string_no_follow(&path)
+}
+
+fn find_init_source_path(dir: &Path, sc: Option<ScriptClass>) -> io::Result<PathBuf> {
+    let index = PortableDirectoryIndex::read(dir)?;
+    if let Some(entry) = index.unique_init_source() {
+        let class = parse_init_file(&entry.fragment)
             .map(|(class, _)| class)
-            .or_else(|| parse_plain_init_file(name_str));
-        let Some(class) = class else { continue };
-        if sc.map(|want| want == class).unwrap_or(true) {
-            return fs::read_to_string(entry.path());
+            .or_else(|| parse_plain_init_file(&entry.fragment));
+        if class.is_some_and(|class| sc.map(|want| want == class).unwrap_or(true)) {
+            return Ok(entry.path.clone());
         }
     }
     Err(io::Error::new(
@@ -2272,6 +2741,44 @@ mod tests {
         assert!(!write_project_tooling_if_missing_or_merge(d.path()).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn refresh_refuses_a_linked_generated_document() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new("linked-refresh-doc");
+        let external = TempDir::new("linked-refresh-external");
+        let sentinel = external.path().join("sentinel.md");
+        fs::write(&sentinel, "# external sentinel\n").unwrap();
+        symlink(&sentinel, project.path().join(RO_SYNC_MD)).unwrap();
+
+        let error = refresh_ro_sync_md(project.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            "# external sentinel\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tooling_creation_refuses_a_linked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new("linked-tooling-parent");
+        let external = TempDir::new("linked-tooling-external");
+        fs::write(external.path().join("sentinel"), "keep").unwrap();
+        symlink(external.path(), project.path().join("tools")).unwrap();
+
+        let error = write_roblox_definitions_if_missing_or_update(project.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!external.path().join("luau-lsp").exists());
+        assert_eq!(
+            fs::read_to_string(external.path().join("sentinel")).unwrap(),
+            "keep"
+        );
+    }
+
     #[test]
     fn luaurc_merge_preserves_existing_config_without_definitions_key() {
         let d = TempDir::new("luaurc-merge");
@@ -2418,6 +2925,8 @@ mod tests {
 
         let config = find_child(rs_node, "Config").unwrap();
         assert_eq!(config["class"], "ModuleScript");
+        assert_eq!(config["diskFragment"], "Config.luau");
+        assert_eq!(config["diskFragmentIsDir"], false);
         assert_eq!(config["properties"]["Source"], "return {}");
         assert_eq!(config["children"].as_array().unwrap().len(), 0);
 
@@ -2430,6 +2939,42 @@ mod tests {
         let util = find_child(shared_node, "Util").unwrap();
         assert_eq!(util["class"], "ModuleScript");
         assert_eq!(util["properties"]["Source"], "return 42");
+    }
+
+    #[test]
+    fn duplicate_snapshot_nodes_retain_exact_disk_fragment_identity() {
+        let d = TempDir::new("duplicate-fragment-identity");
+        let rs = d.path().join("ReplicatedStorage");
+        fs::create_dir_all(&rs).unwrap();
+        fs::write(rs.join("Same.luau"), b"return 'first'").unwrap();
+        fs::write(rs.join("Same [1].luau"), b"return 'second'").unwrap();
+
+        let services = emit_services(d.path()).unwrap();
+        let rs_node = find_service(&services, "ReplicatedStorage").unwrap();
+        let children = rs_node["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["name"], "Same");
+        assert_eq!(children[0]["diskFragment"], "Same [1].luau");
+        assert_eq!(children[0]["properties"]["Source"], "return 'second'");
+        assert_eq!(children[1]["name"], "Same");
+        assert_eq!(children[1]["diskFragment"], "Same.luau");
+        assert_eq!(children[1]["properties"]["Source"], "return 'first'");
+    }
+
+    #[test]
+    fn over_deep_disk_tree_fails_cleanly_before_recursive_overflow() {
+        let d = TempDir::new("over-deep-disk-tree");
+        let mut cursor = d.path().join("ReplicatedStorage");
+        fs::create_dir_all(&cursor).unwrap();
+        for index in 0..=MAX_EMITTED_INSTANCE_DEPTH {
+            cursor = cursor.join(format!("D{index}"));
+            fs::create_dir(&cursor).unwrap();
+        }
+        fs::write(cursor.join("Leaf.luau"), b"return true").unwrap();
+
+        let error = emit_services(d.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("snapshot tree depth exceeds"));
     }
 
     #[test]
@@ -2537,6 +3082,47 @@ mod tests {
     }
 
     #[test]
+    fn direct_init_rojo_path_preserves_wrapper_directory_shape_in_flat_and_legacy() {
+        let d = TempDir::new("wally-direct-init-wrapper");
+        let package = d.path().join("ReplicatedStorage").join("Promise");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("default.project.json"),
+            r#"{"tree":{"$path":"init.luau"}}"#,
+        )
+        .unwrap();
+        fs::write(package.join("init.luau"), "return {}").unwrap();
+        fs::write(package.join("Error.luau"), "return {}").unwrap();
+
+        let legacy = emit_service(d.path(), "ReplicatedStorage").unwrap();
+        let promise = find_child(&legacy, "Promise").unwrap();
+        assert_eq!(promise["class"], "ModuleScript");
+        assert_eq!(promise["diskFragmentIsDir"], true);
+        assert_eq!(promise["properties"]["Source"], "return {}");
+        assert_eq!(
+            find_child(promise, "Error").unwrap()["class"],
+            "ModuleScript"
+        );
+
+        let flat = emit_flat_service(d.path(), "ReplicatedStorage").unwrap();
+        let promise = flat
+            .records
+            .iter()
+            .find(|record| record.name == "Promise")
+            .unwrap();
+        assert_eq!(promise.class, "ModuleScript");
+        assert_eq!(promise.disk_fragment_is_dir, Some(true));
+        assert!(promise.has_children);
+        assert_eq!(
+            flat.source_paths
+                .get(&promise.id)
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
+            Some("init.luau")
+        );
+    }
+
+    #[test]
     fn default_project_path_rejects_windows_parent_traversal() {
         let d = TempDir::new("wally-default-project-traversal");
         let pkg = d.path().join("ReplicatedStorage").join("Packages");
@@ -2547,7 +3133,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(default_project_path(&pkg).unwrap().is_none());
+        let error = default_project_path(&pkg).unwrap_err();
+        assert!(error.to_string().contains("unsafe Rojo $path"));
     }
 
     #[test]

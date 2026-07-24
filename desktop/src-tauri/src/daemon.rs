@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -23,7 +23,9 @@ use crate::{resources::display_path, AppState};
 
 const LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_CLOSE_IO_TIMEOUT: Duration = Duration::from_millis(750);
-const EXIT_CLOSE_WAIT: Duration = Duration::from_secs(3);
+const EXIT_CLOSE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_EXIT_CLOSE_WORKERS: usize = 4;
+const MAX_LOCAL_JSON_RESPONSE_BYTES: usize = 64 * 1024;
 const MANAGED_DAEMON_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -217,20 +219,45 @@ fn exact_managed_daemon_claim(value: &Value, owner_token: &str) -> Option<ExactM
 }
 
 fn close_managed_daemons(claims: Vec<ExactManagedDaemonClaim>) {
-    // Each exact close has its own bounded network deadline. Run them in
-    // parallel so app exit remains bounded by one close window rather than by
-    // the number of simultaneously served projects.
-    thread::scope(|scope| {
-        for claim in &claims {
-            scope.spawn(|| {
-                let _ = close_exact_managed_daemon(claim);
-            });
+    if claims.is_empty() {
+        return;
+    }
+
+    // Request every normal local shutdown before waiting for any one daemon to
+    // release its listener. A small fixed worker pool avoids one OS thread per
+    // served project, while one shared deadline keeps app/update exit bounded.
+    // Every request still performs the full immutable identity handshake.
+    let deadline = Instant::now() + EXIT_CLOSE_TOTAL_TIMEOUT;
+    let accepted = (0..claims.len())
+        .map(|_| AtomicBool::new(false))
+        .collect::<Vec<_>>();
+    run_bounded_exit_workers(claims.len(), deadline, |index| {
+        if request_exact_managed_daemon_close(&claims[index], deadline).is_ok() {
+            accepted[index].store(true, Ordering::Release);
+        }
+    });
+
+    // Daemons receive the requests concurrently above, so in the healthy case
+    // they all complete their graceful 250 ms drain together. Confirm accepted
+    // closes with the same bounded worker count and absolute deadline.
+    run_bounded_exit_workers(claims.len(), deadline, |index| {
+        if accepted[index].load(Ordering::Acquire) {
+            let _ = wait_for_exact_managed_daemon_release(&claims[index], deadline);
         }
     });
 }
 
 fn close_exact_managed_daemon(claim: &ExactManagedDaemonClaim) -> Result<(), String> {
-    let hello = local_json_request(claim.port, "GET", "/hello", &[])?;
+    let deadline = Instant::now() + EXIT_CLOSE_TOTAL_TIMEOUT;
+    request_exact_managed_daemon_close(claim, deadline)?;
+    wait_for_exact_managed_daemon_release(claim, deadline)
+}
+
+fn request_exact_managed_daemon_close(
+    claim: &ExactManagedDaemonClaim,
+    deadline: Instant,
+) -> Result<(), String> {
+    let hello = local_json_request_until(claim.port, "GET", "/hello", &[], deadline)?;
     let exact_daemon = hello.get("managed").and_then(Value::as_bool) == Some(true)
         && hello.get("managedBy").and_then(Value::as_str) == Some("desktop")
         && hello.get("project").and_then(Value::as_str) == Some(claim.project.as_str())
@@ -244,20 +271,37 @@ fn close_exact_managed_daemon(claim: &ExactManagedDaemonClaim) -> Result<(), Str
     let body = serde_json::to_vec(&serde_json::json!({
         "token": claim.owner_token,
         "reason": "desktop app exited",
+        "expectedBootId": claim.boot_id,
+        "expectedPid": claim.pid,
+        "expectedPort": claim.port,
+        "expectedCanonicalProject": claim.project,
     }))
     .map_err(|error| format!("encode managed daemon close request: {error}"))?;
-    let response = local_json_request(claim.port, "POST", "/manager-close", &body)?;
+    let response = local_json_request_until(claim.port, "POST", "/manager-close", &body, deadline)?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("managed daemon rejected the authenticated close request".into());
     }
+    Ok(())
+}
 
+fn wait_for_exact_managed_daemon_release(
+    claim: &ExactManagedDaemonClaim,
+    deadline: Instant,
+) -> Result<(), String> {
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, claim.port));
-    let deadline = Instant::now() + EXIT_CLOSE_WAIT;
     while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err() {
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        if timeout.is_zero() || TcpStream::connect_timeout(&address, timeout).is_err() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        let pause = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50));
+        if !pause.is_zero() {
+            thread::sleep(pause);
+        }
     }
     Err("managed daemon remained reachable after the authenticated close request".into())
 }
@@ -287,14 +331,41 @@ fn heartbeat_exact_managed_daemon(claim: &ExactManagedDaemonClaim) -> Result<(),
 }
 
 fn local_json_request(port: u16, method: &str, path: &str, body: &[u8]) -> Result<Value, String> {
+    local_json_request_until(
+        port,
+        method,
+        path,
+        body,
+        Instant::now() + EXIT_CLOSE_IO_TIMEOUT.saturating_mul(3),
+    )
+}
+
+fn local_json_request_until(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    deadline: Instant,
+) -> Result<Value, String> {
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&address, EXIT_CLOSE_IO_TIMEOUT)
+    let mut timeout = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "managed daemon request deadline expired".to_string())?
+        .min(EXIT_CLOSE_IO_TIMEOUT);
+    if timeout.is_zero() {
+        return Err("managed daemon request deadline expired".into());
+    }
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
         .map_err(|error| format!("connect to managed daemon: {error}"))?;
+    timeout = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "managed daemon request deadline expired".to_string())?
+        .min(EXIT_CLOSE_IO_TIMEOUT);
     stream
-        .set_read_timeout(Some(EXIT_CLOSE_IO_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|error| format!("set managed daemon read timeout: {error}"))?;
     stream
-        .set_write_timeout(Some(EXIT_CLOSE_IO_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|error| format!("set managed daemon write timeout: {error}"))?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -305,9 +376,29 @@ fn local_json_request(port: u16, method: &str, path: &str, body: &[u8]) -> Resul
         .and_then(|_| stream.write_all(body))
         .map_err(|error| format!("send managed daemon close request: {error}"))?;
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("read managed daemon close response: {error}"))?;
+    loop {
+        timeout = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "managed daemon request deadline expired".to_string())?
+            .min(EXIT_CLOSE_IO_TIMEOUT);
+        if timeout.is_zero() {
+            return Err("managed daemon request deadline expired".into());
+        }
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("set managed daemon read timeout: {error}"))?;
+        let mut chunk = [0_u8; 4096];
+        let count = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("read managed daemon close response: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        if response.len().saturating_add(count) > MAX_LOCAL_JSON_RESPONSE_BYTES {
+            return Err("managed daemon response exceeded the 64 KiB limit".into());
+        }
+        response.extend_from_slice(&chunk[..count]);
+    }
     let header_end = response
         .windows(4)
         .position(|part| part == b"\r\n\r\n")
@@ -322,6 +413,53 @@ fn local_json_request(port: u16, method: &str, path: &str, body: &[u8]) -> Resul
     }
     serde_json::from_slice(&response[header_end + 4..])
         .map_err(|error| format!("decode managed daemon response: {error}"))
+}
+
+fn run_bounded_exit_workers<F>(item_count: usize, deadline: Instant, task: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if item_count == 0 || Instant::now() >= deadline {
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for worker_index in 0..item_count.min(MAX_EXIT_CLOSE_WORKERS) {
+            let next = &next;
+            let task = &task;
+            let worker = thread::Builder::new()
+                .name(format!("rosync-daemon-close-{}", worker_index + 1))
+                .spawn_scoped(scope, move || loop {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= item_count {
+                        break;
+                    }
+                    task(index);
+                });
+            if let Ok(worker) = worker {
+                workers.push(worker);
+            }
+        }
+
+        // A heavily constrained host can refuse even a small helper thread.
+        // Continue synchronously instead of panicking or dropping every close.
+        if workers.is_empty() {
+            while Instant::now() < deadline {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= item_count {
+                    break;
+                }
+                task(index);
+            }
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
 }
 
 #[derive(Default)]
@@ -964,6 +1102,47 @@ mod tests {
     }
 
     #[test]
+    fn exit_close_worker_pool_is_bounded_under_load() {
+        const ITEM_COUNT: usize = 200;
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let visited = (0..ITEM_COUNT)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>();
+
+        run_bounded_exit_workers(
+            ITEM_COUNT,
+            Instant::now() + Duration::from_secs(5),
+            |index| {
+                let concurrent = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(concurrent, Ordering::AcqRel);
+                thread::sleep(Duration::from_millis(2));
+                visited[index].store(true, Ordering::Release);
+                active.fetch_sub(1, Ordering::AcqRel);
+            },
+        );
+
+        assert!(visited
+            .iter()
+            .all(|visited| visited.load(Ordering::Acquire)));
+        assert!(peak.load(Ordering::Acquire) <= MAX_EXIT_CLOSE_WORKERS);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn exit_close_worker_pool_stops_dispatching_after_the_deadline() {
+        let calls = AtomicUsize::new(0);
+        let started = Instant::now();
+        run_bounded_exit_workers(1_000, started + Duration::from_millis(20), |_| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(60));
+        });
+
+        assert!(calls.load(Ordering::Acquire) <= MAX_EXIT_CLOSE_WORKERS);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn lifecycle_command_specs_keep_existing_fields_and_accept_multi_project_fields() {
         let ensure = serde_json::from_value::<DaemonEnsureSpec>(serde_json::json!({
             "project": "/projects/alpha",
@@ -1197,6 +1376,10 @@ mod tests {
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /manager-close HTTP/1.1\r\n"));
         assert!(request.contains("\"token\":\"0123456789abcdef\""));
+        assert!(request.contains("\"expectedBootId\":\"boot-exact\""));
+        assert!(request.contains("\"expectedPid\":4242"));
+        assert!(request.contains(&format!("\"expectedPort\":{port}")));
+        assert!(request.contains("\"expectedCanonicalProject\":\"/project-exact\""));
         assert!(claims.state.lock().unwrap().by_project.is_empty());
     }
 

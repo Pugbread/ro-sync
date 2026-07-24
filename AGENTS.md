@@ -456,7 +456,7 @@ rosync find-attr --project . --name Color --value \
 
 ## 6f. Capability discovery and screenshots
 
-Protocol 3 / plugin 2.2.0 exposes optional Studio features explicitly. Check
+Protocol 5 / plugin 2.4.0 exposes optional Studio features explicitly. Check
 them before choosing capture or playtest commands:
 
 ```

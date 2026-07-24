@@ -364,7 +364,7 @@ fn canonical_project(
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir()?,
     };
-    fs::canonicalize(&path)
+    crate::lifecycle::canonical_project(&path)
         .map_err(|error| format!("{operation}: project {}: {error}", path.display()).into())
 }
 
@@ -880,5 +880,27 @@ mod tests {
         assert!(validate_roots(&[]).is_err());
         let root = sample_manifest(b"x").roots[0].clone();
         assert!(validate_roots(&vec![root; MAX_ROOTS + 1]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_refuses_a_linked_project_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let physical = parent.path().join("physical-project");
+        let linked = parent.path().join("linked-project");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, &linked).unwrap();
+
+        let error = canonical_project(Some(&linked), "copy").unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+    }
+
+    #[test]
+    fn clipboard_project_policy_inherits_windows_reparse_detection() {
+        assert!(crate::fs_safety::attributes_have_reparse_point(
+            crate::fs_safety::WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        ));
     }
 }

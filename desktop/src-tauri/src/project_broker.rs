@@ -1,9 +1,9 @@
 use std::{
     collections::{HashSet, VecDeque},
-    fs,
+    ffi::OsStr,
     io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -11,6 +11,8 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(test)]
+use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -433,11 +435,14 @@ fn initialize_project(
         })
     })?;
 
-    let (project_path, reused) =
+    let projects_root =
+        storage::open_authorized_directory(&shared.paths.authorized_roots_file, &projects_root)?;
+    let (project, reused) =
         find_or_create_project(&projects_root, &directory_display_name, &game_id)?;
-    storage::ensure_authorized_path(&shared.paths.authorized_roots_file, &project_path)?;
+    let project_path = project.path().to_path_buf();
+    let project_name = project_path.file_name().map(OsStr::to_os_string);
     let effective_name = write_project_config(
-        &project_path,
+        &project,
         &ProjectConfigWrite {
             game_name: &game_name,
             place_name: &place_name,
@@ -450,7 +455,9 @@ fn initialize_project(
     )
     .inspect_err(|_| {
         if !reused {
-            let _ = fs::remove_dir(&project_path);
+            if let Some(name) = project_name.as_deref() {
+                let _ = projects_root.remove_child_directory_if_matches(name, &project);
+            }
         }
     })?;
 
@@ -510,14 +517,8 @@ fn configured_projects_root(shared: &BrokerShared) -> (Option<PathBuf>, Option<S
             Some("The Projects folder in Ro Sync Settings is not absolute".into()),
         );
     }
-    let root = match root.canonicalize() {
-        Ok(root) if root.is_dir() => root,
-        Ok(_) => {
-            return (
-                None,
-                Some("The Projects folder in Ro Sync Settings is not a directory".into()),
-            )
-        }
+    let root = match storage::canonicalize_physical_directory(&root) {
+        Ok(root) => root,
         Err(error) => {
             return (
                 None,
@@ -623,28 +624,20 @@ fn sanitize_folder_name(raw: &str) -> String {
 }
 
 fn find_or_create_project(
-    projects_root: &Path,
+    projects_root: &storage::PhysicalDirectoryCapability,
     display_name: &str,
     game_id: &str,
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(storage::PhysicalDirectoryCapability, bool), String> {
     let mut existing_names = HashSet::new();
-    let entries = fs::read_dir(projects_root).map_err(|error| {
-        format!(
-            "could not inspect Projects folder {}: {error}",
-            display_path(projects_root)
-        )
-    })?;
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_PROJECT_ROOT_ENTRIES {
-            return Err("Projects folder contains too many direct children".into());
-        }
-        let entry = entry.map_err(|error| format!("could not inspect Projects folder: {error}"))?;
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+    for name in projects_root.entry_names(MAX_PROJECT_ROOT_ENTRIES)? {
+        if let Some(name) = name.to_str() {
             existing_names.insert(name.to_ascii_lowercase());
         }
-        if path.is_dir() && config_game_id(&path).as_deref() == Some(game_id) {
-            return Ok((path.canonicalize().unwrap_or(path), true));
+        let Some(project) = projects_root.optional_child_directory(&name)? else {
+            continue;
+        };
+        if config_game_id(&project).as_deref() == Some(game_id) {
+            return Ok((project, true));
         }
     }
 
@@ -662,28 +655,20 @@ fn find_or_create_project(
         if existing_names.contains(&name.to_ascii_lowercase()) {
             continue;
         }
-        let path = projects_root.join(name);
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok((path, false)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "could not create project folder {}: {error}",
-                    display_path(&path)
-                ))
-            }
+        match projects_root.create_child_directory(OsStr::new(&name)) {
+            Ok(Some(project)) => return Ok((project, false)),
+            Ok(None) => continue,
+            Err(error) => return Err(error),
         }
     }
     Err("could not allocate a unique project folder name".into())
 }
 
-fn config_game_id(project: &Path) -> Option<String> {
-    let path = project.join("ro-sync.json");
-    let metadata = fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+fn config_game_id(project: &storage::PhysicalDirectoryCapability) -> Option<String> {
+    let text = project
+        .read_optional_utf8(OsStr::new("ro-sync.json"), MAX_CONFIG_BYTES)
+        .ok()??;
+    let value: Value = serde_json::from_str(&text).ok()?;
     value
         .get("gameId")
         .and_then(Value::as_str)
@@ -700,34 +685,26 @@ struct ProjectConfigWrite<'a> {
     creator_id: Option<&'a str>,
 }
 
-fn write_project_config(project: &Path, values: &ProjectConfigWrite<'_>) -> Result<String, String> {
-    let path = project.join("ro-sync.json");
-    let mut config = if path.is_file() {
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("could not inspect {}: {error}", display_path(&path)))?;
-        if metadata.len() > MAX_CONFIG_BYTES {
-            return Err(format!(
-                "{} exceeds the config size limit",
-                display_path(&path)
-            ));
-        }
-        serde_json::from_slice::<Value>(
-            &fs::read(&path)
-                .map_err(|error| format!("could not read {}: {error}", display_path(&path)))?,
-        )
-        .map_err(|error| format!("{} contains invalid JSON: {error}", display_path(&path)))?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| format!("{} must contain a JSON object", display_path(&path)))?
-    } else {
-        Map::new()
+fn write_project_config(
+    project: &storage::PhysicalDirectoryCapability,
+    values: &ProjectConfigWrite<'_>,
+) -> Result<String, String> {
+    let path = project.path().join("ro-sync.json");
+    let existing = project.read_optional_utf8(OsStr::new("ro-sync.json"), MAX_CONFIG_BYTES)?;
+    let mut config = match existing {
+        Some(text) => serde_json::from_str::<Value>(&text)
+            .map_err(|error| format!("{} contains invalid JSON: {error}", display_path(&path)))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("{} must contain a JSON object", display_path(&path)))?,
+        None => Map::new(),
     };
 
     if let Some(existing) = config.get("gameId").and_then(Value::as_str) {
         if existing != values.game_id {
             return Err(format!(
                 "{} is already linked to a different game",
-                display_path(project)
+                display_path(project.path())
             ));
         }
     }
@@ -788,7 +765,7 @@ fn write_project_config(project: &Path, values: &ProjectConfigWrite<'_>) -> Resu
     let mut bytes = serde_json::to_vec_pretty(&config)
         .map_err(|error| format!("encode project config: {error}"))?;
     bytes.push(b'\n');
-    storage::atomic_write(&path, &bytes, 0o644)?;
+    project.atomic_write(OsStr::new("ro-sync.json"), &bytes, 0o644)?;
     Ok(effective_name)
 }
 
@@ -829,6 +806,10 @@ pub(crate) fn project_init_drain(
 mod tests {
     use super::*;
 
+    fn test_directory_capability(path: &Path) -> storage::PhysicalDirectoryCapability {
+        storage::open_physical_directory(&path.canonicalize().unwrap()).unwrap()
+    }
+
     fn test_shared(data: &Path) -> BrokerShared {
         BrokerShared {
             paths: AppPaths {
@@ -858,19 +839,20 @@ mod tests {
         assert_eq!(unavailable["projectInit"]["available"], false);
         assert!(unavailable["projectInit"]["error"].is_string());
 
-        storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
-            .unwrap();
+        let projects =
+            storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
+                .unwrap();
         storage::state_set(
             &shared.paths.state_file,
             "state",
-            json!({ "projectsRoot": display_path(projects.path()) }),
+            json!({ "projectsRoot": display_path(&projects) }),
         )
         .unwrap();
         let available = broker_hello(&shared);
         assert_eq!(available["projectInit"]["available"], true);
         assert_eq!(
             available["projectInit"]["projectsRoot"],
-            display_path(&projects.path().canonicalize().unwrap())
+            display_path(&projects)
         );
         assert_eq!(available["projectInit"]["endpoint"], "/projects/init");
         assert_eq!(available["pluginCapability"], "a".repeat(64));
@@ -881,12 +863,13 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let projects = tempfile::tempdir().unwrap();
         let shared = test_shared(data.path());
-        storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
-            .unwrap();
+        let projects =
+            storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
+                .unwrap();
         storage::state_set(
             &shared.paths.state_file,
             "state",
-            json!({ "projectsRoot": display_path(projects.path()) }),
+            json!({ "projectsRoot": display_path(&projects) }),
         )
         .unwrap();
 
@@ -949,12 +932,13 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let projects = tempfile::tempdir().unwrap();
         let shared = test_shared(data.path());
-        storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
-            .unwrap();
+        let projects =
+            storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
+                .unwrap();
         storage::state_set(
             &shared.paths.state_file,
             "state",
-            json!({ "projectsRoot": display_path(projects.path()) }),
+            json!({ "projectsRoot": display_path(&projects) }),
         )
         .unwrap();
         let request =
@@ -981,8 +965,8 @@ mod tests {
     #[test]
     fn project_creation_is_idempotent_by_game_id() {
         let directory = tempfile::tempdir().unwrap();
-        let (first, reused) =
-            find_or_create_project(directory.path(), "Race Stars", "123").unwrap();
+        let projects = test_directory_capability(directory.path());
+        let (first, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
         assert!(!reused);
         write_project_config(
             &first,
@@ -997,11 +981,104 @@ mod tests {
             },
         )
         .unwrap();
-        let (second, reused) = find_or_create_project(directory.path(), "Renamed", "123").unwrap();
+        let (second, reused) = find_or_create_project(&projects, "Renamed", "123").unwrap();
         assert!(reused);
+        assert_eq!(first.path(), second.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_reuse_rejects_a_link_to_another_authorized_root() {
+        use std::os::unix::fs::symlink;
+
+        let data = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let shared = test_shared(data.path());
+        let projects =
+            storage::authorize_project_root(&shared.paths.authorized_roots_file, projects.path())
+                .unwrap();
+        let outside =
+            storage::authorize_project_root(&shared.paths.authorized_roots_file, outside.path())
+                .unwrap();
+        fs::write(
+            outside.join("ro-sync.json"),
+            br#"{"name":"Outside","gameId":"123","placeIds":["456"]}"#,
+        )
+        .unwrap();
+        symlink(&outside, projects.join("Linked Project")).unwrap();
+        storage::state_set(
+            &shared.paths.state_file,
+            "state",
+            json!({ "projectsRoot": display_path(&projects) }),
+        )
+        .unwrap();
+
+        let result = initialize_project(
+            &shared,
+            ProjectInitRequest {
+                plugin_capability: shared.capability.clone(),
+                request_id: "linked-project".into(),
+                game_name: "Race Stars".into(),
+                place_name: "Main Place".into(),
+                game_id: "123".into(),
+                place_id: "456".into(),
+                group_id: None,
+                creator_type: None,
+                creator_id: None,
+            },
+        );
+        assert!(result.is_err());
+        let outside_config: Value =
+            serde_json::from_slice(&fs::read(outside.join("ro-sync.json")).unwrap()).unwrap();
+        assert_eq!(outside_config["name"], "Outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_capabilities_survive_root_and_project_path_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let projects_path = base.join("projects");
+        let moved_projects = base.join("moved-projects");
+        let outside = base.join("outside");
+        fs::create_dir(&projects_path).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("ro-sync.json"), "outside sentinel").unwrap();
+        let projects = test_directory_capability(&projects_path);
+
+        fs::rename(&projects_path, &moved_projects).unwrap();
+        symlink(&outside, &projects_path).unwrap();
+        let (project, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        assert!(!reused);
+
+        let original_project_path = moved_projects.join("Race Stars");
+        let relocated_project = moved_projects.join("relocated-project");
+        fs::rename(&original_project_path, &relocated_project).unwrap();
+        symlink(&outside, &original_project_path).unwrap();
+        write_project_config(
+            &project,
+            &ProjectConfigWrite {
+                game_name: "Race Stars",
+                place_name: "Main Place",
+                game_id: "123",
+                place_id: "456",
+                group_id: None,
+                creator_type: None,
+                creator_id: None,
+            },
+        )
+        .unwrap();
+
+        let value: Value =
+            serde_json::from_slice(&fs::read(relocated_project.join("ro-sync.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["gameId"], "123");
         assert_eq!(
-            first.canonicalize().unwrap(),
-            second.canonicalize().unwrap()
+            fs::read_to_string(outside.join("ro-sync.json")).unwrap(),
+            "outside sentinel"
         );
     }
 
@@ -1009,10 +1086,10 @@ mod tests {
     fn colliding_folder_names_receive_a_stable_id_suffix() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("Race Stars")).unwrap();
-        let (created, reused) =
-            find_or_create_project(directory.path(), "Race Stars", "123").unwrap();
+        let projects = test_directory_capability(directory.path());
+        let (created, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
         assert!(!reused);
-        assert_eq!(created.file_name().unwrap(), "Race Stars-123");
+        assert_eq!(created.path().file_name().unwrap(), "Race Stars-123");
     }
 
     #[test]
@@ -1023,8 +1100,9 @@ mod tests {
             br#"{"name":"Old","gameId":"123","placeIds":["1"],"custom":true}"#,
         )
         .unwrap();
+        let directory_capability = test_directory_capability(directory.path());
         write_project_config(
-            directory.path(),
+            &directory_capability,
             &ProjectConfigWrite {
                 game_name: "New",
                 place_name: "Second Place",
@@ -1056,8 +1134,9 @@ mod tests {
             br#"{"name":"Place1","gameId":"123","placeIds":["1"]}"#,
         )
         .unwrap();
+        let directory_capability = test_directory_capability(directory.path());
         let effective = write_project_config(
-            directory.path(),
+            &directory_capability,
             &ProjectConfigWrite {
                 game_name: "Place1",
                 place_name: "Race Stars",

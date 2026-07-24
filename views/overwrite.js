@@ -6,10 +6,17 @@
 import { installDocumentEscape } from "./runtime.js";
 import { daemonJson } from "../bridge.js";
 import {
-  divergenceItems,
+  INITIAL_DETAIL_PAGE_LIMIT,
+  INITIAL_LIST_RENDER_LIMIT,
+  acceptChoiceDetailPage,
+  boundedRenderPair,
+  choiceDetailsPath,
+  choiceSummaryCounts,
+  createChoiceDetailAccumulator,
   itemClassLabel,
   itemStateLabel,
-  selectedTransferPaths,
+  selectedTransferIds,
+  selectionIdChunks,
   splitDisplayPath,
   transferMeta,
   transferVerb,
@@ -101,8 +108,10 @@ export function mountOverwriteModal(api) {
           <div class="transfer-toolbar-copy">
             <strong>Stage disk files for Studio</strong>
             <span>Staging makes the disk copy win — even if the file was last edited in Studio. Nothing applies until you confirm.</span>
+            <span data-detail-progress role="status" aria-live="polite"></span>
           </div>
           <div class="transfer-toolbar-actions">
+            <button type="button" data-act="retry-details" hidden>Retry list</button>
             <button type="button" data-act="all">Stage all</button>
           </div>
         </div>
@@ -150,6 +159,7 @@ export function mountOverwriteModal(api) {
           <p data-transfer-summary>Unstaged files keep their Studio version.</p>
           <div class="modal-actions">
             <button type="button" data-act="cancel">Cancel</button>
+            <button type="button" data-act="all-disk">Move all disk changes</button>
             <button type="button" class="primary" data-act="done" disabled>Move to Studio</button>
           </div>
         </footer>
@@ -179,42 +189,169 @@ export function mountOverwriteModal(api) {
   const $studioQueueCount = overlay.querySelector("[data-studio-queue-count]");
   const $diskChangeCount = overlay.querySelector("[data-disk-change-count]");
   const $transferSummary = overlay.querySelector("[data-transfer-summary]");
+  const $detailProgress = overlay.querySelector("[data-detail-progress]");
+  const $retryDetails = overlay.querySelector('[data-act="retry-details"]');
   const $done = overlay.querySelector('[data-act="done"]');
   const $all = overlay.querySelector('[data-act="all"]');
+  const $allDisk = overlay.querySelector('[data-act="all-disk"]');
   const $err = overlay.querySelector("[data-err]");
 
   let currentChoiceId = null;
   let currentProjectId = null;
+  let currentOverviewData = {};
+  let currentEdits = {};
   let currentItems = [];
-  let itemsByPath = new Map();
+  let itemsById = new Map();
   let selected = new Set();
+  let detailAccumulator = null;
+  let detailAbort = null;
+  let detailGeneration = 0;
+  let detailLoading = false;
+  let detailError = null;
+  let detailTotal = 0;
   let busy = false;
   let step = "choice";
   let sortMode = "path";
   let filterAction = "all";
   let searchText = "";
+  let visibleCache = null;
+  let actionCounts = { create: 0, overwrite: 0, remove: 0 };
 
   function open(data) {
-    if (!overlay.hidden && currentChoiceId && data.choiceId === currentChoiceId) return;
-    currentChoiceId = data.choiceId || null;
+    const choiceId = typeof data?.choiceId === "string" ? data.choiceId : null;
+    if (!choiceId) return;
+    if (!overlay.hidden && currentChoiceId === choiceId) {
+      currentOverviewData = { ...currentOverviewData, ...data };
+      const latestSummary = choiceSummaryCounts(currentOverviewData);
+      if (
+        latestSummary.total > 0
+        && (!detailAccumulator
+          || (detailAccumulator.totalCount === 0 && currentItems.length === 0))
+      ) {
+        initializeDetailState(latestSummary);
+        void loadDetails();
+      }
+      renderOverview();
+      renderDetailProgress();
+      return;
+    }
+
+    abortDetailLoad();
+    currentChoiceId = choiceId;
     currentProjectId = data.projectId || null;
+    currentOverviewData = { ...data };
     const memoryKey = projectMemoryKey(data.projectPath, data.projectId);
-    const edits = api.lastEdited?.forProject?.(memoryKey) || {};
-    currentItems = annotateLastEdited(divergenceItems(data.comparison), edits);
-    itemsByPath = new Map(currentItems.map((item) => [item.path, item]));
+    currentEdits = api.lastEdited?.forProject?.(memoryKey) || {};
+    initializeDetailState(choiceSummaryCounts(data));
     selected = new Set();
-    sortMode = currentItems.some((item) => item.editedAt) ? "recent" : "path";
+    sortMode = "path";
     filterAction = "all";
     searchText = "";
+    visibleCache = null;
     $search.value = "";
     $sort.value = sortMode;
-    renderOverview(data);
+    renderOverview();
     renderTransfer();
     showStep("choice");
     clearError();
     setBusy(false);
     overlay.hidden = false;
     if (!anotherModalOwnsInput()) overlay.querySelector('[data-act="disk"]')?.focus();
+    if (detailTotal > 0) void loadDetails();
+  }
+
+  function initializeDetailState(summary) {
+    currentItems = [];
+    itemsById = new Map();
+    visibleCache = null;
+    detailTotal = summary.total;
+    detailAccumulator = createChoiceDetailAccumulator(currentChoiceId, detailTotal);
+    detailLoading = false;
+    detailError = null;
+    actionCounts = {
+      create: summary.create,
+      overwrite: summary.overwrite,
+      remove: summary.remove,
+    };
+  }
+
+  async function loadDetails({ restart = false } = {}) {
+    if (!currentChoiceId || detailTotal === 0) {
+      renderDetailProgress();
+      return;
+    }
+    const base = api.getDaemonBase(currentProjectId);
+    if (!base) {
+      detailError = "Daemon offline — reconnect to load individual paths.";
+      renderDetailProgress();
+      renderTransfer();
+      return;
+    }
+    if (detailLoading) return;
+    if (restart || !detailAccumulator || detailAccumulator.complete) {
+      if (!restart && detailAccumulator?.complete) return;
+      selected = new Set();
+      initializeDetailState(choiceSummaryCounts(currentOverviewData));
+    }
+
+    abortDetailLoad();
+    const controller = new AbortController();
+    detailAbort = controller;
+    const generation = ++detailGeneration;
+    const choiceId = currentChoiceId;
+    detailLoading = true;
+    detailError = null;
+    renderDetailProgress();
+    renderTransfer();
+
+    try {
+      while (!detailAccumulator.complete) {
+        const page = await daemonJson(
+          base,
+          choiceDetailsPath(
+            choiceId,
+            detailAccumulator.cursor,
+            INITIAL_DETAIL_PAGE_LIMIT,
+          ),
+          { signal: controller.signal },
+        );
+        if (generation !== detailGeneration || choiceId !== currentChoiceId) return;
+        const added = acceptChoiceDetailPage(detailAccumulator, page);
+        const annotated = annotateLastEdited(added, currentEdits);
+        currentItems.push(...annotated);
+        for (const item of annotated) itemsById.set(item.id, item);
+        renderDetailProgress();
+      }
+
+      detailLoading = false;
+      detailAbort = null;
+      detailError = null;
+      actionCounts = { create: 0, overwrite: 0, remove: 0 };
+      for (const item of currentItems) {
+        actionCounts[item.action] = (actionCounts[item.action] || 0) + 1;
+      }
+      sortMode = currentItems.some((item) => item.editedAt) ? "recent" : "path";
+      $sort.value = sortMode;
+      visibleCache = null;
+      renderOverview();
+      renderDetailProgress();
+      renderTransfer();
+    } catch (error) {
+      if (controller.signal.aborted || generation !== detailGeneration) return;
+      detailLoading = false;
+      detailAbort = null;
+      detailError = error?.message || "Could not load individual paths.";
+      renderOverview();
+      renderDetailProgress();
+      renderTransfer();
+    }
+  }
+
+  function abortDetailLoad() {
+    detailGeneration += 1;
+    if (detailAbort) detailAbort.abort();
+    detailAbort = null;
+    detailLoading = false;
   }
 
   // App-level prompts (projects root, update confirm) render above this
@@ -225,12 +362,19 @@ export function mountOverwriteModal(api) {
   }
 
   function close() {
+    abortDetailLoad();
     overlay.hidden = true;
     currentChoiceId = null;
     currentProjectId = null;
+    currentOverviewData = {};
+    currentEdits = {};
     currentItems = [];
-    itemsByPath = new Map();
+    itemsById = new Map();
     selected = new Set();
+    detailAccumulator = null;
+    detailError = null;
+    detailTotal = 0;
+    visibleCache = null;
     showStep("choice");
     setBusy(false);
   }
@@ -268,42 +412,91 @@ export function mountOverwriteModal(api) {
     $err.textContent = message;
   }
 
-  function renderOverview(data) {
-    $studioStats.textContent = formatStats(data.studioStats);
-    $diskStats.textContent = formatStats(data.diskStats);
-    const total = currentItems.length;
+  function renderOverview() {
+    $studioStats.textContent = formatStats(currentOverviewData.studioStats);
+    $diskStats.textContent = formatStats(currentOverviewData.diskStats);
+    const total = detailTotal;
     $differenceCount.textContent = `${total} ${total === 1 ? "difference" : "differences"}`;
     $summaryTotal.textContent = `${total} ${total === 1 ? "path" : "paths"}`;
     $diskHint.textContent = total
-      ? "Pick per file — staged files use the disk copy."
+      ? detailError
+        ? "Individual review is unavailable; complete Studio and Disk choices remain safe."
+        : detailAccumulator?.complete
+        ? "Pick per file — staged files use the disk copy."
+        : "Review individual changes as the bounded file list loads."
       : "Use the complete local synced tree.";
-    $summaryGroups.innerHTML = overviewGroups(currentItems)
-      .filter((group) => group.items.length)
-      .map(renderOverviewGroup)
-      .join("") || `<div class="initial-summary-fallback">Detailed path comparison is unavailable. Keeping Disk will use the complete local synced tree.</div>`;
+    $summaryGroups.innerHTML = detailAccumulator?.complete
+      ? overviewGroups(currentItems)
+        .filter((group) => group.items.length)
+        .map(renderOverviewGroup)
+        .join("")
+      : renderOverviewCounts(actionCounts);
+    if (!$summaryGroups.innerHTML) {
+      $summaryGroups.innerHTML = total
+        ? `<div class="initial-summary-fallback">${total} divergent paths reported. Individual details are loading separately.</div>`
+        : `<div class="initial-summary-fallback">No divergent paths were reported. Keeping Disk will use the complete local synced tree.</div>`;
+    }
+  }
+
+  function renderDetailProgress() {
+    const loaded = currentItems.length;
+    if (detailError) {
+      $detailProgress.textContent = `Individual path list unavailable (${loaded} of ${detailTotal} loaded). You can still keep all of Studio or all of Disk.`;
+      $retryDetails.hidden = false;
+    } else if (detailLoading) {
+      $detailProgress.textContent = `Loading individual paths… ${loaded} of ${detailTotal}`;
+      $retryDetails.hidden = true;
+    } else if (detailAccumulator?.complete) {
+      $detailProgress.textContent = `${detailTotal} individual ${detailTotal === 1 ? "path" : "paths"} ready`;
+      $retryDetails.hidden = true;
+    } else {
+      $detailProgress.textContent = detailTotal
+        ? `Waiting to load ${detailTotal} individual paths`
+        : "No individual paths to review";
+      $retryDetails.hidden = true;
+    }
+    $retryDetails.disabled = busy || detailLoading;
+    $allDisk.disabled = busy;
   }
 
   function visibleItems() {
+    if (visibleCache) return visibleCache;
     let list = sortDivergenceItems(currentItems, sortMode);
     if (filterAction !== "all") list = list.filter((item) => item.action === filterAction);
     const query = searchText.trim().toLowerCase();
     if (query) list = list.filter((item) => item.path.toLowerCase().includes(query));
-    return list;
+    visibleCache = list;
+    return visibleCache;
   }
 
   function stagedItems() {
-    return [...selected].map((path) => itemsByPath.get(path)).filter(Boolean);
+    return [...selected]
+      .sort((left, right) => left - right)
+      .map((id) => itemsById.get(id))
+      .filter(Boolean);
   }
 
   function renderTransfer() {
+    const detailReady = detailAccumulator?.complete === true && !detailError;
     const visible = visibleItems();
     const staged = stagedItems();
     const filtered = filterAction !== "all" || searchText.trim() !== "";
-    const unstagedVisible = visible.filter((item) => !selected.has(item.path));
+    const unstagedVisible = visible.filter((item) => !selected.has(item.id));
+    const overviewRows = detailAccumulator?.complete
+      ? Math.min(actionCounts.create || 0, 6)
+        + Math.min(actionCounts.overwrite || 0, 6)
+        + Math.min(actionCounts.remove || 0, 6)
+      : 0;
+    const transferRowBudget = Math.max(0, INITIAL_LIST_RENDER_LIMIT - overviewRows);
+    const windows = boundedRenderPair(visible, staged, transferRowBudget);
+    const diskWindow = windows.available;
+    const stagedWindow = windows.staged;
 
     $diskChangeCount.textContent = filtered
       ? `${visible.length} of ${currentItems.length}`
-      : `${currentItems.length} ${currentItems.length === 1 ? "change" : "changes"}`;
+      : detailReady
+        ? `${currentItems.length} ${currentItems.length === 1 ? "change" : "changes"}`
+        : `${currentItems.length} of ${detailTotal} loaded`;
     $studioQueueCount.textContent = staged.length
       ? `${staged.length} staged`
       : "Nothing staged";
@@ -311,67 +504,78 @@ export function mountOverwriteModal(api) {
     $all.textContent = unstagedVisible.length
       ? `Stage ${filtered ? "shown" : "all"} (${unstagedVisible.length})`
       : `Unstage ${filtered ? "shown" : "all"}`;
-    $all.disabled = busy || visible.length === 0;
-    $done.disabled = busy || staged.length === 0;
+    $all.disabled = busy || !detailReady || visible.length === 0;
+    $done.disabled = busy || !detailReady || staged.length === 0;
     $done.textContent = staged.length ? `Move ${staged.length} to Studio` : "Move to Studio";
     $transferSummary.textContent = transferSummaryText(staged);
+    $search.disabled = busy || !detailReady;
+    $sort.disabled = busy || !detailReady;
+    $allDisk.disabled = busy;
+    renderDetailProgress();
 
     $filterChips.innerHTML = FILTERS.map((filter) => {
       const count = filter.key === "all"
-        ? currentItems.length
-        : currentItems.filter((item) => item.action === filter.key).length;
+        ? detailTotal
+        : actionCounts[filter.key] || 0;
       const active = filterAction === filter.key;
       return `
         <button type="button" class="transfer-chip${active ? " is-active" : ""} chip-${filter.key}"
-          data-filter="${filter.key}" aria-pressed="${active}" ${busy || (!count && filter.key !== "all") ? "disabled" : ""}>
+          data-filter="${filter.key}" aria-pressed="${active}" ${busy || !detailReady || (!count && filter.key !== "all") ? "disabled" : ""}>
           ${filter.mark ? `<i aria-hidden="true">${filter.mark}</i>` : ""}${filter.label}
           <span>${count}</span>
         </button>`;
     }).join("");
 
     $diskList.innerHTML = visible.length
-      ? visible.map((item) => renderDiskItem(item, selected.has(item.path))).join("")
-      : `<div class="transfer-empty is-quiet"><strong>${currentItems.length ? "No matches" : "No disk changes"}</strong><small>${currentItems.length ? "Adjust the filter or search." : "Studio and disk agree on every synced path."}</small></div>`;
+      ? diskWindow.items.map((item) => renderDiskItem(item, selected.has(item.id))).join("")
+        + renderListOverflow(diskWindow.hidden, "more matching paths", "Filter by name or change type to narrow the list.")
+      : renderAvailableEmpty({
+        detailReady,
+        detailLoading,
+        detailError,
+        detailTotal,
+        loaded: currentItems.length,
+      });
     $selectedList.innerHTML = staged.length
-      ? staged.map(renderSelectedItem).join("")
+      ? stagedWindow.items.map(renderSelectedItem).join("")
+        + renderListOverflow(stagedWindow.hidden, "more staged paths", "All staged paths will still be applied on confirm.")
       : `<div class="transfer-empty"><span aria-hidden="true">→</span><strong>Nothing staged yet</strong><small>Click or drag disk files to stage them here.</small></div>`;
   }
 
-  function addPath(path) {
-    if (busy || !itemsByPath.has(path) || selected.has(path)) return;
-    selected.add(path);
+  function addItem(rawId) {
+    const id = uiItemId(rawId);
+    if (busy || id === null || !itemsById.has(id) || selected.has(id)) return;
+    selected.add(id);
     renderTransfer();
   }
 
-  function removePath(path) {
-    if (busy || !selected.has(path)) return;
-    selected.delete(path);
+  function removeItem(rawId) {
+    const id = uiItemId(rawId);
+    if (busy || id === null || !selected.has(id)) return;
+    selected.delete(id);
     renderTransfer();
   }
 
-  function togglePath(path) {
-    if (busy || !itemsByPath.has(path)) return;
-    if (selected.has(path)) selected.delete(path);
-    else selected.add(path);
+  function toggleItem(rawId) {
+    const id = uiItemId(rawId);
+    if (busy || id === null || !itemsById.has(id)) return;
+    if (selected.has(id)) selected.delete(id);
+    else selected.add(id);
     renderTransfer();
   }
 
-  async function submit(choice) {
+  async function submitFullChoice(choice) {
     if (busy || !currentChoiceId) return;
     const base = api.getDaemonBase(currentProjectId);
     if (!base) {
       showError("Daemon offline — reconnect before resolving this divergence.");
       return;
     }
-    const paths = choice === "disk" ? selectedTransferPaths(currentItems, selected) : null;
-    if (choice === "disk" && currentItems.length > 0 && paths.length === 0) {
-      showError("Stage at least one disk change before confirming.");
-      return;
-    }
+    const choiceId = currentChoiceId;
     setBusy(true);
     try {
-      const body = { choiceId: currentChoiceId, choice };
-      if (choice === "disk" && currentItems.length > 0) body.paths = paths;
+      const body = { choiceId, choice };
+      if (choice === "disk") body.mode = "all";
       const result = await daemonJson(base, "/initial-choice", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -379,7 +583,7 @@ export function mountOverwriteModal(api) {
       });
       if (result && result.ok === false) throw new Error(result.error || "choice rejected");
       if (choice === "studio") api.toast?.("Studio will overwrite the local synced tree");
-      else if (choice === "disk") api.toast?.(`${paths.length || "All"} disk changes queued for Studio`);
+      else if (choice === "disk") api.toast?.("All disk changes queued for Studio");
       else api.toast?.("Initial sync canceled");
       close();
     } catch (error) {
@@ -388,51 +592,136 @@ export function mountOverwriteModal(api) {
     }
   }
 
+  async function submitSelected() {
+    if (busy || !currentChoiceId) return;
+    if (!detailAccumulator?.complete || detailError) {
+      showError("Wait for the individual path list, retry it, or move all disk changes.");
+      return;
+    }
+    const ids = selectedTransferIds(currentItems, selected);
+    if (ids.length === 0) {
+      showError("Stage at least one disk change before confirming.");
+      return;
+    }
+    if (ids.length === detailTotal) {
+      await submitFullChoice("disk");
+      return;
+    }
+    const base = api.getDaemonBase(currentProjectId);
+    if (!base) {
+      showError("Daemon offline — reconnect before resolving this divergence.");
+      return;
+    }
+
+    const choiceId = currentChoiceId;
+    const submissionId = newSubmissionId();
+    const chunks = selectionIdChunks(ids);
+    setBusy(true);
+    try {
+      let selectedCount = 0;
+      for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+        const body = {
+          choiceId,
+          submissionId,
+          chunkIndex,
+          finalChunk: chunkIndex === chunks.length - 1,
+          ids: chunks[chunkIndex],
+        };
+        if (chunkIndex === 0) body.restart = true;
+        $detailProgress.textContent = `Submitting selection… ${selectedCount} of ${ids.length}`;
+        const result = await postSelectionChunk(base, body);
+        selectedCount += body.ids.length;
+        assertSelectionReceipt(result, body, selectedCount);
+      }
+      api.toast?.(`${ids.length} disk changes queued for Studio`);
+      close();
+    } catch (error) {
+      await abortSelection(base, choiceId, submissionId);
+      setBusy(false);
+      renderDetailProgress();
+      showError(`Failed: ${error.message}`);
+    }
+  }
+
+  async function postSelectionChunk(base, body) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await daemonJson(base, "/initial-choice/selection", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("selection chunk failed");
+  }
+
+  async function abortSelection(base, choiceId, submissionId) {
+    try {
+      await daemonJson(base, "/initial-choice/selection", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ op: "abort", choiceId, submissionId }),
+      });
+    } catch {
+      // A final chunk may already have committed, or the daemon may be
+      // offline. A fresh chunk zero uses restart:true so reloads cannot remain
+      // wedged behind this abandoned, uncommitted accumulator.
+    }
+  }
+
   overlay.addEventListener("click", (event) => {
     if (busy) return;
     const action = event.target.closest("[data-act]")?.dataset.act;
-    if (action === "studio" || action === "cancel") void submit(action);
+    if (action === "studio" || action === "cancel") void submitFullChoice(action);
     if (action === "disk") {
-      if (currentItems.length) showStep("transfer");
-      else void submit("disk");
+      if (detailTotal > 0) showStep("transfer");
+      else void submitFullChoice("disk");
     }
     if (action === "back") showStep("choice");
-    if (action === "done") void submit("disk");
+    if (action === "done") void submitSelected();
+    if (action === "all-disk") void submitFullChoice("disk");
+    if (action === "retry-details") void loadDetails({ restart: true });
     if (action === "all") {
       const visible = visibleItems();
-      const unstaged = visible.filter((item) => !selected.has(item.path));
-      if (unstaged.length) unstaged.forEach((item) => selected.add(item.path));
-      else visible.forEach((item) => selected.delete(item.path));
+      const unstaged = visible.filter((item) => !selected.has(item.id));
+      if (unstaged.length) unstaged.forEach((item) => selected.add(item.id));
+      else visible.forEach((item) => selected.delete(item.id));
       renderTransfer();
       return;
     }
     const filter = event.target.closest("[data-filter]")?.dataset.filter;
     if (filter) {
       filterAction = filter;
+      visibleCache = null;
       renderTransfer();
       return;
     }
-    const remove = event.target.closest("[data-remove-path]")?.dataset.removePath;
-    if (remove) {
-      removePath(remove);
+    const remove = event.target.closest("[data-remove-id]")?.dataset.removeId;
+    if (remove !== undefined) {
+      removeItem(remove);
       return;
     }
-    const toggle = event.target.closest("[data-toggle-path]")?.dataset.togglePath;
-    if (toggle) togglePath(toggle);
+    const toggle = event.target.closest("[data-toggle-id]")?.dataset.toggleId;
+    if (toggle !== undefined) toggleItem(toggle);
   });
 
   overlay.addEventListener("keydown", (event) => {
     if (busy || (event.key !== "Enter" && event.key !== " ")) return;
-    const row = event.target.closest?.("[data-toggle-path]");
+    const row = event.target.closest?.("[data-toggle-id]");
     if (!row) return;
     event.preventDefault();
-    togglePath(row.dataset.togglePath);
+    toggleItem(row.dataset.toggleId);
     // Re-render replaced the row node; keep keyboard position on its successor.
-    overlay.querySelector(`[data-toggle-path="${cssEscape(row.dataset.togglePath)}"]`)?.focus();
+    overlay.querySelector(`[data-toggle-id="${cssEscape(row.dataset.toggleId)}"]`)?.focus();
   });
 
   $search.addEventListener("input", () => {
     searchText = $search.value;
+    visibleCache = null;
     renderTransfer();
   });
   $search.addEventListener("keydown", (event) => {
@@ -440,11 +729,13 @@ export function mountOverwriteModal(api) {
       event.stopPropagation();
       $search.value = "";
       searchText = "";
+      visibleCache = null;
       renderTransfer();
     }
   });
   $sort.addEventListener("change", () => {
     sortMode = $sort.value;
+    visibleCache = null;
     renderTransfer();
   });
 
@@ -456,10 +747,11 @@ export function mountOverwriteModal(api) {
 
   function beginPointerDrag(event, row, fromList) {
     if (busy || drag || event.button !== 0) return;
-    const path = fromList === "disk" ? row.dataset.dragPath : row.dataset.unstagePath;
-    if (!path || (fromList === "disk" && selected.has(path))) return;
+    const rawId = fromList === "disk" ? row.dataset.dragId : row.dataset.unstageId;
+    const id = uiItemId(rawId);
+    if (id === null || (fromList === "disk" && selected.has(id))) return;
     drag = {
-      path,
+      id,
       fromList,
       row,
       pointerId: event.pointerId,
@@ -507,12 +799,12 @@ export function mountOverwriteModal(api) {
 
   $diskList.addEventListener("pointerdown", (event) => {
     if (event.target.closest("button")) return;
-    const row = event.target.closest("[data-drag-path]");
+    const row = event.target.closest("[data-drag-id]");
     if (row) beginPointerDrag(event, row, "disk");
   });
   $selectedList.addEventListener("pointerdown", (event) => {
     if (event.target.closest("button")) return;
-    const row = event.target.closest("[data-unstage-path]");
+    const row = event.target.closest("[data-unstage-id]");
     if (row) beginPointerDrag(event, row, "staged");
   });
   overlay.addEventListener("pointermove", (event) => {
@@ -529,7 +821,7 @@ export function mountOverwriteModal(api) {
   });
   overlay.addEventListener("pointerup", (event) => {
     if (!drag || event.pointerId !== drag.pointerId) return;
-    const { active, over, path, fromList } = drag;
+    const { active, over, id, fromList } = drag;
     cleanupPointerDrag();
     if (!active) return;
     // The click that may follow this pointerup would toggle the path a second
@@ -542,8 +834,8 @@ export function mountOverwriteModal(api) {
     document.addEventListener("click", squelch, { capture: true, once: true });
     setTimeout(() => document.removeEventListener("click", squelch, { capture: true }), 0);
     if (over) {
-      if (fromList === "disk") addPath(path);
-      else removePath(path);
+      if (fromList === "disk") addItem(id);
+      else removeItem(id);
     }
   });
   overlay.addEventListener("pointercancel", (event) => {
@@ -558,7 +850,7 @@ export function mountOverwriteModal(api) {
       return;
     }
     if (step === "transfer") showStep("choice");
-    else void submit("cancel");
+    else void submitFullChoice("cancel");
   });
 
   api.onBus("initial-choice-needed", (data) => {
@@ -572,6 +864,74 @@ export function mountOverwriteModal(api) {
       close();
     }
   });
+}
+
+function renderOverviewCounts(counts) {
+  const groups = [
+    { title: "Only on disk", hint: "missing in Studio", mark: "+", cls: "is-new", count: counts.create || 0 },
+    { title: "Differs", hint: "changed in Studio or on disk", mark: "~", cls: "is-changed", count: counts.overwrite || 0 },
+    { title: "Missing on disk", hint: "only in Studio", mark: "−", cls: "is-removed", count: counts.remove || 0 },
+  ];
+  return groups
+    .filter((group) => group.count > 0)
+    .map((group) => `
+      <section class="initial-summary-group">
+        <div class="initial-summary-label">
+          <span><i class="${group.cls}" aria-hidden="true">${group.mark}</i> ${escape(group.title)}</span>
+          <span>${group.count} · ${escape(group.hint)}</span>
+        </div>
+      </section>`)
+    .join("");
+}
+
+function renderAvailableEmpty({
+  detailReady,
+  detailLoading,
+  detailError,
+  detailTotal,
+  loaded,
+}) {
+  if (detailError) {
+    return `<div class="transfer-empty is-quiet"><strong>Individual list unavailable</strong><small>Retry the list, or use all of Disk without loading paths.</small></div>`;
+  }
+  if (detailLoading || (!detailReady && detailTotal > 0)) {
+    return `<div class="transfer-empty is-quiet"><strong>Loading disk changes</strong><small>${loaded} of ${detailTotal} paths received.</small></div>`;
+  }
+  return `<div class="transfer-empty is-quiet"><strong>No disk changes</strong><small>Studio and disk agree on every synced path.</small></div>`;
+}
+
+function assertSelectionReceipt(result, body, selectedCount) {
+  if (!result || result.ok !== true) {
+    throw new Error(result?.error || "selection chunk rejected");
+  }
+  if (result.choiceId !== body.choiceId || result.submissionId !== body.submissionId) {
+    throw new Error("selection receipt belongs to another submission");
+  }
+  if (Number(result.acceptedChunk) !== body.chunkIndex) {
+    throw new Error("selection receipt acknowledged the wrong chunk");
+  }
+  if (Number(result.nextChunk) !== body.chunkIndex + 1) {
+    throw new Error("selection receipt has an invalid next chunk");
+  }
+  if (Number(result.selectedCount) !== selectedCount) {
+    throw new Error("selection receipt has an invalid selected count");
+  }
+  if (body.finalChunk && result.committed !== true) {
+    throw new Error("final selection chunk was not committed");
+  }
+  if (!body.finalChunk && result.committed === true) {
+    throw new Error("selection committed before its final chunk");
+  }
+}
+
+function newSubmissionId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+}
+
+function uiItemId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id >= 0 ? id : null;
 }
 
 function transferSummaryText(staged) {
@@ -607,6 +967,14 @@ function renderOverviewGroup(group) {
     </section>`;
 }
 
+function renderListOverflow(hidden, label, hint) {
+  if (!hidden) return "";
+  return `<div class="transfer-empty is-quiet transfer-overflow">
+    <strong>+${hidden} ${escape(label)}</strong>
+    <small>${escape(hint)}</small>
+  </div>`;
+}
+
 function renderPathSpan(path, className) {
   const { parent, name } = splitDisplayPath(path);
   return `<span class="${className}" title="${escape(path)}">${parent ? `<span class="path-parent">${escape(parent)}/</span>` : ""}<span class="path-name">${escape(name)}</span></span>`;
@@ -616,8 +984,8 @@ function renderDiskItem(item, staged) {
   const edited = formatRelativeEdited(item.editedAt);
   return `
     <article class="transfer-file action-${item.action}${staged ? " is-staged" : ""}"
-      data-drag-path="${escape(item.path)}"
-      data-toggle-path="${escape(item.path)}" role="button" tabindex="0" aria-pressed="${staged}"
+      data-drag-id="${item.id}"
+      data-toggle-id="${item.id}" role="button" tabindex="0" aria-pressed="${staged}"
       aria-label="${staged ? "Unstage" : "Stage"} ${escape(item.path)}">
       <span class="transfer-file-mark" aria-hidden="true">${markFor(item.action)}</span>
       <span class="transfer-file-copy">
@@ -644,13 +1012,13 @@ function diskItemMeta(item) {
 
 function renderSelectedItem(item) {
   return `
-    <article class="transfer-file is-selected action-${item.action}" data-unstage-path="${escape(item.path)}">
+    <article class="transfer-file is-selected action-${item.action}" data-unstage-id="${item.id}">
       <span class="transfer-file-mark" aria-hidden="true">${markFor(item.action)}</span>
       <span class="transfer-file-copy">
         <span class="transfer-file-top">${renderPathSpan(item.path, "transfer-file-path")}</span>
         <small>${escape(transferVerb(item))}</small>
       </span>
-      <button type="button" data-remove-path="${escape(item.path)}" aria-label="Unstage ${escape(item.path)}">✕</button>
+      <button type="button" data-remove-id="${item.id}" aria-label="Unstage ${escape(item.path)}">✕</button>
     </article>`;
 }
 

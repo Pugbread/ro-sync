@@ -18,20 +18,23 @@ import { mountConflicts } from "./views/conflicts.js";
 import { mountDocs } from "./views/docs.js";
 import { mountSettings } from "./views/settings.js";
 import { mountOverwriteModal } from "./views/overwrite.js";
+import { createChoiceReplayEpochGuard } from "./views/initial-selection.js";
 import { createLastEditedStore, projectMemoryKey } from "./views/last-edited.js";
 import { mergeProjectInitEvent } from "./project-init.js";
 import {
   canStopDesktopDaemon,
   desktopStartOwnership,
   desktopStopPlan,
+  exactLifecycleCloseIdentity,
   isDesktopManagedStatus,
 } from "./lifecycle-policy.js";
 import {
   PLATFORM, IS_WINDOWS,
   BINARY_REL, WIDGET_DIR_SHELL,
+  daemonIdentityMatchesTrackedSession,
+  projectPathsEqual,
   shQuote,
   pidAliveCmd, parsePidAlive,
-  killPidCmd,
   tailLogCmd, portOwnerCmd,
   launchDaemonCmd, tmpLogPath,
   joinShell,
@@ -65,7 +68,8 @@ document.addEventListener("visibilitychange", () => {
 //   {
 //     projects: [{ id, name, path, addedAt, gameId, groupId, placeIds }],
 //     activeProjectId, servedProjectIds, daemonSessions, projectsRoot,
-//     daemonPid, daemonPort, daemonProject, daemonBootId, daemonOwnerToken,
+//     daemonPid, daemonPort, daemonProject, daemonCanonicalProject,
+//     daemonBootId, daemonOwnerToken,
 //     appearanceTheme, lastView,
 //   }
 const DEFAULT_STATE = {
@@ -77,6 +81,7 @@ const DEFAULT_STATE = {
   daemonPid: null,
   daemonPort: null,
   daemonProject: null,
+  daemonCanonicalProject: null,
   daemonBootId: null,
   daemonOwnerToken: null,
   appearanceTheme: DEFAULT_APPEARANCE_THEME,
@@ -141,7 +146,7 @@ function normalizePersistedState(value) {
   }
   // Migrate the singleton daemon claim into the matching project session.
   const legacyProject = incoming.daemonProject
-    ? next.projects.find((project) => project.path === incoming.daemonProject)
+    ? next.projects.find((project) => projectPathsEqual(project.path, incoming.daemonProject))
     : next.projects.find((project) => project.id === incoming.activeProjectId);
   if (
     !hasServedProjectIds
@@ -157,6 +162,7 @@ function normalizePersistedState(value) {
   )) {
     sessions[legacyProject.id] = normalizeDaemonSession({
       project: incoming.daemonProject || legacyProject.path,
+      canonicalProject: incoming.daemonCanonicalProject || null,
       port: incoming.daemonPort,
       pid: incoming.daemonPid,
       bootId: incoming.daemonBootId,
@@ -309,13 +315,25 @@ const pendingDesktopOwnershipByProject = new Map();
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
 // Persisted via t64:get-state/set-state under key "sessions". Shape:
-//   [{ port, pid, project, startedAt }]
-// On boot we `kill -0 <pid>` each entry; dead entries are dropped before
-// ensureDaemon() runs so we never try to reuse a stale record.
+//   [{ port, pid, project, canonicalProject, bootId, startedAt }]
+// On boot we use PID liveness only to prune obvious dead entries. Every
+// destructive cleanup independently re-authenticates the exact PID, port,
+// project, and boot ID so PID reuse can never authorize a kill.
 async function loadSessions() {
   try {
     const v = await host.stateGet("sessions");
-    return Array.isArray(v) ? v : [];
+    if (!Array.isArray(v)) return [];
+    return v
+      .filter((session) => session && typeof session === "object")
+      .map((session) => {
+        const port = parseInt(session.port, 10);
+        const pid = parseInt(session.pid, 10);
+        return {
+          ...session,
+          port: Number.isFinite(port) && port > 0 ? port : null,
+          pid: Number.isFinite(pid) && pid > 0 ? pid : null,
+        };
+      });
   } catch { return []; }
 }
 
@@ -325,65 +343,196 @@ async function saveSessions(list) {
   } catch (e) { console.warn("t64:set-state sessions failed", e); }
 }
 
-async function pidAlive(pid) {
+const PID_STATUS_ALIVE = "alive";
+const PID_STATUS_DEAD = "dead";
+const PID_STATUS_UNKNOWN = "unknown";
+
+async function pidStatus(pid) {
   const n = parseInt(pid, 10);
-  if (!Number.isFinite(n) || n <= 0) return false;
+  if (!Number.isFinite(n) || n <= 0) return PID_STATUS_DEAD;
   try {
     const res = await t64("t64:exec", { command: pidAliveCmd(n) });
-    return parsePidAlive(res && res.stdout);
-  } catch { return false; }
+    const stdout = String(res?.stdout || "");
+    if (/\bdead\b/i.test(stdout)) return PID_STATUS_DEAD;
+    if (parsePidAlive(stdout)) return PID_STATUS_ALIVE;
+    console.warn("PID probe returned an ambiguous result; preserving tracked state", {
+      pid: n,
+      stdout,
+    });
+    return PID_STATUS_UNKNOWN;
+  } catch (error) {
+    console.warn("PID probe failed; preserving tracked state", { pid: n, error });
+    return PID_STATUS_UNKNOWN;
+  }
 }
 
 async function pruneDeadSessions() {
   const list = await loadSessions();
-  const alive = [];
+  const retained = [];
+  const statusByPid = new Map();
   for (const s of list) {
-    if (await pidAlive(s && s.pid)) alive.push(s);
+    const status = await pidStatus(s?.pid);
+    const pid = parseInt(s?.pid, 10);
+    if (Number.isFinite(pid) && pid > 0) statusByPid.set(pid, status);
+    if (status !== PID_STATUS_DEAD) retained.push(s);
   }
-  if (alive.length !== list.length) await saveSessions(alive);
+  if (retained.length !== list.length) await saveSessions(retained);
   // If we still hold a daemonPid in widget state but its process is gone (the
   // user rebooted, killed it manually, widget reloaded after Studio crashed),
-  // clear it so ensureDaemon doesn't try to reuse a dead pid on relaunch.
-  const pid = app.state && app.state.daemonPid;
-  if (pid && !alive.some((s) => s.pid === pid)) {
-    setState({ daemonPid: null });
+  // clear it so ensureDaemon doesn't try to reuse a dead pid on relaunch. A
+  // missing/failed host probe is deliberately not evidence that it is gone.
+  const pid = parseInt(app.state?.daemonPid, 10);
+  if (Number.isFinite(pid) && pid > 0 && !retained.some((s) => parseInt(s?.pid, 10) === pid)) {
+    const status = statusByPid.get(pid) || await pidStatus(pid);
+    if (status === PID_STATUS_DEAD) {
+      // A manager capability belongs to the authenticated boot even though it
+      // is not itself the boot identity. Rotate it after confirmed death so a
+      // stale/leaked capability cannot authorize the replacement process.
+      setState({
+        daemonPid: null,
+        daemonCanonicalProject: null,
+        daemonBootId: null,
+        daemonOwnerToken: null,
+      });
+    }
+  } else if (app.state?.daemonPid && (!Number.isFinite(pid) || pid <= 0)) {
+    setState({
+      daemonPid: null,
+      daemonCanonicalProject: null,
+      daemonBootId: null,
+      daemonOwnerToken: null,
+    });
   }
-  return alive;
+  return retained;
 }
 
 async function upsertSession(entry) {
   const list = await loadSessions();
+  const entryPort = parseInt(entry?.port, 10);
+  const entryPid = parseInt(entry?.pid, 10);
   const next = list.filter((s) => {
     if (!s) return false;
-    if (s.port === entry.port) return false;
-    if (entry.pid && s.pid === entry.pid) return false;
+    if (Number.isFinite(entryPort) && parseInt(s.port, 10) === entryPort) return false;
+    if (Number.isFinite(entryPid) && entryPid > 0 && parseInt(s.pid, 10) === entryPid) return false;
     return true;
   });
-  next.push(entry);
+  next.push({
+    ...entry,
+    port: Number.isFinite(entryPort) && entryPort > 0 ? entryPort : null,
+    pid: Number.isFinite(entryPid) && entryPid > 0 ? entryPid : null,
+  });
   await saveSessions(next);
 }
 
 async function removeSession(match) {
   const list = await loadSessions();
+  const matchPort = parseInt(match?.port, 10);
+  const matchPid = parseInt(match?.pid, 10);
+  const matchBootId = typeof match?.bootId === "string" && match.bootId
+    ? match.bootId
+    : null;
+  const hasPort = Number.isFinite(matchPort) && matchPort > 0;
+  const hasPid = Number.isFinite(matchPid) && matchPid > 0;
+  const hasBootId = !!matchBootId;
+  if (!hasPort && !hasPid && !hasBootId) return;
   const next = list.filter((s) => {
     if (!s) return false;
-    if (match.pid && s.pid === match.pid) return false;
-    if (match.port && s.port === match.port) return false;
-    return true;
+    // Every supplied field is part of one identity. Single-field cleanup
+    // remains available for deliberately forgetting whichever process owns a
+    // port, while exact shutdown cleanup cannot erase a replacement boot.
+    const matches = (
+      (!hasPid || parseInt(s.pid, 10) === matchPid)
+      && (!hasPort || parseInt(s.port, 10) === matchPort)
+      && (!hasBootId || s.bootId === matchBootId)
+    );
+    return !matches;
   });
   if (next.length !== list.length) await saveSessions(next);
 }
 
+async function inspectTrackedSessionOwnership(session) {
+  if (!session?.port || !session?.pid || !session?.bootId) {
+    return { owned: false, status: "incomplete" };
+  }
+  const hit = await probePort(session.port);
+  if (!hit) return { owned: false, status: "unreachable" };
+  if (!daemonIdentityMatchesTrackedSession(session, hit.info)) {
+    return { owned: false, status: "identity-mismatch", hit };
+  }
+  if (!isWidgetOwnedDaemon(hit.info) || !app.state.daemonOwnerToken) {
+    return { owned: false, status: "ownership-unavailable", hit };
+  }
+  if (!(await verifyDaemonOwnership(`http://127.0.0.1:${hit.port}`))) {
+    return { owned: false, status: "ownership-rejected", hit };
+  }
+  return { owned: true, status: "owned", hit };
+}
+
+async function trackedSessionStillOwnsProcess(session) {
+  return (await inspectTrackedSessionOwnership(session)).owned;
+}
+
 async function stopTrackedSession(session) {
-  if (!session) return;
+  if (!session) return false;
   try {
-    if (session.pid && await pidAlive(session.pid)) {
-      await t64("t64:exec", { command: killPidCmd(session.pid) });
+    // Authenticate the full daemon identity first. This remains authoritative
+    // when the host process probe is unavailable or PowerShell fails.
+    const ownership = await inspectTrackedSessionOwnership(session);
+    if (ownership.owned) {
+      const base = `http://127.0.0.1:${session.port}`;
+      const identity = exactLifecycleCloseIdentity(session);
+      if (!identity) {
+        console.warn("tracked daemon has no complete close identity", session);
+        return false;
+      }
+      const result = await daemonLifecycleRequest(
+        base,
+        "/manager-close",
+        "duplicate daemon cleanup",
+        app.state.daemonOwnerToken,
+        identity,
+      );
+      if (!result.ok || !(await waitForPortRelease(session.port, 4000, session.pid))) {
+        console.warn("tracked daemon remained running after authenticated cleanup", session, result);
+        return false;
+      }
+      await removeSession({ pid: session.pid, port: session.port, bootId: session.bootId });
+      return true;
     }
+
+    const status = await pidStatus(session.pid);
+    if (status === PID_STATUS_DEAD) {
+      await removeSession({ pid: session.pid, port: session.port, bootId: session.bootId });
+      return true;
+    }
+
+    if (status === PID_STATUS_UNKNOWN) {
+      console.warn("could not verify tracked PID; preserving session for a later retry", session);
+      return false;
+    }
+
+    if (ownership.status === "identity-mismatch" || ownership.status === "incomplete") {
+      console.warn("discarding stale tracked identity without stopping its live PID", {
+        session,
+        status: ownership.status,
+      });
+      await removeSession({ pid: session.pid, port: session.port, bootId: session.bootId });
+      return false;
+    }
+
+    // A busy daemon can miss a short /hello timeout while its PID remains
+    // healthy. Preserve the exact boot record for a later retry instead of
+    // turning a transient transport or ownership check into a permanent
+    // orphan.
+    console.warn("tracked daemon ownership could not be re-authenticated; preserving session", {
+      session,
+      status: ownership.status,
+    });
+    return false;
   } catch (e) {
     console.warn("stopTrackedSession failed", session, e);
+    return false;
   }
-  await removeSession({ pid: session.pid, port: session.port });
 }
 
 async function stopDuplicateTrackedSessions(keepProject, keepPort) {
@@ -391,22 +540,17 @@ async function stopDuplicateTrackedSessions(keepProject, keepPort) {
   const sessions = await pruneDeadSessions();
   for (const session of sessions) {
     const sessionPort = parseInt(session && session.port, 10);
-    if (Number.isFinite(keepPortN) && sessionPort === keepPortN) continue;
+    if (
+      Number.isFinite(keepPortN)
+      && sessionPort === keepPortN
+      && projectPathsEqual(session?.project, keepProject)
+    ) continue;
 
-    // The widget serves one project at a time. Kill only daemons this widget
+    // The widget serves one project at a time. Stop only daemons this widget
     // launched/tracked; manually launched daemons are not in this registry.
     if (session && session.project) {
       await stopTrackedSession(session);
     }
-  }
-
-  const remaining = await loadSessions();
-  const activeOnly = remaining.filter((session) => {
-    const sessionPort = parseInt(session && session.port, 10);
-    return session && session.project === keepProject && sessionPort === keepPortN;
-  });
-  if (activeOnly.length !== remaining.length) {
-    await saveSessions(activeOnly);
   }
 }
 
@@ -444,22 +588,31 @@ async function getPortOwnerPid(port) {
   return parsePortOwnerPid(await getPortOwner(port));
 }
 
-async function waitForPidExit(pid, timeoutMs = 4000) {
+async function waitForPortRelease(port, timeoutMs = 4000, expectedPid = null) {
   const deadline = Date.now() + timeoutMs;
+  let consecutiveHelloMisses = 0;
+  let checkedOwnerAfterMiss = false;
   while (Date.now() < deadline) {
-    if (!(await pidAlive(pid))) return true;
+    if (await probePort(port)) {
+      consecutiveHelloMisses = 0;
+    } else {
+      consecutiveHelloMisses += 1;
+      // Avoid launching a PowerShell/Get-NetTCPConnection process on every
+      // 100 ms poll. Two failed daemon probes establish the shutdown edge;
+      // inspect the OS listener once there, then once more at the deadline.
+      if (consecutiveHelloMisses >= 2 && !checkedOwnerAfterMiss) {
+        checkedOwnerAfterMiss = true;
+        const owner = await getPortOwner(port);
+        if (!owner && (
+          !expectedPid || await pidStatus(expectedPid) === PID_STATUS_DEAD
+        )) return true;
+      }
+    }
     await sleep(100);
   }
-  return !(await pidAlive(pid));
-}
-
-async function waitForPortRelease(port, timeoutMs = 4000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!(await getPortOwner(port))) return true;
-    await sleep(100);
-  }
-  return !(await getPortOwner(port));
+  const owner = await getPortOwner(port);
+  if (owner) return false;
+  return !expectedPid || await pidStatus(expectedPid) === PID_STATUS_DEAD;
 }
 
 function makeOwnerToken() {
@@ -484,10 +637,15 @@ async function daemonLifecycleRequest(
   path,
   reason,
   token = app.state.daemonOwnerToken,
+  exactIdentity = null,
 ) {
   if (!base || !token) return { sent: false, ok: false, error: "missing daemon owner token" };
+  const destructive = path === "/manager-close" || path === "/widget-close";
+  if (destructive && !exactIdentity) {
+    return { sent: false, ok: false, error: "missing exact daemon close identity" };
+  }
   const url = daemonURL(base, path, token);
-  const body = JSON.stringify({ token, reason });
+  const body = JSON.stringify({ token, reason, ...(exactIdentity || {}) });
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -508,12 +666,20 @@ async function daemonLifecycleRequest(
   }
 }
 
-function daemonLifecyclePost(path, reason, preferBeacon = false, override = null) {
+function daemonLifecyclePost(
+  path,
+  reason,
+  preferBeacon = false,
+  override = null,
+  exactIdentity = null,
+) {
   const base = override?.base || app.daemonBase;
   const token = override?.token || app.state.daemonOwnerToken;
   if (!base || !token) return false;
+  const destructive = path === "/manager-close" || path === "/widget-close";
+  if (destructive && !exactIdentity) return false;
   const url = daemonURL(base, path, token);
-  const body = JSON.stringify({ token, reason });
+  const body = JSON.stringify({ token, reason, ...(exactIdentity || {}) });
   if (preferBeacon && navigator.sendBeacon) {
     try {
       const blob = new Blob([body], { type: "application/json" });
@@ -608,7 +774,9 @@ function notifyWidgetClosing() {
     projectBrokerTimer = null;
   }
   stopDaemonHeartbeat();
-  daemonLifecyclePost("/widget-close", "widget closed", true);
+  const identity = exactLifecycleCloseIdentity(app.state);
+  if (!identity) return;
+  daemonLifecyclePost("/widget-close", "widget closed", true, null, identity);
 }
 
 function activeProject() {
@@ -626,7 +794,7 @@ function servedProjectIds() {
 }
 
 function projectIdForPath(path) {
-  return (app.state.projects || []).find((project) => project.path === path)?.id || null;
+  return (app.state.projects || []).find((project) => projectPathsEqual(project.path, path))?.id || null;
 }
 
 function sessionPolicyState(session) {
@@ -634,6 +802,7 @@ function sessionPolicyState(session) {
     daemonPid: session?.pid ?? null,
     daemonPort: session?.port ?? null,
     daemonProject: session?.project ?? null,
+    daemonCanonicalProject: session?.canonicalProject ?? null,
     daemonBootId: session?.bootId ?? null,
     daemonOwnerToken: session?.ownerToken ?? null,
   };
@@ -648,6 +817,7 @@ function legacyDaemonPatch(sessions, preferredProjectId = app.state.activeProjec
     daemonPid: session?.pid ?? null,
     daemonPort: session?.port ?? null,
     daemonProject: session?.project ?? null,
+    daemonCanonicalProject: session?.canonicalProject ?? null,
     daemonBootId: session?.bootId ?? null,
     daemonOwnerToken: session?.ownerToken ?? null,
   };
@@ -734,7 +904,6 @@ async function launchDaemon(projectPath, port) {
     const pid = parseInt(payload, 10);
     if (Number.isFinite(pid) && pid > 0) {
       setState({ daemonPid: pid, daemonPort: port, daemonProject: projectPath });
-      await upsertSession({ port, pid, project: projectPath, startedAt: Date.now() });
       return pid;
     }
 
@@ -774,11 +943,13 @@ async function launchDaemon(projectPath, port) {
 }
 
 async function scanFallbackPorts(project, preferred) {
+  const trackedSessions = await loadSessions();
   for (let p = preferred + 1; p <= PORT_SCAN_MAX; p++) {
     // Skip ports already occupied by a non-ours daemon.
     const occ = await probePort(p);
-    if (occ && !isOwnDaemon(occ.info, project)) continue;
-    if (occ && isOwnDaemon(occ.info, project)) {
+    const ours = occ && isOwnDaemon(occ.info, project, trackedSessions);
+    if (occ && !ours) continue;
+    if (ours) {
       if (!isWidgetOwnedDaemon(occ.info) || !app.state.daemonOwnerToken) {
         toast(`Port ${preferred} busy — using existing daemon on :${p}`);
         return occ;
@@ -814,16 +985,22 @@ function cleanPsStderr(s) {
   return "PowerShell error (see devtools console for full CLIXML)";
 }
 
-// Probes a port and, if a daemon responds, decides whether it's OURS for the
-// currently-active project. Matches on gameId when we have one, otherwise on
-// daemonProject history — mirrors plugin-side port-probe behavior.
-function isOwnDaemon(info, project) {
+// Probes a port and decides whether the daemon serves this exact filesystem
+// project. A universe/game ID is intentionally insufficient: two local clones
+// of the same Roblox game are distinct sync roots.
+function isOwnDaemon(info, project, trackedSessions = []) {
   if (!info || typeof info !== "object") return false;
-  const proj = activeProject();
-  // GameId match against the CURRENTLY active project — authoritative.
-  if (proj && proj.gameId && info.gameId && String(info.gameId) === String(proj.gameId)) return true;
   // Project-path match against the currently active project.
-  if (info.project && project && info.project === project) return true;
+  if (projectPathsEqual(info.project, project)) return true;
+  // Windows canonicalization can change the spelling beyond prefix/separator
+  // normalization (junctions, symlinks, 8.3 aliases, or component case).
+  // Reattach only
+  // through a session that pairs the current UI path with the exact daemon
+  // PID, port, boot ID, and canonical project captured after authentication.
+  if (trackedSessions.some((session) =>
+    projectPathsEqual(session?.project, project)
+      && daemonIdentityMatchesTrackedSession(session, info)
+  )) return true;
   // NOTE: the old third check (`daemonProject === info.project`) was removed:
   // it claimed ownership based on *prior* daemonProject state, so after a
   // project switch the stale daemon would be treated as ours, skipping the
@@ -841,14 +1018,29 @@ async function launchAndWait(project, port) {
   for (let i = 0; i < 20; i++) {
     await sleep(200);
     const hit = await probePort(port);
-    if (hit) return hit;
+    if (hit) {
+      const helloPid = Number.parseInt(hit.info?.pid, 10);
+      if (helloPid === launchedPid) return hit;
+      // A listener can win the preferred-port race after our launch attempt.
+      // Never attach the just-created ownership token or PID to that process.
+      console.warn("ignoring daemon launch race with a different listener PID", {
+        expectedPid: launchedPid,
+        actualPid: helloPid,
+        port,
+      });
+    }
   }
-  // A process that launched but never passed the authenticated browser probe
-  // must not leak into the fallback scan. Stop only the exact PID we just
-  // created; manually managed daemons are never touched here.
-  await stopTrackedSession({ pid: launchedPid, port, project });
+  // This process never produced an authenticated identity. Do not persist it
+  // or force-kill a bare PID: if it already exited, the OS may have reused that
+  // PID for an unrelated process. A responsive owned daemon is cleaned up only
+  // after its exact boot identity has been recorded below.
   if (app.state.daemonPid === launchedPid) {
-    setState({ daemonPid: null, daemonProject: null, daemonBootId: null });
+    setState({
+      daemonPid: null,
+      daemonProject: null,
+      daemonCanonicalProject: null,
+      daemonBootId: null,
+    });
   }
   return null;
 }
@@ -1045,7 +1237,7 @@ async function ensureDesktopDaemon(projectId, project) {
   let ownedCandidate = null;
   let requestedToken = null;
   const existingSession = app.state.daemonSessions?.[projectId] || null;
-  const preferredPort = existingSession?.project === project && existingSession?.port
+  const preferredPort = projectPathsEqual(existingSession?.project, project) && existingSession?.port
     ? existingSession.port
     : DEFAULT_PORT;
   let pending = pendingDesktopOwnershipByProject.get(projectId) || null;
@@ -1212,7 +1404,7 @@ async function ensureDesktopDaemon(projectId, project) {
 async function ensureDaemonInner() {
   const project = activeProjectPath();
   const preferred =
-    app.state.daemonProject === project && app.state.daemonPort
+    projectPathsEqual(app.state.daemonProject, project) && app.state.daemonPort
       ? app.state.daemonPort
       : DEFAULT_PORT;
 
@@ -1231,11 +1423,12 @@ async function ensureDaemonInner() {
 
   // 1. Probe preferred port.
   let hit = await probePort(preferred);
+  const trackedSessions = hit ? await loadSessions() : [];
 
   // 2. If someone is on preferred port: is it ours?
   if (hit) {
-    const ours = isOwnDaemon(hit.info, project);
-    const pointedAtOurProject = hit.info && hit.info.project === project;
+    const ours = isOwnDaemon(hit.info, project, trackedSessions);
+    const pointedAtOurProject = projectPathsEqual(hit.info?.project, project);
     if (ours && (!isWidgetOwnedDaemon(hit.info) || !app.state.daemonOwnerToken)) {
       // A manually started daemon, or a widget daemon whose ownership token
       // is no longer available, is external to this widget. Reuse it without
@@ -1249,10 +1442,23 @@ async function ensureDaemonInner() {
       // Daemon IS serving our current project path, but gameId/groupId/placeIds don't
       // match. The daemon hot-reloads ro-sync.json, so keep the existing
       // process instead of risking a pattern-based kill of a manual daemon.
-    } else if (app.state.daemonProject && app.state.daemonProject !== project) {
+    } else if (app.state.daemonProject && !projectPathsEqual(app.state.daemonProject, project)) {
       // It's our own prior daemon but for a different project — stop and relaunch here.
-      await killDaemon();
+      if (!(await killDaemon())) {
+        app.daemonOk = false;
+        app.daemonBase = null;
+        setDaemonDot("idle", "previous project still connected");
+        emit("daemon:down", { project, error: "previous project daemon is still running" });
+        return;
+      }
       hit = await launchAndWait(project, preferred);
+      // The preferred port may belong to the unrelated listener that led us
+      // into this branch; stopping our previous-project daemon does not free
+      // that port. Continue through the normal fallback range instead of
+      // leaving the newly selected project offline.
+      if (!hit && await getPortOwner(preferred)) {
+        hit = await scanFallbackPorts(project, preferred);
+      }
     } else {
       // Occupied by someone we don't own — fall back to port scan.
       hit = await scanFallbackPorts(project, preferred);
@@ -1273,7 +1479,7 @@ async function ensureDaemonInner() {
     app.daemonOk = true;
     setDaemonDot("ok", `:${hit.port}`);
     if (app.state.daemonPort !== hit.port) setState({ daemonPort: hit.port });
-    if (app.state.daemonProject !== project) setState({ daemonProject: project });
+    if (!projectPathsEqual(app.state.daemonProject, project)) setState({ daemonProject: project });
     if (hit.info?.bootId && app.state.daemonBootId !== hit.info.bootId) {
       setState({ daemonBootId: hit.info.bootId });
     }
@@ -1288,13 +1494,21 @@ async function ensureDaemonInner() {
       !!app.state.daemonOwnerToken &&
       await verifyDaemonOwnership(app.daemonBase);
     if (ownsLifecycle) {
-      const ownerPid = await getPortOwnerPid(hit.port);
+      const helloPid = parseInt(hit.info?.pid, 10);
+      const ownerPid = Number.isFinite(helloPid) && helloPid > 0
+        ? helloPid
+        : await getPortOwnerPid(hit.port);
       const daemonPid = ownerPid || app.state.daemonPid || null;
       if (daemonPid && app.state.daemonPid !== daemonPid) setState({ daemonPid });
+      if (app.state.daemonCanonicalProject !== hit.info?.project) {
+        setState({ daemonCanonicalProject: hit.info?.project || null });
+      }
       await upsertSession({
         port: hit.port,
         pid: daemonPid,
         project,
+        canonicalProject: hit.info?.project || project,
+        bootId: hit.info?.bootId || null,
         startedAt: Date.now(),
       });
       await stopDuplicateTrackedSessions(project, hit.port);
@@ -1302,8 +1516,18 @@ async function ensureDaemonInner() {
       // Forget any stale record for this listener. Keeping a token or PID here
       // would make killDaemon()/heartbeat treat an external process as ours.
       await removeSession({ port: hit.port });
-      if (app.state.daemonPid || app.state.daemonOwnerToken) {
-        setState({ daemonPid: null, daemonBootId: null, daemonOwnerToken: null });
+      if (
+        app.state.daemonPid
+        || app.state.daemonCanonicalProject
+        || app.state.daemonBootId
+        || app.state.daemonOwnerToken
+      ) {
+        setState({
+          daemonPid: null,
+          daemonCanonicalProject: null,
+          daemonBootId: null,
+          daemonOwnerToken: null,
+        });
       }
     }
     emit("daemon:up", { base: app.daemonBase, info: hit.info, project });
@@ -1374,52 +1598,44 @@ async function killDaemon(projectIdOrOptions = null, maybeOptions = {}) {
       return false;
     }
   }
-  if (!pid) {
-    // No tracked PID means the process may have been started manually. Only
-    // the authenticated lifecycle endpoint is safe to use in this case.
-    if (!app.daemonBase || !app.state.daemonOwnerToken) {
-      toast("Daemon is externally managed; it was left running.");
-      return false;
-    }
-    const result = await daemonLifecycleRequest(app.daemonBase, "/widget-close", "daemon stopped");
-    if (!result.ok) {
-      toast(`Could not stop daemon safely: ${result.error || "ownership rejected"}`);
-      return false;
-    }
-    if (result.data && result.data.keptAlive) {
-      toast("Daemon kept running because Studio is connected.");
-      return false;
-    }
-    if (port && !(await waitForPortRelease(port))) {
-      toast(`Daemon did not release port ${port}; restart was cancelled.`);
-      return false;
-    }
-    await removeSession({ port });
-    setState({
-      daemonPid: null,
-      daemonProject: preserveTarget ? app.state.daemonProject : null,
-      daemonBootId: null,
-      daemonOwnerToken: null,
-    });
-    app.daemonOk = false;
-    app.daemonBase = null;
-    setDaemonDot("idle", "daemon stopped");
-    emit("daemon:down", {});
-    return true;
-  }
-  try {
-    await t64("t64:exec", { command: killPidCmd(pid) });
-  } catch (e) {
-    console.warn("kill failed", e);
-  }
-  if (!(await waitForPidExit(pid))) {
-    toast(`Daemon PID ${pid} did not exit; restart was cancelled.`);
+  const trackedSessions = await loadSessions();
+  const registeredStop = trackedSessions.find((session) =>
+    app.state.daemonBootId
+      && session?.bootId === app.state.daemonBootId
+      && parseInt(session?.port, 10) === parseInt(port, 10)
+      && projectPathsEqual(session?.project, app.state.daemonProject)
+      && (!pid || parseInt(session?.pid, 10) === parseInt(pid, 10))
+  );
+  if (!registeredStop || !(await trackedSessionStillOwnsProcess(registeredStop))) {
+    toast("The daemon could not be matched to an exact authenticated session and was left running.");
     return false;
   }
-  await removeSession({ pid, port });
+  const base = `http://127.0.0.1:${port}`;
+  const identity = exactLifecycleCloseIdentity(registeredStop);
+  if (!identity) {
+    toast("The daemon session has no complete close identity and was left running.");
+    return false;
+  }
+  const graceful = await daemonLifecycleRequest(
+    base,
+    "/manager-close",
+    "daemon stopped",
+    app.state.daemonOwnerToken,
+    identity,
+  );
+  if (!graceful.ok) {
+    toast(`Could not stop daemon safely: ${graceful.error || "ownership rejected"}`);
+    return false;
+  }
+  if (!(await waitForPortRelease(port, 4000, registeredStop.pid))) {
+    toast(`Daemon did not release port ${port}; it was left tracked.`);
+    return false;
+  }
+  await removeSession({ pid: registeredStop.pid, port, bootId: registeredStop.bootId });
   setState({
     daemonPid: null,
     daemonProject: preserveTarget ? app.state.daemonProject : null,
+    daemonCanonicalProject: null,
     daemonBootId: null,
     daemonOwnerToken: null,
   });
@@ -2228,19 +2444,36 @@ const ENABLE_APP_REALTIME_STREAM = true;
 //   {type:"error"} → transport-only, ignored here
 const appStreams = new Map();
 const RAW_OP_RE = /"type"\s*:\s*"op"/;
+const INITIAL_CHOICE_REPLAY = Object.freeze({
+  REPLAYED: "replayed",
+  RESOLVED: "resolved",
+  UNAVAILABLE: "unavailable",
+});
+const initialChoiceReplayEpoch = createChoiceReplayEpochGuard();
 
 async function replayPendingInitialChoice(projectId, base, event = {}) {
+  const replayEpoch = initialChoiceReplayEpoch.begin(projectId, event.choiceId);
   try {
     const pending = await daemonJson(base, "/initial-choice");
-    if (!pending?.pending || pending.choice || !pending.choiceId) return;
+    if (!initialChoiceReplayEpoch.accepts(replayEpoch, pending?.choiceId)) {
+      return INITIAL_CHOICE_REPLAY.RESOLVED;
+    }
+    if (!pending?.pending || pending.choice || !pending.choiceId) {
+      return INITIAL_CHOICE_REPLAY.RESOLVED;
+    }
     emit("initial-choice-needed", {
       ...pending,
       projectId: projectId === "__single" ? app.state.activeProjectId : projectId,
       projectPath: event.project || projectById(projectId)?.path || null,
     });
+    return INITIAL_CHOICE_REPLAY.REPLAYED;
   } catch {
+    if (!initialChoiceReplayEpoch.accepts(replayEpoch, event.choiceId || null)) {
+      return INITIAL_CHOICE_REPLAY.RESOLVED;
+    }
     // The realtime stream will still deliver a newly-created decision. Replay
     // is best-effort recovery for a decision broadcast before this UI attached.
+    return INITIAL_CHOICE_REPLAY.UNAVAILABLE;
   }
 }
 
@@ -2261,6 +2494,7 @@ function openAppStream(event = {}) {
     || "__single";
   const base = event.base || getDaemonBase(projectId === "__single" ? null : projectId);
   if (!base) return;
+  initialChoiceReplayEpoch.invalidate(projectId);
   const previous = appStreams.get(projectId);
   if (previous) { try { previous.close(); } catch {} }
   // Resolved lazily: in single-daemon mode the active project can change
@@ -2297,8 +2531,31 @@ function openAppStream(event = {}) {
         // Everything else is a state.events passthrough carrying its
         // original top-level type. Fan out to the bus so app-level controls
         // can react.
-        if (t === "initial-choice-needed" || t === "initial-choice-made"
-            || t === "config-changed" || t === "conflict") {
+        if (t === "initial-choice-needed") {
+          // The realtime event and this status replay are both deliberately
+          // bounded. The modal opens from the summary returned here, then
+          // pages immutable stable-ID details itself; this relay never pulls a
+          // tens-of-thousands-path payload into the app event hot path.
+          initialChoiceReplayEpoch.invalidate(projectId);
+          void replayPendingInitialChoice(projectId, base, {
+            ...event,
+            project: data.project || event.project,
+            choiceId: data.choiceId,
+          }).then((outcome) => {
+            // An authoritative "not pending" status means this WS event raced
+            // with resolution. Only a transport failure may fall back to the
+            // bounded event summary; otherwise a stale modal would reopen.
+            if (outcome !== INITIAL_CHOICE_REPLAY.UNAVAILABLE) return;
+            emit(t, {
+              ...data,
+              projectId: projectId === "__single" ? app.state.activeProjectId : projectId,
+              projectPath: event.project || projectById(projectId)?.path || null,
+            });
+          });
+          return;
+        }
+        if (t === "initial-choice-made" || t === "config-changed" || t === "conflict") {
+          if (t === "initial-choice-made") initialChoiceReplayEpoch.invalidate(projectId);
           emit(t, {
             ...data,
             projectId: projectId === "__single" ? app.state.activeProjectId : projectId,
@@ -2324,6 +2581,7 @@ on("daemon:up", openAppStream);
 on("daemon:down", (event = {}) => {
   const projectId = event.projectId || projectIdForPath(event.project) || null;
   if (projectId) {
+    initialChoiceReplayEpoch.invalidate(projectId);
     const stream = appStreams.get(projectId);
     if (stream) { try { stream.close(); } catch {} }
     appStreams.delete(projectId);
@@ -2337,6 +2595,7 @@ on("daemon:down", (event = {}) => {
   // stamps) to the old project.
   for (const stream of appStreams.values()) { try { stream.close(); } catch {} }
   appStreams.clear();
+  initialChoiceReplayEpoch.invalidateAll();
 });
 
 // ---------- Native Studio project-initialization broker ----------

@@ -31,6 +31,26 @@ function validOwnerToken(value) {
     : null;
 }
 
+// Destructive lifecycle endpoints pin the request to one immutable daemon
+// boot. The capability proves manager ownership; these fields prevent that
+// capability from being replayed against a replacement process on the same
+// port.
+export function exactLifecycleCloseIdentity(value) {
+  const bootId = nonBlankString(value?.bootId ?? value?.daemonBootId);
+  const pid = positiveInteger(value?.pid ?? value?.daemonPid, 0xffff_ffff);
+  const port = positiveInteger(value?.port ?? value?.daemonPort, 0xffff);
+  const canonicalProject = nonBlankString(
+    value?.canonicalProject ?? value?.daemonCanonicalProject,
+  );
+  if (!bootId || !pid || !port || !canonicalProject) return null;
+  return {
+    expectedBootId: bootId,
+    expectedPid: pid,
+    expectedPort: port,
+    expectedCanonicalProject: canonicalProject,
+  };
+}
+
 // Desktop persists one lifecycle session per project ID. Accepting the legacy
 // daemon* field names here keeps migration and Terminal 64 callers compatible,
 // but authorization always resolves to one selected project record; claims can

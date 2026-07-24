@@ -14,6 +14,7 @@ mod artifact;
 mod conflict;
 mod diff;
 mod fs_map;
+mod fs_safety;
 mod http;
 mod img_upload;
 mod initial_sync;
@@ -2811,7 +2812,7 @@ fn daemon_hello_matches_project(
 }
 
 fn canonicalize_project_path(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    lifecycle::canonical_project(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 const CLI_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -3146,11 +3147,7 @@ fn atomic_replace_bytes(
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        #[cfg(windows)]
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        std::fs::rename(&temporary, path)
+        lifecycle::replace_file_atomic(&temporary, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -3867,6 +3864,7 @@ async fn daemon_start(
         arm_parent_stdin_lease()?;
     }
     validate_lifecycle_timeout(args.timeout, "daemon start")?;
+    let timeout = Duration::from_secs_f64(args.timeout);
     if args.managed_by.trim().is_empty() {
         return Err("daemon start: --managed-by cannot be empty".into());
     }
@@ -3984,6 +3982,16 @@ async fn daemon_start(
         }
     }
 
+    // Project start locks are intentionally independent, but TCP ports are
+    // process-global. Serialize selection through the shared daemon state
+    // directory and hold this lock until the child has bound and completed its
+    // exact boot handshake. Without this guard, two different projects can
+    // both probe the same fallback port before either child starts.
+    let port_lock_path = daemon_port_allocation_lock_path(&paths)?;
+    let _port_lock = acquire_daemon_port_allocation_lock(&port_lock_path, timeout)
+        .await
+        .map_err(|error| format!("daemon start: {error}"))?;
+
     // No matching live daemon exists after the locked status/port probes, so
     // these explicit launch overrides can safely seed the process about to be
     // created. A foreign live daemon always returned above without mutation.
@@ -3991,7 +3999,10 @@ async fn daemon_start(
 
     let port = match args.port {
         Some(0) => reserve_ephemeral_port()?,
-        Some(port) => port,
+        Some(port) => {
+            ensure_daemon_port_available(port)?;
+            port
+        }
         None => find_available_daemon_port().ok_or_else(|| {
             format!(
                 "daemon start: no available port in {DEFAULT_DAEMON_PORT}-{DAEMON_PORT_SCAN_MAX}"
@@ -4004,7 +4015,6 @@ async fn daemon_start(
     };
     let boot_id = artifact::random_hex(32)?;
     let started_at = unix_secs();
-    let timeout = Duration::from_secs_f64(args.timeout);
     spawn_managed_daemon(ManagedDaemonLaunch {
         canonical_project: &canonical_project,
         paths: &paths,
@@ -4018,6 +4028,56 @@ async fn daemon_start(
         projects_root: projects_root.as_deref(),
     })
     .await
+}
+
+fn daemon_port_allocation_lock_path(
+    paths: &lifecycle::RuntimePaths,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let daemon_dir = paths
+        .start_lock
+        .parent()
+        .ok_or("daemon start: invalid per-project lock path")?;
+    Ok(daemon_dir.join("ports.start.lock"))
+}
+
+async fn acquire_daemon_port_allocation_lock(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> std::io::Result<lifecycle::StartLock> {
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon port-allocation timeout overflow",
+        )
+    })?;
+    loop {
+        match lifecycle::StartLock::acquire_named(path, "daemon port allocation") {
+            Ok(lock) => return Ok(lock),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for another daemon to finish port allocation (lock {})",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn ensure_daemon_port_available(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .map_err(|error| format!("daemon start: requested port {port} is unavailable: {error}"))?;
+    drop(listener);
+    Ok(())
 }
 
 fn reserve_ephemeral_port() -> Result<u16, Box<dyn std::error::Error>> {
@@ -4199,6 +4259,20 @@ async fn spawn_managed_daemon(
     }
 }
 
+fn managed_daemon_close_request(
+    record: &lifecycle::RuntimeRecord,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "token": record.control_token,
+        "reason": reason,
+        "expectedBootId": record.boot_id,
+        "expectedPid": record.pid,
+        "expectedPort": record.port,
+        "expectedCanonicalProject": record.canonical_project,
+    })
+}
+
 async fn daemon_stop(
     canonical_project: &std::path::Path,
     paths: &lifecycle::RuntimePaths,
@@ -4243,10 +4317,7 @@ async fn daemon_stop(
     let response = http_post_json_until(
         record.port,
         "/manager-close",
-        &serde_json::json!({
-            "token": record.control_token,
-            "reason": "managed daemon stop requested",
-        }),
+        &managed_daemon_close_request(&record, "managed daemon stop requested"),
         deadline,
     )
     .await
@@ -4569,7 +4640,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         tx.clone(),
         conflict_engine.clone(),
         push_quiet.clone(),
-    );
+    )
+    .map_err(|error| format!("serve: validate watched filesystem: {error}"))?;
     spawn_config_hot_reload(state.clone());
     if args.widget_owned {
         spawn_widget_owner_watchdog(state.clone());
@@ -4854,7 +4926,7 @@ fn run_commands(args: CommandsArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_context(args: ContextArgs) -> Result<(), Box<dyn std::error::Error>> {
     let project = project_or_cwd(args.project.as_deref(), "context")?;
-    let canonical_project = std::fs::canonicalize(&project).unwrap_or_else(|_| project.clone());
+    let canonical_project = canonicalize_project_path(&project);
     let command_bundle: serde_json::Value = serde_json::from_str(COMMANDS_BUNDLE_JSON)
         .map_err(|e| format!("context: embedded command registry is invalid: {e}"))?;
     let command_names = command_names_from_bundle(&command_bundle);
@@ -8042,18 +8114,8 @@ async fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => p,
         None => std::env::current_dir().map_err(|e| format!("lint: current directory: {e}"))?,
     };
-    if !project.exists() {
-        return Err(format!("lint: project path does not exist: {}", project.display()).into());
-    }
-    if !project.is_dir() {
-        return Err(format!(
-            "lint: project path is not a directory: {}",
-            project.display()
-        )
-        .into());
-    }
-    let project = std::fs::canonicalize(&project)
-        .map_err(|e| format!("lint: canonicalize {}: {e}", project.display()))?;
+    let project = lifecycle::canonical_project(&project)
+        .map_err(|e| format!("lint: validate project {}: {e}", project.display()))?;
 
     if args.scope_only && args.paths.is_empty() {
         return Err("lint: --scope-only requires at least one --path".into());
@@ -8074,15 +8136,10 @@ async fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map(|path| lint_target_path(&project, path))
             .collect()
     };
-    for target in &targets {
-        if !target.exists() {
-            return Err(format!("lint: path does not exist: {}", target.display()).into());
-        }
-    }
     targets = targets
         .into_iter()
-        .map(|target| std::fs::canonicalize(&target).unwrap_or(target))
-        .collect();
+        .map(|target| validate_lint_target(&project, &target))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let compile_report = run_lint_compiler(
         &project,
@@ -8124,6 +8181,7 @@ async fn run_lint(args: LintArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     } else {
         find_luau_definitions(&project)
+            .map_err(|error| format!("lint: locate Roblox definitions: {error}"))?
     };
     let strict_settings = if coverage.strict
         && !extra_args_include_settings(&args.extra_args)
@@ -8518,13 +8576,22 @@ fn collect_lint_compile_sources(
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut sources = Vec::new();
     for target in targets {
-        if target.is_file() {
+        let metadata = crate::fs_safety::require_metadata_no_follow(target)
+            .map_err(|error| format!("lint: inspect {}: {error}", target.display()))?;
+        if metadata.is_file() {
             if is_lint_compile_source(project, target, true)
                 && !lint_compile_path_ignored(project, target, use_default_ignores, ignores)
             {
-                sources.push(normalize_existing_path(target));
+                sources.push(validate_lint_target(project, target)?);
             }
             continue;
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "lint: target is not a regular file or directory: {}",
+                target.display()
+            )
+            .into());
         }
         collect_lint_compile_directory(
             project,
@@ -8546,22 +8613,46 @@ fn collect_lint_compile_directory(
     ignores: &[String],
     sources: &mut Vec<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut entries = std::fs::read_dir(directory)
-        .map_err(|error| format!("lint: read {}: {error}", directory.display()))?
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        if lint_compile_path_ignored(project, &path, use_default_ignores, ignores) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_lint_compile_directory(project, &path, use_default_ignores, ignores, sources)?;
-        } else if (file_type.is_file() || (file_type.is_symlink() && path.is_file()))
-            && is_lint_compile_source(project, &path, false)
+    let mut pending = vec![directory.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(current) = pending.pop() {
+        let relative = current.strip_prefix(project).unwrap_or(&current);
+        let first = relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str());
+        let index = if current == project {
+            crate::fs_safety::PortableDirectoryIndex::read_project_root(&current)
+        } else if first.is_some_and(|service| crate::fs_safety::SYNCED_SERVICES.contains(&service))
         {
-            sources.push(normalize_existing_path(&path));
+            crate::fs_safety::PortableDirectoryIndex::read(&current)
+        } else {
+            crate::fs_safety::PortableDirectoryIndex::read_raw(&current)
+        }
+        .map_err(|error| format!("lint: scan {}: {error}", current.display()))?;
+        visited = visited.saturating_add(index.entries().len());
+        if visited > crate::fs_safety::MAX_SERVICE_TREE_NODES {
+            return Err(format!(
+                "lint: source scan exceeds the {} node safety limit",
+                crate::fs_safety::MAX_SERVICE_TREE_NODES
+            )
+            .into());
+        }
+
+        for entry in index.entries().iter().rev() {
+            let path = &entry.path;
+            if lint_compile_path_ignored(project, path, use_default_ignores, ignores) {
+                continue;
+            }
+            match entry.kind {
+                crate::fs_safety::SafeEntryKind::Directory => pending.push(path.clone()),
+                crate::fs_safety::SafeEntryKind::File
+                    if is_lint_compile_source(project, path, false) =>
+                {
+                    sources.push(validate_lint_target(project, path)?);
+                }
+                crate::fs_safety::SafeEntryKind::File => {}
+            }
         }
     }
     Ok(())
@@ -8850,6 +8941,59 @@ fn lint_target_path(project: &std::path::Path, path: &std::path::Path) -> PathBu
     }
 }
 
+fn validate_lint_target(
+    project: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if target == project {
+        return Ok(project.to_path_buf());
+    }
+
+    let validated = if let Ok(relative) = target.strip_prefix(project) {
+        let synced = relative
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .is_some_and(|service| crate::fs_safety::SYNCED_SERVICES.contains(&service));
+        if synced {
+            crate::fs_safety::validate_synced_path(project, target, false)
+        } else {
+            crate::fs_safety::validate_descendant_no_follow(project, relative, false)
+        }
+        .map_err(|error| format!("lint: validate target {}: {error}", target.display()))?
+    } else {
+        let metadata = crate::fs_safety::require_metadata_no_follow(target)
+            .map_err(|error| format!("lint: inspect target {}: {error}", target.display()))?;
+        if metadata.is_dir() {
+            crate::fs_safety::stable_canonical_directory(target).map_err(|error| {
+                format!(
+                    "lint: validate target directory {}: {error}",
+                    target.display()
+                )
+            })?
+        } else if metadata.is_file() {
+            target.to_path_buf()
+        } else {
+            return Err(format!(
+                "lint: target is not a regular file or directory: {}",
+                target.display()
+            )
+            .into());
+        }
+    };
+
+    let metadata = crate::fs_safety::require_metadata_no_follow(&validated)
+        .map_err(|error| format!("lint: inspect target {}: {error}", target.display()))?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(format!(
+            "lint: target is not a regular file or directory: {}",
+            target.display()
+        )
+        .into());
+    }
+    Ok(validated)
+}
+
 #[derive(Debug, Clone)]
 struct LintDiagnostic {
     path: PathBuf,
@@ -8866,10 +9010,7 @@ fn filter_lint_output_to_targets(
     targets: &[PathBuf],
     output: &str,
 ) -> String {
-    let scopes: Vec<PathBuf> = targets
-        .iter()
-        .map(|target| normalize_existing_path(target))
-        .collect();
+    let scopes: Vec<PathBuf> = targets.to_vec();
     let mut filtered = String::new();
     for line in output.lines() {
         match parse_lint_diagnostic(project, line) {
@@ -8897,6 +9038,7 @@ fn lint_path_in_scopes(path: &std::path::Path, scopes: &[PathBuf]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn normalize_existing_path(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -8915,7 +9057,7 @@ fn parse_lint_diagnostic(project: &std::path::Path, line: &str) -> Option<LintDi
         project.join(file_path)
     };
     Some(LintDiagnostic {
-        path: normalize_existing_path(&absolute),
+        path: validate_lint_target(project, &absolute).unwrap_or(absolute),
         category: category.trim().to_string(),
         message: diagnostic_message.trim().to_string(),
         line: coordinates[0],
@@ -9079,7 +9221,7 @@ fn lint_summary_counts(
     analyzer_output: &str,
     compiler: &LintCompileReport,
 ) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
-    let project = normalize_existing_path(project);
+    let project = lifecycle::canonical_project(project).unwrap_or_else(|_| project.to_path_buf());
     let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_file: BTreeMap<String, usize> = BTreeMap::new();
     let analyzer_diagnostics = lint_diagnostics(&project, analyzer_output);
@@ -9477,18 +9619,28 @@ fn find_executable_on_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
-fn find_luau_definitions(project: &std::path::Path) -> Option<PathBuf> {
+fn find_luau_definitions(project: &std::path::Path) -> Result<Option<PathBuf>, String> {
     // The widget snapshot is paired with the analyzer version Ro Sync tests.
     // A project copy exists for editor tooling and as a standalone fallback,
     // but it can be stale until the next `rosync refresh`.
     if let Some(definitions) = find_bundled_luau_definitions() {
-        return Some(definitions);
+        let metadata = crate::fs_safety::require_metadata_no_follow(&definitions)
+            .map_err(|error| format!("inspect bundled definitions: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "bundled definitions are not a regular file: {}",
+                definitions.display()
+            ));
+        }
+        return Ok(Some(definitions));
     }
     let project_definitions = project.join(snapshot::ROBLOX_DEFINITIONS_PATH);
-    if project_definitions.is_file() {
-        return Some(project_definitions);
+    if snapshot::project_tool_file_exists(project, &project_definitions)
+        .map_err(|error| format!("inspect project definitions: {error}"))?
+    {
+        return Ok(Some(project_definitions));
     }
-    None
+    Ok(None)
 }
 
 fn find_bundled_luau_definitions() -> Option<PathBuf> {
@@ -10409,9 +10561,9 @@ async fn run_source(args: SourceArgs) -> Result<(), Box<dyn std::error::Error>> 
             "source",
         )
         .await?;
-        let source_path = disk_source_path(&resolved.fs_path)
+        let source_path = disk_source_path(&resolved.fs_path)?
             .ok_or_else(|| format!("source: no source file at {}", resolved.fs_path.display()))?;
-        let source = std::fs::read_to_string(&source_path)
+        let source = fs_safety::read_to_string_no_follow(&source_path)
             .map_err(|e| format!("source: read {}: {e}", source_path.display()))?;
         if args.raw {
             println!(
@@ -10492,9 +10644,14 @@ async fn run_services(args: ServicesArgs) -> Result<(), Box<dyn std::error::Erro
         .iter()
         .map(|service| {
             let path = project.join(service);
+            let disk = fs_safety::validate_service_path(&project, service, true)
+                .and_then(|safe| fs_safety::metadata_no_follow(&safe))
+                .ok()
+                .flatten()
+                .is_some_and(|metadata| metadata.is_dir());
             serde_json::json!({
                 "name": service,
-                "disk": path.is_dir(),
+                "disk": disk,
                 "studio": live.contains(*service),
                 "path": path,
             })
@@ -13831,15 +13988,41 @@ async fn run_doctor(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> 
     };
     let mut checks = Vec::new();
 
-    let project_ok = project.is_dir();
+    let safe_project = lifecycle::canonical_project(&project);
+    let project_ok = safe_project.is_ok();
     checks.push(check_project_path(&project));
-    checks.push(check_project_config(&project));
-    checks.push(check_sourcemap(&project));
+    if let Ok(project) = safe_project.as_ref() {
+        checks.push(check_project_config(project));
+        checks.push(check_sourcemap(project));
+    } else {
+        let detail = safe_project.as_ref().unwrap_err().to_string();
+        checks.push(doctor_check(
+            "ro-sync.json",
+            DoctorStatus::Fail,
+            format!("skipped for unsafe project path: {detail}"),
+        ));
+        checks.push(doctor_check(
+            "sourcemap",
+            DoctorStatus::Fail,
+            format!("skipped for unsafe project path: {detail}"),
+        ));
+    }
     checks.push(check_daemon_hello(args.port));
-    checks.push(check_luau_lsp(&project));
-    checks.push(check_luau_compile(&project));
-    checks.push(check_luau_definitions(&project));
-    checks.push(check_luaurc(&project));
+    if let Ok(project) = safe_project.as_ref() {
+        checks.push(check_luau_lsp(project));
+        checks.push(check_luau_compile(project));
+        checks.push(check_luau_definitions(project));
+        checks.push(check_luaurc(project));
+    } else {
+        let detail = safe_project.as_ref().unwrap_err().to_string();
+        for name in ["luau-lsp", "luau-compile", "roblox defs", ".luaurc"] {
+            checks.push(doctor_check(
+                name,
+                DoctorStatus::Fail,
+                format!("skipped for unsafe project path: {detail}"),
+            ));
+        }
+    }
     checks.push(check_writes_log_path());
     checks.push(check_plugin_version(args.port).await);
 
@@ -13892,6 +14075,8 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(p) => p,
         None => std::env::current_dir().map_err(|e| format!("refresh: current directory: {e}"))?,
     };
+    let project = lifecycle::canonical_project(&project)
+        .map_err(|error| format!("refresh: validate project {}: {error}", project.display()))?;
 
     let ro_sync_status = snapshot::refresh_ro_sync_md(&project)?;
     let mut files = vec![RefreshFileStatus {
@@ -13904,7 +14089,8 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     }];
 
-    let claude_existed = project.join(snapshot::CLAUDE_MD).exists();
+    let claude_existed =
+        snapshot::project_tool_file_exists(&project, &project.join(snapshot::CLAUDE_MD))?;
     let claude_changed = snapshot::write_claude_md_if_missing_or_merge(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::CLAUDE_MD,
@@ -13915,7 +14101,7 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
     let codex_config_path = project
         .join(snapshot::CODEX_DIR)
         .join(snapshot::CODEX_CONFIG_TOML);
-    let codex_config_existed = codex_config_path.exists();
+    let codex_config_existed = snapshot::project_tool_file_exists(&project, &codex_config_path)?;
     let codex_config_changed = snapshot::write_codex_config_if_missing_or_merge(&project)?;
     files.push(RefreshFileStatus {
         path: ".codex/config.toml",
@@ -13923,7 +14109,8 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("project doc fallbacks merged"),
     });
 
-    let agents_existed = project.join(snapshot::AGENTS_MD).exists();
+    let agents_existed =
+        snapshot::project_tool_file_exists(&project, &project.join(snapshot::AGENTS_MD))?;
     let agents_changed = snapshot::write_agents_md_if_missing_or_merge(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::AGENTS_MD,
@@ -13931,7 +14118,8 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("only the Ro Sync marker block was regenerated"),
     });
 
-    let stylua_existed = project.join(snapshot::STYLUA_TOML).exists();
+    let stylua_existed =
+        snapshot::project_tool_file_exists(&project, &project.join(snapshot::STYLUA_TOML))?;
     let stylua_changed = snapshot::write_stylua_toml_if_missing(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::STYLUA_TOML,
@@ -13939,7 +14127,8 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("Luau formatter config ensured"),
     });
 
-    let aftman_existed = project.join(snapshot::AFTMAN_TOML).exists();
+    let aftman_existed =
+        snapshot::project_tool_file_exists(&project, &project.join(snapshot::AFTMAN_TOML))?;
     let aftman_changed = snapshot::write_aftman_stylua_if_missing_or_merge(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::AFTMAN_TOML,
@@ -13947,7 +14136,10 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("StyLua and luau-lsp tool pins ensured"),
     });
 
-    let definitions_existed = project.join(snapshot::ROBLOX_DEFINITIONS_PATH).exists();
+    let definitions_existed = snapshot::project_tool_file_exists(
+        &project,
+        &project.join(snapshot::ROBLOX_DEFINITIONS_PATH),
+    )?;
     let definitions_changed = snapshot::write_roblox_definitions_if_missing_or_update(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::ROBLOX_DEFINITIONS_PATH,
@@ -13955,7 +14147,8 @@ fn run_refresh(args: RefreshArgs) -> Result<(), Box<dyn std::error::Error>> {
         note: Some("Roblox Luau definitions ensured"),
     });
 
-    let luaurc_existed = project.join(snapshot::LUAURC).exists();
+    let luaurc_existed =
+        snapshot::project_tool_file_exists(&project, &project.join(snapshot::LUAURC))?;
     let luaurc_changed = snapshot::write_luaurc_if_missing_or_cleanup(&project)?;
     files.push(RefreshFileStatus {
         path: snapshot::LUAURC,
@@ -14056,26 +14249,12 @@ fn status_check_json(check: &DoctorCheck) -> serde_json::Value {
 }
 
 fn check_project_path(project: &std::path::Path) -> DoctorCheck {
-    if !project.exists() {
-        return doctor_check(
-            "project",
-            DoctorStatus::Fail,
-            format!("missing: {}", project.display()),
-        );
-    }
-    if !project.is_dir() {
-        return doctor_check(
-            "project",
-            DoctorStatus::Fail,
-            format!("not a directory: {}", project.display()),
-        );
-    }
-    match std::fs::canonicalize(project) {
+    match lifecycle::canonical_project(project) {
         Ok(path) => doctor_check("project", DoctorStatus::Ok, path.display().to_string()),
         Err(e) => doctor_check(
             "project",
-            DoctorStatus::Warn,
-            format!("exists, but canonicalize failed: {e}"),
+            DoctorStatus::Fail,
+            format!("unsafe or unavailable: {e}"),
         ),
     }
 }
@@ -14203,14 +14382,27 @@ fn check_luau_definitions(project: &std::path::Path) -> DoctorCheck {
     use sha2::{Digest as _, Sha256};
 
     let project_copy = project.join(snapshot::ROBLOX_DEFINITIONS_PATH);
-    let Some(active_path) = find_luau_definitions(project) else {
-        return doctor_check("roblox defs", DoctorStatus::Warn, "not found");
+    let active_path = match find_luau_definitions(project) {
+        Ok(Some(path)) => path,
+        Ok(None) => return doctor_check("roblox defs", DoctorStatus::Warn, "not found"),
+        Err(error) => return doctor_check("roblox defs", DoctorStatus::Fail, error),
     };
     let read_hash = |path: &std::path::Path| -> Result<String, String> {
-        let bytes = std::fs::read(path).map_err(|error| format!("read: {error}"))?;
+        let bytes = crate::fs_safety::read_file_no_follow(path)
+            .map_err(|error| format!("read: {error}"))?;
         Ok(format!("{:x}", Sha256::digest(&bytes)))
     };
-    let active_hash = match read_hash(&active_path) {
+    let read_project_hash = || -> Result<String, String> {
+        let text = snapshot::read_project_tool_text(project, &project_copy)
+            .map_err(|error| format!("read: {error}"))?
+            .ok_or_else(|| "not found".to_string())?;
+        Ok(format!("{:x}", Sha256::digest(text.as_bytes())))
+    };
+    let active_hash = match if active_path == project_copy {
+        read_project_hash()
+    } else {
+        read_hash(&active_path)
+    } {
         Ok(hash) => hash,
         Err(error) => {
             return doctor_check(
@@ -14236,7 +14428,7 @@ fn check_luau_definitions(project: &std::path::Path) -> DoctorCheck {
     )];
 
     if active_path != project_copy {
-        match read_hash(&project_copy) {
+        match read_project_hash() {
             Ok(hash) if hash == ROBLOX_DEFINITIONS_SHA256 => details.push(format!(
                 "editor: {} (security=None, current)",
                 project_copy.display()
@@ -14248,7 +14440,7 @@ fn check_luau_definitions(project: &std::path::Path) -> DoctorCheck {
                     project_copy.display()
                 ));
             }
-            Err(_) if !project_copy.exists() => {
+            Err(error) if error == "not found" => {
                 status = DoctorStatus::Warn;
                 details.push(format!(
                     "editor: {} (missing; run `rosync refresh`)",
@@ -14256,7 +14448,7 @@ fn check_luau_definitions(project: &std::path::Path) -> DoctorCheck {
                 ));
             }
             Err(error) => {
-                status = DoctorStatus::Warn;
+                status = DoctorStatus::Fail;
                 details.push(format!("editor: {} ({error})", project_copy.display()));
             }
         }
@@ -14313,11 +14505,9 @@ fn check_luau_compile(project: &std::path::Path) -> DoctorCheck {
 
 fn check_luaurc(project: &std::path::Path) -> DoctorCheck {
     let path = project.join(snapshot::LUAURC);
-    if !path.exists() {
-        return doctor_check(".luaurc", DoctorStatus::Warn, "missing");
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let text = match snapshot::read_project_tool_text(project, &path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return doctor_check(".luaurc", DoctorStatus::Warn, "missing"),
         Err(error) => {
             return doctor_check(".luaurc", DoctorStatus::Fail, format!("read: {error}"));
         }
@@ -14635,8 +14825,7 @@ fn daemon_project_mismatch(
         return serde_json::Value::Null;
     };
     let daemon_path = std::path::Path::new(daemon_project);
-    let daemon_canonical =
-        std::fs::canonicalize(daemon_path).unwrap_or_else(|_| daemon_path.to_path_buf());
+    let daemon_canonical = canonicalize_project_path(daemon_path);
     let mismatch = daemon_canonical != canonical_project;
     serde_json::json!({
         "mismatch": mismatch,
@@ -14805,21 +14994,30 @@ fn context_services(project: &std::path::Path) -> Vec<serde_json::Value> {
         .iter()
         .map(|service| {
             let path = project.join(service);
+            let exists = fs_safety::validate_service_path(project, service, true)
+                .and_then(|safe| fs_safety::metadata_no_follow(&safe))
+                .ok()
+                .flatten()
+                .is_some_and(|metadata| metadata.is_dir());
             serde_json::json!({
                 "name": service,
                 "diskPath": path.display().to_string(),
-                "exists": path.is_dir(),
+                "exists": exists,
             })
         })
         .collect()
 }
 
 fn count_tree_nodes(node: &serde_json::Value) -> usize {
-    1 + node
-        .get("children")
-        .and_then(|value| value.as_array())
-        .map(|children| children.iter().map(count_tree_nodes).sum::<usize>())
-        .unwrap_or(0)
+    let mut count = 0usize;
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        count = count.saturating_add(1);
+        if let Some(children) = current.get("children").and_then(|value| value.as_array()) {
+            pending.extend(children);
+        }
+    }
+    count
 }
 
 fn context_project_files(project: &std::path::Path) -> serde_json::Value {
@@ -14848,26 +15046,26 @@ fn file_summary(path: &std::path::Path) -> serde_json::Value {
     })
 }
 
-fn disk_source_path(path: &std::path::Path) -> Option<PathBuf> {
-    if path.is_file() {
-        return Some(path.to_path_buf());
+fn disk_source_path(path: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    let Some(metadata) = fs_safety::metadata_no_follow(path)
+        .map_err(|error| format!("inspect disk source {}: {error}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    if metadata.is_file() {
+        fs_safety::file_generation_no_follow(path)?;
+        return Ok(Some(path.to_path_buf()));
     }
-    if !path.is_dir() {
-        return None;
+    if !metadata.is_dir() {
+        return Ok(None);
     }
-    let entries = std::fs::read_dir(path).ok()?;
-    let mut candidates = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.into_iter().find(|child| {
-        child
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(crate::fs_map::parse_init_file)
-            .is_some()
-    })
+    let index = fs_safety::PortableDirectoryIndex::read(path)
+        .map_err(|error| format!("scan disk source directory {}: {error}", path.display()))?;
+    let Some(source) = index.unique_init_source() else {
+        return Ok(None);
+    };
+    fs_safety::file_generation_no_follow(&source.path)?;
+    Ok(Some(source.path.clone()))
 }
 
 fn collect_live_service_names(
@@ -15406,8 +15604,8 @@ fn diff_kind_label(kind: diff::DiffKind) -> &'static str {
     }
 }
 
-/// Bridges the filesystem-watcher's `broadcast::Sender<Op>` into the shared
-/// `broadcast::Sender<String>` that `/events` streams. Each Op is first run
+/// Bridges the filesystem-watcher's typed operation/resync stream into the
+/// shared `broadcast::Sender<String>` that `/events` streams. Each Op is first run
 /// through `ConflictEngine::on_fs_change` so that echoes of our own writes
 /// (baseline matches) are dropped and conflicts are surfaced as their own
 /// event type rather than a propagation op.
@@ -15417,8 +15615,11 @@ fn spawn_watch_bridge(
     events: broadcast::Sender<String>,
     conflicts: Arc<ConflictEngine>,
     push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>>,
-) {
+) -> Result<(), String> {
     let mut rx = watcher.subscribe();
+    let initial_parent_dirs = collect_existing_parent_candidates(&root)?;
+    let hydration_validation = fs_safety::SyncedPathValidationCache::new(&root)
+        .map_err(|error| format!("initialize watcher hydration safety cache: {error}"))?;
     // Move the Watch into the task so the debouncer stays alive for the lifetime
     // of the daemon.
     tokio::spawn(async move {
@@ -15430,24 +15631,35 @@ fn spawn_watch_bridge(
         // Workspace/tools`, followed later (even after a daemon restart) by
         // `Workspace/tools/Test.luau`, sends a child op whose parent does not
         // exist in Studio and the plugin has no safe way to infer it.
-        let mut pending_parent_dirs = collect_existing_parent_candidates(&root);
+        let mut pending_parent_dirs = initial_parent_dirs;
+        let mut hydration_validation = hydration_validation;
         loop {
             match rx.recv().await {
-                Ok(op) => {
+                Ok(watch::WatchEvent::Op(mut op)) => {
                     if is_synced_service_root_op(&op, &root) {
                         continue;
                     }
-                    if is_push_quiet(&push_quiet, &op.path) {
+                    if is_push_quiet(&push_quiet, &op.path, &root) {
                         continue;
                     }
                     // For renames, also suppress if the source side was a recent
                     // /push write — otherwise daemon-initiated renames echo back.
                     if let Some(from) = &op.from {
-                        if is_push_quiet(&push_quiet, from) {
+                        if is_push_quiet(&push_quiet, from, &root) {
                             continue;
                         }
                     }
-                    if op.kind == OpKind::Rename && op.path.is_dir() {
+                    if let Err(error) = hydrate_watcher_op(&mut op, &mut hydration_validation) {
+                        reset_watch_bridge_after_barrier(
+                            &_watcher,
+                            &mut rx,
+                            &root,
+                            &mut pending_parent_dirs,
+                        );
+                        let _ = events.send(watcher_hydration_shutdown(&error));
+                        continue;
+                    }
+                    if op.kind == OpKind::Rename && op.is_dir == Some(true) {
                         if let Some(from) = &op.from {
                             rebase_pending_parent_candidates(
                                 &mut pending_parent_dirs,
@@ -15456,7 +15668,7 @@ fn spawn_watch_bridge(
                             );
                         }
                     }
-                    if op.kind == OpKind::Add && op.content.is_none() && op.path.is_dir() {
+                    if op.kind == OpKind::Add && op.content.is_none() && op.is_dir == Some(true) {
                         pending_parent_dirs.insert(op.path.clone());
                     }
                     for parent in
@@ -15469,12 +15681,24 @@ fn spawn_watch_bridge(
                                 path: parent,
                                 from: None,
                                 content: None,
+                                is_dir: Some(true),
                             },
                         );
                     }
                     if matches!(op.kind, OpKind::Delete | OpKind::Rename) {
-                        if let Err(error) = begin_fs_destructive_preflight(&op, &conflicts) {
+                        if let Err(error) = begin_fs_destructive_preflight(
+                            &op,
+                            &mut hydration_validation,
+                            &conflicts,
+                        ) {
                             emit_sync_error(&events, &op.path, &error);
+                            reset_watch_bridge_after_barrier(
+                                &_watcher,
+                                &mut rx,
+                                &root,
+                                &mut pending_parent_dirs,
+                            );
+                            let _ = events.send(watcher_hydration_shutdown(&error));
                             let _ = http::write_log_entry(axum::Json(serde_json::json!({
                                 "source": "filesystem-sync-conflict",
                                 "op": match op.kind {
@@ -15506,11 +15730,49 @@ fn spawn_watch_bridge(
                         })));
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(watch::WatchEvent::Resync { reason }) => {
+                    reset_watch_bridge_after_barrier(
+                        &_watcher,
+                        &mut rx,
+                        &root,
+                        &mut pending_parent_dirs,
+                    );
+                    let _ =
+                        events.send(watcher_resync_shutdown("WATCHER_BATCH_AMBIGUOUS", &reason));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    reset_watch_bridge_after_barrier(
+                        &_watcher,
+                        &mut rx,
+                        &root,
+                        &mut pending_parent_dirs,
+                    );
+                    let _ = events.send(watcher_lag_shutdown(skipped));
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+    Ok(())
+}
+
+fn reset_watch_bridge_after_barrier(
+    watcher: &Watch,
+    receiver: &mut broadcast::Receiver<watch::WatchEvent>,
+    root: &std::path::Path,
+    pending_parent_dirs: &mut HashSet<PathBuf>,
+) {
+    watcher.discard_retained_tail(receiver);
+    refresh_parent_candidates_after_barrier(root, pending_parent_dirs);
+}
+
+fn refresh_parent_candidates_after_barrier(
+    root: &std::path::Path,
+    pending_parent_dirs: &mut HashSet<PathBuf>,
+) {
+    // A failed refresh must not retain pre-barrier candidates: those paths
+    // describe a filesystem generation that the reconnect is discarding.
+    *pending_parent_dirs = collect_existing_parent_candidates(root).unwrap_or_default();
 }
 
 // ScriptEditorService source notifications are debounced for 350 ms in the
@@ -15525,20 +15787,138 @@ fn deleted_sync_path_is_dir(path: &std::path::Path) -> bool {
     fs_map::classify_script_file(name).is_none() && !fs_map::is_init_file(name)
 }
 
-fn begin_fs_destructive_preflight(op: &Op, conflicts: &ConflictEngine) -> Result<(), String> {
+fn ensure_watcher_file_generation_unchanged(
+    before: &fs_safety::FileGeneration,
+    after: &fs_safety::FileGeneration,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    if before == after {
+        return Ok(());
+    }
+    Err(format!(
+        "watcher source changed while hydrating; retry exact sync: {}",
+        path.display()
+    ))
+}
+
+fn read_stable_watcher_file(
+    path: &std::path::Path,
+    validation: &mut fs_safety::SyncedPathValidationCache,
+) -> Result<Vec<u8>, String> {
+    let validated = validation
+        .validate(path, false)
+        .map_err(|error| format!("validate watcher source {}: {error}", path.display()))?;
+    let before = fs_safety::file_generation_no_follow(&validated)?;
+    if before.len > fs_safety::MAX_SYNCED_SCRIPT_BYTES {
+        return Err(format!(
+            "watcher source exceeds {} byte limit ({} bytes): {}",
+            fs_safety::MAX_SYNCED_SCRIPT_BYTES,
+            before.len,
+            path.display()
+        ));
+    }
+    let bytes =
+        fs_safety::read_file_no_follow_bounded(&validated, fs_safety::MAX_SYNCED_SCRIPT_BYTES)
+            .map_err(|error| format!("read bounded watcher source {}: {error}", path.display()))?
+            .ok_or_else(|| {
+                format!(
+                    "watcher source grew beyond {} byte limit while reading: {}",
+                    fs_safety::MAX_SYNCED_SCRIPT_BYTES,
+                    path.display()
+                )
+            })?;
+    validation
+        .validate(path, false)
+        .map_err(|error| format!("revalidate watcher source {}: {error}", path.display()))?;
+    let after = fs_safety::file_generation_no_follow(&validated)?;
+    ensure_watcher_file_generation_unchanged(&before, &after, path)?;
+    Ok(bytes)
+}
+
+fn hydrate_watcher_op(
+    op: &mut Op,
+    validation: &mut fs_safety::SyncedPathValidationCache,
+) -> Result<(), String> {
+    if matches!(op.kind, OpKind::Add | OpKind::Update | OpKind::Rename) && op.is_dir == Some(false)
+    {
+        op.content = Some(read_stable_watcher_file(&op.path, validation)?);
+    }
+    Ok(())
+}
+
+fn begin_fs_destructive_preflight(
+    op: &Op,
+    validation: &mut fs_safety::SyncedPathValidationCache,
+    conflicts: &ConflictEngine,
+) -> Result<(), String> {
     match op.kind {
         OpKind::Delete => {
-            conflicts.begin_fs_delete(&op.path, deleted_sync_path_is_dir(&op.path));
+            conflicts.begin_fs_delete(
+                &op.path,
+                op.is_dir
+                    .unwrap_or_else(|| deleted_sync_path_is_dir(&op.path)),
+            );
         }
         OpKind::Rename => {
             if let Some(from) = &op.from {
-                let is_dir = op.path.is_dir();
+                let validated = validation.validate(&op.path, false).map_err(|error| {
+                    format!(
+                        "validate retained rename destination {}: {error}",
+                        op.path.display()
+                    )
+                })?;
+                let metadata = fs_safety::metadata_no_follow(&validated)
+                    .map_err(|error| {
+                        format!(
+                            "inspect retained rename destination {}: {error}",
+                            op.path.display()
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!(
+                            "retained rename destination disappeared: {}",
+                            op.path.display()
+                        )
+                    })?;
+                let is_dir = metadata.is_dir();
+                if op.is_dir.is_some_and(|expected| expected != is_dir) {
+                    return Err(format!(
+                        "retained rename destination changed filesystem shape: {}",
+                        op.path.display()
+                    ));
+                }
                 let retained_bytes = if is_dir {
+                    let before =
+                        fs_safety::directory_generation_no_follow(&validated).map_err(|error| {
+                            format!(
+                                "inspect retained rename directory {}: {error}",
+                                op.path.display()
+                            )
+                        })?;
+                    validation.validate(&op.path, false).map_err(|error| {
+                        format!(
+                            "revalidate retained rename directory {}: {error}",
+                            op.path.display()
+                        )
+                    })?;
+                    let after =
+                        fs_safety::directory_generation_no_follow(&validated).map_err(|error| {
+                            format!(
+                                "reinspect retained rename directory {}: {error}",
+                                op.path.display()
+                            )
+                        })?;
+                    if before != after {
+                        return Err(format!(
+                            "retained rename directory changed during preflight: {}",
+                            op.path.display()
+                        ));
+                    }
                     None
                 } else {
-                    Some(std::fs::read(&op.path).map_err(|error| {
+                    Some(op.content.clone().ok_or_else(|| {
                         format!(
-                            "read retained rename destination {}: {error}",
+                            "retained file rename was not hydrated before preflight: {}",
                             op.path.display()
                         )
                     })?)
@@ -15551,29 +15931,43 @@ fn begin_fs_destructive_preflight(op: &Op, conflicts: &ConflictEngine) -> Result
     Ok(())
 }
 
-fn collect_existing_parent_candidates(root: &std::path::Path) -> HashSet<PathBuf> {
-    fn collect(dir: &std::path::Path, candidates: &mut HashSet<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            candidates.insert(path.clone());
-            collect(&path, candidates);
-        }
-    }
+fn watcher_lag_shutdown(skipped: u64) -> String {
+    serde_json::json!({
+        "type": "shutdown",
+        "reason": "filesystem watcher lagged; reconnect to rebuild exact sync state",
+        "code": "WATCHER_LAGGED",
+        "retryable": true,
+        "skipped": skipped,
+    })
+    .to_string()
+}
 
+fn watcher_resync_shutdown(code: &str, reason: &str) -> String {
+    serde_json::json!({
+        "type": "shutdown",
+        "reason": reason,
+        "code": code,
+        "retryable": true,
+    })
+    .to_string()
+}
+
+fn watcher_hydration_shutdown(reason: &str) -> String {
+    watcher_resync_shutdown("WATCHER_HYDRATION_FAILED", reason)
+}
+
+fn collect_existing_parent_candidates(root: &std::path::Path) -> Result<HashSet<PathBuf>, String> {
     let mut candidates = HashSet::new();
     for service in snapshot::SYNCED_SERVICES {
-        collect(&root.join(service), &mut candidates);
+        let tree = fs_safety::capture_tree_metadata(root, service)?;
+        candidates.extend(
+            tree.entries()
+                .iter()
+                .filter(|entry| entry.kind == fs_safety::SafeEntryKind::Directory)
+                .map(|entry| root.join(service).join(&entry.relative)),
+        );
     }
-    candidates
+    Ok(candidates)
 }
 
 fn rebase_pending_parent_candidates(
@@ -15644,19 +16038,41 @@ fn is_synced_service_root_op(op: &Op, root: &std::path::Path) -> bool {
 fn is_push_quiet(
     push_quiet: &Arc<Mutex<HashMap<PathBuf, Instant>>>,
     path: &std::path::Path,
+    project_root: &std::path::Path,
 ) -> bool {
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(relative) = path.strip_prefix(project_root) else {
+        return false;
+    };
+    let Some(service) = relative
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+    else {
+        return false;
+    };
+    if !snapshot::SYNCED_SERVICES.contains(&service) {
+        return false;
+    }
+
     let now = Instant::now();
     let mut guard = push_quiet.lock().unwrap();
-    // Prune any expired entries as we go — cheap since the map is small in
-    // steady state (one entry per in-flight push target).
-    guard.retain(|_, deadline| *deadline > now);
-    if let Some(deadline) = guard.get(&canon) {
-        return *deadline > now;
+    // Prune amortized rather than walking the full map for every filesystem
+    // notification during a large commit.
+    static QUIET_PRUNE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if QUIET_PRUNE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xff == 0 {
+        guard.retain(|_, deadline| *deadline > now);
     }
-    // Also check the raw path for robustness against pre-canonicalize inserts.
-    if let Some(deadline) = guard.get(path) {
-        return *deadline > now;
+
+    let service_root = project_root.join(service);
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if guard.get(current).is_some_and(|deadline| *deadline > now) {
+            return true;
+        }
+        if current == service_root {
+            break;
+        }
+        candidate = current.parent();
     }
     false
 }
@@ -15850,11 +16266,18 @@ fn emit_sync_error(events: &broadcast::Sender<String>, path: &std::path::Path, e
 }
 
 fn fs_mtime(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
+    fs_safety::metadata_no_follow(path)
         .ok()
+        .flatten()
+        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|duration| {
+            duration
+                .as_nanos()
+                .min(u128::from(u64::MAX))
+                .try_into()
+                .unwrap_or(u64::MAX)
+        })
         .unwrap_or(0)
 }
 
@@ -16059,6 +16482,23 @@ mod tier2_tests {
     use clap::CommandFactory;
 
     #[test]
+    fn atomic_replace_bytes_replaces_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("RoSync.rbxm");
+        std::fs::write(&destination, b"old plugin bytes").unwrap();
+
+        atomic_replace_bytes(&destination, b"new plugin bytes", 0o644).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new plugin bytes");
+        let leftovers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
     fn parse_duration_seconds_units() {
         assert_eq!(parse_duration_seconds("30").unwrap(), 30.0);
         assert_eq!(parse_duration_seconds("30s").unwrap(), 30.0);
@@ -16119,12 +16559,14 @@ mod tier2_tests {
             path: root.join("ReplicatedStorage"),
             from: None,
             content: None,
+            is_dir: Some(true),
         };
         let script_op = Op {
             kind: OpKind::Update,
             path: root.join("ReplicatedStorage").join("Client.luau"),
             from: None,
             content: Some(b"return {}".to_vec()),
+            is_dir: Some(false),
         };
 
         assert!(is_synced_service_root_op(&service_op, &root));
@@ -16142,6 +16584,7 @@ mod tier2_tests {
             path: nested.join("Test.luau"),
             from: None,
             content: Some(b"return true".to_vec()),
+            is_dir: Some(false),
         };
 
         assert_eq!(
@@ -16160,12 +16603,174 @@ mod tier2_tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(temp.path().join("tools/root-only")).unwrap();
 
-        let candidates = collect_existing_parent_candidates(temp.path());
+        let candidates = collect_existing_parent_candidates(temp.path()).unwrap();
 
         assert!(candidates.contains(&tools));
         assert!(candidates.contains(&nested));
         assert!(!candidates.contains(&workspace));
         assert!(!candidates.contains(&temp.path().join("tools/root-only")));
+    }
+
+    #[test]
+    fn failed_barrier_refresh_clears_stale_parent_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_root = temp.path().join("removed-project");
+        let stale = missing_root.join("Workspace/Stale");
+        let mut candidates = HashSet::from([stale]);
+
+        refresh_parent_candidates_after_barrier(&missing_root, &mut candidates);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn watcher_lag_forces_retryable_full_resync() {
+        let event: serde_json::Value = serde_json::from_str(&watcher_lag_shutdown(42)).unwrap();
+        assert_eq!(event["type"], "shutdown");
+        assert_eq!(event["code"], "WATCHER_LAGGED");
+        assert_eq!(event["retryable"], true);
+        assert_eq!(event["skipped"], 42);
+    }
+
+    #[test]
+    fn watcher_typed_resync_is_retryable() {
+        let event: serde_json::Value = serde_json::from_str(&watcher_resync_shutdown(
+            "WATCHER_BATCH_AMBIGUOUS",
+            "rename cycle",
+        ))
+        .unwrap();
+        assert_eq!(event["type"], "shutdown");
+        assert_eq!(event["code"], "WATCHER_BATCH_AMBIGUOUS");
+        assert_eq!(event["retryable"], true);
+        assert_eq!(event["reason"], "rename cycle");
+    }
+
+    #[test]
+    fn watcher_hydrates_only_one_bounded_source_at_the_receiver() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Workspace/Main.luau");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"--!strict\nreturn true\n").unwrap();
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+        let mut op = Op {
+            kind: OpKind::Update,
+            path: source,
+            from: None,
+            content: None,
+            is_dir: Some(false),
+        };
+
+        hydrate_watcher_op(&mut op, &mut validation).unwrap();
+        assert_eq!(
+            op.content.as_deref(),
+            Some(&b"--!strict\nreturn true\n"[..])
+        );
+    }
+
+    #[test]
+    fn watcher_oversize_add_and_rename_require_resync_without_reading_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Workspace/Oversize.luau");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(fs_safety::MAX_SYNCED_SCRIPT_BYTES + 1)
+            .unwrap();
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+        for kind in [OpKind::Add, OpKind::Rename] {
+            let mut op = Op {
+                kind,
+                path: source.clone(),
+                from: (kind == OpKind::Rename).then(|| temp.path().join("Workspace/Old.luau")),
+                content: None,
+                is_dir: Some(false),
+            };
+
+            let error = hydrate_watcher_op(&mut op, &mut validation).unwrap_err();
+            assert!(error.contains("exceeds"), "{error}");
+            assert!(op.content.is_none());
+        }
+    }
+
+    #[test]
+    fn watcher_missing_hydration_maps_to_typed_retryable_resync() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("Workspace")).unwrap();
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+        let mut op = Op {
+            kind: OpKind::Update,
+            path: temp.path().join("Workspace/Missing.luau"),
+            from: None,
+            content: None,
+            is_dir: Some(false),
+        };
+
+        let error = hydrate_watcher_op(&mut op, &mut validation).unwrap_err();
+        let event: serde_json::Value =
+            serde_json::from_str(&watcher_hydration_shutdown(&error)).unwrap();
+        assert_eq!(event["code"], "WATCHER_HYDRATION_FAILED");
+        assert_eq!(event["retryable"], true);
+        assert!(op.content.is_none());
+    }
+
+    #[test]
+    fn watcher_changed_generation_maps_to_typed_retryable_resync() {
+        let before = fs_safety::FileGeneration {
+            len: 10,
+            modified_ns: Some(1),
+            identity: fs_safety::FileIdentity {
+                device: Some(2),
+                file: Some(3),
+            },
+        };
+        let mut after = before.clone();
+        after.modified_ns = Some(2);
+
+        let error = ensure_watcher_file_generation_unchanged(
+            &before,
+            &after,
+            std::path::Path::new("/project/Workspace/Main.luau"),
+        )
+        .unwrap_err();
+        let event: serde_json::Value =
+            serde_json::from_str(&watcher_hydration_shutdown(&error)).unwrap();
+        assert_eq!(event["code"], "WATCHER_HYDRATION_FAILED");
+        assert_eq!(event["retryable"], true);
+        assert!(event["reason"].as_str().unwrap().contains("changed"));
+    }
+
+    #[test]
+    fn service_root_quiet_entry_suppresses_descendants_only_until_deadline() {
+        let root = PathBuf::from("/project");
+        let quiet = Arc::new(Mutex::new(HashMap::new()));
+        quiet.lock().unwrap().insert(
+            root.join("Workspace"),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(is_push_quiet(
+            &quiet,
+            &root.join("Workspace/Deep/Main.luau"),
+            &root
+        ));
+        assert!(!is_push_quiet(
+            &quiet,
+            &root.join("ReplicatedStorage/Main.luau"),
+            &root
+        ));
+        assert!(!is_push_quiet(
+            &quiet,
+            &root.join(".rosync-stage-x/Workspace/Main.luau"),
+            &root
+        ));
+
+        quiet.lock().unwrap().insert(
+            root.join("ReplicatedStorage"),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(!is_push_quiet(
+            &quiet,
+            &root.join("ReplicatedStorage/Main.luau"),
+            &root
+        ));
     }
 
     #[test]
@@ -16187,6 +16792,7 @@ mod tier2_tests {
             path: root.join("ReplicatedStorage/Shared/Config.luau"),
             from: None,
             content: Some(b"return true".to_vec()),
+            is_dir: Some(false),
         };
 
         assert!(
@@ -16213,15 +16819,50 @@ mod tier2_tests {
             path: source.clone(),
             from: None,
             content: None,
+            is_dir: Some(false),
         };
         let (events, mut receiver) = broadcast::channel(4);
-        begin_fs_destructive_preflight(&op, &conflicts).unwrap();
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+        begin_fs_destructive_preflight(&op, &mut validation, &conflicts).unwrap();
         let blocked = handle_op(op, &events, &conflicts).expect("delete must be blocked");
 
         assert_eq!(blocked.kind, "delete");
         let event: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
         assert_eq!(event["type"], "conflict");
         assert!(receiver.try_recv().is_err(), "no delete op may be emitted");
+    }
+
+    #[test]
+    fn deleted_directory_with_script_suffix_preserves_directory_shape_in_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("Workspace/Foo.luau");
+        let child = directory.join("Child.luau");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&child, b"disk edit\n").unwrap();
+        let conflicts = ConflictEngine::new();
+        conflicts.record_sync(&child, conflict::hash(b"agreed\n"), 1);
+        assert_eq!(
+            conflicts.on_studio_push(&child, b"studio edit\n", Some((b"disk edit\n", 2))),
+            conflict::StudioDecision::Conflict
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let op = Op {
+            kind: OpKind::Delete,
+            path: directory.clone(),
+            from: None,
+            content: None,
+            is_dir: Some(true),
+        };
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+        begin_fs_destructive_preflight(&op, &mut validation, &conflicts).unwrap();
+        match conflicts.resolve(&child, conflict::Resolution::KeepLocal) {
+            Some(conflict::Resolved::DeleteStudio { path, is_dir, .. }) => {
+                assert_eq!(path, directory);
+                assert!(is_dir);
+            }
+            other => panic!("expected directory delete resolution, got {other:?}"),
+        }
     }
 
     #[test]
@@ -16239,14 +16880,18 @@ mod tier2_tests {
         );
         std::fs::rename(&from, &to).unwrap();
 
-        let op = Op {
+        let mut op = Op {
             kind: OpKind::Rename,
             path: to,
             from: Some(from),
             content: None,
+            is_dir: Some(false),
         };
         let (events, mut receiver) = broadcast::channel(4);
-        begin_fs_destructive_preflight(&op, &conflicts).unwrap();
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+        hydrate_watcher_op(&mut op, &mut validation).unwrap();
+        assert_eq!(op.content.as_deref(), Some(&b"disk edit\n"[..]));
+        begin_fs_destructive_preflight(&op, &mut validation, &conflicts).unwrap();
         let blocked = handle_op(op, &events, &conflicts).expect("rename must be blocked");
 
         assert_eq!(blocked.kind, "rename");
@@ -16453,6 +17098,54 @@ mod tier2_tests {
     }
 
     #[test]
+    fn different_projects_share_one_cross_process_port_allocation_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let first_project = state.path().join("First");
+        let second_project = state.path().join("Second");
+        std::fs::create_dir_all(&first_project).unwrap();
+        std::fs::create_dir_all(&second_project).unwrap();
+        let first = lifecycle::runtime_paths(state.path().to_path_buf(), &first_project);
+        let second = lifecycle::runtime_paths(state.path().to_path_buf(), &second_project);
+
+        assert_ne!(first.start_lock, second.start_lock);
+        assert_eq!(
+            daemon_port_allocation_lock_path(&first).unwrap(),
+            daemon_port_allocation_lock_path(&second).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn port_allocation_lock_retries_then_times_out_and_recovers() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("ports.start.lock");
+        let held = lifecycle::StartLock::acquire_named(&path, "test port allocation").unwrap();
+
+        let started = Instant::now();
+        let error =
+            match acquire_daemon_port_allocation_lock(&path, Duration::from_millis(75)).await {
+                Ok(_) => panic!("second allocator must time out while the lock is held"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        drop(held);
+        let recovered = acquire_daemon_port_allocation_lock(&path, Duration::from_millis(100))
+            .await
+            .unwrap();
+        drop(recovered);
+    }
+
+    #[test]
+    fn explicit_daemon_port_is_rechecked_under_the_allocation_lock() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(ensure_daemon_port_available(port).is_err());
+        drop(listener);
+        ensure_daemon_port_available(port).unwrap();
+    }
+
+    #[test]
     fn lifecycle_secret_sources_and_metadata_are_validated() {
         assert_eq!(
             resolve_optional_secret(Some("secret".into()), None, "test").unwrap(),
@@ -16485,6 +17178,31 @@ mod tier2_tests {
         assert!(validate_existing_daemon_owner(&record, Some("0123456789abcdef")).is_ok());
         assert!(validate_existing_daemon_owner(&record, Some("fedcba9876543210")).is_err());
         assert!(validate_existing_daemon_owner(&record, Some("short")).is_err());
+    }
+
+    #[test]
+    fn managed_daemon_close_request_pins_the_runtime_record_identity() {
+        let record = lifecycle::RuntimeRecord {
+            version: lifecycle::RUNTIME_RECORD_VERSION,
+            project: "C:\\Game".into(),
+            canonical_project: "\\\\?\\C:\\Game".into(),
+            pid: 4242,
+            port: 7878,
+            boot_id: "boot-exact".into(),
+            control_token: "0123456789abcdef".into(),
+            managed_by: "desktop".into(),
+            log_path: "C:\\state\\rosync.log".into(),
+            started_at: 1,
+        };
+
+        let request = managed_daemon_close_request(&record, "test stop");
+
+        assert_eq!(request["token"], "0123456789abcdef");
+        assert_eq!(request["reason"], "test stop");
+        assert_eq!(request["expectedBootId"], "boot-exact");
+        assert_eq!(request["expectedPid"], 4242);
+        assert_eq!(request["expectedPort"], 7878);
+        assert_eq!(request["expectedCanonicalProject"], "\\\\?\\C:\\Game");
     }
 
     #[test]
@@ -17151,6 +17869,45 @@ mod tier2_tests {
         assert_eq!(check_luaurc(dir.path()).status, DoctorStatus::Fail);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_refuses_linked_project_tooling_paths() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let luaurc_sentinel = external.path().join("outside.luaurc");
+        std::fs::write(&luaurc_sentinel, r#"{"languageMode":"strict"}"#).unwrap();
+        symlink(&luaurc_sentinel, project.path().join(snapshot::LUAURC)).unwrap();
+        assert_eq!(check_luaurc(project.path()).status, DoctorStatus::Fail);
+        assert_eq!(
+            std::fs::read_to_string(&luaurc_sentinel).unwrap(),
+            r#"{"languageMode":"strict"}"#
+        );
+
+        std::fs::remove_file(project.path().join(snapshot::LUAURC)).unwrap();
+        symlink(external.path(), project.path().join("tools")).unwrap();
+        assert_eq!(
+            check_luau_definitions(project.path()).status,
+            DoctorStatus::Fail
+        );
+        assert!(!external.path().join("luau-lsp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_rejects_a_direct_project_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical");
+        let linked = temporary.path().join("linked");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &linked).unwrap();
+
+        assert_eq!(check_project_path(&linked).status, DoctorStatus::Fail);
+    }
+
     #[test]
     fn lint_compile_source_collection_respects_scope_and_ignores() {
         let dir = tempfile::tempdir().unwrap();
@@ -17193,6 +17950,33 @@ mod tier2_tests {
             collect_lint_compile_sources(root, &[main], false, &["**/Main.luau".to_string()])
                 .unwrap();
         assert!(sources.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lint_compile_collection_refuses_links_in_synced_services() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let workspace = project.path().join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let sentinel = external.path().join("External.luau");
+        std::fs::write(&sentinel, "return 'external'\n").unwrap();
+        symlink(external.path(), workspace.join("Linked")).unwrap();
+
+        let error = collect_lint_compile_sources(
+            project.path(),
+            &[project.path().to_path_buf()],
+            false,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("linked/reparse"));
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "return 'external'\n"
+        );
     }
 
     #[test]
@@ -17370,7 +18154,8 @@ mod tier2_tests {
 ReplicatedStorage/Client/Main.luau(1,1): TypeError: owned
 ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
 ";
-        let filtered = filter_lint_output_to_targets(&root, &[owned], output);
+        let owned = normalize_existing_path(&owned);
+        let filtered = filter_lint_output_to_targets(&root, std::slice::from_ref(&owned), output);
         assert!(filtered.contains("[INFO] sourcemap loaded"));
         assert!(filtered.contains("Client/Main.luau"));
         assert!(!filtered.contains("Packages/Dep.luau"));
@@ -17380,11 +18165,8 @@ ReplicatedStorage/Packages/Dep.luau(1,1): TypeError: vendor
 ReplicatedStorage/Client/Main.luau:1:1-8: (W0) TypeError: owned
 ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
 ";
-        let filtered = filter_lint_output_to_targets(
-            &root,
-            &[root.join("ReplicatedStorage/Client")],
-            plain_output,
-        );
+        let filtered =
+            filter_lint_output_to_targets(&root, std::slice::from_ref(&owned), plain_output);
         assert!(filtered.contains("[INFO] sourcemap loaded"));
         assert!(filtered.contains("Client/Main.luau"));
         assert!(!filtered.contains("Packages/Dep.luau"));

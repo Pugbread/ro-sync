@@ -49,6 +49,8 @@ jobs:
             compiler_bin: luau-compile.exe
 
     runs-on: ${{ matrix.os }}
+    env:
+      ROSYNC_TAGGED_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +74,82 @@ jobs:
       - name: Build
         working-directory: daemon
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Import Windows Authenticode certificate
+        if: runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+        run: |
+          $required = @(
+            'WINDOWS_CODESIGN_PFX_BASE64',
+            'WINDOWS_CODESIGN_PFX_PASSWORD'
+          )
+          $missing = @($required | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+          if ($missing.Count -gt 0) {
+            throw "tagged Windows releases require repository secrets: $($missing -join ', ')"
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'ro-sync-authenticode.pfx'
+          try {
+            [IO.File]::WriteAllBytes(
+              $pfxPath,
+              [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64)
+            )
+            $password = ConvertTo-SecureString `
+              -String $env:WINDOWS_CODESIGN_PFX_PASSWORD `
+              -AsPlainText `
+              -Force
+            $imported = @(Import-PfxCertificate `
+              -FilePath $pfxPath `
+              -CertStoreLocation 'Cert:\CurrentUser\My' `
+              -Password $password)
+            $certificate = $imported |
+              Where-Object { $_.HasPrivateKey } |
+              Select-Object -First 1
+            if (-not $certificate) {
+              throw 'WINDOWS_CODESIGN_PFX_BASE64 did not contain a certificate with a private key'
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $thumbprint = $certificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "WINDOWS_CODESIGN_THUMBPRINT=$thumbprint"
+
+          $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Source -First 1
+          if (-not $signTool) {
+            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signTool = Get-ChildItem -Path $kitsRoot -Filter signtool.exe -File -Recurse |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -ExpandProperty FullName -First 1
+          }
+          if (-not $signTool) { throw 'signtool.exe was not found on the Windows runner' }
+
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "WINDOWS_SIGNTOOL=$signTool"
+
+      - name: Sign and verify standalone Windows daemon
+        if: runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
+        shell: pwsh
+        run: |
+          $binary = "daemon/target/${{ matrix.target }}/release/${{ matrix.src_bin }}"
+          & $env:WINDOWS_SIGNTOOL sign `
+            /s My `
+            /sha1 $env:WINDOWS_CODESIGN_THUMBPRINT `
+            /fd SHA256 `
+            /tr 'http://timestamp.digicert.com' `
+            /td SHA256 `
+            $binary
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $binary" }
+
+          & $env:WINDOWS_SIGNTOOL verify /pa /all /tw $binary
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $binary" }
 
       - name: Install checksum-pinned Luau compiler
         run: node scripts/install-luau-compiler.mjs --target ${{ matrix.tool_target }}
@@ -108,14 +186,29 @@ jobs:
             (cd "$bundle" && zip -q -r "$archive_abs" .)
           fi
 
-          ARCHIVE_PATH="$archive" node -e '
+          RAW_PATH="$dist/${{ matrix.out }}" ARCHIVE_PATH="$archive" node -e '
             const crypto = require("node:crypto");
             const fs = require("node:fs");
             const path = require("node:path");
-            const file = process.env.ARCHIVE_PATH;
-            const hash = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-            fs.writeFileSync(file + ".sha256", hash + "  " + path.basename(file) + "\n");
+            for (const file of [process.env.RAW_PATH, process.env.ARCHIVE_PATH]) {
+              const hash = crypto.createHash("sha256")
+                .update(fs.readFileSync(file))
+                .digest("hex");
+              fs.writeFileSync(file + ".sha256", hash + "  " + path.basename(file) + "\n");
+            }
           '
+          (
+            cd "$dist"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --check --strict -- \
+                "${{ matrix.out }}.sha256" \
+                "rosync-${{ matrix.tool_target }}-bundle.zip.sha256"
+            else
+              shasum -a 256 --check \
+                "${{ matrix.out }}.sha256" \
+                "rosync-${{ matrix.tool_target }}-bundle.zip.sha256"
+            fi
+          )
           rm -rf "$bundle"
 
       - uses: actions/upload-artifact@v4
@@ -123,8 +216,18 @@ jobs:
           name: ${{ matrix.out }}
           path: |
             daemon/dist/${{ matrix.out }}
+            daemon/dist/${{ matrix.out }}.sha256
             daemon/dist/rosync-${{ matrix.tool_target }}-bundle.zip
             daemon/dist/rosync-${{ matrix.tool_target }}-bundle.zip.sha256
+
+      - name: Remove imported Windows Authenticode certificate
+        if: always() && runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_THUMBPRINT)) {
+            $certificatePath = "Cert:\CurrentUser\My\$($env:WINDOWS_CODESIGN_THUMBPRINT)"
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
 
   plugin:
     runs-on: ubuntu-22.04
@@ -187,6 +290,7 @@ jobs:
       CARGO_BUILD_TARGET: ${{ matrix.target }}
       LUAU_LSP_VERSION: "1.68.1"
       LUAU_LSP_LICENSE_SHA256: 5bf374ce7ab54c8d75f14e21f04932cae10708189afaec95321aed1a47701935
+      ROSYNC_TAGGED_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -224,9 +328,19 @@ jobs:
         run: |
           set -euo pipefail
           sidecar="$(find .release-input/daemon -type f -name '${{ matrix.sidecar }}' -print -quit)"
+          sidecar_checksum="$(find .release-input/daemon -type f -name '${{ matrix.sidecar }}.sha256' -print -quit)"
           studio_plugin="$(find .release-input/plugin -type f -name Plugin.rbxm -print -quit)"
           test -n "$sidecar"
+          test -n "$sidecar_checksum"
           test -n "$studio_plugin"
+          (
+            cd "$(dirname "$sidecar_checksum")"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --check --strict -- "$(basename "$sidecar_checksum")"
+            else
+              shasum -a 256 --check "$(basename "$sidecar_checksum")"
+            fi
+          )
           cp "$sidecar" "daemon/${{ matrix.sidecar }}"
           cp "$studio_plugin" plugin/Plugin.rbxm
           if [[ "$RUNNER_OS" != "Windows" ]]; then
@@ -298,7 +412,7 @@ jobs:
           node -e '
             const fs = require("node:fs");
             const config = require("./desktop/src-tauri/tauri.conf.json");
-            const tagged = process.env.GITHUB_REF_TYPE === "tag";
+            const tagged = process.env.ROSYNC_TAGGED_RELEASE === "1";
             const version = tagged ? process.env.GITHUB_REF_NAME.replace(/^v/, "") : config.version;
             const semver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
             if (!semver.test(version)) throw new Error(`invalid desktop release version: ${version}`);
@@ -312,6 +426,64 @@ jobs:
       - name: Test desktop native host
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
 
+      - name: Import Windows Authenticode certificate
+        if: runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+        run: |
+          $required = @(
+            'WINDOWS_CODESIGN_PFX_BASE64',
+            'WINDOWS_CODESIGN_PFX_PASSWORD'
+          )
+          $missing = @($required | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+          if ($missing.Count -gt 0) {
+            throw "tagged Windows releases require repository secrets: $($missing -join ', ')"
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'ro-sync-authenticode.pfx'
+          try {
+            [IO.File]::WriteAllBytes(
+              $pfxPath,
+              [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64)
+            )
+            $password = ConvertTo-SecureString `
+              -String $env:WINDOWS_CODESIGN_PFX_PASSWORD `
+              -AsPlainText `
+              -Force
+            $imported = @(Import-PfxCertificate `
+              -FilePath $pfxPath `
+              -CertStoreLocation 'Cert:\CurrentUser\My' `
+              -Password $password)
+            $certificate = $imported |
+              Where-Object { $_.HasPrivateKey } |
+              Select-Object -First 1
+            if (-not $certificate) {
+              throw 'WINDOWS_CODESIGN_PFX_BASE64 did not contain a certificate with a private key'
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $thumbprint = $certificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "WINDOWS_CODESIGN_THUMBPRINT=$thumbprint"
+
+          $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Source -First 1
+          if (-not $signTool) {
+            $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signTool = Get-ChildItem -Path $kitsRoot -Filter signtool.exe -File -Recurse |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -ExpandProperty FullName -First 1
+          }
+          if (-not $signTool) { throw 'signtool.exe was not found on the Windows runner' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "WINDOWS_SIGNTOOL=$signTool"
+
       - name: Build desktop installers and signed updater artifacts
         working-directory: desktop
         shell: bash
@@ -319,10 +491,11 @@ jobs:
           ROSYNC_UPDATER_PUBLIC_KEY: ${{ vars.ROSYNC_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
         run: |
           set -euo pipefail
           config="$RUNNER_TEMP/ro-sync-release-config.json"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          if [[ "$ROSYNC_TAGGED_RELEASE" == "1" ]]; then
             test -n "$ROSYNC_UPDATER_PUBLIC_KEY" || {
               echo "ROSYNC_UPDATER_PUBLIC_KEY repository variable is required for tagged releases" >&2
               exit 1
@@ -334,11 +507,23 @@ jobs:
             node ../scripts/check-updater-key-pin.mjs verify
             node -e '
               const fs = require("node:fs");
-              fs.writeFileSync(process.argv[1], JSON.stringify({
+              const config = {
                 version: process.env.ROSYNC_DESKTOP_VERSION,
                 bundle: { createUpdaterArtifacts: true },
                 plugins: { updater: { pubkey: process.env.ROSYNC_UPDATER_PUBLIC_KEY } },
-              }));
+              };
+              if (process.platform === "win32") {
+                if (!process.env.WINDOWS_CODESIGN_THUMBPRINT) {
+                  throw new Error("tagged Windows release is missing imported certificate thumbprint");
+                }
+                config.bundle.windows = {
+                  certificateThumbprint: process.env.WINDOWS_CODESIGN_THUMBPRINT,
+                  digestAlgorithm: "sha256",
+                  timestampUrl: process.env.WINDOWS_TIMESTAMP_URL,
+                  tsp: true,
+                };
+              }
+              fs.writeFileSync(process.argv[1], JSON.stringify(config));
             ' "$config"
           else
             node -e '
@@ -353,7 +538,7 @@ jobs:
             --ci
             --config "$config"
           )
-          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+          if [[ "$ROSYNC_TAGGED_RELEASE" != "1" ]]; then
             build_args+=(--no-sign)
           fi
           npm run build -- "${build_args[@]}"
@@ -374,7 +559,7 @@ jobs:
             installer="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
             test -n "$installer"
             cp "$installer" "$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-macos-arm64.dmg"
-            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$ROSYNC_TAGGED_RELEASE" == "1" ]]; then
               updater="$(find "$bundle_root/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
               test -n "$updater"
               test -f "$updater.sig"
@@ -391,7 +576,7 @@ jobs:
             setup_asset="$RELEASE_ASSET_DIR/Ro-Sync-$ROSYNC_DESKTOP_VERSION-windows-x64-setup.exe"
             cp "$msi" "$msi_asset"
             cp "$setup" "$setup_asset"
-            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ "$ROSYNC_TAGGED_RELEASE" == "1" ]]; then
               test -f "$msi.sig"
               test -f "$setup.sig"
               cp "$msi.sig" "$msi_asset.sig"
@@ -429,16 +614,43 @@ jobs:
             }
           '
 
+      - name: Verify final Windows installer Authenticode signatures
+        if: runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
+        shell: pwsh
+        run: |
+          $installers = @(
+            "desktop/release-assets/Ro-Sync-$env:ROSYNC_DESKTOP_VERSION-windows-x64.msi",
+            "desktop/release-assets/Ro-Sync-$env:ROSYNC_DESKTOP_VERSION-windows-x64-setup.exe"
+          )
+          foreach ($installer in $installers) {
+            if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+              throw "final signed installer was not produced: $installer"
+            }
+            & $env:WINDOWS_SIGNTOOL verify /pa /all /tw $installer
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verify failed for $installer"
+            }
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: ro-sync-desktop-${{ matrix.asset_platform }}
           path: desktop/release-assets/*
           if-no-files-found: error
 
+      - name: Remove imported Windows Authenticode certificate
+        if: always() && runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_THUMBPRINT)) {
+            $certificatePath = "Cert:\CurrentUser\My\$($env:WINDOWS_CODESIGN_THUMBPRINT)"
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+
   release:
     needs: [build, plugin, desktop]
     runs-on: ubuntu-22.04
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -453,6 +665,16 @@ jobs:
           set -euo pipefail
           cd artifacts
           shopt -s nullglob
+          standalone_daemons=(
+            rosync-darwin-arm64
+            rosync-linux-x86_64
+            rosync-windows-x86_64.exe
+          )
+          for daemon in "${standalone_daemons[@]}"; do
+            test -f "$daemon"
+            test -f "$daemon.sha256"
+            sha256sum --check --strict -- "$daemon.sha256"
+          done
           bundles=(rosync-*-bundle.zip)
           test "${#bundles[@]}" -eq 3
           sha256sum --check --strict -- *-bundle.zip.sha256

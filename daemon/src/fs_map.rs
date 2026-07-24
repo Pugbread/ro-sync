@@ -16,11 +16,15 @@
 //!   * Sibling name collisions are broken with numeric suffixes.
 //!   * Unsafe characters in instance names are percent-encoded.
 
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
+use crate::fs_safety::{metadata_no_follow, PortableDirectoryIndex, SafeEntryKind};
+
 pub const META_FILE: &str = ".meta.json";
+pub const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
+pub const EMPTY_NAME_SENTINEL: &str = "%_";
 
 /// Normalize CRLF → LF. Returns borrowed when nothing would change, owned
 /// otherwise. Used before hashing / comparing script bytes so that a Studio
@@ -75,6 +79,21 @@ impl ScriptClass {
             "LocalScript" => Some(Self::LocalScript),
             _ => None,
         }
+    }
+}
+
+/// Preferred source marker for a script-with-children directory.
+///
+/// The named Ro Sync form is easier to recognize by eye, but a near-limit
+/// directory name can make `init (<Name>).server.luau` exceed Windows' 255
+/// UTF-16-code-unit component limit. The already-supported plain init form
+/// derives identity from the parent directory and stays portable.
+pub fn portable_init_file_name(name: &str, class: ScriptClass) -> String {
+    let named = format!("init ({}){}", encode_name(name), class.suffix());
+    if named.len() <= MAX_PORTABLE_COMPONENT_BYTES {
+        named
+    } else {
+        format!("init{}", class.suffix())
     }
 }
 
@@ -174,6 +193,8 @@ fn is_windows_reserved_stem(stem: &str) -> bool {
     matches!(
         upper.as_str(),
         "CON"
+            | "CONIN$"
+            | "CONOUT$"
             | "PRN"
             | "AUX"
             | "NUL"
@@ -200,16 +221,25 @@ fn is_windows_reserved_stem(stem: &str) -> bool {
 
 /// Percent-encode non-ASCII text and characters that can't (or shouldn't)
 /// appear in POSIX / NTFS paths. ASCII-only output avoids Unicode
-/// case/normalization aliases across filesystems. Also guards against trailing
-/// `.`/space (illegal as a Windows file name tail) and Windows reserved device
-/// names (CON, PRN, ...).
+/// case/normalization aliases across filesystems. Also guards against leading
+/// ASCII space, trailing `.`/space, and Windows reserved device names (CON,
+/// PRN, ...).
 pub fn encode_name(name: &str) -> String {
+    // An empty path component collapses to its parent on every supported
+    // filesystem. `%_` cannot be emitted for a literal Roblox name because
+    // literal percent signs are encoded as `%25`, so it is a compact,
+    // reversible sentinel (`"%_"` itself becomes `%25_`).
+    if name.is_empty() {
+        return EMPTY_NAME_SENTINEL.to_string();
+    }
+
     let mut out = String::with_capacity(name.len());
     let char_count = name.chars().count();
     for (i, ch) in name.chars().enumerate() {
         let leading_dot = i == 0 && ch == '.';
+        let leading_space = i == 0 && ch == ' ';
         let trailing_dot_or_space = i + 1 == char_count && (ch == '.' || ch == ' ');
-        if leading_dot || trailing_dot_or_space || needs_escape(ch) {
+        if leading_dot || leading_space || trailing_dot_or_space || needs_escape(ch) {
             let mut buf = [0u8; 4];
             for b in ch.encode_utf8(&mut buf).as_bytes() {
                 out.push_str(&format!("%{:02X}", b));
@@ -231,7 +261,16 @@ pub fn encode_name(name: &str) -> String {
                 escaped.push_str(&format!("%{:02X}", b));
             }
             escaped.push_str(&rest);
-            return escaped;
+            out = escaped;
+        }
+    }
+    // `<Name> [N]` is Ro Sync's generated sibling-disambiguation grammar.
+    // Escape the opening bracket when it is part of the literal Roblox name
+    // so reverse mapping cannot silently strip it as an allocator ordinal.
+    if parse_disambiguated(&out).is_some() {
+        if let Some(open) = out.rfind(" [") {
+            let ordinal = out[open + 2..out.len() - 1].to_string();
+            out.replace_range(open.., &format!(" %5B{ordinal}%5D"));
         }
     }
     out
@@ -239,6 +278,10 @@ pub fn encode_name(name: &str) -> String {
 
 /// Reverse of [`encode_name`]. Best-effort: invalid escapes are passed through.
 pub fn decode_name(encoded: &str) -> String {
+    if encoded == EMPTY_NAME_SENTINEL {
+        return String::new();
+    }
+
     let bytes = encoded.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -254,6 +297,27 @@ pub fn decode_name(encoded: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Validate an already-encoded physical path component against the common
+/// Windows/macOS/Linux representation budget.
+///
+/// Ro Sync's canonical fragments are ASCII-only, so byte length is also the
+/// Windows UTF-16 code-unit length. A lossless shortening scheme would require
+/// persisted identity metadata; until one exists, callers must reject an
+/// overlong fragment before applying any part of a bootstrap transaction.
+pub fn validate_portable_component(fragment: &str) -> Result<(), String> {
+    if fragment.is_empty() {
+        return Err("generated filesystem component is empty".to_string());
+    }
+    if fragment.len() > MAX_PORTABLE_COMPONENT_BYTES {
+        return Err(format!(
+            "generated filesystem component is {} bytes; portable limit is {}",
+            fragment.len(),
+            MAX_PORTABLE_COMPONENT_BYTES
+        ));
+    }
+    Ok(())
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -291,50 +355,73 @@ pub struct PathFragment {
 /// `Name [1]`, `Name [2]`, … applied *before* the script extension (so a
 /// `ModuleScript` named `Thing` that collides becomes `Thing [1].luau`).
 pub fn instance_to_path(inst: &InstanceDescriptor, taken: &[String]) -> PathFragment {
-    let encoded = encode_name(inst.name);
-    let script = ScriptClass::from_class(inst.class);
+    let mut allocator = PathFragmentAllocator::from_taken(taken.iter().map(String::as_str));
+    allocator.allocate(inst)
+}
 
-    let is_dir = match script {
-        Some(_) if inst.has_children => true,
-        Some(_) => false,
-        None => true,
-    };
+/// Incremental sibling-fragment allocator for wide directories.
+///
+/// `instance_to_path` accepts a slice for convenient one-off calls, but
+/// repeatedly scanning that slice makes an N-child bootstrap quadratic.
+/// This allocator preserves the same case-insensitive collision and ordinal
+/// rules while indexing reserved fragments once.
+#[derive(Debug, Default)]
+pub struct PathFragmentAllocator {
+    taken: HashSet<String>,
+    next_ordinal: HashMap<String, usize>,
+}
 
-    let make_fragment = |stem: &str| -> String {
-        match script {
-            Some(_) if inst.has_children => stem.to_string(),
-            Some(sc) => format!("{}{}", stem, sc.suffix()),
-            None => stem.to_string(),
-        }
-    };
-
-    let base = make_fragment(&encoded);
-    if !fragment_taken(taken, &base) {
-        return PathFragment {
-            fragment: base,
-            is_dir,
-        };
+impl PathFragmentAllocator {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    for n in 1..10_000 {
-        let candidate = make_fragment(&format!("{} [{}]", encoded, n));
-        if !fragment_taken(taken, &candidate) {
+    pub fn from_taken<'a>(taken: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            taken: taken
+                .into_iter()
+                .map(|fragment| fragment.to_ascii_lowercase())
+                .collect(),
+            next_ordinal: HashMap::new(),
+        }
+    }
+
+    pub fn allocate(&mut self, inst: &InstanceDescriptor<'_>) -> PathFragment {
+        let encoded = encode_name(inst.name);
+        let script = ScriptClass::from_class(inst.class);
+        let is_dir = script.is_none() || inst.has_children;
+        let extension = match script {
+            Some(sc) if !inst.has_children => sc.suffix(),
+            _ => "",
+        };
+        let make_fragment = |stem: &str| format!("{stem}{extension}");
+
+        let base = make_fragment(&encoded);
+        let base_key = base.to_ascii_lowercase();
+        if self.taken.insert(base_key.clone()) {
+            self.next_ordinal.entry(base_key).or_insert(1);
             return PathFragment {
-                fragment: candidate,
+                fragment: base,
                 is_dir,
             };
         }
-    }
-    PathFragment {
-        fragment: format!("{}__{}", base, taken.len()),
-        is_dir,
-    }
-}
 
-fn fragment_taken(taken: &[String], candidate: &str) -> bool {
-    taken
-        .iter()
-        .any(|existing| fragments_equal(existing, candidate))
+        let mut ordinal = self.next_ordinal.get(&base_key).copied().unwrap_or(1);
+        loop {
+            let stem = format!("{encoded} [{ordinal}]");
+            let candidate = make_fragment(&stem);
+            ordinal = ordinal
+                .checked_add(1)
+                .expect("filesystem sibling ordinal exceeds addressable memory");
+            if self.taken.insert(candidate.to_ascii_lowercase()) {
+                self.next_ordinal.insert(base_key, ordinal);
+                return PathFragment {
+                    fragment: candidate,
+                    is_dir,
+                };
+            }
+        }
+    }
 }
 
 fn fragments_equal(a: &str, b: &str) -> bool {
@@ -370,7 +457,12 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
         return Ok(None);
     }
 
-    let meta = fs::symlink_metadata(path)?;
+    let Some(meta) = metadata_no_follow(path)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("filesystem path does not exist: {}", path.display()),
+        ));
+    };
 
     if meta.is_file() {
         if parse_init_file(file_name).is_some() {
@@ -403,20 +495,12 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
     };
     let decoded_dir_name = decode_name(&dir_display);
 
-    let mut named_init: Option<(ScriptClass, String)> = None;
-    let mut plain_init: Option<ScriptClass> = None;
-    for entry in fs::read_dir(path)? {
-        let e = entry?;
-        if let Some(n) = e.file_name().to_str() {
-            if let Some(parsed) = parse_init_file(n) {
-                named_init = Some(parsed);
-            } else if let Some(sc) = parse_plain_init_file(n) {
-                plain_init = Some(sc);
-            }
-        }
-    }
-
-    let init_entry = named_init.or_else(|| plain_init.map(|sc| (sc, decoded_dir_name.clone())));
+    let index = PortableDirectoryIndex::read(path)?;
+    let init_entry = index.unique_init_source().and_then(|entry| {
+        parse_init_file(&entry.fragment).or_else(|| {
+            parse_plain_init_file(&entry.fragment).map(|sc| (sc, decoded_dir_name.clone()))
+        })
+    });
     let (name, class, script_class) = if let Some((sc, inner)) = init_entry.clone() {
         (inner, sc.class_name().to_string(), Some(sc))
     } else {
@@ -439,13 +523,12 @@ pub fn is_empty_plain_folder(path: &Path) -> io::Result<bool> {
     if inst.class != "Folder" || !inst.is_dir || inst.is_script_with_children {
         return Ok(false);
     }
-    for entry in fs::read_dir(path)? {
-        let e = entry?;
-        let Some(name) = e.file_name().to_str().map(str::to_string) else {
-            return Ok(false);
-        };
-        if name == META_FILE || name == ".DS_Store" {
+    for entry in PortableDirectoryIndex::read(path)?.entries() {
+        if entry.fragment == META_FILE || entry.fragment == ".DS_Store" {
             continue;
+        }
+        if entry.kind != SafeEntryKind::File && entry.kind != SafeEntryKind::Directory {
+            return Ok(false);
         }
         return Ok(false);
     }
@@ -643,6 +726,26 @@ mod tests {
     }
 
     #[test]
+    fn encode_escapes_leading_ascii_space_for_win32_portability() {
+        assert_eq!(encode_name(" Foo"), "%20Foo");
+        assert_eq!(encode_name("  Foo"), "%20 Foo");
+        assert_eq!(decode_name(&encode_name(" Foo")), " Foo");
+    }
+
+    #[test]
+    fn empty_name_uses_a_non_collapsing_reversible_sentinel() {
+        assert_eq!(encode_name(""), EMPTY_NAME_SENTINEL);
+        assert_eq!(decode_name(EMPTY_NAME_SENTINEL), "");
+
+        // A literal name equal to the sentinel remains distinct.
+        assert_eq!(encode_name(EMPTY_NAME_SENTINEL), "%25_");
+        assert_eq!(
+            decode_name(&encode_name(EMPTY_NAME_SENTINEL)),
+            EMPTY_NAME_SENTINEL
+        );
+    }
+
+    #[test]
     fn encode_escapes_windows_reserved_names() {
         // Exact reserved name — first char must be escaped so the result isn't CON.
         let enc = encode_name("CON");
@@ -656,9 +759,38 @@ mod tests {
         // Case-insensitive.
         assert_ne!(encode_name("nul").to_ascii_uppercase(), "NUL");
 
+        // CreateFile also recognizes the console device aliases even though
+        // the shorter Win32 naming-rule summary lists only CON.
+        assert_eq!(encode_name("CONIN$"), "%43ONIN$");
+        assert_eq!(encode_name("conout$.txt"), "%63onout$.txt");
+        assert_eq!(decode_name(&encode_name("CONOUT$")), "CONOUT$");
+
+        // Microsoft also reserves COM/LPT with superscript 1, 2, and 3.
+        // Encoding all non-ASCII UTF-8 bytes makes those spellings portable
+        // without growing a second device-name table in either codec.
+        let superscript = encode_name("COM¹");
+        assert_eq!(superscript, "COM%C2%B9");
+        assert_eq!(decode_name(&superscript), "COM¹");
+        assert!(!is_windows_reserved_stem(&superscript));
+
         // Non-reserved stems are left alone.
         assert_eq!(encode_name("CONFIG"), "CONFIG");
         assert_eq!(encode_name("COM"), "COM"); // only COM1..COM9 are reserved
+    }
+
+    #[test]
+    fn reserved_name_with_literal_ordinal_suffix_applies_both_escapes() {
+        let encoded = encode_name("CON.foo [1]");
+        assert_eq!(encoded, "%43ON.foo %5B1%5D");
+        assert_eq!(decode_name(&encoded), "CON.foo [1]");
+        assert_eq!(parse_disambiguated(&encoded), None);
+        assert!(!is_windows_reserved_stem(&encoded));
+
+        let lowercase = encode_name("nul.data [12]");
+        assert_eq!(lowercase, "%6Eul.data %5B12%5D");
+        assert_eq!(decode_name(&lowercase), "nul.data [12]");
+        assert_eq!(parse_disambiguated(&lowercase), None);
+        assert!(!is_windows_reserved_stem(&lowercase));
     }
 
     #[test]
@@ -693,6 +825,75 @@ mod tests {
         assert_eq!(encode_name("Value%2FName"), "Value%252FName");
         assert_eq!(decode_name(&encode_name("Value%2FName")), "Value%2FName");
         assert_eq!(decode_name(&encode_name("%")), "%");
+    }
+
+    #[test]
+    fn literal_disambiguation_suffix_roundtrips_without_becoming_an_ordinal() {
+        let encoded = encode_name("Thing [1]");
+        assert_eq!(encoded, "Thing %5B1%5D");
+        assert_eq!(decode_name(&encoded), "Thing [1]");
+        assert_eq!(parse_disambiguated(&encoded), None);
+
+        let fragment = instance_to_path(
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Thing [1]",
+                has_children: false,
+            },
+            &[],
+        );
+        assert_eq!(fragment.fragment, "Thing %5B1%5D.luau");
+    }
+
+    #[test]
+    fn empty_sibling_names_keep_distinct_leaf_and_directory_fragments() {
+        let mut folders = PathFragmentAllocator::new();
+        let first_folder = folders.allocate(&InstanceDescriptor {
+            class: "Folder",
+            name: "",
+            has_children: true,
+        });
+        let second_folder = folders.allocate(&InstanceDescriptor {
+            class: "Folder",
+            name: "",
+            has_children: true,
+        });
+        assert_eq!(first_folder.fragment, "%_");
+        assert_eq!(second_folder.fragment, "%_ [1]");
+        let (folder_name, folder_ordinal) = parse_disambiguated(&second_folder.fragment).unwrap();
+        assert_eq!(decode_name(&folder_name), "");
+        assert_eq!(folder_ordinal, 1);
+
+        let mut scripts = PathFragmentAllocator::new();
+        let first_script = scripts.allocate(&InstanceDescriptor {
+            class: "ModuleScript",
+            name: "",
+            has_children: false,
+        });
+        let second_script = scripts.allocate(&InstanceDescriptor {
+            class: "ModuleScript",
+            name: "",
+            has_children: false,
+        });
+        assert_eq!(first_script.fragment, "%_.luau");
+        assert_eq!(second_script.fragment, "%_ [1].luau");
+        let temp = TempDir::new("empty-script-name");
+        let empty_script = temp.path().join(&first_script.fragment);
+        fs::write(&empty_script, "return true").unwrap();
+        assert_eq!(
+            path_to_instance_meta(&empty_script).unwrap().unwrap().name,
+            ""
+        );
+
+        let empty_script_dir = temp.path().join(EMPTY_NAME_SENTINEL);
+        fs::create_dir(&empty_script_dir).unwrap();
+        let empty_init = portable_init_file_name("", ScriptClass::Script);
+        assert_eq!(empty_init, "init (%_).server.luau");
+        fs::write(empty_script_dir.join(empty_init), "print('ok')").unwrap();
+        let metadata = path_to_instance_meta(&empty_script_dir).unwrap().unwrap();
+        assert_eq!(metadata.name, "");
+        assert_eq!(metadata.class, "Script");
+        assert!(metadata.is_script_with_children);
     }
 
     // ----- instance_to_path --------------------------------------------
@@ -865,6 +1066,146 @@ mod tests {
             &[],
         );
         assert_eq!(f.fragment, "a%2Fb.luau");
+    }
+
+    #[test]
+    fn fragment_allocator_preserves_case_insensitive_collision_rules() {
+        let mut allocator = PathFragmentAllocator::from_taken(["Config.luau", "Thing [1].luau"]);
+        let config = allocator.allocate(&InstanceDescriptor {
+            class: "ModuleScript",
+            name: "config",
+            has_children: false,
+        });
+        let thing = allocator.allocate(&InstanceDescriptor {
+            class: "ModuleScript",
+            name: "Thing",
+            has_children: false,
+        });
+        let duplicate = allocator.allocate(&InstanceDescriptor {
+            class: "ModuleScript",
+            name: "Thing",
+            has_children: false,
+        });
+
+        assert_eq!(config.fragment, "config [1].luau");
+        assert_eq!(thing.fragment, "Thing.luau");
+        assert_eq!(duplicate.fragment, "Thing [2].luau");
+    }
+
+    #[test]
+    fn fragment_allocator_handles_tens_of_thousands_of_wide_siblings() {
+        const WIDTH: usize = 20_000;
+        let mut allocator = PathFragmentAllocator::new();
+        for index in 0..WIDTH {
+            let name = format!("Item{index:05}");
+            let fragment = allocator.allocate(&InstanceDescriptor {
+                class: "ModuleScript",
+                name: &name,
+                has_children: false,
+            });
+            assert_eq!(fragment.fragment, format!("{name}.luau"));
+        }
+        assert_eq!(allocator.taken.len(), WIDTH);
+    }
+
+    #[test]
+    fn fragment_allocator_keeps_five_digit_duplicate_ordinals_roundtrippable() {
+        let module = InstanceDescriptor {
+            class: "ModuleScript",
+            name: "Repeated",
+            has_children: false,
+        };
+        let mut module_allocator = PathFragmentAllocator::new();
+        let mut module_fragment = None;
+        for _ in 0..=10_000 {
+            module_fragment = Some(module_allocator.allocate(&module));
+        }
+        let module_fragment = module_fragment.unwrap();
+        assert_eq!(module_fragment.fragment, "Repeated [10000].luau");
+        let (class, stem) = classify_script_file(&module_fragment.fragment).unwrap();
+        assert_eq!(class, ScriptClass::ModuleScript);
+        assert_eq!(
+            parse_disambiguated(&stem),
+            Some(("Repeated".to_string(), 10_000))
+        );
+
+        let folder = InstanceDescriptor {
+            class: "Folder",
+            name: "Repeated",
+            has_children: true,
+        };
+        let mut folder_allocator = PathFragmentAllocator::new();
+        let mut folder_fragment = None;
+        for _ in 0..=10_000 {
+            folder_fragment = Some(folder_allocator.allocate(&folder));
+        }
+        let folder_fragment = folder_fragment.unwrap();
+        assert_eq!(folder_fragment.fragment, "Repeated [10000]");
+        assert_eq!(
+            parse_disambiguated(&folder_fragment.fragment),
+            Some(("Repeated".to_string(), 10_000))
+        );
+    }
+
+    #[test]
+    fn one_off_path_mapping_keeps_five_digit_duplicate_ordinal_before_extension() {
+        let mut taken = Vec::with_capacity(10_000);
+        taken.push("Repeated.luau".to_string());
+        taken.extend((1..10_000).map(|ordinal| format!("Repeated [{ordinal}].luau")));
+
+        let fragment = instance_to_path(
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "Repeated",
+                has_children: false,
+            },
+            &taken,
+        );
+        assert_eq!(fragment.fragment, "Repeated [10000].luau");
+    }
+
+    #[test]
+    fn overlong_duplicate_component_is_lossless_but_fails_portable_preflight() {
+        let name = "A".repeat(MAX_PORTABLE_COMPONENT_BYTES - ".luau".len());
+        let descriptor = InstanceDescriptor {
+            class: "ModuleScript",
+            name: &name,
+            has_children: false,
+        };
+        let mut allocator = PathFragmentAllocator::new();
+        let bare = allocator.allocate(&descriptor);
+        let duplicate = allocator.allocate(&descriptor);
+
+        assert_eq!(bare.fragment.len(), MAX_PORTABLE_COMPONENT_BYTES);
+        assert!(validate_portable_component(&bare.fragment).is_ok());
+        assert!(duplicate.fragment.ends_with(" [1].luau"));
+        assert!(duplicate.fragment.len() > MAX_PORTABLE_COMPONENT_BYTES);
+        assert!(validate_portable_component(&duplicate.fragment).is_err());
+        let (class, stem) = classify_script_file(&duplicate.fragment).unwrap();
+        assert_eq!(class, ScriptClass::ModuleScript);
+        let (decoded_name, ordinal) = parse_disambiguated(&stem).unwrap();
+        assert_eq!(ordinal, 1);
+        assert_eq!(decoded_name, name);
+    }
+
+    #[test]
+    fn percent_expanded_unicode_component_fails_portable_preflight() {
+        let encoded = encode_name(&"😀".repeat(100));
+        assert_eq!(decode_name(&encoded), "😀".repeat(100));
+        assert!(encoded.len() > MAX_PORTABLE_COMPONENT_BYTES);
+        let error = validate_portable_component(&encoded).unwrap_err();
+        assert!(error.contains("portable limit is 255"));
+    }
+
+    #[test]
+    fn long_script_directory_uses_a_portable_plain_init_marker() {
+        let name = "A".repeat(MAX_PORTABLE_COMPONENT_BYTES - 1);
+        let init = portable_init_file_name(&name, ScriptClass::LocalScript);
+        assert_eq!(init, "init.client.luau");
+        assert!(init.len() <= MAX_PORTABLE_COMPONENT_BYTES);
+
+        let ordinary = portable_init_file_name("Controller", ScriptClass::ModuleScript);
+        assert_eq!(ordinary, "init (Controller).luau");
     }
 
     // ----- path_to_instance_meta ---------------------------------------

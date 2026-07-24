@@ -790,29 +790,43 @@ impl ConflictEngine {
 }
 
 fn stable_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
+    // Conflict paths are rooted beneath one of the exact synced services.
+    // Canonicalize only the project root (which permits benign platform
+    // aliases such as macOS /var -> /private/var while rejecting a direct
+    // project-root link), then validate every service descendant without
+    // following a symlink or Windows reparse point.
+    let mut project_root = PathBuf::new();
+    let mut found_service = false;
+    for component in path.components() {
+        let is_service = matches!(
+            component,
+            std::path::Component::Normal(fragment)
+                if fragment
+                    .to_str()
+                    .is_some_and(|fragment| crate::fs_safety::SYNCED_SERVICES.contains(&fragment))
+        );
+        if is_service {
+            found_service = true;
+            break;
+        }
+        project_root.push(component.as_os_str());
+    }
+    if !found_service || project_root.as_os_str().is_empty() {
+        return path.to_path_buf();
     }
 
-    // Deleted and renamed paths no longer canonicalize directly. Canonicalize
-    // the nearest surviving ancestor (important on macOS where /var resolves
-    // to /private/var), then append the missing suffix unchanged.
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-    while let Some(name) = ancestor.file_name() {
-        suffix.push(name.to_os_string());
-        let Some(parent) = ancestor.parent() else {
-            break;
-        };
-        ancestor = parent;
-        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
-            for component in suffix.iter().rev() {
-                canonical.push(component);
-            }
-            return canonical;
-        }
-    }
-    path.to_path_buf()
+    let Ok(canonical_root) = crate::fs_safety::stable_canonical_directory(&project_root) else {
+        return path.to_path_buf();
+    };
+    let Ok(relative) = path.strip_prefix(&project_root) else {
+        return path.to_path_buf();
+    };
+    let candidate = canonical_root.join(relative);
+    crate::fs_safety::validate_synced_path(&canonical_root, &candidate, true)
+        // Keep the exact lexical descendant on validation failure. This is a
+        // stable key, not permission to access the path, and crucially does
+        // not collapse a linked subtree onto its external target.
+        .unwrap_or(candidate)
 }
 
 fn now_secs() -> u64 {
@@ -1106,5 +1120,53 @@ mod tests {
         assert_eq!(engine.finish_fs_destructive(&source), FsDecision::Propagate);
         engine.commit_fs_rename(&source, &renamed);
         assert!(engine.matches_baseline(&renamed, b"agreed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_path_does_not_follow_a_linked_synced_parent() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let workspace = project.path().join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let external_source = external.path().join("Controller.server.luau");
+        std::fs::write(&external_source, b"external\n").unwrap();
+        symlink(external.path(), workspace.join("Linked")).unwrap();
+
+        let requested = workspace.join("Linked/Controller.server.luau");
+        let stable = stable_path(&requested);
+        let canonical_project = std::fs::canonicalize(project.path()).unwrap();
+        assert_eq!(
+            stable,
+            canonical_project.join("Workspace/Linked/Controller.server.luau")
+        );
+        assert_ne!(stable, std::fs::canonicalize(&requested).unwrap());
+        assert_eq!(std::fs::read(&external_source).unwrap(), b"external\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_path_does_not_follow_a_linked_source_file() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let workspace = project.path().join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let external_source = external.path().join("outside.luau");
+        std::fs::write(&external_source, b"external\n").unwrap();
+        let requested = workspace.join("Controller.server.luau");
+        symlink(&external_source, &requested).unwrap();
+
+        let stable = stable_path(&requested);
+        let canonical_project = std::fs::canonicalize(project.path()).unwrap();
+        assert_eq!(
+            stable,
+            canonical_project.join("Workspace/Controller.server.luau")
+        );
+        assert_ne!(stable, std::fs::canonicalize(&requested).unwrap());
+        assert_eq!(std::fs::read(&external_source).unwrap(), b"external\n");
     }
 }

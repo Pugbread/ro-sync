@@ -4,27 +4,34 @@
 //! by luau-lsp: `{ name, className, filePaths?, children? }`.
 
 use crate::fs_map::{is_init_file, path_to_instance_meta};
+use crate::fs_safety::{
+    file_generation_no_follow, metadata_no_follow, read_to_string_no_follow,
+    resolve_rojo_path_no_follow, validate_rojo_project_directory, validate_service_path,
+    PortableDirectoryIndex, SafeEntryKind,
+};
 use crate::snapshot::SYNCED_SERVICES;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 const ROJO_PROJECT_FILE: &str = "default.project.json";
+const MAX_SOURCEMAP_DEPTH: usize = 256;
 
 pub fn generate(project: &Path) -> io::Result<Value> {
     let mut children = Vec::new();
     for service in SYNCED_SERVICES {
+        let _validated_service = validate_service_path(project, service, true)?;
         let service_dir = project.join(service);
-        if !service_dir.is_dir() {
+        if metadata_no_follow(&service_dir)?.is_none() {
             continue;
         }
+        validate_rojo_project_directory(&service_dir)?;
         children.push(json!({
             "name": service,
             "className": service,
             "filePaths": [rel_path(project, &service_dir)],
-            "children": walk_children(project, &service_dir)?,
+            "children": walk_children(project, &service_dir, 1)?,
         }));
     }
 
@@ -185,20 +192,22 @@ fn live_to_sourcemap(live_node: &Value) -> Option<Value> {
     Some(Value::Object(object))
 }
 
-fn walk_children(project: &Path, dir: &Path) -> io::Result<Vec<Value>> {
+fn walk_children(project: &Path, dir: &Path, depth: usize) -> io::Result<Vec<Value>> {
+    if depth > MAX_SOURCEMAP_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "sourcemap tree exceeds maximum depth {MAX_SOURCEMAP_DEPTH} at {}",
+                dir.display()
+            ),
+        ));
+    }
     let mut out = Vec::new();
-    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if is_init_file(name) {
+    for entry in PortableDirectoryIndex::read(dir)?.entries() {
+        if is_init_file(&entry.fragment) {
             continue;
         }
-        if let Some(node) = build_node(project, &path)? {
+        if let Some(node) = build_node(project, &entry.path, depth)? {
             out.push(node);
         }
     }
@@ -206,10 +215,18 @@ fn walk_children(project: &Path, dir: &Path) -> io::Result<Vec<Value>> {
     Ok(out)
 }
 
-fn build_node(project: &Path, path: &Path) -> io::Result<Option<Value>> {
-    if path.is_dir() {
+fn build_node(project: &Path, path: &Path, depth: usize) -> io::Result<Option<Value>> {
+    let Some(metadata) = metadata_no_follow(path)? else {
+        return Ok(None);
+    };
+    if metadata.is_dir() {
         if let Some(target) = default_project_path(path)? {
-            if target.exists() {
+            let target_is_own_init = target.parent() == Some(path)
+                && target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_init_file);
+            if !target_is_own_init && metadata_no_follow(&target)?.is_some() {
                 let name = path_to_instance_meta(path)?
                     .map(|inst| inst.name)
                     .or_else(|| {
@@ -217,18 +234,19 @@ fn build_node(project: &Path, path: &Path) -> io::Result<Option<Value>> {
                             .and_then(|name| name.to_str())
                             .map(|name| name.to_string())
                     });
-                return build_node_at(project, &target, name);
+                return build_node_at(project, &target, name, depth);
             }
         }
     }
 
-    build_node_at(project, path, None)
+    build_node_at(project, path, None, depth)
 }
 
 fn build_node_at(
     project: &Path,
     path: &Path,
     name_override: Option<String>,
+    depth: usize,
 ) -> io::Result<Option<Value>> {
     let Some(inst) = path_to_instance_meta(path)? else {
         return Ok(None);
@@ -241,12 +259,12 @@ fn build_node_at(
     );
     obj.insert("className".into(), Value::String(inst.class));
 
-    if let Some(source_path) = source_path_for(path, inst.is_script_with_children) {
+    if let Some(source_path) = source_path_for(path, inst.is_script_with_children)? {
         obj.insert(
             "filePaths".into(),
             Value::Array(vec![Value::String(rel_path(project, &source_path))]),
         );
-    } else if path.is_dir() {
+    } else if metadata_no_follow(path)?.is_some_and(|metadata| metadata.is_dir()) {
         obj.insert(
             "filePaths".into(),
             Value::Array(vec![Value::String(rel_path(project, path))]),
@@ -256,7 +274,7 @@ fn build_node_at(
     if inst.is_dir {
         obj.insert(
             "children".into(),
-            Value::Array(walk_children(project, path)?),
+            Value::Array(walk_children(project, path, depth + 1)?),
         );
     }
 
@@ -264,12 +282,22 @@ fn build_node_at(
 }
 
 fn default_project_path(dir: &Path) -> io::Result<Option<PathBuf>> {
-    let project_file = dir.join(ROJO_PROJECT_FILE);
-    if !project_file.is_file() {
+    let index = PortableDirectoryIndex::read(dir)?;
+    let Some(project_file) = index.exact(ROJO_PROJECT_FILE) else {
         return Ok(None);
+    };
+    if project_file.kind != SafeEntryKind::File {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Rojo project marker is not a regular file: {}",
+                project_file.path.display()
+            ),
+        ));
     }
 
-    let text = fs::read_to_string(project_file)?;
+    file_generation_no_follow(&project_file.path).map_err(io::Error::other)?;
+    let text = read_to_string_no_follow(&project_file.path)?;
     let value: Value = serde_json::from_str(&text).map_err(io::Error::other)?;
     let Some(path) = value
         .get("tree")
@@ -279,62 +307,44 @@ fn default_project_path(dir: &Path) -> io::Result<Option<PathBuf>> {
         return Ok(None);
     };
 
-    let Some(relative_path) = safe_rojo_relative_path(path) else {
-        return Ok(None);
-    };
-
-    Ok(Some(dir.join(relative_path)))
+    Ok(Some(resolve_rojo_path_no_follow(dir, path, true)?))
 }
 
-fn safe_rojo_relative_path(path: &str) -> Option<PathBuf> {
-    if path.is_empty() || Path::new(path).is_absolute() || looks_like_windows_rooted_path(path) {
-        return None;
-    }
-
-    let mut out = PathBuf::new();
-    for segment in path.split(['/', '\\']) {
-        if segment.is_empty() || segment == ".." {
-            return None;
-        }
-        if segment != "." {
-            out.push(segment);
-        }
-    }
-    Some(out)
-}
-
-fn looks_like_windows_rooted_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-        || path.starts_with('\\')
-        || path.starts_with("//")
-}
-
-fn source_path_for(path: &Path, is_script_with_children: bool) -> Option<PathBuf> {
+fn source_path_for(path: &Path, is_script_with_children: bool) -> io::Result<Option<PathBuf>> {
     if !is_script_with_children {
-        return path.is_file().then(|| path.to_path_buf());
+        let Some(metadata) = metadata_no_follow(path)? else {
+            return Ok(None);
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        file_generation_no_follow(path).map_err(io::Error::other)?;
+        return Ok(Some(path.to_path_buf()));
     }
 
-    let entries = fs::read_dir(path).ok()?;
-    for entry in entries.flatten() {
-        let child = entry.path();
-        let Some(name) = child.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if is_init_file(name) {
-            return Some(child);
-        }
-    }
-    None
+    let index = PortableDirectoryIndex::read(path)?;
+    let source = index.unique_init_source().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "script directory has no unique init source: {}",
+                path.display()
+            ),
+        )
+    })?;
+    file_generation_no_follow(&source.path).map_err(io::Error::other)?;
+    Ok(Some(source.path.clone()))
 }
 
 fn rel_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::new();
+    for component in path.strip_prefix(root).unwrap_or(path).components() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(&component.as_os_str().to_string_lossy());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -457,7 +467,27 @@ mod tests {
         )
         .unwrap();
 
-        assert!(default_project_path(&package).unwrap().is_none());
+        let error = default_project_path(&package).unwrap_err();
+        assert!(error.to_string().contains("unsafe Rojo $path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_init_source_is_an_error_not_a_silently_missing_file_path() {
+        use std::os::unix::fs::symlink;
+        let d = TempDir::new("linked-init");
+        let package = d.path().join("ReplicatedStorage").join("Package");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&package).unwrap();
+        fs::write(outside.path().join("sentinel"), "keep").unwrap();
+        symlink(outside.path().join("sentinel"), package.join("init.lua")).unwrap();
+
+        let error = generate(d.path()).unwrap_err();
+        assert!(error.to_string().contains("linked/reparse"));
+        assert_eq!(
+            fs::read_to_string(outside.path().join("sentinel")).unwrap(),
+            "keep"
+        );
     }
 
     #[test]

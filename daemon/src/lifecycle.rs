@@ -35,14 +35,7 @@ pub struct RuntimePaths {
 }
 
 pub fn canonical_project(project: &Path) -> io::Result<PathBuf> {
-    let canonical = fs::canonicalize(project)?;
-    if !canonical.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("project is not a directory: {}", project.display()),
-        ));
-    }
-    Ok(canonical)
+    crate::fs_safety::stable_canonical_directory(project)
 }
 
 pub fn state_dir(explicit: Option<&Path>) -> io::Result<PathBuf> {
@@ -202,6 +195,7 @@ pub fn write_record(path: &Path, record: &RuntimeRecord) -> io::Result<()> {
     write_private_atomic(path, &text)
 }
 
+#[cfg(not(windows))]
 pub fn remove_record_if_boot(path: &Path, boot_id: &str) -> io::Result<bool> {
     let Some(record) = read_record(path)? else {
         return Ok(false);
@@ -213,6 +207,82 @@ pub fn remove_record_if_boot(path: &Path, boot_id: &str) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+pub fn remove_record_if_boot(path: &Path, boot_id: &str) -> io::Result<bool> {
+    use std::io::Read as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+
+    #[repr(C)]
+    struct FileDispositionInfo {
+        // Win32 BOOLEAN is an unsigned byte (not the four-byte BOOL type).
+        delete_file: u8,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information_class: i32,
+            information: *const std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(GENERIC_READ | DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    // Validate through the same open handle that will be marked for deletion.
+    // A concurrent replacement can move this file out of the directory, but
+    // the handle remains bound to the old boot and can never delete the new
+    // record installed at the original path.
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let record = serde_json::from_str::<RuntimeRecord>(&text)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if record.version != RUNTIME_RECORD_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported daemon runtime record version {}; expected {}",
+                record.version, RUNTIME_RECORD_VERSION
+            ),
+        ));
+    }
+    if record.boot_id != boot_id {
+        return Ok(false);
+    }
+
+    let disposition = FileDispositionInfo { delete_file: 1 };
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FILE_DISPOSITION_INFO_CLASS,
+            (&disposition as *const FileDispositionInfo).cast(),
+            std::mem::size_of::<FileDispositionInfo>() as u32,
+        )
+    };
+    if removed == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(true)
     }
 }
 
@@ -366,7 +436,10 @@ fn write_private_atomic_impl(path: &Path, bytes: &[u8], terminate_line: bool) ->
             file.write_all(b"\n")?;
         }
         file.sync_all()?;
-        replace_private_file(&temporary, path)
+        // Windows replacement can be denied while the staging handle is
+        // still open, depending on filesystem/share-mode policy.
+        drop(file);
+        replace_file_atomic(&temporary, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -374,13 +447,18 @@ fn write_private_atomic_impl(path: &Path, bytes: &[u8], terminate_line: bool) ->
     result
 }
 
+/// Replace `destination` with a fully-written sibling temp file without first
+/// unlinking the old destination. The Windows implementation must use the
+/// native replace flag because `std::fs::rename` cannot overwrite there.
 #[cfg(not(windows))]
-fn replace_private_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomic(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)
 }
 
 #[cfg(windows)]
-fn replace_private_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+/// Windows counterpart to [`replace_file_atomic`] using replace-existing and
+/// write-through flags so the old name remains valid until the swap succeeds.
+pub(crate) fn replace_file_atomic(temporary: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
@@ -427,6 +505,22 @@ mod tests {
         assert_eq!(first, repeated);
         assert_ne!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_project_rejects_a_direct_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical-project");
+        let linked = temporary.path().join("linked-project");
+        fs::create_dir(&physical).unwrap();
+        symlink(&physical, &linked).unwrap();
+
+        let error = canonical_project(&linked).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(physical.is_dir());
     }
 
     #[test]

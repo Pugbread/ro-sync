@@ -171,6 +171,7 @@ jobs:
           node scripts/check-host-adapter.mjs
           node scripts/check-lifecycle-policy.mjs
           node scripts/check-platform-commands.mjs
+          node scripts/check-windows-release-policy.mjs
           node scripts/check-project-path-policy.mjs
           node scripts/check-project-init-policy.mjs
           node scripts/check-initial-selection.mjs
@@ -225,6 +226,13 @@ jobs:
       - name: Test daemon
         working-directory: daemon
         run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Exercise Windows source build without optional tool downloads
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ROSYNC_SKIP_TOOL_DOWNLOAD: "1"
+        run: ./daemon/build.ps1
 
   desktop:
     needs: quality
@@ -342,5 +350,21 @@ jobs:
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --target ${{ matrix.target }}
 
       - name: Prepare and compile desktop application
+        if: runner.os != 'Windows'
         working-directory: desktop
         run: npm run build -- --target ${{ matrix.target }} --no-bundle --ci --no-sign
+
+      - name: Build unsigned Windows MSI and NSIS installers
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        run: npm run build -- --target ${{ matrix.target }} --bundles msi,nsis --ci --no-sign
+
+      - name: Check unsigned Windows MSI and NSIS outputs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bundleRoot = "desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          $msi = @(Get-ChildItem -LiteralPath "$bundleRoot/msi" -Filter '*.msi' -File)
+          $nsis = @(Get-ChildItem -LiteralPath "$bundleRoot/nsis" -Filter '*-setup.exe' -File)
+          if ($msi.Count -eq 0) { throw "unsigned MSI bundle was not produced" }
+          if ($nsis.Count -eq 0) { throw "unsigned NSIS bundle was not produced" }

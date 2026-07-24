@@ -28,7 +28,7 @@ export function mountActive(root, api) {
       <div class="activity-toolbar-actions">
         <button id="act-clear" type="button">Clear activity</button>
         <button id="act-live" type="button">Pause updates</button>
-        <button id="act-snapshot" type="button">Refresh snapshot</button>
+        <button id="act-snapshot" type="button">Refresh status</button>
       </div>
       <span id="act-unsynced" class="badge badge-warn" hidden></span>
     </div>
@@ -297,12 +297,11 @@ export function mountActive(root, api) {
     const base = api.getDaemonBase();
     if (!base || !project) return;
     try {
-      const info = await daemonJson(base, "/snapshot");
+      // `/snapshot` materializes the complete synced filesystem tree. That is
+      // useful for explicit tooling, but a status refresh must stay O(1) even
+      // when a project contains tens of thousands of instances.
+      const info = await daemonJson(base, "/hello");
       if (api.getState().activeProjectId !== projectId || api.getDaemonBase() !== base) return;
-      if (info.lastSync) {
-        lastSync = info.lastSync;
-        updateLastSyncDisplay();
-      }
       if (typeof info.pluginConnected === "boolean") {
         setPluginStatus(info.pluginConnected ? "Connected" : "Disconnected", info.pluginConnected ? "ok" : "warn");
       }
@@ -351,11 +350,11 @@ export function mountActive(root, api) {
       return;
     }
     try {
-      await daemonJson(base, "/snapshot");
+      await daemonJson(base, "/hello");
       await refreshHeader();
-      api.toast("Snapshot refreshed");
+      api.toast("Status refreshed");
     } catch (error) {
-      api.toast(`Snapshot failed: ${error.message}`);
+      api.toast(`Status refresh failed: ${error.message}`);
     }
   });
 

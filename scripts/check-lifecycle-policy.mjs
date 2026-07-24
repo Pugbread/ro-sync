@@ -5,6 +5,7 @@ import {
   desktopStartOwnership,
   desktopStopPlan,
   desktopTrackedOwnership,
+  exactLifecycleCloseIdentity,
   isDesktopManagedStatus,
 } from "../lifecycle-policy.js";
 
@@ -75,6 +76,41 @@ const betaSession = {
   bootId: "other-desktop-boot",
   ownerToken: "other-desktop-owner-token",
 };
+assert.deepEqual(exactLifecycleCloseIdentity({
+  bootId: "boot-exact",
+  pid: 4242,
+  port: 7878,
+  canonicalProject: "\\\\?\\C:\\Game",
+}), {
+  expectedBootId: "boot-exact",
+  expectedPid: 4242,
+  expectedPort: 7878,
+  expectedCanonicalProject: "\\\\?\\C:\\Game",
+});
+assert.deepEqual(exactLifecycleCloseIdentity({
+  daemonBootId: "widget-boot",
+  daemonPid: 4343,
+  daemonPort: 7879,
+  daemonCanonicalProject: "\\\\?\\C:\\WidgetGame",
+}), {
+  expectedBootId: "widget-boot",
+  expectedPid: 4343,
+  expectedPort: 7879,
+  expectedCanonicalProject: "\\\\?\\C:\\WidgetGame",
+});
+for (const field of ["bootId", "pid", "port", "canonicalProject"]) {
+  assert.equal(
+    exactLifecycleCloseIdentity({
+      bootId: "boot-exact",
+      pid: 4242,
+      port: 7878,
+      canonicalProject: "\\\\?\\C:\\Game",
+      [field]: null,
+    }),
+    null,
+    `destructive lifecycle identity requires ${field}`,
+  );
+}
 const projectState = {
   servedProjectIds: ["alpha", "beta"],
   daemonSessions: { alpha: alphaSession, beta: betaSession },
@@ -238,19 +274,45 @@ for (const required of [
 }
 assert.match(
   tauriDaemonSource,
-  /fn close_managed_daemons[\s\S]*?thread::scope[\s\S]*?for claim in &claims[\s\S]*?close_exact_managed_daemon\(claim\)/,
-  "all project claims must close independently and in parallel during app exit",
+  /const EXIT_CLOSE_TOTAL_TIMEOUT:[\s\S]*?const MAX_EXIT_CLOSE_WORKERS: usize = 4;/,
+  "native exit cleanup must have one shared deadline and a fixed worker limit",
 );
-
-const closeExactSource = tauriDaemonSource.slice(
+const closeAllSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("fn close_managed_daemons"),
   tauriDaemonSource.indexOf("fn close_exact_managed_daemon"),
-  tauriDaemonSource.indexOf("fn local_json_request"),
 );
 assert.match(
-  closeExactSource,
-  /local_json_request\(claim\.port, "GET", "\/hello", &\[\]\)[\s\S]*?managedBy[\s\S]*?claim\.project[\s\S]*?claim\.boot_id[\s\S]*?claim\.pid[\s\S]*?claim\.port[\s\S]*?"token": claim\.owner_token[\s\S]*?local_json_request\(claim\.port, "POST", "\/manager-close", &body\)/,
-  "native cleanup must revalidate project, boot, PID, and port before sending the owner token",
+  closeAllSource,
+  /run_bounded_exit_workers\(claims\.len\(\), deadline,[\s\S]*?request_exact_managed_daemon_close[\s\S]*?run_bounded_exit_workers\(claims\.len\(\), deadline,[\s\S]*?wait_for_exact_managed_daemon_release/,
+  "all project claims must use the bounded request and release-confirmation phases",
 );
+
+const closeRequestSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("fn request_exact_managed_daemon_close"),
+  tauriDaemonSource.indexOf("fn wait_for_exact_managed_daemon_release"),
+);
+assert.match(
+  closeRequestSource,
+  /local_json_request_until\(claim\.port, "GET", "\/hello", &\[\], deadline\)[\s\S]*?managedBy[\s\S]*?claim\.project[\s\S]*?claim\.boot_id[\s\S]*?claim\.pid[\s\S]*?claim\.port[\s\S]*?"token": claim\.owner_token[\s\S]*?"expectedBootId": claim\.boot_id[\s\S]*?"expectedPid": claim\.pid[\s\S]*?"expectedPort": claim\.port[\s\S]*?"expectedCanonicalProject": claim\.project[\s\S]*?local_json_request_until\(claim\.port, "POST", "\/manager-close", &body, deadline\)/,
+  "native cleanup must pin project, boot, PID, and port in the destructive request",
+);
+
+const boundedWorkersSource = tauriDaemonSource.slice(
+  tauriDaemonSource.indexOf("fn run_bounded_exit_workers"),
+  tauriDaemonSource.indexOf("#[derive(Default)]\npub(crate) struct LifecycleChildren"),
+);
+for (const required of [
+  "AtomicUsize::new(0)",
+  "item_count.min(MAX_EXIT_CLOSE_WORKERS)",
+  "spawn_scoped",
+  "Instant::now() >= deadline",
+]) {
+  assert.equal(
+    boundedWorkersSource.includes(required),
+    true,
+    `native exit worker pool must include ${required}`,
+  );
+}
 
 const tauriEnsureSource = tauriDaemonSource.slice(
   tauriDaemonSource.indexOf("pub(crate) async fn daemon_ensure"),
@@ -385,14 +447,173 @@ const closeSource = appSource.slice(
 );
 assert.match(
   closeSource,
-  /if \(IS_DESKTOP_HOST\) return;[\s\S]*?"\/widget-close"/,
-  "Desktop renderer teardown must defer daemon cleanup to native RunEvent::Exit",
+  /if \(IS_DESKTOP_HOST\) return;[\s\S]*?exactLifecycleCloseIdentity\(app\.state\)[\s\S]*?"\/widget-close"[\s\S]*?identity/,
+  "Terminal64 teardown must pin widget-close while Desktop defers cleanup to native RunEvent::Exit",
 );
 assert.equal(closeSource.includes("/manager-close"), false, "renderer teardown must never stop Desktop daemons");
 assert.match(
   appSource,
   /if \(!IS_DESKTOP_HOST\) \{[\s\S]*?addEventListener\("pagehide"[\s\S]*?addEventListener\("beforeunload"/,
   "page lifecycle close handlers must remain Terminal 64-only",
+);
+const terminalStopSource = appSource.slice(
+  appSource.indexOf("async function killDaemon"),
+  appSource.indexOf("// ---------- Health loop ----------"),
+);
+assert.match(
+  terminalStopSource,
+  /trackedSessionStillOwnsProcess[\s\S]*?exactLifecycleCloseIdentity\(registeredStop\)[\s\S]*?"\/manager-close"[\s\S]*?identity[\s\S]*?waitForPortRelease/,
+  "explicit Terminal64 stop must pin its authenticated identity in manager-close",
+);
+assert.equal(
+  terminalStopSource.includes('"/widget-close"'),
+  false,
+  "explicit stop must not use the page-teardown endpoint that keeps connected Studio daemons alive",
+);
+const pidLifecycleSource = appSource.slice(
+  appSource.indexOf("const PID_STATUS_ALIVE"),
+  appSource.indexOf("async function upsertSession"),
+);
+assert.match(
+  pidLifecycleSource,
+  /PID_STATUS_ALIVE[\s\S]*?PID_STATUS_DEAD[\s\S]*?PID_STATUS_UNKNOWN/,
+  "Terminal64 PID probing must preserve a distinct unknown/error result",
+);
+assert.match(
+  pidLifecycleSource,
+  /catch \(error\)[\s\S]*?return PID_STATUS_UNKNOWN/,
+  "host or PowerShell PID-probe failures must remain unknown rather than being treated as dead",
+);
+assert.match(
+  pidLifecycleSource,
+  /status !== PID_STATUS_DEAD\) retained\.push\(s\)/,
+  "session pruning must retain both live and ambiguously probed daemon sessions",
+);
+assert.match(
+  pidLifecycleSource,
+  /status === PID_STATUS_DEAD[\s\S]*?daemonPid: null,[\s\S]*?daemonCanonicalProject: null,[\s\S]*?daemonBootId: null,[\s\S]*?daemonOwnerToken: null/,
+  "confirmed daemon death must rotate the old boot's lifecycle capability and identity",
+);
+const removeSessionSource = appSource.slice(
+  appSource.indexOf("async function removeSession"),
+  appSource.indexOf("async function inspectTrackedSessionOwnership"),
+);
+assert.match(
+  removeSessionSource,
+  /const matches = \([\s\S]*?!hasPid[\s\S]*?&& \(!hasPort[\s\S]*?&& \(!hasBootId[\s\S]*?return !matches/,
+  "exact session cleanup must match every supplied PID, port, and boot field conjunctively",
+);
+assert.match(
+  appSource,
+  /removeSession\(\{ pid: registeredStop\.pid, port, bootId: registeredStop\.bootId \}\)/,
+  "successful explicit shutdown must remove only the exact stopped boot",
+);
+assert.match(
+  pidLifecycleSource,
+  /if \(status === PID_STATUS_DEAD\) \{[\s\S]*?setState\(\{[\s\S]*?daemonPid: null/,
+  "persisted daemon state may be cleared only after a confirmed-dead PID result",
+);
+const trackedStopSource = appSource.slice(
+  appSource.indexOf("async function stopTrackedSession"),
+  appSource.indexOf("async function stopDuplicateTrackedSessions"),
+);
+assert(
+  trackedStopSource.indexOf("inspectTrackedSessionOwnership(session)")
+    < trackedStopSource.indexOf("pidStatus(session.pid)"),
+  "tracked cleanup must authenticate exact daemon identity before consulting PID liveness",
+);
+assert.match(
+  trackedStopSource,
+  /status === PID_STATUS_UNKNOWN[\s\S]*?preserving session for a later retry[\s\S]*?return false/,
+  "a PID probe failure must preserve the tracked session for later recovery",
+);
+assert.match(
+  trackedStopSource,
+  /ownership\.status === "identity-mismatch"[\s\S]*?removeSession[\s\S]*?tracked daemon ownership could not be re-authenticated; preserving session/,
+  "a live mismatched PID may be discarded, but transient hello/authentication failures must remain tracked",
+);
+const duplicateStopSource = appSource.slice(
+  appSource.indexOf("async function stopDuplicateTrackedSessions"),
+  appSource.indexOf("async function probePort"),
+);
+assert.equal(
+  duplicateStopSource.includes("saveSessions("),
+  false,
+  "duplicate cleanup must not bulk-discard sessions whose authenticated stop or PID probe was inconclusive",
+);
+const sessionRegistrySource = appSource.slice(
+  appSource.indexOf("async function loadSessions"),
+  appSource.indexOf("async function trackedSessionStillOwnsProcess"),
+);
+assert.match(
+  sessionRegistrySource,
+  /parseInt\(session\.port[\s\S]*?parseInt\(session\.pid/,
+  "persisted legacy string PID/port values must be normalized when sessions load",
+);
+assert.match(
+  sessionRegistrySource,
+  /parseInt\(s\.port, 10\) === entryPort[\s\S]*?parseInt\(s\.pid, 10\) === entryPid/,
+  "session upsert must deduplicate numeric and legacy string identities",
+);
+const portReleaseSource = appSource.slice(
+  appSource.indexOf("async function waitForPortRelease"),
+  appSource.indexOf("function makeOwnerToken"),
+);
+assert.match(
+  portReleaseSource,
+  /await probePort\(port\)[\s\S]*?consecutiveHelloMisses >= 2[\s\S]*?getPortOwner\(port\)/,
+  "port-release polling must use cheap daemon probes before an OS owner check",
+);
+assert.equal(
+  (portReleaseSource.match(/getPortOwner\(port\)/g) || []).length,
+  2,
+  "port-release polling must not spawn an OS process on every retry",
+);
+assert.match(
+  portReleaseSource,
+  /expectedPid[\s\S]*?pidStatus\(expectedPid\) === PID_STATUS_DEAD/,
+  "an empty/failed OS owner probe must not discard tracking until the exact prior PID is confirmed dead",
+);
+const terminalLaunchSource = appSource.slice(
+  appSource.indexOf("async function launchAndWait"),
+  appSource.indexOf("let ensureDaemonPromise"),
+);
+assert.match(
+  terminalLaunchSource,
+  /helloPid[\s\S]*?=== launchedPid/,
+  "a daemon launch must reject a different listener that wins the preferred-port race",
+);
+const terminalEnsureSource = appSource.slice(
+  appSource.indexOf("async function ensureDaemonInner"),
+  appSource.indexOf("async function killDaemon"),
+);
+assert.match(
+  terminalEnsureSource,
+  /await loadSessions\(\)[\s\S]*?isOwnDaemon\(hit\.info, project, trackedSessions\)/,
+  "Terminal64 reload must use exact persisted canonical daemon identity when the UI path is an alias",
+);
+assert.match(
+  terminalEnsureSource,
+  /previous project still connected[\s\S]*?launchAndWait\(project, preferred\)[\s\S]*?getPortOwner\(preferred\)[\s\S]*?scanFallbackPorts\(project, preferred\)/,
+  "a project switch must scan fallback ports when an unrelated listener still owns the preferred port",
+);
+const ownershipMatchSource = appSource.slice(
+  appSource.indexOf("function isOwnDaemon"),
+  appSource.indexOf("function isWidgetOwnedDaemon"),
+);
+assert.equal(
+  ownershipMatchSource.includes("gameId"),
+  false,
+  "a Roblox game ID alone must never equate two different local sync roots",
+);
+const fallbackScanSource = appSource.slice(
+  appSource.indexOf("async function scanFallbackPorts"),
+  appSource.indexOf("// PowerShell serializes errors"),
+);
+assert.match(
+  fallbackScanSource,
+  /const trackedSessions = await loadSessions\(\)[\s\S]*?isOwnDaemon\(occ\.info, project, trackedSessions\)/,
+  "fallback-port scans must retain exact canonical session identity for Windows aliases",
 );
 const ensureDesktopSource = appSource.slice(
   appSource.indexOf("async function ensureDesktopDaemon"),

@@ -15,21 +15,218 @@ The Studio plugin first reads `/hello`, retains the process-local
 announces both the protocol version and capability:
 
 ```json
-{"type":"hello","clientId":"123456789","role":"plugin","protocol":3,"pluginCapability":"<64 hex characters>"}
+{"type":"hello","clientId":"123456789","role":"plugin","protocol":5,"pluginCapability":"<64 hex characters>"}
 ```
 
 The daemon rejects a missing/incompatible protocol or capability with a
-`shutdown` frame. Every socket sends exactly one hello using protocol 3;
+`shutdown` frame. Every socket sends exactly one hello using protocol 5;
 `plugin`, command-capable CLI/agent, and read-only widget/watch roles receive
 only the traffic appropriate to that role. The daemon replaces caller request
 IDs with private correlation IDs before routing them to Studio.
 Origin-bearing browser HTTP/WebSocket requests must also carry the owning
 widget's capability as `?widgetToken=...`; native loopback Studio/CLI clients
 do not send an Origin header.
-Protocol 3 corresponds to Studio plugin 2.2.0 and adds selective initial
-Disk-to-Studio snapshots. It retains the structured errors, capability
-discovery, artifact-backed capture, playtest runtime routing, and workflow
-transaction/precondition operations introduced by protocol 2.
+Protocol 5 corresponds to Studio plugin 2.4.0 and replaces place-sized initial
+snapshots with bounded, ordered structure/hash/Source streams in both
+directions. It retains exact physical-path identity, selective initial
+Disk-to-Studio sync, structured errors, capability discovery, artifact-backed
+capture, playtest runtime routing, and workflow transaction/precondition
+operations introduced by earlier protocols.
+
+## Initial synchronization
+
+The plugin first posts aggregate Studio counts to `/initial-compare`, with an
+empty `studioSnapshot`. Empty-side decisions therefore require no structure or
+Source serialization. If both sides contain data, the daemon returns an opaque
+`compareId`, the ordered synced-service list, and a cursor beginning at the
+first service's `structure` phase.
+
+```json
+{
+  "studioStats": {"scriptCount": 12000, "instanceCount": 18000},
+  "studioSnapshot": [],
+  "pluginProtocol": 5,
+  "compareId": "opaque-session-id",
+  "service": "ReplicatedStorage",
+  "phase": "structure",
+  "chunkIndex": 0,
+  "finalChunk": false,
+  "records": [
+    {
+      "id": 0,
+      "parentId": null,
+      "childIndex": 0,
+      "childCount": 2,
+      "hasChildren": true,
+      "name": "ReplicatedStorage",
+      "class": "ReplicatedStorage",
+      "avoidSync": false,
+      "avoidSyncCarrier": false
+    }
+  ],
+  "hashes": []
+}
+```
+
+Structure is a source-free, dense depth-first preorder. Each request carries
+at most 512 records and must encode to at most 512 KiB; a single record that
+cannot fit is rejected instead of silently exceeding the bound. After a
+service's final structure chunk, the daemon requests `hashes` chunks. Each
+contains at most 64 `{id, sha256}` records for the script IDs declared by that
+structure. IDs, parent/child counts, cursor order, class, generated disk
+fragments, and the complete hash set are validated before comparison.
+`/initial-compare` and `/push` reject request bodies over 512 KiB before JSON
+deserialization. A record name or `diskFragment` is limited to 32 KiB and its
+class to 128 bytes. Exact encoded structure accounting is limited to 64 MiB per
+service and 128 MiB for the complete session, and is charged before records are
+cloned into retained state.
+
+The daemon compares one service at a time, retains only compact divergence
+metadata plus exact disk generations/baselines, and releases that service's
+structure and hashes before requesting the next service. An exact retry of the
+immediately preceding chunk replays its response; changed, stale, or
+out-of-order retries are rejected. The final clean/decision response is compact;
+`GET /initial-choice` returns only aggregate counts while the immutable
+divergence detail is paged separately.
+
+Compare, push, and pull sessions expire after 15 minutes without progress.
+After completion their terminal response remains replayable for two minutes.
+Only the exact immediately preceding request is idempotently replayed; a reused
+cursor with different content is rejected.
+
+### Initial-choice pagination
+
+`GET /initial-choice` is a bounded status response containing `choiceId`,
+disk/Studio stats, aggregate divergence counts, and `detailCount`. It never
+contains the full path list or a selected-path array.
+
+`GET /initial-choice/details?choiceId=…&cursor=…&limit=…` pages an immutable,
+path-sorted vector. Every item has a dense numeric `id`, action, path, kind,
+class metadata, and Source/class-change flags. The default page limit is 512
+and the maximum is 1024; encoded responses never exceed 512 KiB. Cursors are
+opaque and bound to one choice, and exact retries return the same page.
+
+Complete Studio, cancel, and complete Disk choices use a small
+`POST /initial-choice` body; a complete Disk choice declares `mode: "all"` and
+never posts paths. A selective Disk choice sends at most 2,048 dense IDs per
+request to `POST /initial-choice/selection`, under a 64-KiB body limit. Chunks
+carry one `submissionId`, a sequential `chunkIndex`, and an explicit final
+marker. The daemon validates a whole chunk before changing the accumulator,
+rejects duplicate/out-of-range IDs and changed or out-of-order retries, and
+replays an exact receipt. A short-lived terminal receipt also makes a lost
+final response safe to retry after the pending choice is consumed.
+
+### Studio → disk bootstrap
+
+`/push` uses a client-generated `streamId` and the ordered phases
+`structure → diskFence → sources → diskRevalidate` for each service.
+`structure` uses the same source-free flat records and 512-record/512-KiB
+bounds. `diskFence` is an empty continuation phase while the daemon captures
+the service's exact disk generation. `sources` transfers scripts separately in
+ordered UTF-8-safe parts of at most 64 KiB, with no more than 64 parts or
+512 KiB of encoded JSON in one request. Parts carry offsets, total length,
+`finalPart`, and a complete SHA-256; one script is limited to 32 MiB. Declared
+Source totals are charged exactly once at part zero and are limited to 64 MiB
+per service and 128 MiB for the complete push. A rejected chunk commits neither
+its staging writes nor its aggregate counters.
+`diskRevalidate` is another empty continuation phase while the daemon stages
+and commits.
+
+For each service, the daemon copies the current service into a same-volume
+stage, applies the fully validated Studio projection there, and checks that the
+live service still has the fenced generation. Cancellation is checked before
+the rename transaction begins. It then renames the live service to one
+recoverable rollback backup and atomically renames the same-volume stage into
+place. A failed rename restores the backup. The service swap is the transaction
+boundary: successfully committed earlier services are not rolled back if a
+later service fails. Every fallible check after `live → backup` is inside that
+transaction's guarded restore path. If an installed live tree changed
+concurrently, rollback is refused rather than overwriting it; the recovery
+backup is retained and audited, and the exact request receives a replayable
+terminal receipt:
+
+```json
+{
+  "ok": false,
+  "action": "partial",
+  "streamId": "...",
+  "error": "...",
+  "failedService": "StarterGui",
+  "recoveryRequired": true,
+  "backups": ["/project/.rosync-backups/stream-..."],
+  "committedServices": [
+    {
+      "service": "ReplicatedStorage",
+      "created": false,
+      "backup": "/project/.rosync-backups/stream-...",
+      "recoveryAction": "restoreBackup"
+    },
+    {
+      "service": "ServerScriptService",
+      "created": true,
+      "backup": null,
+      "recoveryAction": "removeCreatedService"
+    }
+  ]
+}
+```
+
+`committedServices` is the ordered service prefix already committed. Existing
+services name an exact backup to restore; newly created services explicitly
+require removal. `backups` is ordered and can contain one additional retained
+backup for the currently failed service. The plugin validates this bounded
+schema, displays every recovery action/path, and stops reconnecting before the
+HTTP retry branch. Completed-transfer backups are promoted to a
+`stream-success-*` namespace and only that namespace is eligible for bounded
+retention (seven days and 32 transactions). Eligibility additionally requires
+an exact canonical transaction name, a bounded create-new completion marker,
+and the same physical directory generation observed during discovery.
+Lookalikes, replacements, unproven directories, and partial `stream-*`
+recovery backups are never automatically pruned.
+
+### Disk → Studio bootstrap
+
+The plugin starts `/snapshot/stream`, then fetches each service through
+`structure` and `sources` phases using an exact request/session/service/chunk
+cursor. Responses are bounded to 512 KiB. Structure chunks contain at most 512
+source-free flat records. Source responses contain at most 64 parts and use the
+same 64-KiB, ordered offset/length/SHA-256 contract; parts are accepted only for
+the script IDs declared by the structure. An empty non-final Sources response
+is a continuation tick while the daemon captures or revalidates the exact disk
+generation.
+
+The plugin validates every service and builds its Instances under detached
+staging roots before touching the live DataModel. Per-service and all-service
+Source budgets keep that detached state bounded. Only after the terminal
+response validates does one `ChangeHistoryService` recording apply the complete
+plan. Any structure, Source, readback, mutation, cancellation, or commit error
+cancels that recording; `Undo` is used only as a fallback if Studio errors
+while finishing the cancellation. A successful pull is therefore one Studio
+Undo, and a failure in a later service rolls back earlier services too.
+If both `Cancel` and the one `Undo` fallback fail, the plugin reports that
+Studio may be partially applied and stops reconnecting terminally. It does not
+claim success, claim rollback, or retry against the uncertain live state.
+
+A selective pull adds a `deletes` phase after Sources for every service.
+Required ancestor scripts are carried with `sourceIncluded: false`, so reaching
+a selected descendant cannot overwrite an unselected ancestor Source. Each
+delete chunk contains at most 512 unique
+`{"path":["Service", "..."],"pathMode":"generated"}` records. These authorized
+Studio-only paths come only from the server-authorized selection, are validated
+before the recording begins, and are deleted in the same all-service recording
+as selected updates. An empty non-final delete response may act as the
+service's disk-revalidation continuation tick. Unselected siblings,
+Studio-authoritative descendants, and `AvoidSync` boundaries are preserved.
+
+Only the final `Lighting` Sources response (a full pull) or final `Lighting`
+deletes response (a selective pull) carries `action: "complete"`. A terminal
+action on any earlier service, phase, or chunk is invalid and is rejected
+before that service can commit.
+
+Stats, comparison, pull validation, and the hook-install handoff are guarded
+against Studio mutations. A watched rename, reparent, add, removal, or Source
+edit marks the view stale; the current bootstrap is abandoned and initial
+comparison restarts before live hooks are considered ready.
 
 ## Desktop-authorized project initialization
 
@@ -104,7 +301,8 @@ plugin operations are sent one at a time in an `op` frame:
 Supported sync operation payloads:
 
 - `set`: `path` is the parent instance path and `node` contains `class`,
-  `name`, `properties`, and `children`.
+  `name`, `properties`, and `children`. Representation transitions may include
+  `fromDiskPath` and the destination `diskPath`.
 - `update`: `path` identifies an existing script; the only mirrored property
   is `Source`.
 - `delete`: `path` identifies the removed instance.
@@ -113,6 +311,13 @@ Supported sync operation payloads:
 - `move`: `from` and `to` are full instance paths in the sync pipeline.
 - `class_change`: daemon → plugin replaces a script class while preserving
   its destination identity and `Source`.
+
+Whenever available, `diskPath`, `fromDiskPath`, and `toDiskPath` are arrays of
+exact encoded physical fragments. They take precedence over generated Roblox
+paths, preserving identity for duplicate names, encoded names, and leaf-script
+↔ script-with-children transitions. Selective snapshot ops additionally carry
+`targetPath` plus `pathMode: "generated"` so the exact physical identity can
+be seeded before a missing ancestor is materialized.
 
 Nodes outside the four mirrored classes may appear as pass-through containers
 while carrying mirrored descendants, but their properties remain
@@ -168,7 +373,7 @@ The read-only `capabilities` operation is the feature-negotiation entrypoint:
 {"type":"request","request_id":1,"op":"capabilities","args":{}}
 ```
 
-Its value identifies `pluginVersion` (`2.1.0`), `protocolVersion` (`2`), the
+Its value identifies `pluginVersion` (`2.4.0`), `protocolVersion` (`5`), the
 Studio/host DataModel and place/game IDs, limits, current screenshot permission,
 and feature flags. `features.photo`, `features.photoTransparent`,
 `features.photoUiOnly`, `features.photoCameraCFrame`,
@@ -469,7 +674,7 @@ required completion record.
 
 The workflow schema is a CLI contract (`rosync run --file`), not a second wire
 format. The CLI validates all schema-v1 steps and references, opens one
-persistent WebSocket session, then maps each step onto ordinary protocol 3
+persistent WebSocket session, then maps each step onto ordinary protocol 5
 requests. Three operations add safe workflow semantics:
 
 - `inspect_ref` checks a live target and rejects mismatched `expectedClass` or

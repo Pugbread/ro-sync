@@ -24,10 +24,6 @@ export const BINARY_REL =
   PLATFORM === "linux"   ? "daemon/rosync-linux-x86_64"       :
                            "daemon/rosync-darwin-arm64";
 
-// The bare process name used for pattern-match kills (must match BINARY_REL's
-// trailing file name — on Windows that's the .exe file, elsewhere the binary).
-export const BINARY_NAME = BINARY_REL.split("/").pop();
-
 // ---------- Base paths (shell-level, NOT resolved in JS) ----------
 // These expand when the host runs the command, so we don't need to know the
 // actual user directory from JS.
@@ -50,6 +46,64 @@ export const PATH_SEP = IS_WINDOWS ? "\\" : "/";
 // native separator for composition with WIDGET_DIR_SHELL.
 export function nativeRel(rel) {
   return IS_WINDOWS ? String(rel).replace(/\//g, "\\") : String(rel);
+}
+
+// Rust's std::fs::canonicalize() returns extended-length paths on Windows
+// (`\\?\C:\...` / `\\?\UNC\...`). Folder pickers and drag/drop return ordinary
+// Win32 paths, so raw string equality would make the widget reject the daemon
+// it just launched after a renderer reload. Keep path component case exact:
+// Windows supports case-sensitive directories, and tracked sessions bridge an
+// ordinary UI spelling to the exact canonical spelling returned by /hello.
+export function normalizeProjectPathForComparison(value) {
+  let path = String(value ?? "");
+  if (!IS_WINDOWS) return path;
+
+  path = path.replace(/\//g, "\\");
+  if (/^\\\\\?\\UNC\\/i.test(path)) {
+    path = "\\\\" + path.slice("\\\\?\\UNC\\".length);
+  } else if (/^\\\\\?\\/i.test(path)) {
+    path = path.slice("\\\\?\\".length);
+  }
+  // Drive designators are case-insensitive even inside a case-sensitive NTFS
+  // directory. Normalize only that designator; preserve every component.
+  path = path.replace(/^([a-z]):/, (_, drive) => `${drive.toUpperCase()}:`);
+
+  // Preserve the two-character UNC introducer while collapsing redundant
+  // separators elsewhere. UNC server and share identifiers are
+  // case-insensitive on Windows, even when a directory below the share opts
+  // into case sensitivity. Normalize exactly those two components and preserve
+  // every descendant spelling. A drive root keeps its final separator because
+  // `C:\` and drive-relative `C:` are not the same location.
+  if (path.startsWith("\\\\")) {
+    path = "\\\\" + path.slice(2).replace(/\\+/g, "\\");
+    const components = path.slice(2).split("\\");
+    if (components.length >= 2 && components[0] && components[1]) {
+      components[0] = components[0].toUpperCase();
+      components[1] = components[1].toUpperCase();
+      path = "\\\\" + components.join("\\");
+    }
+  } else {
+    path = path.replace(/\\+/g, "\\");
+  }
+  if (!/^[A-Za-z]:\\$/.test(path)) path = path.replace(/\\+$/, "");
+  return path;
+}
+
+export function projectPathsEqual(left, right) {
+  if (left == null || right == null) return false;
+  return normalizeProjectPathForComparison(left) === normalizeProjectPathForComparison(right);
+}
+
+export function daemonIdentityMatchesTrackedSession(session, info) {
+  if (!session || !info || typeof session !== "object" || typeof info !== "object") return false;
+  const expectedPid = Number.parseInt(session.pid, 10);
+  const actualPid = Number.parseInt(info.pid, 10);
+  const expectedPort = Number.parseInt(session.port, 10);
+  const actualPort = Number.parseInt(info.port, 10);
+  if (!Number.isFinite(expectedPid) || expectedPid <= 0 || actualPid !== expectedPid) return false;
+  if (!Number.isFinite(expectedPort) || expectedPort <= 0 || actualPort !== expectedPort) return false;
+  if (!session.bootId || info.bootId !== session.bootId) return false;
+  return projectPathsEqual(session.canonicalProject || session.project, info.project);
 }
 
 // ---------- Quoting ----------
@@ -156,15 +210,6 @@ export function parsePidAlive(stdout) {
   return /alive/i.test(String(stdout || ""));
 }
 
-// Kill a single PID (SIGTERM equivalent).
-export function killPidCmd(pid) {
-  const n = parseInt(pid, 10);
-  if (!Number.isFinite(n) || n <= 0) return `echo nope`;
-  return IS_WINDOWS
-    ? `taskkill /PID ${n} /F`
-    : `/bin/kill ${n}`;
-}
-
 // Tail the last ~40 lines of a log file (best-effort; empty if missing).
 export function tailLogCmd(path) {
   if (IS_WINDOWS) {
@@ -182,12 +227,14 @@ export function portOwnerCmd(port) {
   if (!Number.isFinite(p)) return `echo`;
   if (IS_WINDOWS) {
     const ps =
-      `$c = Get-NetTCPConnection -LocalPort ${p} -State Listen -ErrorAction SilentlyContinue | Select -First 1; ` +
+      `$c = Get-NetTCPConnection -LocalPort ${p} -State Listen -ErrorAction SilentlyContinue | ` +
+      `Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '0.0.0.0' } | ` +
+      `Select-Object -First 1; ` +
       `if ($c) { $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; ` +
       `if ($proc) { $proc.ProcessName + '(' + $proc.Id + ')' } }`;
     return psEncodedCmd(ps);
   }
-  return `lsof -nP -iTCP:${p} -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1 "(" $2 ")"}' | head -1`;
+  return `lsof -nP -i4TCP:${p} -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1 "(" $2 ")"}' | head -1`;
 }
 
 // Launch the daemon detached, redirect output to `logPath`, and print the PID
@@ -292,8 +339,19 @@ export function pluginInstallCmd({ srcFile, destDir, destName, staleName, staleN
       `$dir   = & $xp ${psQuote(destDir)}; ` +
       `$dest  = & $xp ${psQuote(destFile)}; ` +
       `if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }; ` +
-      `Copy-Item -LiteralPath $src -Destination $dest -Force; ` +
-      staleDeletes;
+      `$tmp = Join-Path $dir ('.' + [IO.Path]::GetFileName($dest) + '.' + [Diagnostics.Process]::GetCurrentProcess().Id + '.tmp'); ` +
+      `try { ` +
+      `  Copy-Item -LiteralPath $src -Destination $tmp -Force; ` +
+      `  if (Test-Path -LiteralPath $dest) { ` +
+      `    [IO.File]::Replace($tmp, $dest, $null, $true) ` +
+      `  } else { ` +
+      `    [IO.File]::Move($tmp, $dest) ` +
+      `  }; ` +
+      staleDeletes +
+      `} catch { ` +
+      `  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }; ` +
+      `  throw ` +
+      `}`;
     return psEncodedCmd(ps);
   }
   // POSIX: sh sequence — mkdir -p is idempotent, cp -f overwrites, rm -f
@@ -375,8 +433,11 @@ export function writeFileFromB64Cmd(absPath, b64) {
       `$tmp = Join-Path $dir ('.' + [IO.Path]::GetFileName($p) + '.' + [Diagnostics.Process]::GetCurrentProcess().Id + '.tmp'); ` +
       `try { ` +
       `  [IO.File]::WriteAllBytes($tmp, [Convert]::FromBase64String(${psQuote(b64)})); ` +
-      `  if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }; ` +
-      `  Move-Item -LiteralPath $tmp -Destination $p -Force ` +
+      `  if (Test-Path -LiteralPath $p) { ` +
+      `    [IO.File]::Replace($tmp, $p, $null, $true) ` +
+      `  } else { ` +
+      `    [IO.File]::Move($tmp, $p) ` +
+      `  } ` +
       `} catch { ` +
       `  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }; ` +
       `  throw ` +

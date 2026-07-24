@@ -63,6 +63,16 @@ assert.match(
   /msg\.retryable/,
   "structured retryability should be honored when a newer daemon supplies it",
 );
+assert.match(
+  shutdownBranch,
+  /recoveryContext = "daemon rejected WebSocket: " \.\. tostring\(msg\.code or reason\)[\s\S]*?client:Close\(\)/,
+  "retryable shutdowns such as WATCHER_LAGGED must close the socket and retain a resync reason",
+);
+assert.match(
+  wsLoop,
+  /elseif kind == "shutdown"[\s\S]*?client:Close\(\)[\s\S]*?if needResyncAfter then[\s\S]*?disconnectHooks\(\)[\s\S]*?reconnectState\.retryInitialCompare\(recoveryContext\)/,
+  "WATCHER_LAGGED shutdown recovery must tear down hooks and re-enter initial comparison",
+);
 
 const refreshHello = source.slice(
   source.indexOf("reconnectState.refreshHello = function"),
@@ -98,6 +108,16 @@ assert.equal(
   false,
   "pre-auth initial comparisons must not reset transport recovery backoff",
 );
+assert.match(
+  startHooks,
+  /local installGeneration = wsGeneration[\s\S]*?installHooks\(shouldContinueInstall\)[\s\S]*?disconnectHooks\(\)[\s\S]*?connected = true/,
+  "time-sliced hook installation must be generation-cancellable and clean up before publishing connected=true",
+);
+assert.ok(
+  startHooks.indexOf("if not shouldContinueInstall()")
+    < startHooks.indexOf("connected = true"),
+  "hook installation must re-check cancellation after its last possible yield",
+);
 
 const initialCompare = source.slice(
   source.indexOf("runInitialCompare = function()"),
@@ -119,17 +139,22 @@ assert.match(
   "explicit user disconnect and plugin unload must remain terminal",
 );
 
-assert.match(source, /local PLUGIN_VERSION_STRING = "2\.2\.0"/);
-assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 3/);
+assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.0"/);
+assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 5/);
 assert.match(
   source,
-  /return tostring\(decoded\.choice\), decoded\.paths/,
-  "the initial decision poll must retain the user's selective disk paths",
+  /return choice, true, selectedCount/,
+  "the initial decision poll must retain only the bounded selective grant metadata",
 );
 assert.match(
   source,
-  /httpJson\("\/snapshot\/selective", "POST", \{/,
-  "selective initial sync must request the bounded disk snapshot endpoint",
+  /startBody\.choiceId = selectionChoiceId[\s\S]*?postExact\(startBody, "snapshot stream start"\)/,
+  "selective initial sync must redeem its short choice grant through the bounded snapshot stream",
+);
+assert.equal(
+  source.includes('httpJson("/snapshot/selective"'),
+  false,
+  "initial decisions must not decode a monolithic selective Source snapshot",
 );
 
 const ensureBranch = source.slice(
@@ -138,8 +163,1491 @@ const ensureBranch = source.slice(
 );
 assert.match(
   ensureBranch,
-  /if parent:FindFirstChild\(node\.name\) then\s+return/,
-  "selective parent materialization must leave an existing unselected ancestor untouched",
+  /snapshotApplyState\.buildAssignments\(parent, \{ node \}, nodeOpts\._applyContext\)/,
+  "selective parent materialization must resolve one unclaimed sibling identity",
 );
+assert.match(
+  ensureBranch,
+  /claimedInstances\[assignment\.candidate\] = true[\s\S]*?return/,
+  "an existing unselected ancestor must be claimed but otherwise left untouched",
+);
+assert.equal(
+  ensureBranch.includes("parent:FindFirstChild(node.name)"),
+  false,
+  "selective parent materialization must not collapse duplicate sibling names",
+);
+
+assert.match(
+  source,
+  /GetPropertyChangedSignal\("Parent"\):Connect[\s\S]*?scaleState\.onParentChanged\(inst\)/,
+  "same-service reparents must remain observable without per-instance child signals",
+);
+assert.match(
+  source,
+  /if oldExcluded then\s+onDescendantAdded\(inst\)\s+connectTree\(inst\)/,
+  "moving an excluded subtree into live scope must upgrade its lightweight hooks",
+);
+assert.match(
+  source,
+  /or propertyName == "Parent"/,
+  "initial scans must reject a snapshot raced by a same-service reparent",
+);
+assert.match(
+  source,
+  /avoidSyncPushInFlight = true[\s\S]*?local revision = scaleState\.avoidSyncRevision/,
+  "compact AvoidSync path updates must be single-flight and revisioned",
+);
+assert.match(
+  source,
+  /if scaleState\.avoidSyncRevision == revision then\s+scaleState\.avoidSyncPathsDirty = false/,
+  "an older AvoidSync response must not clear a newer path update",
+);
+const serializer = source.slice(
+  source.indexOf("local function serializeInstance(inst, shouldContinue)"),
+  source.indexOf("local function avoidSyncMarker"),
+);
+assert.match(
+  serializer,
+  /while #stack > 0 do/,
+  "large live subtree serialization must use an iterative stack",
+);
+assert.doesNotMatch(
+  serializer,
+  /serializeInstance\(child\)/,
+  "large live subtree serialization must not recurse through every descendant",
+);
+assert.match(
+  serializer,
+  /visited % 500 == 0[\s\S]*?task\.wait\(\)[\s\S]*?shouldContinue[\s\S]*?return nil, "cancelled"/,
+  "large live subtree preflight must yield and honor connection-generation cancellation",
+);
+assert.match(
+  serializer,
+  /estimatedBytes \+= #source[\s\S]*?estimatedBytes > LIVE_PUSH_MAX_BYTES[\s\S]*?return nil, "oversized"/,
+  "large live Sources/subtrees must fail into streamed resync before building an unbounded nested operation",
+);
+assert.match(
+  source,
+  /local leadingSpace = index == 1 and byte == 32[\s\S]*?if leadingDot or leadingSpace or trailingDotOrSpace or unsafe then/,
+  "Windows-safe physical names must encode a leading ASCII space",
+);
+
+const httpRequestHelper = source.slice(
+  source.indexOf("local function httpRequestTo"),
+  source.indexOf("local function httpRequest("),
+);
+assert.match(
+  httpRequestHelper,
+  /if internalJsonSafe == true then body else sanitizeJson\(body\)/,
+  "trusted snapshot bodies may skip the whole-tree sanitization copy",
+);
+assert.match(
+  httpRequestHelper,
+  /HttpService:JSONEncode\(value\)/,
+  "the trusted snapshot path must still catch direct JSON encoding failures",
+);
+const httpJsonHelper = source.slice(
+  source.indexOf("local function httpJson"),
+  source.indexOf("-- Pushing local changes"),
+);
+assert.match(
+  httpJsonHelper,
+  /maxResponseBytes and #resp\.Body > maxResponseBytes[\s\S]*?HttpService:JSONDecode/,
+  "bounded protocol responses must be size-checked before JSON decoding",
+);
+
+const livePush = source.slice(
+  source.indexOf("scaleState.preflightLiveOp = function"),
+  source.indexOf("local function queueScriptUpdateOp"),
+);
+assert.match(
+  livePush,
+  /local stack = \{ \{ value = op, depth = 0 \} \}[\s\S]*?while #stack > 0 do[\s\S]*?estimated > LIVE_PUSH_MAX_BYTES[\s\S]*?task\.wait\(\)[\s\S]*?shouldContinue/,
+  "live operations must be iteratively preflighted and cancellable before JSON allocation",
+);
+assert.match(
+  livePush,
+  /Preflight every operation before sending the first frame[\s\S]*?for index, op in ipairs\(ops\)[\s\S]*?local prefix =[\s\S]*?for index, op in ipairs\(ops\)[\s\S]*?table\.concat\(batch, ","\)/,
+  "live pushes must use a discard-only pass before retaining only one bounded frame in pass two",
+);
+assert.equal(
+  livePush.includes("encodedOps"),
+  false,
+  "two-pass live preflight must not retain an encoded string for every queued operation",
+);
+assert.match(
+  source,
+  /scaleState\.requestControlledLiveResync = function\(reason\)[\s\S]*?liveResyncPending = true[\s\S]*?pendingOps = \{\}[\s\S]*?disconnectHooks\(\)[\s\S]*?wsGeneration \+= 1[\s\S]*?retryInitialCompare\(reason\)/,
+  "an oversized live update must trigger exactly one controlled bounded resync instead of requeueing its frame",
+);
+
+function modelLiveFrames(opSizes, limit = 512 * 1024) {
+  if (opSizes.some((size) => size + 32 > limit)) {
+    return { frames: [], resyncs: 1, peakRetained: 0 };
+  }
+  const envelope = 26;
+  const frames = [];
+  let current = envelope;
+  let peakRetained = 0;
+  let count = 0;
+  for (const size of opSizes) {
+    const comma = count === 0 ? 0 : 1;
+    if (count > 0 && current + comma + size > limit) {
+      frames.push(current);
+      current = envelope;
+      count = 0;
+    }
+    current += (count === 0 ? 0 : 1) + size;
+    count += 1;
+    peakRetained = Math.max(peakRetained, current);
+  }
+  if (count > 0) frames.push(current);
+  return { frames, resyncs: 0, peakRetained };
+}
+
+{
+  const modeled = modelLiveFrames(Array(25_000).fill(48));
+  assert.equal(modeled.resyncs, 0);
+  assert.ok(modeled.frames.length > 1, "25k small operations must split into several frames");
+  assert.ok(modeled.frames.every((bytes) => bytes <= 512 * 1024));
+  assert.ok(modeled.peakRetained <= 512 * 1024, "only one bounded candidate frame may be retained");
+}
+{
+  const modeled = modelLiveFrames([48, 512 * 1024]);
+  assert.deepEqual(modeled.frames, [], "an oversized op must prevent any prefix frame from being sent");
+  assert.equal(modeled.resyncs, 1, "an oversized burst must request one controlled resync");
+}
+
+const snapshotMatcher = source.slice(
+  source.indexOf("function snapshotApplyState.takeCandidate"),
+  source.indexOf("function snapshotApplyState.createInstance"),
+);
+assert.match(
+  snapshotMatcher,
+  /not used\[candidate\] and not claimed\[candidate\][\s\S]*?used\[candidate\] = true/,
+  "snapshot sibling matching must consume each Instance identity at most once",
+);
+assert.match(
+  snapshotMatcher,
+  /projection\.boundary and SCRIPT_CLASSES\[projection\.mappedClass\][\s\S]*?not projection\.directory/,
+  "AvoidSync scripts must reserve both leaf and directory physical shapes",
+);
+assert.match(
+  snapshotMatcher,
+  /PathHelpers\.allocatePhysicalFragment[\s\S]*?byFragment\[string\.lower\(fragment\)\]/,
+  "snapshot identity must use the complete physical fragment allocator",
+);
+assert.match(
+  snapshotMatcher,
+  /local logicalAllocator = \{[\s\S]*?allocatePhysicalFragment\(logicalAllocator, entry\.name, "Folder", true\)[\s\S]*?byLookupSegment\[logicalSegment\]/,
+  "generated lookup paths must use a class-independent encoded sibling allocator",
+);
+assert.doesNotMatch(
+  snapshotMatcher,
+  /diskFragmentInfo|decodeDiskFragment|stripDiskScriptSuffix/,
+  "exact disk fragments must remain opaque instead of being reduced to name ordinals",
+);
+assert.match(
+  snapshotMatcher,
+  /return left\.index < right\.index/,
+  "equal sibling signatures must retain Studio GetChildren order",
+);
+assert.match(
+  snapshotMatcher,
+  /Exact physical identities are assigned as a batch[\s\S]*?for _, assignment in ipairs\(assignments\)/,
+  "all exact identities must win before same-name safety fallbacks",
+);
+assert.match(
+  snapshotMatcher,
+  /takeCandidate\(bucket\.boundaries, used, ctx\.claimedInstances\)/,
+  "a changed-shape AvoidSync boundary must still consume one same-name disk node",
+);
+assert.equal(
+  snapshotMatcher.includes("FindFirstChild"),
+  false,
+  "wide snapshot apply must index siblings instead of searching once per node",
+);
+const generatedLookup = source.slice(
+  source.indexOf("function PathHelpers.findGeneratedPathChild"),
+  source.indexOf("function PathHelpers.findRawDisambiguatedChild"),
+);
+assert.match(
+  generatedLookup,
+  /buildPhysicalSiblingIndex\(parent, ctx\)[\s\S]*?byLookupSegment\[seg\]/,
+  "generated lookup must reuse the iterative projection index",
+);
+assert.equal(
+  source.includes("syncRelevantSignature"),
+  false,
+  "generated lookup must not recursively recompute descendant signatures",
+);
+const snapshotPrepare = source.slice(
+  source.indexOf("function snapshotApplyState.prepareInstance"),
+  source.indexOf("function snapshotApplyState.pruneUnkept"),
+);
+assert.match(
+  snapshotPrepare,
+  /local existingBlocked = existing[\s\S]*?if existingBlocked then[\s\S]*?return existing, true/,
+  "a matched AvoidSync boundary must consume its disk identity without applying descendants",
+);
+assert.match(
+  snapshotPrepare,
+  /ctx\.avoidSyncCarriers\[existing\][\s\S]*?applyNodeProperties = false/,
+  "an AvoidSync carrier's own source must remain Studio-authoritative",
+);
+
+const physicalAllocator = source.slice(
+  source.indexOf("function PathHelpers.allocatePhysicalFragment"),
+  source.indexOf("function PathHelpers.mappedSyncClass"),
+);
+assert.match(
+  physicalAllocator,
+  /while true do[\s\S]*?ordinal \+= 1/,
+  "duplicate allocation must support ordinals beyond four digits",
+);
+assert.equal(
+  physicalAllocator.includes("9999"),
+  false,
+  "duplicate allocation must not have the old 9,999 sibling ceiling",
+);
+
+const snapshotWalker = source.slice(
+  source.indexOf("function snapshotApplyState.runChildren"),
+  source.indexOf("local function applyNode"),
+);
+assert.match(
+  snapshotWalker,
+  /while #stack > 0 do/,
+  "large disk snapshots must use an iterative DFS",
+);
+assert.match(
+  snapshotWalker,
+  /snapshotApplyState\.checkpoint\(ctx\)/,
+  "large disk snapshots must cooperatively yield and observe cancellation",
+);
+assert.doesNotMatch(
+  snapshotWalker,
+  /applyNode\(/,
+  "the disk snapshot walker must not recurse through descendants",
+);
+
+const strictPruner = source.slice(
+  source.indexOf("function snapshotApplyState.pruneUnkept"),
+  source.indexOf("function snapshotApplyState.runChildren"),
+);
+assert.match(
+  strictPruner,
+  /keptInstances\[child\]/,
+  "strict snapshot pruning must key wanted children by Instance identity",
+);
+assert.match(
+  strictPruner,
+  /isAvoidSyncBlocked\(frame\.inst\)/,
+  "strict snapshot pruning must preserve AvoidSync boundaries",
+);
+assert.match(
+  strictPruner,
+  /remaining\.Parent = targetParent[\s\S]*?inst:Destroy\(\)/,
+  "deleting a stale script must preserve its Studio-authoritative descendants",
+);
+
+const snapshotApply = source.slice(
+  source.indexOf("local function applySnapshot"),
+  source.indexOf("-- HTTP helpers"),
+);
+const sourceComparison = source.slice(
+  source.indexOf("local function normalizeSourceForCompare"),
+  source.indexOf("local function applyScriptSource"),
+);
+assert.match(
+  sourceComparison,
+  /source:find\("\\r\\n"[\s\S]*?source:gsub\("\\r\\n", "\\n"\)/,
+  "Source apply equivalence must use the protocol's CRLF-only normalization",
+);
+assert.equal(
+  sourceComparison.includes('gsub("\\r", "\\n")'),
+  false,
+  "Source apply equivalence must preserve a lone CR as real content",
+);
+assert.match(
+  snapshotApply,
+  /snapshotApplyState\.runChildren\(svc, node\.children, applyOpts, true\)/,
+  "a service snapshot must reconcile all siblings in one duplicate-safe batch",
+);
+assert.match(
+  snapshotApply,
+  /failedSources > 0[\s\S]*?error\(/,
+  "partial ScriptEditorService failures must fail the initial pull",
+);
+assert.match(
+  snapshotApply,
+  /return false, tostring\(err\)[\s\S]*?return true, nil/,
+  "snapshot application must report failure or success to its caller",
+);
+
+const pullPath = source.slice(
+  source.indexOf("local function doPullPath"),
+  source.indexOf("local function doPullSelectedChoice"),
+);
+assert.match(
+  pullPath,
+  /httpRequest\("\/snapshot\/stream", "POST", body, true\)/,
+  "full initial pulls must use the protocol-5 bounded snapshot stream",
+);
+assert.match(
+  pullPath,
+  /#\(raw\.Body or ""\) > scaleState\.maxStreamRequestBytes/,
+  "snapshot responses must be rejected before decoding when they exceed the bounded wire limit",
+);
+assert.match(
+  pullPath,
+  /id ~= #state\.records[\s\S]*?disk structure is not dense depth-first preorder/,
+  "streamed disk structure must use dense, validated preorder IDs",
+);
+assert.match(
+  pullPath,
+  /#records > scaleState\.structureChunkRecords/,
+  "pull structure chunks must enforce the shared 512-record bound",
+);
+assert.match(
+  pullPath,
+  /#part\.data > scaleState\.sourceChunkBytes[\s\S]*?totalBytes > scaleState\.maxScriptSourceBytes/,
+  "pull Source parts must enforce both piece and per-script byte bounds",
+);
+assert.match(
+  source,
+  /maxStagedSourceBytesPerService = 64 \* 1024 \* 1024[\s\S]*?maxStagedSourceBytesTotal = 128 \* 1024 \* 1024/,
+  "detached Source staging must publish defensible per-service and all-service memory caps",
+);
+assert.match(
+  pullPath,
+  /state\.stagedSourceBytes \+ totalBytes > scaleState\.maxStagedSourceBytesPerService[\s\S]*?totalStagedSourceBytes \+ totalBytes > scaleState\.maxStagedSourceBytesTotal[\s\S]*?state\.stagedSourceBytes \+= totalBytes[\s\S]*?totalStagedSourceBytes \+= totalBytes/,
+  "pull must reserve aggregate Source bytes once before retaining each detached script",
+);
+function modelStageSource(serviceBytes, totalBytes, incoming) {
+  const perServiceCap = 64 * 1024 * 1024;
+  const totalCap = 128 * 1024 * 1024;
+  if (serviceBytes + incoming > perServiceCap) return "service";
+  if (totalBytes + incoming > totalCap) return "total";
+  return [serviceBytes + incoming, totalBytes + incoming];
+}
+assert.equal(modelStageSource(64 * 1024 * 1024, 64 * 1024 * 1024, 1), "service");
+assert.equal(
+  modelStageSource(32 * 1024 * 1024, 128 * 1024 * 1024, 1),
+  "total",
+);
+assert.deepEqual(modelStageSource(0, 0, 1024), [1024, 1024]);
+assert.match(
+  pullPath,
+  /#sources > scaleState\.sourcePartChunkRecords/,
+  "pull must cap each Source response at 64 part records",
+);
+assert.match(
+  pullPath,
+  /#sources == 0 and not finalChunk[\s\S]*?beforeFirstSource[\s\S]*?afterEverySource[\s\S]*?Source fence tick arrived between ordinary Source parts/,
+  "empty non-final Source responses must be no-progress fence ticks only before the first or after every Source",
+);
+assert.match(
+  pullPath,
+  /offset ~= active\.offset[\s\S]*?sha256Hex\(source\) ~= digest/,
+  "pull Source assembly must validate contiguous offsets and full raw SHA-256",
+);
+assert.match(
+  pullPath,
+  /state\.activeSource = \{[\s\S]*?parts = \{\}[\s\S]*?state\.activeSource = nil/,
+  "pull buffering must retain at most one script Source at a time",
+);
+assert.match(
+  pullPath,
+  /stageStructure\(serviceState\)[\s\S]*?acceptSources\([\s\S]*?commitAllServices\(stagedServiceStates\)/,
+  "pull must stage source-free structure, validate every Source, and only then commit all services",
+);
+assert.match(
+  pullPath,
+  /if strict then[\s\S]*?snapshotApplyState\.pruneUnkept/,
+  "strict pruning must be deferred until the complete service Source phase",
+);
+assert.match(
+  pullPath,
+  /snapshotApplyState\.activeMutationGuard = mutationGuard[\s\S]*?not mutationGuard\.dirty/,
+  "long pull application must install an exact expected-mutation guard while still rejecting external changes",
+);
+assert.match(
+  pullPath,
+  /local exactCoordinate = response\.service == expectedService[\s\S]*?response\.phase == expectedPhase[\s\S]*?responseChunk == expectedChunk[\s\S]*?not exactCoordinate and not diskPrepareReady/,
+  "pull responses must match the exact requested coordinate or the one authenticated diskPrepare-to-structure transition",
+);
+assert.equal(
+  pullPath.includes('"/snapshot?service="'),
+  false,
+  "full pull must not fall back to legacy nested per-service snapshots",
+);
+assert.match(
+  pullPath,
+  /avoidSyncPaths = scaleState\.collectAvoidSyncPaths\(\)/,
+  "snapshot stream start must carry current compact AvoidSync paths before any strict pull",
+);
+assert.match(
+  pullPath,
+  /startBody\.choiceId = selectionChoiceId/,
+  "selective initial decisions must remain server-authorized inside the bounded stream",
+);
+assert.match(
+  pullPath,
+  /local selective = selectiveSelectedCount ~= nil[\s\S]*?selectiveSelectedCount <= 0[\s\S]*?selectiveSelectedCount % 1 ~= 0[\s\S]*?selectiveSelectedCount > scaleState\.maxStreamNodes/,
+  "selective snapshot pulls must require a positive bounded integer selectedCount",
+);
+assert.equal(
+  pullPath.includes("startBody.paths"),
+  false,
+  "an all-selected decision must not resend a potentially unbounded paths array",
+);
+assert.match(
+  pullPath,
+  /type\(part\.finalPart\) ~= "boolean"/,
+  "pull Source validation must reject non-boolean finalPart metadata",
+);
+assert.match(
+  pullPath,
+  /record\.sourceIncluded ~= false[\s\S]*?state\.sourceIds/,
+  "selective ancestor script shells must not cause unselected Sources to be requested or applied",
+);
+assert.match(
+  pullPath,
+  /local function acceptDeletes[\s\S]*?#deletes > scaleState\.deleteChunkRecords[\s\S]*?deletion\.pathMode ~= "generated"[\s\S]*?path\[1\] ~= state\.serviceName/,
+  "selective delete chunks must be bounded and contain only generated paths rooted at the active service",
+);
+assert.match(
+  pullPath,
+  /acceptDeletes[\s\S]*?empty non-final chunk is an authenticated continuation tick[\s\S]*?for deleteIndex in pairs\(deletes\)/,
+  "selective delete streams must allow bounded no-op ticks while exact disk revalidation runs",
+);
+assert.match(
+  pullPath,
+  /expectedPhase == "deletes" and selective[\s\S]*?acceptDeletes\(serviceState[\s\S]*?commitAllServices\(stagedServiceStates\)/,
+  "selective pulls must validate every delete chunk before the all-service commit",
+);
+
+const selectiveDeletePlanner = pullPath.slice(
+  pullPath.indexOf("local function buildSelectiveDeletePlan"),
+  pullPath.indexOf("local function cancelRecording"),
+);
+assert.match(
+  selectiveDeletePlanner,
+  /local siblingIndexes = \{\}[\s\S]*?local siblings = siblingIndexes\[target\][\s\S]*?if not siblings then[\s\S]*?buildPhysicalSiblingIndex\(target, resolveContext\)[\s\S]*?siblingIndexes\[target\] = siblings/,
+  "selective delete planning must build each unchanged parent's generated sibling index at most once",
+);
+assert.match(
+  selectiveDeletePlanner,
+  /if resolvedTargets\[target\] then[\s\S]*?same Studio target[\s\S]*?resolvedTargets\[target\] = true/,
+  "distinct authorized paths must not alias the same Studio target",
+);
+assert.match(
+  selectiveDeletePlanner,
+  /while ancestor and ancestor ~= service do[\s\S]*?if resolvedTargets\[ancestor\] then[\s\S]*?targets overlap by ancestry/,
+  "ancestor and descendant delete targets must be rejected before mutation",
+);
+assert.match(
+  selectiveDeletePlanner,
+  /local group = groupsByParent\[parent\][\s\S]*?groupsByParent\[parent\] = group[\s\S]*?group\.targets\[entry\.target\] = true/,
+  "immutable delete targets must be grouped by parent before pruning",
+);
+assert.equal(
+  selectiveDeletePlanner.includes("pruneUnkept"),
+  false,
+  "selective delete planning must remain read-only",
+);
+
+const selectiveDeleteCommit = pullPath.slice(
+  pullPath.indexOf("for _, group in ipairs(deletePlan.groups)"),
+  pullPath.indexOf("if strict then"),
+);
+assert.match(
+  pullPath,
+  /buildSelectiveDeletePlan\(state, service\)[\s\S]*?ChangeHistoryService:TryBeginRecording/,
+  "every selective target must resolve against one immutable projection before ChangeHistory mutation starts",
+);
+assert.match(
+  selectiveDeleteCommit,
+  /for target in pairs\(group\.targets\)[\s\S]*?claimedInstances\[target\][\s\S]*?target\.Parent ~= group\.parent/,
+  "planned targets must retain identity and remain disjoint from streamed structure assignments",
+);
+assert.match(
+  selectiveDeleteCommit,
+  /for _, sibling in ipairs\(group\.parent:GetChildren\(\)\)[\s\S]*?not group\.targets\[sibling\][\s\S]*?isAvoidSyncBlocked\(sibling\)[\s\S]*?pruneUnkept\(group\.parent, kept, state\.applyContext\)/,
+  "one parent-level prune must delete the immutable target set while preserving unselected and AvoidSync siblings",
+);
+assert.equal(
+  selectiveDeleteCommit.includes("resolveGeneratedPath"),
+  false,
+  "generated ordinals must never be re-resolved after selective deletion begins",
+);
+assert.match(
+  pullPath,
+  /local terminalResponse =[\s\S]*?response\.action ~= "complete"[\s\S]*?response\.action ~= nil[\s\S]*?commitAllServices\(stagedServiceStates\)/,
+  "terminal action and phase state must be validated before the only live all-service commit",
+);
+
+// Executable policy model for the two adversarial cases that broke the old
+// resolve-then-delete loop. Static assertions above bind these invariants to
+// Plugin.luau; this model makes the identity/complexity expectations explicit.
+function modeledDeleteNode(segment, children = []) {
+  const node = { segment, children, parent: null };
+  for (const child of children) child.parent = node;
+  return node;
+}
+
+function modelImmutableDeletePlan(service, paths) {
+  const siblingIndexes = new Map();
+  const resolvedTargets = new Set();
+  const entries = [];
+  let indexBuilds = 0;
+
+  const indexFor = (parent) => {
+    if (!siblingIndexes.has(parent)) {
+      const index = new Map();
+      for (const child of parent.children) index.set(child.segment, child);
+      siblingIndexes.set(parent, index);
+      indexBuilds += 1;
+    }
+    return siblingIndexes.get(parent);
+  };
+
+  for (const path of paths) {
+    let target = service;
+    for (let index = 1; index < path.length && target; index += 1) {
+      target = indexFor(target).get(path[index]);
+    }
+    if (!target) continue;
+    if (resolvedTargets.has(target)) throw new Error("duplicate target");
+    resolvedTargets.add(target);
+    entries.push(target);
+  }
+
+  for (const target of entries) {
+    let ancestor = target.parent;
+    while (ancestor && ancestor !== service) {
+      if (resolvedTargets.has(ancestor)) throw new Error("overlapping target");
+      ancestor = ancestor.parent;
+    }
+    if (ancestor !== service) throw new Error("escaped service");
+  }
+
+  const groupsByParent = new Map();
+  for (const target of entries) {
+    if (!groupsByParent.has(target.parent)) groupsByParent.set(target.parent, new Set());
+    groupsByParent.get(target.parent).add(target);
+  }
+  return { groupsByParent, indexBuilds };
+}
+
+{
+  const twins = [
+    modeledDeleteNode("Twin"),
+    modeledDeleteNode("Twin [1]"),
+    modeledDeleteNode("Twin [2]"),
+  ];
+  const service = modeledDeleteNode("Workspace", twins);
+  const plan = modelImmutableDeletePlan(service, [
+    ["Workspace", "Twin [1]"],
+    ["Workspace", "Twin [2]"],
+  ]);
+  const targets = plan.groupsByParent.get(service);
+  assert.equal(targets.has(twins[1]), true);
+  assert.equal(targets.has(twins[2]), true);
+  service.children = service.children.filter((child) => !targets.has(child));
+  assert.deepEqual(service.children, [twins[0]], "duplicate ordinals must retain pre-mutation Instance identity");
+}
+
+{
+  const leaf = modeledDeleteNode("Leaf");
+  const folder = modeledDeleteNode("Folder", [leaf]);
+  const service = modeledDeleteNode("Workspace", [folder]);
+  assert.throws(
+    () => modelImmutableDeletePlan(service, [
+      ["Workspace", "Folder"],
+      ["Workspace", "Folder", "Leaf"],
+    ]),
+    /overlapping target/,
+  );
+  assert.throws(
+    () => modelImmutableDeletePlan(service, [
+      ["Workspace", "Folder"],
+      ["Workspace", "Folder"],
+    ]),
+    /duplicate target/,
+  );
+}
+
+{
+  const width = 25_000;
+  const children = Array.from(
+    { length: width },
+    (_, index) => modeledDeleteNode(index === 0 ? "Wide" : `Wide [${index}]`),
+  );
+  const service = modeledDeleteNode("Workspace", children);
+  const paths = children.map((child) => ["Workspace", child.segment]);
+  const plan = modelImmutableDeletePlan(service, paths);
+  assert.equal(plan.indexBuilds, 1, "a 25k-wide selection must index its parent once");
+  assert.equal(plan.groupsByParent.size, 1);
+  assert.equal(plan.groupsByParent.get(service).size, width);
+}
+
+const detachedStage = pullPath.slice(
+  pullPath.indexOf("local function stageStructure"),
+  pullPath.indexOf("local function acceptSources"),
+);
+assert.match(
+  detachedStage,
+  /stagingRoot = Instance\.new\("Folder"\)[\s\S]*?staged\.Parent = parent/,
+  "pull structure must be built under a detached staging root",
+);
+assert.equal(
+  detachedStage.includes("game:GetService"),
+  false,
+  "structure validation/staging must not mutate a live Studio service",
+);
+
+const sourceStage = pullPath.slice(
+  pullPath.indexOf("local function acceptSources"),
+  pullPath.indexOf("local function applyStagedService"),
+);
+assert.match(
+  sourceStage,
+  /sha256Hex\(source\) ~= digest[\s\S]*?inst\.Source = source/,
+  "a Source must validate fully before being written only to its detached script",
+);
+assert.equal(
+  sourceStage.includes("writeScriptSource"),
+  false,
+  "no live Script Source may change before the full service validates",
+);
+
+const streamedCommit = pullPath.slice(
+  pullPath.indexOf("local function applyStagedService"),
+  pullPath.indexOf("local response, startErr"),
+);
+assert.match(
+  streamedCommit,
+  /prepareInstance[\s\S]*?writeScriptSource[\s\S]*?pruneUnkept[\s\S]*?local function commitAllServices[\s\S]*?TryBeginRecording/,
+  "the all-service transaction must apply structure and Sources before strict prune under one recording",
+);
+assert.match(
+  streamedCommit,
+  /writeScriptSource\(target, source\)[\s\S]*?rawReadbackMatches[\s\S]*?normalizeSourceForCompare\(readback\)[\s\S]*?streamed Source readback SHA-256/,
+  "streamed Source writes must verify raw or CRLF-contract-normalized readback before commit",
+);
+const allServiceCommit = pullPath.slice(
+  pullPath.indexOf("local function commitAllServices"),
+  pullPath.indexOf("local startBody"),
+);
+assert.match(
+  allServiceCommit,
+  /for _, state in ipairs\(states\)[\s\S]*?buildSelectiveDeletePlan\(state, service\)[\s\S]*?TryBeginRecording[\s\S]*?for _, plan in ipairs\(plans\)[\s\S]*?applyStagedService/,
+  "every service/delete plan must validate before one all-service ChangeHistory recording mutates Studio",
+);
+assert.equal(
+  (allServiceCommit.match(/TryBeginRecording/g) || []).length,
+  1,
+  "the complete streamed pull must open exactly one ChangeHistory recording",
+);
+assert.equal(
+  pullPath.includes("commitService"),
+  false,
+  "a pull must never expose a successfully committed service before the whole stream is terminal",
+);
+assert.match(
+  pullPath,
+  /for _, state in ipairs\(stagedServiceStates\)[\s\S]*?state\.stagingRoot:Destroy\(\)/,
+  "success, cancellation, and failure must dispose every retained detached service",
+);
+
+const streamedRollback = pullPath.slice(
+  pullPath.indexOf("local function cancelRecording"),
+  pullPath.indexOf("local response, startErr"),
+);
+assert.match(
+  streamedRollback,
+  /FinishRecording\(recordingId, Enum\.FinishRecordingOperation\.Cancel\)[\s\S]*?if cancelled then[\s\S]*?method = "cancel"[\s\S]*?ChangeHistoryService:Undo\(\)[\s\S]*?ok = undone[\s\S]*?cancelError = tostring\(cancelErr\)[\s\S]*?undoError = if undone then nil else tostring\(undoErr\)/,
+  "stream rollback must report Cancel success or preserve the fallback Undo outcome and both errors",
+);
+assert.match(
+  streamedRollback,
+  /TryBeginRecording[\s\S]*?pcall\(function\(\)[\s\S]*?applyStagedService[\s\S]*?if not committed then[\s\S]*?cancelRecording\(recordingId\)/,
+  "any cancellation or mutation after TryBeginRecording must use the same Cancel/Undo rollback path",
+);
+assert.match(
+  streamedRollback,
+  /if not rollback\.ok then[\s\S]*?may be partially applied[\s\S]*?rollback\.cancelError[\s\S]*?rollback\.undoError[\s\S]*?reconnectState\.stopTerminal\(fatalMessage\)/,
+  "Cancel+Undo double failure must report possible partial state and terminally halt bootstrap",
+);
+assert.match(
+  streamedRollback,
+  /rollback\.method == "undo"[\s\S]*?rolled back via %s%s/,
+  "a successful single fallback Undo must remain an ordinary verified rollback and retry path",
+);
+
+function modelRecordingRollback(cancelOk, undoOk) {
+  if (cancelOk) {
+    return { ok: true, method: "cancel", undoCalls: 0 };
+  }
+  return {
+    ok: undoOk,
+    method: undoOk ? "undo" : null,
+    undoCalls: 1,
+    cancelError: "cancel failed",
+    undoError: undoOk ? null : "undo failed",
+  };
+}
+assert.deepEqual(modelRecordingRollback(false, true), {
+  ok: true,
+  method: "undo",
+  undoCalls: 1,
+  cancelError: "cancel failed",
+  undoError: null,
+});
+assert.deepEqual(modelRecordingRollback(false, false), {
+  ok: false,
+  method: null,
+  undoCalls: 1,
+  cancelError: "cancel failed",
+  undoError: "undo failed",
+});
+assert.deepEqual(modelRecordingRollback(true, false), {
+  ok: true,
+  method: "cancel",
+  undoCalls: 0,
+});
+
+const scanGuard = source.slice(
+  source.indexOf("scaleState.beginStudioScanGuard"),
+  source.indexOf("scaleState.disconnectStudioScanGuard"),
+);
+assert.equal(
+  source.includes("streamInternalDepth"),
+  false,
+  "streamed pulls must not suppress mutations through a process-global write depth",
+);
+assert.match(
+  source,
+  /runInternalWrite\(callback, expectedMutation\)[\s\S]*?guard\.pushExpectedMutation\(expectedMutation\)[\s\S]*?guard\.popExpectedMutation\(expectedMutation\)/,
+  "internal write scopes must register and retire an exact expected mutation",
+);
+assert.match(
+  scanGuard,
+  /item == expected\.instance[\s\S]*?eventKind == "structure"[\s\S]*?eventKind == "Source"[\s\S]*?markDirty/,
+  "scan guards must match internal structure/source events to their exact expected Instance",
+);
+
+const applyOp = source.slice(
+  source.indexOf("local function applyOp(op, sharedApplyOpts)"),
+  source.indexOf("local function setWaypoint"),
+);
+assert.match(
+  applyOp,
+  /resolveDiskPath\(op\.diskPath, opContext\)/,
+  "delete/update operations must prefer exact physical disk paths",
+);
+assert.match(
+  applyOp,
+  /resolveDiskPath\(op\.fromDiskPath, opContext\)/,
+  "rename/move operations must prefer their exact source identity",
+);
+assert.match(
+  applyOp,
+  /resolveDiskParent\(destinationDiskPath, opContext\)/,
+  "rename/move operations must resolve exact destination ancestry",
+);
+assert.match(
+  applyOp,
+  /else resolveGeneratedPath\(op\.path, opContext\)/,
+  "legacy selective deletes must use generated lookup precedence",
+);
+assert.match(
+  applyOp,
+  /generatedTarget = resolveGeneratedPath\(op\.targetPath, opContext\)[\s\S]*?seedDiskPathAncestry\(generatedTarget, op\.diskPath\)/,
+  "selective targetPath must seed noncanonical exact disk identity",
+);
+
+const sourceAck = source.slice(
+  source.indexOf("local function sourceAckForAppliedOp"),
+  source.indexOf("local function applySnapshot"),
+);
+assert.match(
+  sourceAck,
+  /ack\.diskPath = diskPath/,
+  "source acknowledgements must preserve exact duplicate identity",
+);
+
+const liveApply = source.slice(
+  source.indexOf("local function applyOps(ops, shouldContinue)"),
+  source.indexOf("local function sourceAckForAppliedOp"),
+);
+assert.match(
+  liveApply,
+  /TryBeginRecording[\s\S]*?shouldContinue[\s\S]*?snapshotApplyState\.checkpoint[\s\S]*?flushScriptSourceWrites\(sourceWrites, shouldContinue\)/,
+  "yielding live filesystem applies must share one generation predicate across structure and Source writes",
+);
+assert.match(
+  liveApply,
+  /FinishRecording\(recordingId, Enum\.FinishRecordingOperation\.Commit\)[\s\S]*?FinishRecording\(recordingId, Enum\.FinishRecordingOperation\.Cancel\)[\s\S]*?ChangeHistoryService:Undo\(\)/,
+  "a disconnected or failed live apply must roll back its recording before returning failure",
+);
+assert.match(
+  wsLoop,
+  /local function shouldContinueApply\(\)[\s\S]*?not closed[\s\S]*?gen == wsGeneration[\s\S]*?ws == client[\s\S]*?applyOps\(\{ msg\.op \}, shouldContinueApply\)[\s\S]*?elseif shouldContinueApply\(\) then/,
+  "WebSocket operation apply must cancel on generation/transport loss and acknowledge only a committed result",
+);
+
+const liveHooks = source.slice(
+  source.indexOf("onDescendantAdded = function"),
+  source.indexOf("disconnectInstance = function"),
+);
+assert.match(
+  liveHooks,
+  /queueRepresentationSet\(representationParent, parentNode, oldDiskPath, newDiskPath\)[\s\S]*?decorateSetIdentity\(inst/,
+  "the parent leaf-to-directory migration must be queued before its first child set",
+);
+assert.match(
+  liveHooks,
+  /deleteOp\.diskPath = diskPath/,
+  "live deletes must carry exact physical identity",
+);
+assert.match(
+  liveHooks,
+  /queueRepresentationSet\([\s\S]*?representationParent,[\s\S]*?leafNode,[\s\S]*?oldParentDiskPath,[\s\S]*?leafDiskPath/,
+  "last-child removal must collapse a script directory back to its leaf file",
+);
+assert.match(
+  liveHooks,
+  /moveOp\.fromDiskPath = oldDiskPath[\s\S]*?moveOp\.toDiskPath = newDiskPath/,
+  "same-service moves must carry exact physical source and destination paths",
+);
+assert.match(
+  liveHooks,
+  /renameOp\.fromDiskPath = oldDiskPath[\s\S]*?renameOp\.toDiskPath = newDiskPath/,
+  "renames must carry exact physical source and destination paths",
+);
+
+const hookInstaller = source.slice(
+  source.indexOf("connectInstance = function"),
+  source.indexOf("-- Studio snapshot + stats"),
+);
+assert.match(
+  hookInstaller,
+  /game\.ItemChanged:Connect[\s\S]*?scaleState\.itemChangedAvailable = true/,
+  "large projects must use one DataModel-wide property signal when Studio exposes it",
+);
+assert.match(
+  hookInstaller,
+  /if scaleState\.itemChangedAvailable then[\s\S]*?return[\s\S]*?if not relevant then[\s\S]*?return/,
+  "irrelevant instances must not receive per-instance fallback property connections",
+);
+assert.match(
+  hookInstaller,
+  /bucket = scaleState\.emptyConnectionBucket[\s\S]*?bucket == scaleState\.emptyConnectionBucket[\s\S]*?bucket = \{\}/,
+  "tracked instances must share one empty bucket and allocate only when fallback hooks are needed",
+);
+assert.doesNotMatch(
+  hookInstaller,
+  /GetAttributeChangedSignal\(AVOID_SYNC_ATTRIBUTE\)/,
+  "ItemChanged-less channels must not allocate one AvoidSync signal per Instance",
+);
+assert.match(
+  hookInstaller,
+  /scaleState\.startAvoidSyncFallbackScanner = function\(\)[\s\S]*?local generation = scaleState\.hookGeneration[\s\S]*?for inst in pairs\(connections\)[\s\S]*?hasAvoidSyncAttribute\(inst\)[\s\S]*?onAvoidSyncChanged\(inst\)[\s\S]*?task\.wait\(0\.5\)/,
+  "one generation-scoped low-memory scan must preserve dynamic AvoidSync changes on fallback channels",
+);
+assert.match(
+  hookInstaller,
+  /connectTree = function\(inst, progress, shouldContinue\): boolean[\s\S]*?task\.wait\(\)[\s\S]*?not shouldContinue\(\)[\s\S]*?return false/,
+  "time-sliced hook indexing must stop promptly when its connection generation is cancelled",
+);
+assert.match(
+  hookInstaller,
+  /local function installHooks\(shouldContinue\): boolean[\s\S]*?if not hookService\(svc, progress, shouldContinue\) then[\s\S]*?disconnectHooks\(\)[\s\S]*?return false/,
+  "a cancelled large-project hook install must tear down its partial index",
+);
+assert.match(
+  source,
+  /local function recordMaterializedAncestors\(inst\)[\s\S]*?connectInstance\(current, false, true\)[\s\S]*?recordMaterializedAncestors\(inst\.Parent\)/,
+  "a dynamically added script must upgrade every newly projected fallback ancestor",
+);
+
+const initialCompareFlow = source.slice(
+  source.indexOf("runInitialCompare = function()"),
+  source.indexOf("-- Port probing / auto-discovery"),
+);
+assert.match(
+  initialCompareFlow,
+  /collectStudioStatsWithGuard\(scanGuard\)[\s\S]*?studioSnapshot = \{\}/,
+  "initial compare must begin with a time-sliced stats-only request",
+);
+assert.match(
+  initialCompareFlow,
+  /resp\.action\) == "compare"[\s\S]*?records = records or \{\}[\s\S]*?streamStudioServiceStructure\(/,
+  "two-sided comparison must stream source-free flat structure by service",
+);
+assert.match(
+  initialCompareFlow,
+  /compareId = compareId,[\s\S]*?service = serviceName,[\s\S]*?for attempt = 1, 2 do[\s\S]*?httpJson\("\/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  "streamed comparison must use the trusted JSON path with bounded idempotent retries",
+);
+assert.match(
+  initialCompareFlow,
+  /encodedCompareBodySize[\s\S]*?HttpService:JSONEncode\(requestBody\)[\s\S]*?bodyBytes > scaleState\.maxStreamRequestBytes/,
+  "every streamed comparison request must enforce its actual encoded 512 KiB wire size",
+);
+assert.match(
+  initialCompareFlow,
+  /while take >= 1 do[\s\S]*?take = math\.floor\(take \/ 2\)[\s\S]*?one Studio comparison structure record exceeds/,
+  "comparison structure chunks must split adaptively and fail clearly when one record cannot fit",
+);
+assert.match(
+  initialCompareFlow,
+  /tonumber\(resp\.nextChunk\) ~= chunkIndex \+ 1[\s\S]*?exact comparison structure cursor/,
+  "adaptively split comparison requests must still acknowledge the exact next cursor",
+);
+assert.match(
+  initialCompareFlow,
+  /resp\.phase ~= "diskPrepare"[\s\S]*?tonumber\(resp\.nextChunk\) ~= 0[\s\S]*?while resp\.phase == "diskPrepare" do/,
+  "every completed comparison structure stream must enter the bounded diskPrepare continuation at cursor zero",
+);
+assert.match(
+  initialCompareFlow,
+  /postCompareChunk\(serviceName, "diskPrepare", prepareChunk, false, \{\}, \{\}\)/,
+  "diskPrepare polls must send an explicitly empty, non-final, exact-replay comparison envelope",
+);
+assert.match(
+  initialCompareFlow,
+  /resp\.phase == "diskPrepare"[\s\S]*?tonumber\(resp\.nextChunk\) ~= prepareChunk \+ 1[\s\S]*?resp\.phase ~= "hashes"[\s\S]*?tonumber\(resp\.nextChunk\) ~= 0/,
+  "diskPrepare may only advance to its exact next poll cursor or the same service's hashes cursor zero",
+);
+assert.match(
+  initialCompareFlow,
+  /#hashes < scaleState\.compareHashChunkRecords/,
+  "streamed comparison must use the shared 64-hash batch bound",
+);
+assert.equal(
+  initialCompareFlow.includes("collectStudioSnapshotWithGuard"),
+  false,
+  "initial comparison must never retain a whole-place Source snapshot",
+);
+assert.match(
+  pullPath,
+  /local expectedPhase = "diskPrepare"[\s\S]*?local allowDiskPrepareReady = false[\s\S]*?local diskPrepareReady = allowDiskPrepareReady[\s\S]*?response\.phase == "structure"[\s\S]*?responseChunk == 0/,
+  "snapshot pull must require the start diskPrepare response and accept structure/0 only after an explicit diskPrepare poll",
+);
+assert.match(
+  pullPath,
+  /if expectedPhase == "diskPrepare" then[\s\S]*?response\.finalChunk ~= false[\s\S]*?response\.records ~= nil[\s\S]*?expectedChunk \+= 1/,
+  "pending pull diskPrepare responses must be payload-free, non-final exact cursor ticks",
+);
+assert.match(
+  pullPath,
+  /expectedService = WATCHED_SERVICES\[expectedServiceIndex\][\s\S]*?expectedPhase = "diskPrepare"[\s\S]*?serviceState = nil/,
+  "every committed pull service must advance through the next service's diskPrepare cursor",
+);
+assert.match(
+  pullPath,
+  /allowDiskPrepareReady = expectedPhase == "diskPrepare"[\s\S]*?postExact\(nextBody/,
+  "only a request actually sent at a diskPrepare cursor may authorize its direct structure response",
+);
+
+const selectedChoicePull = source.slice(
+  source.indexOf("local function doPullSelectedChoice"),
+  source.indexOf("-- A daemon or Desktop broker may advertise"),
+);
+assert.match(
+  selectedChoicePull,
+  /selectedCount <= 0[\s\S]*?selectedCount % 1 ~= 0[\s\S]*?selectedCount > scaleState\.maxStreamNodes[\s\S]*?return false/,
+  "the selective pull entry point must fail closed on malformed or excessive selectedCount metadata",
+);
+assert.match(
+  selectedChoicePull,
+  /type\(choiceId\) ~= "string" or choiceId == ""[\s\S]*?return false[\s\S]*?doPullPath\(true, selectedCount, choiceId\)/,
+  "the selective pull entry point must require the daemon-authorized choiceId without a path vector",
+);
+assert.equal(
+  selectedChoicePull.includes("paths"),
+  false,
+  "the selective pull entry point must not receive or retain selected paths",
+);
+
+const decisionHandshake = source.slice(
+  source.indexOf("local function waitForDecision"),
+  source.indexOf("local function countArray"),
+);
+assert.match(
+  decisionHandshake,
+  /#\(resp\.Body or ""\) > PROTOCOL_STREAM_MAX_BYTES[\s\S]*?HttpService:JSONDecode/,
+  "initial-decision responses must be capped before decode",
+);
+assert.match(
+  decisionHandshake,
+  /decoded\.paths ~= nil[\s\S]*?return "malformed"/,
+  "obsolete initial-decision path vectors must be rejected rather than interpreted as a full pull",
+);
+assert.match(
+  decisionHandshake,
+  /decoded\.pending == true[\s\S]*?decoded\.selective ~= nil or decoded\.selectedCount ~= nil[\s\S]*?return "malformed"/,
+  "pending decision polls must reject premature selective grant metadata",
+);
+assert.match(
+  decisionHandshake,
+  /choice == "disk" and decoded\.selective == true[\s\S]*?selectedCount <= 0[\s\S]*?selectedCount % 1 ~= 0[\s\S]*?selectedCount > scaleState\.maxStreamNodes[\s\S]*?return choice, true, selectedCount/,
+  "selective Disk decisions must carry only a positive bounded integer selectedCount",
+);
+assert.match(
+  decisionHandshake,
+  /elseif choice == "disk" then[\s\S]*?if hasSelective or hasSelectedCount then[\s\S]*?return "malformed"[\s\S]*?return choice, false, nil/,
+  "full Disk decisions must omit selective metadata completely",
+);
+
+assert.match(
+  initialCompareFlow,
+  /local choice, selectiveDiskChoice, selectedDiskCount = waitForDecision[\s\S]*?if selectiveDiskChoice == true[\s\S]*?doPullSelectedChoice\(selectedDiskCount, tostring\(choiceId\)\)[\s\S]*?else doPullPath\(true\)/,
+  "the decision caller must enter selective pull from the boolean grant and count, while absent metadata means full Disk",
+);
+assert.match(
+  initialCompareFlow,
+  /choice == "malformed"[\s\S]*?disconnect\("malformed initial decision"\)/,
+  "malformed bounded decisions must abort instead of falling back to a full overwrite",
+);
+assert.equal(
+  source.includes("selectedDiskPaths") || source.includes("doPullSelectedPaths"),
+  false,
+  "the plugin must not retain the obsolete selected path vector decision flow",
+);
+
+const pushPath = source.slice(
+  source.indexOf("local function doPushPath"),
+  source.indexOf("local function doPullPath"),
+);
+const partialReceiptValidator = pushPath.slice(
+  pushPath.indexOf("local function validatePartialReceipt"),
+  pushPath.indexOf("local function postExact"),
+);
+assert.match(
+  partialReceiptValidator,
+  /allowedFields = \{[\s\S]*?failedService = true[\s\S]*?committedServices = true[\s\S]*?unexpected field/,
+  "partial push receipts must reject fields outside the exact daemon response shape",
+);
+assert.match(
+  partialReceiptValidator,
+  /response\.ok ~= false[\s\S]*?response\.action ~= "partial"[\s\S]*?response\.recoveryRequired ~= true[\s\S]*?response\.streamId ~= streamId/,
+  "only an exact matching recovery-required partial receipt may become terminal",
+);
+assert.match(
+  partialReceiptValidator,
+  /#response\.error > scaleState\.maxRecoveryReceiptStringBytes[\s\S]*?#response\.backups > #WATCHED_SERVICES[\s\S]*?backups must be a dense array[\s\S]*?#backup > scaleState\.maxRecoveryReceiptStringBytes/,
+  "partial receipt errors and dense backup arrays must remain explicitly bounded",
+);
+assert.match(
+  partialReceiptValidator,
+  /committedServices must be a dense array[\s\S]*?type\(entry\) ~= "table"[\s\S]*?field ~= "service"[\s\S]*?field ~= "created"[\s\S]*?field ~= "backup"[\s\S]*?field ~= "recoveryAction"[\s\S]*?unexpected field/,
+  "every committed-service recovery entry must be a dense exact-shape object",
+);
+assert.match(
+  partialReceiptValidator,
+  /entry\.service ~= WATCHED_SERVICES\[index\][\s\S]*?type\(entry\.created\) ~= "boolean"[\s\S]*?if entry\.created then[\s\S]*?entry\.backup ~= nil[\s\S]*?entry\.recoveryAction ~= "removeCreatedService"[\s\S]*?type\(entry\.backup\) ~= "string"[\s\S]*?entry\.recoveryAction ~= "restoreBackup"/,
+  "created and replaced service entries must carry their one exact recovery action",
+);
+assert.match(
+  partialReceiptValidator,
+  /committedBackupCount \+= 1[\s\S]*?response\.backups\[committedBackupCount\] ~= entry\.backup[\s\S]*?response\.failedService ~= WATCHED_SERVICES\[#response\.committedServices \+ 1\][\s\S]*?#response\.backups < committedBackupCount[\s\S]*?#response\.backups > committedBackupCount \+ 1/,
+  "backups must equal committed restore paths in order plus at most the failed service's retained backup",
+);
+assert.match(
+  pushPath,
+  /push recovery restore %s from: %s[\s\S]*?push recovery remove-created-service: %s[\s\S]*?push recovery restore failed service %s from: %s/,
+  "terminal handling must log every restore path and every remove-created-service action",
+);
+assert.match(
+  pushPath,
+  /Restore %s from: %s[\s\S]*?Remove newly created service directory: %s[\s\S]*?Restore failed service %s from retained backup: %s[\s\S]*?Required recovery actions:\\n%s[\s\S]*?reconnectState\.stopTerminal\(fatalMessage\)/,
+  "terminal handling must surface every exact recovery action before stopping reconnects",
+);
+
+const pushPostExact = pushPath.slice(
+  pushPath.indexOf("local function postExact"),
+  pushPath.indexOf("local function acceptAdvance"),
+);
+assert.match(
+  pushPostExact,
+  /response\.ok == false[\s\S]*?response\.action == "partial"[\s\S]*?response\.recoveryRequired == true[\s\S]*?response\.streamId == streamId[\s\S]*?validatePartialReceipt\(response\)/,
+  "postExact must recognize only the matching daemon partial-receipt identity",
+);
+assert.ok(
+  pushPostExact.indexOf("return nil, stopForPartialReceipt(response, label)")
+    < pushPostExact.indexOf("if attempt < 2 then"),
+  "a valid partial receipt must terminally return before the exact-chunk retry branch",
+);
+assert.match(
+  source,
+  /reconnectState\.stopTerminal = function\(reason\)[\s\S]*?reconnectState\.desired = false[\s\S]*?reconnectState\.retryInitialCompare = function\(context\)[\s\S]*?if not reconnectState\.desired then/,
+  "terminal partial recovery must disable the outer comparison retry path",
+);
+
+const modeledWatchedServices = [
+  "ReplicatedStorage",
+  "ServerScriptService",
+  "StarterPlayer",
+  "StarterGui",
+  "Workspace",
+  "ReplicatedFirst",
+  "ServerStorage",
+  "Lighting",
+];
+function modelValidPartialReceipt(receipt, streamId) {
+  const allowed = new Set([
+    "ok",
+    "action",
+    "streamId",
+    "error",
+    "failedService",
+    "recoveryRequired",
+    "backups",
+    "committedServices",
+  ]);
+  if (
+    receipt === null
+    || typeof receipt !== "object"
+    || Array.isArray(receipt)
+    || Object.keys(receipt).length !== allowed.size
+    || Object.keys(receipt).some((field) => !allowed.has(field))
+  ) return false;
+  if (
+    receipt.ok !== false
+    || receipt.action !== "partial"
+    || receipt.recoveryRequired !== true
+    || receipt.streamId !== streamId
+  ) return false;
+  if (
+    typeof receipt.error !== "string"
+    || receipt.error.length === 0
+    || receipt.error.length > 64 * 1024
+    || receipt.error.includes("\0")
+  ) return false;
+  if (
+    !Array.isArray(receipt.backups)
+    || receipt.backups.length > modeledWatchedServices.length
+  ) return false;
+  const backupSeen = new Set();
+  for (let index = 0; index < receipt.backups.length; index += 1) {
+    if (!Object.hasOwn(receipt.backups, index)) return false;
+    const path = receipt.backups[index];
+    if (
+      typeof path !== "string"
+      || path.length === 0
+      || path.length > 64 * 1024
+      || path.includes("\0")
+      || backupSeen.has(path)
+    ) return false;
+    backupSeen.add(path);
+  }
+  if (
+    !Array.isArray(receipt.committedServices)
+    || receipt.committedServices.length > modeledWatchedServices.length
+  ) return false;
+  const entryFields = new Set(["service", "created", "backup", "recoveryAction"]);
+  const committedBackups = [];
+  for (let index = 0; index < receipt.committedServices.length; index += 1) {
+    if (!Object.hasOwn(receipt.committedServices, index)) return false;
+    const entry = receipt.committedServices[index];
+    if (
+      entry === null
+      || typeof entry !== "object"
+      || Array.isArray(entry)
+      || Object.keys(entry).length !== entryFields.size
+      || Object.keys(entry).some((field) => !entryFields.has(field))
+      || entry.service !== modeledWatchedServices[index]
+      || typeof entry.created !== "boolean"
+    ) return false;
+    if (entry.created) {
+      if (entry.backup !== null || entry.recoveryAction !== "removeCreatedService") return false;
+    } else {
+      if (
+        typeof entry.backup !== "string"
+        || entry.backup.length === 0
+        || entry.backup.length > 64 * 1024
+        || entry.backup.includes("\0")
+        || entry.recoveryAction !== "restoreBackup"
+      ) return false;
+      committedBackups.push(entry.backup);
+    }
+  }
+  if (receipt.failedService !== modeledWatchedServices[receipt.committedServices.length]) return false;
+  if (
+    receipt.backups.length < committedBackups.length
+    || receipt.backups.length > committedBackups.length + 1
+    || committedBackups.some((path, index) => receipt.backups[index] !== path)
+  ) return false;
+  return true;
+}
+function modelRecoveryLines(receipt) {
+  const lines = [];
+  let committedBackupCount = 0;
+  for (const entry of receipt.committedServices) {
+    if (entry.recoveryAction === "restoreBackup") {
+      committedBackupCount += 1;
+      lines.push(`Restore ${entry.service} from: ${entry.backup}`);
+    } else {
+      lines.push(`Remove newly created service directory: ${entry.service}`);
+    }
+  }
+  if (receipt.backups.length === committedBackupCount + 1) {
+    lines.push(
+      `Restore failed service ${receipt.failedService} from retained backup: ${receipt.backups.at(-1)}`,
+    );
+  }
+  return lines;
+}
+function modelPartialPost(receipts, streamId) {
+  for (let attempt = 0; attempt < Math.min(2, receipts.length); attempt += 1) {
+    const receipt = receipts[attempt];
+    const matchingCore = receipt
+      && receipt.ok === false
+      && receipt.action === "partial"
+      && receipt.recoveryRequired === true
+      && receipt.streamId === streamId;
+    if (matchingCore && modelValidPartialReceipt(receipt, streamId)) {
+      return {
+        terminal: true,
+        attempts: attempt + 1,
+        visible: `${receipt.error}\n${modelRecoveryLines(receipt).join("\n")}`,
+      };
+    }
+  }
+  return { terminal: false, attempts: Math.min(2, receipts.length) };
+}
+const modeledPartialReceipt = {
+  ok: false,
+  action: "partial",
+  recoveryRequired: true,
+  streamId: "same-stream",
+  error: "installed service changed; rollback refused",
+  failedService: "StarterPlayer",
+  backups: [
+    "C:\\project\\.rosync-backups\\replicated",
+    "C:\\project\\.rosync-backups\\starter-player-retained",
+  ],
+  committedServices: [
+    {
+      service: "ReplicatedStorage",
+      created: false,
+      backup: "C:\\project\\.rosync-backups\\replicated",
+      recoveryAction: "restoreBackup",
+    },
+    {
+      service: "ServerScriptService",
+      created: true,
+      backup: null,
+      recoveryAction: "removeCreatedService",
+    },
+  ],
+};
+{
+  const result = modelPartialPost([modeledPartialReceipt], "same-stream");
+  assert.equal(result.terminal, true);
+  assert.equal(result.attempts, 1, "a valid matching partial receipt must never retry");
+  assert.match(result.visible, /installed service changed/);
+  assert.match(result.visible, /Restore ReplicatedStorage from: .*rosync-backups\\replicated/);
+  assert.match(result.visible, /Remove newly created service directory: ServerScriptService/);
+  assert.match(result.visible, /Restore failed service StarterPlayer .*starter-player-retained/);
+}
+{
+  const result = modelPartialPost(
+    [{ ...modeledPartialReceipt, unexpected: true }, { ...modeledPartialReceipt, unexpected: true }],
+    "same-stream",
+  );
+  assert.equal(result.terminal, false, "a malformed negative receipt must not stop the stream");
+  assert.equal(result.attempts, 2, "a malformed negative receipt remains a normal two-attempt failure");
+}
+assert.equal(
+  modelPartialPost(
+    [{ ...modeledPartialReceipt, streamId: "other" }, { ...modeledPartialReceipt, streamId: "other" }],
+    "same-stream",
+  ).terminal,
+  false,
+  "a mismatched negative receipt must not terminally halt the current stream",
+);
+assert.equal(
+  modelValidPartialReceipt(
+    { ...modeledPartialReceipt, error: "x".repeat(64 * 1024 + 1) },
+    "same-stream",
+  ),
+  false,
+  "partial receipt error strings must be bounded",
+);
+const modeledCreatedOnlyReceipt = {
+  ...modeledPartialReceipt,
+  failedService: "ServerScriptService",
+  backups: [],
+  committedServices: [
+    {
+      service: "ReplicatedStorage",
+      created: true,
+      backup: null,
+      recoveryAction: "removeCreatedService",
+    },
+  ],
+};
+assert.equal(
+  modelValidPartialReceipt(modeledCreatedOnlyReceipt, "same-stream"),
+  true,
+  "created services require an explicit removal action and no backup path",
+);
+assert.match(
+  modelPartialPost([modeledCreatedOnlyReceipt], "same-stream").visible,
+  /Remove newly created service directory: ReplicatedStorage/,
+);
+for (const [name, mutate] of [
+  ["created with backup", (entry) => ({ ...entry, backup: "C:\\unexpected" })],
+  ["created with restore action", (entry) => ({ ...entry, recoveryAction: "restoreBackup" })],
+  ["replaced without backup", (entry) => ({ ...entry, created: false, backup: null })],
+  ["replaced with remove action", (entry) => ({
+    ...entry,
+    created: false,
+    backup: "C:\\expected",
+    recoveryAction: "removeCreatedService",
+  })],
+  ["entry with extra field", (entry) => ({ ...entry, unexpected: true })],
+]) {
+  const malformed = {
+    ...modeledCreatedOnlyReceipt,
+    committedServices: [mutate(modeledCreatedOnlyReceipt.committedServices[0])],
+  };
+  assert.equal(modelValidPartialReceipt(malformed, "same-stream"), false, name);
+}
+assert.equal(
+  modelValidPartialReceipt(
+    {
+      ...modeledPartialReceipt,
+      backups: [
+        modeledPartialReceipt.backups[1],
+        modeledPartialReceipt.backups[0],
+      ],
+    },
+    "same-stream",
+  ),
+  false,
+  "committed backup paths must appear first and in service order",
+);
+assert.equal(
+  modelValidPartialReceipt(
+    {
+      ...modeledPartialReceipt,
+      backups: [
+        modeledPartialReceipt.backups[0],
+        modeledPartialReceipt.backups[1],
+        "C:\\project\\.rosync-backups\\second-extra",
+      ],
+    },
+    "same-stream",
+  ),
+  false,
+  "only one extra retained path may belong to the failed service",
+);
+assert.equal(
+  modelValidPartialReceipt(
+    { ...modeledPartialReceipt, failedService: "StarterGui" },
+    "same-stream",
+  ),
+  false,
+  "failedService must immediately follow the committed service prefix",
+);
+assert.equal(
+  modelValidPartialReceipt(
+    {
+      ...modeledPartialReceipt,
+      backups: ["C:\\project\\bad\0path", modeledPartialReceipt.backups[1]],
+      committedServices: [
+        {
+          ...modeledPartialReceipt.committedServices[0],
+          backup: "C:\\project\\bad\0path",
+        },
+        modeledPartialReceipt.committedServices[1],
+      ],
+    },
+    "same-stream",
+  ),
+  false,
+  "recovery paths must reject embedded NUL bytes",
+);
+assert.match(
+  pushPath,
+  /streamStudioServiceStructure\([\s\S]*?candidate\.records = batch/,
+  "bootstrap push must stream flat source-free structure instead of nested service snapshots",
+);
+assert.match(
+  pushPath,
+  /for attempt = 1, 2 do[\s\S]*?httpJson\("\/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  "push chunks must use exact bounded idempotent retries",
+);
+assert.match(
+  initialCompareFlow,
+  /httpJson\("\/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  "every streamed comparison response must be capped before decode",
+);
+assert.match(
+  initialCompareFlow,
+  /studioSnapshot = \{\}[\s\S]*?PROTOCOL_STREAM_MAX_BYTES/,
+  "the stats-first comparison response must also be capped before decode",
+);
+assert.match(
+  pushPath,
+  /bodyBytes > scaleState\.maxStreamRequestBytes/,
+  "push must enforce actual encoded request size before every send",
+);
+assert.match(
+  pushPath,
+  /utf8ChunkEnd[\s\S]*?nextByte >= 0x80 and nextByte < 0xC0/,
+  "push must never split a raw UTF-8 Source inside a multibyte sequence",
+);
+assert.match(
+  pushPath,
+  /#source > scaleState\.maxScriptSourceBytes[\s\S]*?#part\.data/,
+  "push must cap one script and advance offsets using raw Source bytes",
+);
+assert.match(
+  pushPath,
+  /partIndex = partIndex,[\s\S]*?offset = offset,[\s\S]*?totalBytes = #source,[\s\S]*?sha256 = sourceHash/,
+  "every push Source part must carry contiguous coordinates and full raw SHA-256",
+);
+assert.match(
+  pushPath,
+  /response\.nextService == expectedService[\s\S]*?response\.phase == expectedPhase[\s\S]*?response\.nextChunk == expectedChunk/,
+  "push must reject daemon responses that do not advance to the exact next coordinate",
+);
+assert.match(
+  pushPath,
+  /response\.action == "complete"[\s\S]*?response\.phase ~= nil or response\.nextService ~= nil or response\.nextChunk ~= nil[\s\S]*?response\.action ~= nil[\s\S]*?exactExpected and expectedPhase == "complete"/,
+  "push completion must be the sole explicit terminal action, never an unknown or coordinate-only synthetic terminal",
+);
+assert.match(
+  pushPath,
+  /phase == "diskFence"[\s\S]*?phase == "diskRevalidate"[\s\S]*?drainContinuation/,
+  "push must drive bounded daemon disk-fence and revalidation continuation ticks",
+);
+assert.match(
+  pushPath,
+  /body\.records = \{\}[\s\S]*?body\.sources = \{\}/,
+  "push continuation ticks must be empty and retry-safe",
+);
+assert.equal(
+  pushPath.includes("services = {"),
+  false,
+  "protocol-5 push must never construct a legacy nested services payload",
+);
+
+const daemonWs = fs.readFileSync(new URL("../daemon/src/ws.rs", import.meta.url), "utf8");
+const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+const schema = fs.readFileSync(new URL("../plugin/SCHEMA.md", import.meta.url), "utf8");
+const capabilityTemplate = fs.readFileSync(new URL("../daemon/src/snapshot.rs", import.meta.url), "utf8");
+assert.match(daemonWs, /PLUGIN_PROTOCOL_VERSION: u64 = 5/);
+assert.match(readme, /plugin_protocol-5-/);
+assert.match(schema, /Protocol 5 corresponds to Studio plugin 2\.4\.0/);
+assert.match(capabilityTemplate, /Protocol 5 \/ plugin 2\.4\.0 exposes optional Studio features/);
 
 console.log("Studio plugin reconnect policy checks passed");
