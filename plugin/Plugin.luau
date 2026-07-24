@@ -41,7 +41,7 @@ local RO_SYNC_SETTINGS_IMAGE = "rbxassetid://128477924144442"
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "2.2.0"
+local PLUGIN_VERSION_STRING = "2.2.1"
 local PLUGIN_PROTOCOL_VERSION = 3
 
 --------------------------------------------------------------------------------
@@ -53,39 +53,48 @@ local PLUGIN_PROTOCOL_VERSION = 3
 -- PluginConnectionService. The edit-mode copy is the sole external bridge.
 --------------------------------------------------------------------------------
 
-local function hostDataModelTypeName(): string
-	-- HostDataModelType is not available in every Studio channel even though
-	-- PluginConnectionService is. Prefer it when present, then use the
-	-- connection direction plus RunService to distinguish the edit DataModel
-	-- from its PlayServer/PlayClient clones.
+local function hostDataModelTypeName(): (string, string, boolean, boolean)
 	local name = "Unknown"
 	pcall(function()
 		name = plugin.HostDataModelType.Name
 	end)
-	if name == "Edit" or name == "PlayServer" or name == "PlayClient" then
-		return name
-	end
 
+	-- Connection direction is the public, authoritative way to distinguish
+	-- edit and test DataModels. In particular, Run mode can expose an "Edit"
+	-- HostDataModelType from its runtime plugin clone; trusting that value first
+	-- causes the clone to start the edit UI and never advertise a server context.
 	local canConnectToEdit = false
 	local canConnectToTest = false
-	pcall(function()
+	local inspectedConnections = pcall(function()
 		local connectionService = game:GetService("PluginConnectionService")
 		canConnectToEdit = connectionService:CanHaveConnectionType(Enum.PluginConnectionTargetType.Edit)
 		canConnectToTest = connectionService:CanHaveConnectionType(Enum.PluginConnectionTargetType.Test)
 	end)
-	if canConnectToEdit and not canConnectToTest then
-		local runService = game:GetService("RunService")
-		return if runService:IsServer() then "PlayServer" else "PlayClient"
+	if inspectedConnections and canConnectToTest then
+		return "Edit", name, canConnectToEdit, canConnectToTest
 	end
-	if canConnectToTest and not canConnectToEdit then
-		return "Edit"
+	if inspectedConnections and canConnectToEdit then
+		local runService = game:GetService("RunService")
+		return if runService:IsServer() then "PlayServer" else "PlayClient",
+			name,
+			canConnectToEdit,
+			canConnectToTest
+	end
+
+	-- HostDataModelType is unavailable in some Studio channels, so keep it as a
+	-- compatibility fallback after the connection-direction check.
+	if name == "PlayServer" or name == "PlayClient" then
+		return name, name, canConnectToEdit, canConnectToTest
 	end
 
 	local runService = game:GetService("RunService")
 	if runService:IsRunning() then
-		return if runService:IsServer() then "PlayServer" else "PlayClient"
+		return if runService:IsServer() then "PlayServer" else "PlayClient",
+			name,
+			canConnectToEdit,
+			canConnectToTest
 	end
-	return "Edit"
+	return "Edit", name, canConnectToEdit, canConnectToTest
 end
 
 local function sha256Hex(value: string): string
@@ -124,13 +133,23 @@ local function runPlaytestRuntimeAgent()
 	local RUNTIME_MAX_INPUT_SECONDS = 30
 	local runtimeSessionToken = ""
 	local runtimePlaytestJobId = ""
-	pcall(function()
-		local testArgs = game:GetService("StudioTestService"):GetTestArgs()
-		if type(testArgs) == "table" then
-			runtimeSessionToken = tostring(testArgs.__rosyncSessionToken or "")
-			runtimePlaytestJobId = tostring(testArgs.__rosyncJobId or "")
+	-- Studio can clone and start the runtime plugin before Run-mode test args
+	-- become observable. Give that handoff a short grace period instead of
+	-- permanently disabling the bridge after the first empty GetTestArgs().
+	local testArgsDeadline = os.clock() + 5
+	repeat
+		pcall(function()
+			local testArgs = game:GetService("StudioTestService"):GetTestArgs()
+			if type(testArgs) == "table" then
+				runtimeSessionToken = tostring(testArgs.__rosyncSessionToken or "")
+				runtimePlaytestJobId = tostring(testArgs.__rosyncJobId or "")
+			end
+		end)
+		if runtimeSessionToken ~= "" and runtimePlaytestJobId ~= "" then
+			break
 		end
-	end)
+		task.wait(0.05)
+	until os.clock() >= testArgsDeadline
 	if runtimeSessionToken == "" or runtimePlaytestJobId == "" then
 		warn("[Ro Sync runtime] no authenticated Ro Sync playtest session; runtime bridge disabled")
 		return
@@ -313,6 +332,8 @@ local function runPlaytestRuntimeAgent()
 	local function runtimeContext()
 		local playerName = nil
 		local userId = nil
+		local logicalHostDataModelType, rawHostDataModelType, canConnectToEdit, canConnectToTest =
+			hostDataModelTypeName()
 		if role == "client" then
 			pcall(function()
 				local player = game:GetService("Players").LocalPlayer
@@ -326,7 +347,11 @@ local function runPlaytestRuntimeAgent()
 			runtimeId = runtimeId,
 			playtestJobId = runtimePlaytestJobId,
 			role = role,
-			hostDataModelType = hostDataModelTypeName(),
+			hostDataModelType = logicalHostDataModelType,
+			rawHostDataModelType = rawHostDataModelType,
+			canConnectToEdit = canConnectToEdit,
+			canConnectToTest = canConnectToTest,
+			testArgsAuthenticated = runtimeSessionToken ~= "" and runtimePlaytestJobId ~= "",
 			placeId = tostring(game.PlaceId),
 			gameId = tostring(game.GameId),
 			jobId = tostring(game.JobId),
@@ -4265,6 +4290,10 @@ do
 			playtestJobId = context.playtestJobId,
 			role = context.role,
 			hostDataModelType = context.hostDataModelType,
+			rawHostDataModelType = context.rawHostDataModelType,
+			canConnectToEdit = context.canConnectToEdit,
+			canConnectToTest = context.canConnectToTest,
+			testArgsAuthenticated = context.testArgsAuthenticated,
 			placeId = context.placeId,
 			gameId = context.gameId,
 			jobId = context.jobId,
@@ -4333,6 +4362,10 @@ do
 			sessionToken = job.sessionToken,
 			role = tostring(message.role or "unknown"),
 			hostDataModelType = tostring(message.hostDataModelType or "Unknown"),
+			rawHostDataModelType = tostring(message.rawHostDataModelType or "Unknown"),
+			canConnectToEdit = message.canConnectToEdit == true,
+			canConnectToTest = message.canConnectToTest == true,
+			testArgsAuthenticated = message.testArgsAuthenticated == true,
 			placeId = message.placeId,
 			gameId = message.gameId,
 			jobId = message.jobId,
@@ -5130,6 +5163,20 @@ do
 				job.status = retryableStatus
 			end
 		end
+		local function failStop(message)
+			local detail = tostring(message)
+			if forceStop then
+				-- Timeout and boot-failure cleanup are terminal requests. Studio can
+				-- refuse every teardown API while a runtime context is unavailable;
+				-- do not resurrect that generation as an active job forever.
+				job.status = "failed"
+				job.error = detail
+				job.endedAt = os.time()
+			else
+				restoreRetryableState()
+			end
+			error(detail)
+		end
 		job.stopRequested = true
 		job.status = "stopping"
 		if playscriptCoordinator and job.run then
@@ -5146,14 +5193,24 @@ do
 			local canLeave, allowed = pcall(function()
 				return service:CanLeaveTest()
 			end)
-			if not canLeave or allowed ~= true then
-				return false, "Studio cannot leave this playtest"
+			local canLeaveError = nil
+			if not canLeave then
+				canLeaveError = "CanLeaveTest failed: " .. tostring(allowed)
+			elseif allowed ~= true then
+				canLeaveError = "Studio reported that it cannot leave this playtest"
+			end
+			if canLeaveError and not forceStop then
+				return false, canLeaveError
 			end
 			local ok, result = pcall(function()
 				return service:LeaveTest()
 			end)
 			if not ok then
-				return false, tostring(result)
+				local detail = "LeaveTest failed: " .. tostring(result)
+				if canLeaveError then
+					detail = canLeaveError .. "; " .. detail
+				end
+				return false, detail
 			end
 			return true, nil
 		end
@@ -5163,6 +5220,27 @@ do
 				task.wait(0.05)
 			end
 			return tostring(job.status) ~= "stopping"
+		end
+		local function endTestFallback(previousError)
+			if not forceStop then
+				return false, previousError
+			end
+			local ended, endResult = pcall(function()
+				return service:EndTest(args.result or "Ro Sync forced playtest cleanup")
+			end)
+			local endError = nil
+			if ended then
+				if waitForEnd(3) then
+					return true, nil
+				end
+				endError = "Studio accepted EndTest but the playtest remained active"
+			else
+				endError = "EndTest failed: " .. tostring(endResult)
+			end
+			if previousError and previousError ~= "" then
+				return false, tostring(previousError) .. "; " .. endError
+			end
+			return false, endError
 		end
 
 		if forceStop then
@@ -5174,8 +5252,11 @@ do
 				leaveError = "Studio accepted LeaveTest but the playtest remained active"
 			end
 			if not serverContext then
-				restoreRetryableState()
-				error("unable to force-stop playtest: " .. tostring(leaveError))
+				local ended, endError = endTestFallback(leaveError)
+				if ended then
+					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
+				end
+				failStop("unable to force-stop playtest: " .. tostring(endError))
 			end
 		end
 
@@ -5199,24 +5280,37 @@ do
 				end
 				leaveError = "Studio accepted LeaveTest but the playtest remained active"
 			end
-			restoreRetryableState()
-			error(
+			local endError = leaveError
+			if forceStop then
+				local ended, fallbackError = endTestFallback(leaveError)
+				if ended then
+					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
+				end
+				endError = fallbackError
+			end
+			failStop(
 				"unable to stop playtest through PlayServer ("
 					.. tostring(requestError)
 					.. ") or edit mode ("
-					.. tostring(leaveError)
+					.. tostring(endError)
 					.. ")"
 			)
 		end
 
 		local left, leaveError = leaveFromEdit()
 		if not left then
-			restoreRetryableState()
-			error("unable to stop playtest: " .. tostring(leaveError))
+			local ended, endError = endTestFallback(leaveError)
+			if ended then
+				return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
+			end
+			failStop("unable to stop playtest: " .. tostring(endError))
 		end
 		if not waitForEnd(3) then
-			restoreRetryableState()
-			error("Studio accepted LeaveTest but the playtest remained active")
+			local ended, endError = endTestFallback("Studio accepted LeaveTest but the playtest remained active")
+			if ended then
+				return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
+			end
+			failStop(tostring(endError))
 		end
 		return { stopped = true, job = playtestJobSnapshot(job) }
 	end
