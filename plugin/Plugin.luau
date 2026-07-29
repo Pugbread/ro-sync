@@ -1811,14 +1811,10 @@ local urlBox = setmetatable({}, {
 })
 
 local function log(msg)
-	-- Debug: mirror the plugin's internal log panel to Studio Output so
-	-- `rosync logs` and the Output window capture the connection story.
-	print("[Ro Sync dbg] " .. tostring(msg))
 	ui.addLog(msg)
 end
 
 local function setPill(state, detail)
-	print("[Ro Sync dbg] status → " .. tostring(state) .. (detail ~= nil and (" (" .. tostring(detail) .. ")") or ""))
 	ui.setStatus(state, detail)
 end
 
@@ -14800,11 +14796,6 @@ local function probePort(port, gameId)
 	local url = string.format("http://127.0.0.1:%d", port)
 	local ok, resp = httpRequestTo(url .. "/hello", "GET")
 	if not ok or not resp.Success then
-		print(string.format(
-			"[Ro Sync dbg] probe :%d failed — %s",
-			port,
-			if ok then string.format("HTTP %s %s", tostring(resp.StatusCode), tostring(resp.StatusMessage)) else tostring(resp)
-		))
 		return false, url, nil
 	end
 	local hello
@@ -14982,16 +14973,6 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 			elseif probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
-			if probe.hello ~= nil then
-				print(string.format(
-					"[Ro Sync dbg] probe :%d — daemon '%s' gameId=%s project=%s matched=%s",
-					port,
-					tostring(probe.hello.name),
-					tostring(probe.hello.gameId),
-					tostring(probe.hello.project),
-					tostring(probe.matched)
-				))
-			end
 			if daemonInitializer == nil and probe.hello ~= nil then
 				daemonInitializer = projectInitOffer(probe.url, port, probe.hello)
 			end
@@ -15024,15 +15005,6 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 	if result.initializer == nil then
 		result.initializer = daemonInitializer
 	end
-	print(string.format(
-		"[Ro Sync dbg] discover result: found=%s port=%s sawWrongGame=%s initializer=%s initializerError=%s (GameId %s)",
-		tostring(result.found),
-		tostring(result.port),
-		tostring(result.sawWrongGame),
-		tostring(result.initializer ~= nil),
-		tostring(result.initializerError),
-		tostring(gameId)
-	))
 	return result
 end
 
