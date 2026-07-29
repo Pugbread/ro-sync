@@ -68,6 +68,8 @@ local function statusView(state, detail)
 		return "Creating Ro Sync project...", Colors.Accent, "Cancel"
 	elseif state == "project_waiting" then
 		return "Project ready · waiting for Desktop...", Colors.Accent, "Cancel"
+	elseif state == "daemon_waiting" then
+		return string.format("Waiting for Desktop... %ss", tostring(detail or "?")), Colors.Accent, "Cancel"
 	elseif state == "connected" then
 		return string.format("localhost:%s", tostring(detail or "?")), Colors.Good, "Disconnect"
 	elseif state == "no_daemon" then

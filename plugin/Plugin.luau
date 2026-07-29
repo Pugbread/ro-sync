@@ -33,7 +33,8 @@ local SETTING_MANUAL_URL = "manualUrl"
 local DEFAULT_URL = "http://127.0.0.1:7878"
 local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
-local PROBE_TIMEOUT_SECONDS = 2
+local DAEMON_STARTUP_GRACE_SECONDS = 30
+local DAEMON_DISCOVERY_RETRY_SECONDS = 1
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
 local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
@@ -1696,6 +1697,11 @@ local function mountFallbackUi(reason)
 			connectBtn.Text = "Cancel"
 		elseif state == "project_waiting" then
 			status.Text = "Project ready · waiting for Desktop..."
+			status.TextColor3 = Color3.fromRGB(65, 135, 245)
+			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			connectBtn.Text = "Cancel"
+		elseif state == "daemon_waiting" then
+			status.Text = string.format("Waiting for Desktop... %ss", tostring(detail or "?"))
 			status.TextColor3 = Color3.fromRGB(65, 135, 245)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
@@ -14168,6 +14174,7 @@ end
 -- large top-level chunk can reuse earlier compiler registers.
 local projectInitCandidate: any = nil
 local connectionAttempt = 0
+local activeInitialChoiceId: any = nil
 
 local function disconnect(reason)
 	reconnectState.desired = false
@@ -14203,6 +14210,7 @@ end
 --------------------------------------------------------------------------------
 
 local function waitForDecision(choiceId, gen)
+	activeInitialChoiceId = choiceId
 	setPill("waiting")
 	setBanner(string.format("Waiting for overwrite decision… (choice %s)", tostring(choiceId)))
 	while busy and gen == decisionGeneration do
@@ -15001,6 +15009,9 @@ runInitialCompare = function()
 		local gen = decisionGeneration
 		task.spawn(function()
 			local choice, selectiveDiskChoice, selectedDiskCount = waitForDecision(choiceId, gen)
+			if activeInitialChoiceId == choiceId then
+				activeInitialChoiceId = nil
+			end
 			if gen ~= decisionGeneration then
 				disposeScanGuard()
 				return
@@ -15211,11 +15222,16 @@ local function projectInitUnavailableMessage(hello)
 	return "Set a Projects folder in Ro Sync Desktop Settings before creating this project."
 end
 
-reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expectedProject)
-	-- Probe concurrently. A PlaceId match may select one project among several
-	-- daemons for the same experience. During automatic recovery, first restrict
-	-- candidates to the exact canonical project selected by the user; never
-	-- guess by lowest port when multiple exact candidates remain.
+reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expectedProject, shouldContinue)
+	-- Probe deterministically. Roblox throttles a burst of localhost
+	-- RequestAsync calls, and those requests cannot be cancelled after Connect
+	-- is cancelled. A sequential scan keeps at most one stale request alive and
+	-- checks the connection generation before starting every next port.
+	--
+	-- A PlaceId match may select one project among several daemons for the same
+	-- experience. During automatic recovery, first restrict candidates to the
+	-- exact canonical project selected by the user; never guess by lowest port
+	-- when multiple exact candidates remain.
 	if not quiet then
 		setPill("probing")
 		log(string.format("probing ports %d..%d for GameId %s", PORT_RANGE_START, PORT_RANGE_END, gameId))
@@ -15230,28 +15246,21 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 		candidateCount = 0,
 		initializer = nil,
 		initializerError = nil,
+		cancelled = false,
 	}
 	local expectedProjectIdentity = if type(expectedProject) == "string" and expectedProject ~= ""
 		then expectedProject
 		else nil
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
-		local remaining = lastPort - firstPort + 1
-		local closed = false
 		for port = firstPort, lastPort do
-			task.spawn(function()
-				local matched, url, hello = probePort(port, gameId)
-				if not closed then
-					probes[port] = { matched = matched, url = url, hello = hello }
-				end
-				remaining -= 1
-			end)
+			if type(shouldContinue) == "function" and not shouldContinue() then
+				result.cancelled = true
+				break
+			end
+			local matched, url, hello = probePort(port, gameId)
+			probes[port] = { matched = matched, url = url, hello = hello }
 		end
-		local started = os.clock()
-		while remaining > 0 and (os.clock() - started) < PROBE_TIMEOUT_SECONDS do
-			task.wait(0.05)
-		end
-		closed = true
 		return probes
 	end
 
@@ -15577,6 +15586,8 @@ startConnect = function()
 	end
 	if busy then
 		-- Cancel in-flight probing/connecting/waiting
+		local cancelledChoiceId = activeInitialChoiceId
+		activeInitialChoiceId = nil
 		reconnectState.desired = false
 		reconnectState.compareRetryPending = false
 		reconnectState.pluginCapability = nil
@@ -15590,6 +15601,20 @@ startConnect = function()
 		setPill("idle")
 		setBanner(nil)
 		log("cancelled")
+		if cancelledChoiceId ~= nil then
+			local cancelledBaseUrl = baseUrl
+			task.spawn(function()
+				local ok, response = httpRequestTo(cancelledBaseUrl .. "/initial-choice", "POST", {
+					choiceId = cancelledChoiceId,
+					choice = "cancel",
+				})
+				if ok and response.Success then
+					log("cancelled pending overwrite decision")
+				else
+					log("could not cancel pending overwrite decision; it will expire as stale")
+				end
+			end)
+		end
 		return
 	end
 
@@ -15688,7 +15713,40 @@ startConnect = function()
 			chosenPort = typed:match(":(%d+)") or "?"
 			log("using manual URL from modal: " .. typed)
 		else
-			local result = reconnectState.discoverDaemon(gameId, false)
+			local discoveryDeadline = os.clock() + DAEMON_STARTUP_GRACE_SECONDS
+			local result = nil
+			local scanCount = 0
+			repeat
+				scanCount += 1
+				result = reconnectState.discoverDaemon(gameId, scanCount > 1, nil, nil, function()
+					return attempt == connectionAttempt and busy
+				end)
+				if attempt ~= connectionAttempt or not busy or result.cancelled then
+					return
+				end
+				if result.found or result.ambiguous then
+					break
+				end
+				local remaining = math.max(0, math.ceil(discoveryDeadline - os.clock()))
+				if remaining <= 0 then
+					break
+				end
+				setPill("daemon_waiting", remaining)
+				if scanCount == 1 then
+					setBanner("Waiting for Ro Sync Desktop to start this project's daemon. Cancel stops waiting.")
+					log(
+						string.format(
+							"no matching daemon yet; waiting up to %d seconds for Desktop startup",
+							DAEMON_STARTUP_GRACE_SECONDS
+						)
+					)
+				end
+				local retryAt = math.min(discoveryDeadline, os.clock() + DAEMON_DISCOVERY_RETRY_SECONDS)
+				while attempt == connectionAttempt and busy and os.clock() < retryAt do
+					setPill("daemon_waiting", math.max(0, math.ceil(discoveryDeadline - os.clock())))
+					task.wait(0.1)
+				end
+			until os.clock() >= discoveryDeadline
 			if attempt ~= connectionAttempt or not busy then
 				return
 			end

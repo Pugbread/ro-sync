@@ -149,12 +149,22 @@ const daemonDiscovery = source.slice(
 );
 assert.match(
   daemonDiscovery,
+  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?for port = firstPort, lastPort do[\s\S]*?not shouldContinue\(\)[\s\S]*?result\.cancelled = true[\s\S]*?probePort\(port, gameId\)/,
+  "daemon discovery must stop between deterministic port probes when its connection attempt is cancelled",
+);
+assert.doesNotMatch(
+  daemonDiscovery,
+  /for port = firstPort, lastPort do[\s\S]{0,160}?task\.spawn/,
+  "daemon discovery must not launch an uncancellable RequestAsync burst across every port",
+);
+assert.match(
+  daemonDiscovery,
   /currentPlaceId = tostring\(game\.PlaceId\)[\s\S]*?candidate\.hello\.placeIds[\s\S]*?#exactPlaceMatches > 0 then exactPlaceMatches else gameMatches/,
   "daemon discovery must prefer candidates whose configured placeIds include the current PlaceId",
 );
 assert.match(
   daemonDiscovery,
-  /function\(gameId, quiet, includeInitializer, expectedProject\)[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local currentPlaceId/,
+  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local currentPlaceId/,
   "automatic discovery must restrict candidates by canonical project before applying PlaceId preference",
 );
 assert.match(
@@ -276,6 +286,16 @@ assert.match(
   startConnect,
   /if busy then[\s\S]*?reconnectState\.pinnedProject = nil[\s\S]*?return[\s\S]*?Every explicit Connect\/Create Project action[\s\S]*?reconnectState\.pinnedProject = nil/,
   "cancel and every subsequent explicit Connect action must reset the automatic-recovery project pin",
+);
+assert.match(
+  startConnect,
+  /local cancelledChoiceId = activeInitialChoiceId[\s\S]*?activeInitialChoiceId = nil[\s\S]*?choiceId = cancelledChoiceId[\s\S]*?choice = "cancel"/,
+  "Connect-button cancellation must clear the exact pending daemon overwrite decision",
+);
+assert.match(
+  startConnect,
+  /discoveryDeadline = os\.clock\(\) \+ DAEMON_STARTUP_GRACE_SECONDS[\s\S]*?discoverDaemon\(gameId, scanCount > 1, nil, nil, function\(\)[\s\S]*?attempt == connectionAttempt and busy[\s\S]*?result\.found or result\.ambiguous[\s\S]*?setPill\("daemon_waiting", remaining\)[\s\S]*?until os\.clock\(\) >= discoveryDeadline[\s\S]*?if not result\.found then/,
+  "an explicit Connect must retry generation-safely through Desktop startup before reporting no daemon",
 );
 
 assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.1"/);
