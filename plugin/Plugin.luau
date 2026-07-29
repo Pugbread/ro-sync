@@ -11746,6 +11746,7 @@ end
 
 local function wsLoop(gen)
 	local clientId = tostring(game.GameId)
+	local resumeAttempts = 0
 	while connected and gen == wsGeneration do
 		local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
 		if not reconnectState.desired or not connected or gen ~= wsGeneration then
@@ -11858,7 +11859,7 @@ local function wsLoop(gen)
 									and gen == wsGeneration
 									and ws == client
 							end
-							opQueue[#opQueue + 1] = msg.op
+							opQueue[#opQueue + 1] = { op = msg.op, seq = tonumber(msg.seq) }
 							if not opWorkerRunning then
 								opWorkerRunning = true
 								task.spawn(function()
@@ -11868,12 +11869,20 @@ local function wsLoop(gen)
 											break
 										end
 										opQueue = {}
-										if applyOps(batch, shouldContinueApply) and shouldContinueApply() then
+										local batchOps = {}
+										for i, entry in ipairs(batch) do
+											batchOps[i] = entry.op
+										end
+										if applyOps(batchOps, shouldContinueApply) and shouldContinueApply() then
 											-- Echo the sources Studio actually accepted. The
 											-- daemon uses these acks to advance its conflict
 											-- baseline; failed/cancelled writes produce no ack.
-											for _, appliedOp in ipairs(batch) do
-												local ack = sourceAckForAppliedOp(appliedOp)
+											-- Applied seqs advance the resume baseline.
+											for _, entry in ipairs(batch) do
+												if entry.seq ~= nil then
+													reconnectState.lastAppliedOpSeq = entry.seq
+												end
+												local ack = sourceAckForAppliedOp(entry.op)
 												if ack then
 													wsSend(client, { type = "push", ops = { ack } })
 												end
@@ -11892,6 +11901,23 @@ local function wsLoop(gen)
 						else
 							log("ws: op frame missing nested op payload")
 						end
+					elseif kind == "resume-ok" then
+						resumeAttempts = 0
+						local missed = tonumber(msg.missed) or 0
+						if missed > 0 then
+							log(string.format("ws: resumed — daemon replaying %d missed disk op(s)", missed))
+						elseif tonumber(msg.seqHead) ~= nil then
+							-- Fresh baseline: nothing missed; remember the journal
+							-- head so the NEXT transport drop can resume.
+							reconnectState.lastAppliedOpSeq = tonumber(msg.seqHead)
+						end
+					elseif kind == "resume-reject" then
+						log("ws: daemon cannot replay the gap (journal rolled over); falling back to full compare")
+						reconnectState.lastAppliedOpSeq = nil
+						recoveryContext = "resume rejected — journal gap"
+						pcall(function()
+							client:Close()
+						end)
 					elseif kind == "lagged" then
 						log("ws: daemon broadcast lagged — will resync via /initial-compare")
 						recoveryContext = "daemon broadcast lagged"
@@ -11970,6 +11996,10 @@ local function wsLoop(gen)
 				role = "plugin",
 				protocol = PLUGIN_PROTOCOL_VERSION,
 				pluginCapability = reconnectState.pluginCapability,
+				-- Present when a previous authenticated session on this daemon
+				-- boot dropped: the daemon replays the disk ops we missed from
+				-- its journal instead of forcing a full re-compare.
+				resumeFrom = reconnectState.lastAppliedOpSeq,
 			})
 			if helloOk then
 				lastPongClock = os.clock()
@@ -12029,12 +12059,28 @@ local function wsLoop(gen)
 			break
 		end
 
-		if needResyncAfter then
+		if needResyncAfter and reconnectState.lastAppliedOpSeq ~= nil and resumeAttempts < 5 then
+			-- Resume-first recovery: hooks are still installed and pendingOps
+			-- still buffer Studio-side edits, so if the daemon can replay the
+			-- disk ops we missed (its op journal), the entire rebuild — scan,
+			-- hash compare, decision — is unnecessary. The next hello carries
+			-- resumeFrom; an explicit reject clears the baseline and falls
+			-- through to the full path on the following iteration.
+			resumeAttempts += 1
+			log(string.format(
+				"ws: transport gap — resuming from op seq %d (attempt %d/5, no re-compare)",
+				reconnectState.lastAppliedOpSeq,
+				resumeAttempts
+			))
+			setPill("connecting")
+			task.wait(math.min(2 * resumeAttempts, 6))
+		elseif needResyncAfter then
 			-- Tear down Studio hooks and re-enter the full initial-sync handshake.
 			-- Bumping wsGeneration ensures any other in-flight wsLoop iteration
 			-- exits. Pending point ops are represented by the fresh Studio snapshot,
 			-- so discard them before a disk-win decision can accidentally replay one.
 			log("ws: transport gap — scheduling full /initial-compare")
+			reconnectState.lastAppliedOpSeq = nil
 			disconnectHooks()
 			pendingOps = {}
 			pushPending = false
@@ -14038,6 +14084,10 @@ end
 -- section so wsLoop's transport-gap recovery can reach it without a circular
 -- declaration.
 runInitialCompare = function()
+	-- A fresh compare supersedes any resume baseline: the snapshot it
+	-- establishes is the new ground truth, and the post-compare hello learns
+	-- the current journal head from the daemon's resume-ok.
+	reconnectState.lastAppliedOpSeq = nil
 	local compareGeneration = wsGeneration
 	local compareCapability = reconnectState.pluginCapability
 	local scanGuard = nil
