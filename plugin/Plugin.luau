@@ -14134,6 +14134,9 @@ runInitialCompare = function()
 			return
 		end
 		reconnectState.comparedCapability = compareCapability
+		-- The sync landed; any carried decision is spent.
+		reconnectState.carriedInitialChoice = nil
+		reconnectState.carriedChoiceUses = 0
 		scaleState.activeScanGuard = scanGuard
 		if startHooksAndWs() then
 			disposeScanGuard()
@@ -14675,11 +14678,26 @@ runInitialCompare = function()
 		if deltaItems then
 			log(string.format("delta fast path armed: %d changed script(s) prefetched", #deltaItems))
 		end
-		-- Deliberately NO auto-answer here: with disk-side authors (agents,
-		-- other tools) writing into the project, even a changed-scripts-only
-		-- drift is ambiguous about which side is newer. The delta fast path
-		-- below still makes whatever the human chooses apply in seconds, and
-		-- the decision session no longer expires while they think.
+		-- Deliberately NO standing auto-answer here: with disk-side authors
+		-- (agents, other tools) writing into the project, even a
+		-- changed-scripts-only drift is ambiguous about which side is newer.
+		-- The ONE exception is a carried choice: the human just answered this
+		-- exact question and a mid-modal Studio edit voided the cycle — repeat
+		-- their answer (bounded) instead of making them race the dialog.
+		if reconnectState.carriedInitialChoice ~= nil and (reconnectState.carriedChoiceUses or 0) > 0 then
+			reconnectState.carriedChoiceUses -= 1
+			local carried = reconnectState.carriedInitialChoice
+			log(string.format("re-answering '%s' (carried from the voided choice)", carried))
+			task.spawn(function()
+				pcall(function()
+					local body = { choiceId = tostring(choiceId), choice = carried }
+					if carried == "disk" then
+						body.mode = "all"
+					end
+					httpRequestTo(baseUrl .. "/initial-choice", "POST", body)
+				end)
+			end)
+		end
 		decisionGeneration += 1
 		local gen = decisionGeneration
 		task.spawn(function()
@@ -14702,6 +14720,17 @@ runInitialCompare = function()
 				log("decision: malformed daemon response")
 				disconnect("malformed initial decision")
 				return
+			end
+			if scaleState.guardBlocksSnapshot(scanGuard) then
+				-- The compare must rerun (a structural edit landed while the
+				-- modal was open), but the HUMAN's answer doesn't expire with
+				-- it. Carry the choice into the next cycle so they aren't
+				-- racing their own teammates to a dialog button.
+				if choice == "studio" or (choice == "disk" and selectiveDiskChoice ~= true) then
+					reconnectState.carriedInitialChoice = choice
+					reconnectState.carriedChoiceUses = 3
+					log(string.format("choice '%s' carried forward to the restarted compare", choice))
+				end
 			end
 			if scanBecameDirty("Studio changed while the overwrite choice was open") then
 				return
