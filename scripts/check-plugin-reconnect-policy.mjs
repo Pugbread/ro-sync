@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 
 const source = fs.readFileSync(new URL("../plugin/Plugin.luau", import.meta.url), "utf8");
-
 const wsLoop = source.slice(
   source.indexOf("local function wsLoop(gen)"),
   source.indexOf("reconnectState.retryInitialCompare = function"),
@@ -73,6 +73,20 @@ assert.match(
   /elseif kind == "shutdown"[\s\S]*?client:Close\(\)[\s\S]*?if needResyncAfter then[\s\S]*?disconnectHooks\(\)[\s\S]*?reconnectState\.retryInitialCompare\(recoveryContext\)/,
   "WATCHER_LAGGED shutdown recovery must tear down hooks and re-enter initial comparison",
 );
+const pushResultBranch = wsLoop.slice(
+  wsLoop.indexOf('elseif kind == "push-result"'),
+  wsLoop.indexOf('elseif kind == "request"'),
+);
+assert.match(
+  pushResultBranch,
+  /skipped > 0 or conflictCount > 0 or errorCount > 0/,
+  "any partial live push result must be treated as a failure",
+);
+assert.match(
+  pushResultBranch,
+  /setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*client:Close\(\)/,
+  "partial push failure must be visible and close into full reconciliation",
+);
 
 const refreshHello = source.slice(
   source.indexOf("reconnectState.refreshHello = function"),
@@ -87,6 +101,26 @@ assert.match(
   refreshHello,
   /reconnectState\.pluginCapability = capability/,
   "each successful /hello must rotate the in-memory plugin capability",
+);
+assert.match(
+  refreshHello,
+  /discovered\.ambiguous == true[\s\S]*?multiple Ro Sync projects match this place[\s\S]*?true/,
+  "ambiguous recovery discovery must stop instead of silently switching projects",
+);
+
+const daemonDiscovery = source.slice(
+  source.indexOf("reconnectState.discoverDaemon = function"),
+  source.indexOf("local function positiveIdString"),
+);
+assert.match(
+  daemonDiscovery,
+  /currentPlaceId = tostring\(game\.PlaceId\)[\s\S]*?candidate\.hello\.placeIds[\s\S]*?#exactPlaceMatches > 0 then exactPlaceMatches else gameMatches/,
+  "daemon discovery must prefer candidates whose configured placeIds include the current PlaceId",
+);
+assert.match(
+  daemonDiscovery,
+  /#candidates == 1[\s\S]*?result\.found = true[\s\S]*?#candidates > 1[\s\S]*?result\.ambiguous = true/,
+  "daemon discovery must require a unique candidate instead of choosing the lowest port",
 );
 
 const startHooks = source.slice(
@@ -128,6 +162,16 @@ assert.match(
   /reconnectState\.comparedCapability = compareCapability[\s\S]*?startHooksAndWs\(\)/,
   "live hooks may start only after recording which daemon capability was fully compared",
 );
+assert.match(
+  initialCompare,
+  /action == "in-sync"[\s\S]*?comparedDiskIdentityServices\[serviceName\] ~= true[\s\S]*?snapshotApplyState\.seedDiskPathsForService\(service, comparedDiskIdentities\)[\s\S]*?completeInitialCompare\(\)/,
+  "the in-sync fast path must install complete daemon-authored physical identities before live hooks start",
+);
+assert.match(
+  initialCompare,
+  /resp\.phase ~= "identities"[\s\S]*?identityCount > scaleState\.maxStreamNodes[\s\S]*?postCompareChunk\([\s\S]*?"identities"[\s\S]*?PathHelpers\.isPortableDiskFragment\(fragment\)[\s\S]*?colliding sibling disk identities[\s\S]*?resp\.nextPhase ~= "hashes"/,
+  "initial comparison must page, bound, and validate exact daemon-authored disk identity receipts",
+);
 
 const disconnect = source.slice(
   source.indexOf("local function disconnect(reason)"),
@@ -139,8 +183,8 @@ assert.match(
   "explicit user disconnect and plugin unload must remain terminal",
 );
 
-assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.0"/);
-assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 5/);
+assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.1"/);
+assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 6/);
 assert.match(
   source,
   /return choice, true, selectedCount/,
@@ -231,6 +275,37 @@ assert.match(
   /local leadingSpace = index == 1 and byte == 32[\s\S]*?if leadingDot or leadingSpace or trailingDotOrSpace or unsafe then/,
   "Windows-safe physical names must encode a leading ASCII space",
 );
+assert.match(
+  source,
+  /function PathHelpers\.isReservedInitStem[\s\S]*?lower == "init"[\s\S]*?function PathHelpers\.leafScriptStem[\s\S]*?string\.format\("%%%02X"/,
+  "literal leaf scripts matching init-marker grammar must escape their first byte",
+);
+assert.ok(
+  source.includes('return lower:match("^init %((.+)%)$") ~= nil'),
+  "named init reservation must require a non-empty parenthesized name",
+);
+assert.match(
+  source,
+  /allocatePhysicalFragment[\s\S]*?not isDirectory and SCRIPT_CLASSES\[className\][\s\S]*?PathHelpers\.leafScriptStem/,
+  "reserved init escaping must apply only to leaf scripts",
+);
+assert.match(
+  source,
+  /function PathHelpers\.portableInitFileName[\s\S]*?#named <= 255[\s\S]*?return "init" \.\. suffix/,
+  "directory-backed scripts must mirror Rust's portable named/plain init marker selection",
+);
+
+function modelLeafStem(name, isDirectory) {
+  const reserved = /^init$/i.test(name) || /^init \(.+\)$/i.test(name);
+  if (!isDirectory && reserved) {
+    return `%${name.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}${name.slice(1)}`;
+  }
+  return name;
+}
+assert.equal(modelLeafStem("init", false), "%69nit");
+assert.equal(modelLeafStem("Init (Notifications)", false), "%49nit (Notifications)");
+assert.equal(modelLeafStem("init ()", false), "init ()");
+assert.equal(modelLeafStem("init (Notifications)", true), "init (Notifications)");
 
 const httpRequestHelper = source.slice(
   source.indexOf("local function httpRequestTo"),
@@ -274,6 +349,78 @@ assert.equal(
   livePush.includes("encodedOps"),
   false,
   "two-pass live preflight must not retain an encoded string for every queued operation",
+);
+const sourceUpdateQueue = source.slice(
+  source.indexOf("local function queueScriptUpdateOp"),
+  source.indexOf("-- AvoidSync path push"),
+);
+assert.match(
+  sourceUpdateQueue,
+  /snapshotApplyState\.sourceDiskPathForInstance\(inst\)/,
+  "live Source updates must target a leaf file, including a script-with-children init marker",
+);
+assert.doesNotMatch(
+  sourceUpdateQueue,
+  /queueScriptUpdateOp[\s\S]*?snapshotApplyState\.diskPathForInstance\(inst\)/,
+  "live Source updates must not send a directory path as the Source target",
+);
+assert.match(
+  sourceUpdateQueue,
+  /generation = sourceSyncState\.generation\[scriptInst\] or 0[\s\S]*?latest\.generation ~= \(sourceSyncState\.generation\[scriptInst\] or 0\)[\s\S]*?tryReadScriptSource\(scriptInst\)[\s\S]*?queueScriptUpdateOp\(scriptInst, currentSource\)/,
+  "debounced editor writes must be generation-checked and re-read current editor text at commit",
+);
+assert.match(
+  sourceUpdateQueue,
+  /queueOp\(op, true\)/,
+  "per-script Source handling must bypass the unrelated global structure echo clock",
+);
+assert.doesNotMatch(
+  sourceUpdateQueue,
+  /task\.delay\(EDITOR_SOURCE_DEBOUNCE[\s\S]*?queueScriptUpdateOp\(scriptInst, latest\.source\)/,
+  "debounced editor writes must never commit captured stale text",
+);
+const sourceExpectedGuard = source.slice(
+  source.indexOf("function sourceSyncState.expectRemoteSource"),
+  source.indexOf("local function applyScriptSource"),
+);
+assert.match(
+  sourceExpectedGuard,
+  /function sourceSyncState\.expectRemoteSource[\s\S]*?sourceSyncState\.pending\[inst\] = nil[\s\S]*?sourceHash = sha256Hex\(source\)[\s\S]*?function sourceSyncState\.consumeExpected[\s\S]*?observedHash == expected\.sourceHash/,
+  "filesystem Source applies must invalidate stale pending edits and suppress only the expected text for that script",
+);
+assert.doesNotMatch(
+  sourceExpectedGuard,
+  /sourceSyncState\.expected\[inst\] = \{[\s\S]*?source = source/,
+  "expected-source guards must retain bounded hashes rather than every full script Source",
+);
+assert.match(
+  source,
+  /local function tryReadScriptSource[\s\S]*?return nil, "ScriptEditorService:GetEditorSource failed: " \.\. tostring\(src\)/,
+  "authoritative editor reads must surface GetEditorSource failure instead of manufacturing empty Source",
+);
+const authoritativeSourceWrites = source.slice(
+  source.indexOf("local function writeScriptSource"),
+  source.indexOf("local function flushScriptSourceWrites"),
+);
+assert.match(
+  authoritativeSourceWrites,
+  /local function writeScriptSource[\s\S]*?local currentSource = tryReadScriptSource\(inst\)[\s\S]*?currentSource ~= nil and sourcesMatchForApply\(currentSource, newSource\)[\s\S]*?return applyScriptSource\(inst, newSource, suppressStudioEcho\)/,
+  "direct Source equality must use the authoritative editor buffer and force an apply when it is unreadable",
+);
+assert.match(
+  authoritativeSourceWrites,
+  /local function queueScriptSourceWrite[\s\S]*?local currentSource = tryReadScriptSource\(inst\)[\s\S]*?currentSource ~= nil and sourcesMatchForApply\(currentSource, newSource\)[\s\S]*?table\.insert\(queue,[\s\S]*?return true/,
+  "queued Source equality must use the authoritative editor buffer and enqueue an apply when it is unreadable",
+);
+assert.doesNotMatch(
+  authoritativeSourceWrites,
+  /sourcesMatchForApply\(readScriptSource\(inst\), newSource\)/,
+  "authoritative Source write paths must never accept a stale raw Source fallback as equality",
+);
+assert.match(
+  source,
+  /push Source %s could not read the Studio editor buffer[\s\S]*?return false/,
+  "snapshot push must abort coherently when an editor Source cannot be read",
 );
 assert.match(
   source,
@@ -349,8 +496,23 @@ assert.doesNotMatch(
 );
 assert.match(
   snapshotMatcher,
-  /return left\.index < right\.index/,
-  "equal sibling signatures must retain Studio GetChildren order",
+  /groupEnd > groupStart and SCRIPT_CLASSES[\s\S]*?sha256Hex\(\(source:gsub\("\\r\\n", "\\n"\)\)\)[\s\S]*?left\.sourceKey < right\.sourceKey[\s\S]*?left\.entry\.index < right\.entry\.index/,
+  "tied script siblings must use normalized Source identity before GetChildren order",
+);
+assert.match(
+  snapshotMatcher,
+  /local cachedFragmentByInstance = \{\}[\s\S]*?parentDiskPath and not override[\s\S]*?allocator\.taken\[fragmentKey\] = true[\s\S]*?local fragment = cachedFragmentByInstance\[entry\.child\][\s\S]*?or PathHelpers\.allocatePhysicalFragment/,
+  "cached physical identities must be reserved before newly sorted siblings allocate fragments",
+);
+assert.match(
+  snapshotMatcher,
+  /local placementOwner = \{\}[\s\S]*?priorOwner and priorOwner ~= entry\.child[\s\S]*?physical sibling fragment collision/,
+  "physical sibling placements must reject duplicate byInstance fragments",
+);
+assert.match(
+  snapshotMatcher,
+  /cachedFragmentOwner\[fragmentKey\][\s\S]*?clearDiskPathSubtree\(entry\.child\)[\s\S]*?repaired duplicate cached disk fragment/,
+  "colliding cached fragments must be repaired instead of overlaid",
 );
 assert.match(
   snapshotMatcher,
@@ -367,6 +529,109 @@ assert.equal(
   false,
   "wide snapshot apply must index siblings instead of searching once per node",
 );
+
+const streamedStructure = source.slice(
+  source.indexOf("scaleState.streamStudioServiceStructure = function"),
+  source.indexOf("scaleState.normalizedSourceHash = function"),
+);
+assert.match(
+  streamedStructure,
+  /local orderingContext = snapshotApplyState\.newContext[\s\S]*?buildPhysicalSiblingIndex\(frame\.inst, orderingContext, \{\}\)[\s\S]*?order = placement\.order[\s\S]*?left\.order < right\.order/,
+  "streamed structure IDs must follow the canonical physical sibling allocator with stale cache overlays disabled",
+);
+assert.match(
+  streamedStructure,
+  /local childEntry = frame\.children\[frame\.nextChild\][\s\S]*?inst = childEntry\.inst[\s\S]*?childIndex = childIndex/,
+  "canonical child ordering must be applied before streamed IDs and childIndex values are assigned",
+);
+assert.match(
+  streamedStructure,
+  /local instanceById = \{\}[\s\S]*?instanceById\[frame\.id \+ 1\] = frame\.inst[\s\S]*?return sourceInstances, nil, instanceById/,
+  "streamed comparison IDs must retain their exact Studio Instance identity until daemon receipts arrive",
+);
+
+const seedDiskPaths = source.slice(
+  source.indexOf("function snapshotApplyState.seedDiskPathsForService"),
+  source.indexOf("function snapshotApplyState.buildAssignments"),
+);
+assert.match(
+  seedDiskPaths,
+  /if exactIdentities then[\s\S]*?clearDiskPathSubtree\(service\)[\s\S]*?identity\.fragment[\s\S]*?buildPhysicalSiblingIndex\(frame\.parent, ctx\)[\s\S]*?placement\.fragment ~= exact\.fragment/,
+  "clean reconnects must preseed exact fragments, reserve them during allocation, and fail closed on a shape mismatch",
+);
+
+function modelStreamedTiedScriptOrder(entries) {
+  const canonical = [...entries].sort((left, right) => {
+    const leftKey = crypto.createHash("sha256").update(left.source.replaceAll("\r\n", "\n")).digest("hex");
+    const rightKey = crypto.createHash("sha256").update(right.source.replaceAll("\r\n", "\n")).digest("hex");
+    return leftKey.localeCompare(rightKey) || left.index - right.index;
+  });
+  return canonical
+    .map((entry, index) => ({ ...entry, fragment: index === 0 ? "Twin.luau" : `Twin [${index}].luau` }))
+    .map((entry, index) => ({ ...entry, physicalOrder: index + 1 }))
+    .sort((left, right) => left.physicalOrder - right.physicalOrder);
+}
+{
+  const forward = modelStreamedTiedScriptOrder([
+    { source: "return 'A'\n", index: 1 },
+    { source: "return 'B'\n", index: 2 },
+  ]).map((entry) => entry.source);
+  const reversed = modelStreamedTiedScriptOrder([
+    { source: "return 'B'\n", index: 1 },
+    { source: "return 'A'\n", index: 2 },
+  ]).map((entry) => entry.source);
+  assert.deepEqual(
+    forward,
+    reversed,
+    "reversing GetChildren order must not change distinct duplicate-script physical identity",
+  );
+}
+
+function modelCachedDuplicateInsertion(entries) {
+  const canonical = [...entries].sort((left, right) => {
+    const leftKey = crypto.createHash("sha256").update(left.source.replaceAll("\r\n", "\n")).digest("hex");
+    const rightKey = crypto.createHash("sha256").update(right.source.replaceAll("\r\n", "\n")).digest("hex");
+    return leftKey.localeCompare(rightKey) || left.index - right.index;
+  });
+  const taken = new Set(
+    canonical.filter((entry) => entry.cachedFragment).map((entry) => entry.cachedFragment.toLowerCase()),
+  );
+  const allocate = () => {
+    if (!taken.has("twin.luau")) {
+      taken.add("twin.luau");
+      return "Twin.luau";
+    }
+    let ordinal = 1;
+    while (taken.has(`twin [${ordinal}].luau`)) ordinal += 1;
+    const fragment = `Twin [${ordinal}].luau`;
+    taken.add(fragment.toLowerCase());
+    return fragment;
+  };
+  return canonical.map((entry) => ({
+    ...entry,
+    fragment: entry.cachedFragment ?? allocate(),
+  }));
+}
+{
+  const modeled = modelCachedDuplicateInsertion([
+    { id: "cached-A", source: "return 'A'\n", index: 1, cachedFragment: "Twin.luau" },
+    { id: "new-earlier", source: "return 1\n", index: 2 },
+  ]);
+  assert.equal(modeled[0].id, "new-earlier", "the regression requires the new sibling to Source-sort first");
+  assert.deepEqual(
+    Object.fromEntries(modeled.map((entry) => [entry.id, entry.fragment])),
+    {
+      "new-earlier": "Twin [1].luau",
+      "cached-A": "Twin.luau",
+    },
+    "a newly inserted duplicate must not take an existing sibling's cached base fragment",
+  );
+  assert.equal(
+    new Set(modeled.map((entry) => entry.fragment.toLowerCase())).size,
+    modeled.length,
+    "every duplicate Instance must retain a one-to-one physical fragment",
+  );
+}
 const generatedLookup = source.slice(
   source.indexOf("function PathHelpers.findGeneratedPathChild"),
   source.indexOf("function PathHelpers.findRawDisambiguatedChild"),
@@ -492,7 +757,7 @@ const pullPath = source.slice(
 assert.match(
   pullPath,
   /httpRequest\("\/snapshot\/stream", "POST", body, true\)/,
-  "full initial pulls must use the protocol-5 bounded snapshot stream",
+  "full initial pulls must use the protocol-6 bounded snapshot stream",
 );
 assert.match(
   pullPath,
@@ -1638,16 +1903,57 @@ assert.match(
 assert.equal(
   pushPath.includes("services = {"),
   false,
-  "protocol-5 push must never construct a legacy nested services payload",
+  "protocol-6 push must never construct a legacy nested services payload",
 );
 
 const daemonWs = fs.readFileSync(new URL("../daemon/src/ws.rs", import.meta.url), "utf8");
+const bridge = fs.readFileSync(new URL("../bridge.js", import.meta.url), "utf8");
+const settings = fs.readFileSync(new URL("../views/settings.js", import.meta.url), "utf8");
+const projectBroker = fs.readFileSync(
+  new URL("../desktop/src-tauri/src/project_broker.rs", import.meta.url),
+  "utf8",
+);
 const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
 const schema = fs.readFileSync(new URL("../plugin/SCHEMA.md", import.meta.url), "utf8");
 const capabilityTemplate = fs.readFileSync(new URL("../daemon/src/snapshot.rs", import.meta.url), "utf8");
-assert.match(daemonWs, /PLUGIN_PROTOCOL_VERSION: u64 = 5/);
-assert.match(readme, /plugin_protocol-5-/);
-assert.match(schema, /Protocol 5 corresponds to Studio plugin 2\.4\.0/);
-assert.match(capabilityTemplate, /Protocol 5 \/ plugin 2\.4\.0 exposes optional Studio features/);
+assert.match(daemonWs, /PLUGIN_PROTOCOL_VERSION: u64 = 6/);
+assert.match(
+  bridge,
+  /role: "watch",\s*protocol: 6/,
+  "the widget event stream must use the same current protocol as the daemon and plugin",
+);
+assert.match(
+  settings,
+  /const EXPECTED_PLUGIN_PROTOCOL = 6;/,
+  "the settings compatibility UI must use the same current protocol",
+);
+assert.match(
+  projectBroker,
+  /"pluginProtocol": 6,/,
+  "the Desktop project broker must advertise the same current protocol",
+);
+assert.match(
+  projectBroker,
+  /assert_eq!\(unavailable\["pluginProtocol"\], 6\);/,
+  "the Desktop project broker compatibility test must pin the current protocol",
+);
+assert.match(readme, /plugin_protocol-6-/);
+assert.match(schema, /Protocol 6 corresponds to Studio plugin 2\.4\.1/);
+assert.match(
+  schema,
+  /"type":"hello","clientId":"123456789","role":"plugin","protocol":6/,
+  "the documented WebSocket hello must match the runtime protocol",
+);
+assert.equal(
+  schema.includes('"protocol":5'),
+  false,
+  "the wire schema must not advertise a stale protocol",
+);
+assert.match(
+  schema,
+  /"meta":\{"op":"get","durationMs":1,"protocol":6\}/,
+  "documented remote response metadata must use the current protocol",
+);
+assert.match(capabilityTemplate, /Protocol 6 \/ plugin 2\.4\.1 exposes optional Studio features/);
 
 console.log("Studio plugin reconnect policy checks passed");

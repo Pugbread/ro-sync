@@ -283,7 +283,7 @@ fn broker_hello(shared: &BrokerShared) -> Value {
     json!({
         "ok": true,
         "name": "Ro Sync Desktop",
-        "pluginProtocol": 2,
+        "pluginProtocol": 6,
         "pluginCapability": shared.capability,
         "projectInit": {
             "available": projects_root.is_some(),
@@ -835,7 +835,7 @@ mod tests {
         let shared = test_shared(data.path());
 
         let unavailable = broker_hello(&shared);
-        assert_eq!(unavailable["pluginProtocol"], 2);
+        assert_eq!(unavailable["pluginProtocol"], 6);
         assert_eq!(unavailable["projectInit"]["available"], false);
         assert!(unavailable["projectInit"]["error"].is_string());
 

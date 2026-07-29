@@ -118,7 +118,7 @@ pub use crate::fs_safety::SYNCED_SERVICES;
 const MAX_EMITTED_INSTANCE_DEPTH: usize = 48;
 pub const MAX_FLAT_INSTANCE_DEPTH: usize = 256;
 
-/// Source-free, parent-linked snapshot record used by protocol 5 streams.
+/// Source-free, parent-linked snapshot record used by protocol 6 streams.
 ///
 /// IDs are dense preorder ordinals within one service. `child_index` retains
 /// Studio/disk sibling order before the daemon's deterministic projection sort,
@@ -597,7 +597,7 @@ rosync find-attr --project . --name Color --value \
 
 ## 6f. Capability discovery and screenshots
 
-Protocol 5 / plugin 2.4.0 exposes optional Studio features explicitly. Check
+Protocol 6 / plugin 2.4.1 exposes optional Studio features explicitly. Check
 them before choosing capture or playtest commands:
 
 ```

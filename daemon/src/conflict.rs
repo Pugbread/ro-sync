@@ -208,6 +208,16 @@ pub struct ConflictEngine {
     pending_fs_destructive: Mutex<HashMap<PathBuf, FsDestructiveAction>>,
 }
 
+/// In-memory reconciliation state captured before a multi-service generation.
+///
+/// The fields stay private so callers can only restore an exact checkpoint;
+/// they cannot partially mutate conflict-engine internals.
+pub struct ConflictCheckpoint {
+    baselines: HashMap<PathBuf, Baseline>,
+    conflicts: HashMap<PathBuf, ParkedConflict>,
+    pending_fs_destructive: HashMap<PathBuf, FsDestructiveAction>,
+}
+
 /// Resolve `path` to whichever key actually exists in `map`, trying:
 ///   1. the canonicalized path
 ///   2. each ancestor of the canonicalized path (Argon's MultiMap parent-walk —
@@ -236,6 +246,63 @@ fn resolve_key<V>(map: &HashMap<PathBuf, V>, path: &Path) -> PathBuf {
 impl ConflictEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture all in-memory reconciliation state before an atomic
+    /// multi-service publish.
+    pub fn checkpoint(&self) -> ConflictCheckpoint {
+        let baselines = self.baselines.lock().unwrap();
+        let conflicts = self.conflicts.lock().unwrap();
+        let pending_fs_destructive = self.pending_fs_destructive.lock().unwrap();
+        ConflictCheckpoint {
+            baselines: baselines.clone(),
+            conflicts: conflicts.clone(),
+            pending_fs_destructive: pending_fs_destructive.clone(),
+        }
+    }
+
+    /// Restore an exact pre-generation checkpoint after disk rollback.
+    pub fn restore_checkpoint(&self, checkpoint: ConflictCheckpoint) {
+        let mut baselines = self.baselines.lock().unwrap();
+        let mut conflicts = self.conflicts.lock().unwrap();
+        let mut pending_fs_destructive = self.pending_fs_destructive.lock().unwrap();
+        *baselines = checkpoint.baselines;
+        *conflicts = checkpoint.conflicts;
+        *pending_fs_destructive = checkpoint.pending_fs_destructive;
+    }
+
+    /// Publish a fully prepared generation's baselines in one in-memory
+    /// transaction. Disk reads and validation must finish before this call.
+    pub fn commit_generation(
+        &self,
+        roots: &[PathBuf],
+        entries: impl IntoIterator<Item = (PathBuf, Hash, u64)>,
+    ) {
+        let roots = roots
+            .iter()
+            .map(|root| stable_path(root))
+            .collect::<Vec<_>>();
+        let mut baselines = self.baselines.lock().unwrap();
+        let mut conflicts = self.conflicts.lock().unwrap();
+        baselines.retain(|candidate, _| {
+            !roots
+                .iter()
+                .any(|root| candidate == root || candidate.starts_with(root))
+        });
+        conflicts.retain(|candidate, _| {
+            !roots
+                .iter()
+                .any(|root| candidate == root || candidate.starts_with(root))
+        });
+        for (path, content_hash, fs_mtime) in entries {
+            baselines.insert(
+                stable_path(&path),
+                Baseline {
+                    fs_mtime,
+                    last_plugin_push_hash: content_hash,
+                },
+            );
+        }
     }
 
     /// Set or refresh the agreed baseline for `path`. Call after either side's

@@ -37,7 +37,7 @@ local PROBE_TIMEOUT_SECONDS = 2
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
 local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
--- Live point updates share the same bounded wire budget as protocol-5
+-- Live point updates share the same bounded wire budget as protocol-6
 -- bootstrap chunks. Larger subtrees are recovered through a fresh streamed
 -- comparison instead of constructing an unbounded WebSocket frame.
 local LIVE_PUSH_MAX_BYTES = PROTOCOL_STREAM_MAX_BYTES
@@ -46,8 +46,20 @@ local RO_SYNC_SETTINGS_IMAGE = "rbxassetid://128477924144442"
 
 -- Identifier returned by `rosync version` / `ping`. Bump when breaking changes
 -- to the remoteHandlers protocol ship.
-local PLUGIN_VERSION_STRING = "2.4.0"
-local PLUGIN_PROTOCOL_VERSION = 5
+local PLUGIN_VERSION_STRING = "2.4.1"
+local PLUGIN_PROTOCOL_VERSION = 6
+local PLUGIN_BUILD_COMMIT = "unknown"
+local PLUGIN_BUILD_DIRTY = false
+pcall(function()
+	local module = script:FindFirstChild("BuildInfo")
+	local info = if module and module:IsA("ModuleScript") then require(module) else nil
+	if type(info) == "table" then
+		if type(info.commit) == "string" and info.commit ~= "" then
+			PLUGIN_BUILD_COMMIT = info.commit
+		end
+		PLUGIN_BUILD_DIRTY = info.dirty == true
+	end
+end)
 
 --------------------------------------------------------------------------------
 -- Playtest runtime agent
@@ -1927,16 +1939,37 @@ end
 -- effect during /snapshot bootstrap.
 local materializedContainers: { [Instance]: true } = {}
 
-local function readScriptSource(inst): string
+local function tryReadScriptSource(inst): (string?, string?)
 	if ScriptEditorService then
 		local ok, src = pcall(function()
 			return ScriptEditorService:GetEditorSource(inst)
 		end)
 		if ok and type(src) == "string" then
-			return src
+			return src, nil
 		end
+		return nil, "ScriptEditorService:GetEditorSource failed: " .. tostring(src)
 	end
-	return safeGet(inst, "Source") or ""
+	local source = safeGet(inst, "Source")
+	if type(source) == "string" then
+		return source, nil
+	end
+	return nil, "script Source is unavailable"
+end
+
+-- Non-authoritative reads (CLI inspection and detached staging validation) may
+-- still use the raw Source property when ScriptEditorService cannot address an
+-- Instance. Authoritative Studio -> disk paths use tryReadScriptSource
+-- directly and abort coherently instead of manufacturing an empty Source.
+local function readScriptSource(inst): string
+	local source, sourceErr = tryReadScriptSource(inst)
+	if source ~= nil then
+		return source
+	end
+	local fallback = safeGet(inst, "Source")
+	if type(fallback) == "string" then
+		return fallback
+	end
+	error(sourceErr or "script Source is unavailable", 0)
 end
 
 -- Post-scope-down: only Source (for scripts) round-trips. Every other property
@@ -1945,7 +1978,11 @@ end
 -- daemon's op deserializer never sees a missing field.
 local function serializeProperties(inst)
 	if inst:IsA("LuaSourceContainer") then
-		return { Source = readScriptSource(inst) }
+		local source, sourceErr = tryReadScriptSource(inst)
+		if source == nil then
+			error(sourceErr or "script Source is unavailable", 0)
+		end
+		return { Source = source }
 	end
 	return {}
 end
@@ -2013,7 +2050,10 @@ local function serializeInstance(inst, shouldContinue)
 				local allowed = ALLOWED_CLASSES[frame.inst.ClassName] == true
 				local properties = {}
 				if allowed and isScript then
-					local source = readScriptSource(frame.inst)
+					local source, sourceErr = tryReadScriptSource(frame.inst)
+					if source == nil then
+						return nil, "Source unavailable for " .. frame.inst:GetFullName() .. ": " .. tostring(sourceErr)
+					end
 					estimatedBytes += #source
 					if estimatedBytes > LIVE_PUSH_MAX_BYTES then
 						return nil, "oversized"
@@ -2233,6 +2273,34 @@ function PathHelpers.scriptSuffix(className: string): string
 	return ""
 end
 
+function PathHelpers.isReservedInitStem(encoded: string): boolean
+	local lower = string.lower(encoded)
+	if lower == "init" then
+		return true
+	end
+	return lower:match("^init %((.+)%)$") ~= nil
+end
+
+function PathHelpers.leafScriptStem(name: string, className: string): string
+	local encoded = PathHelpers.encodeName(name)
+	if SCRIPT_CLASSES[className] and PathHelpers.isReservedInitStem(encoded) and #encoded > 0 then
+		-- A literal leaf named `init` / `init (<Name>)` must not be parsed as
+		-- the Source marker for its containing directory. Escape the first
+		-- original byte while preserving the exact Roblox name on decode.
+		return string.format("%%%02X", string.byte(encoded, 1)) .. encoded:sub(2)
+	end
+	return encoded
+end
+
+function PathHelpers.portableInitFileName(name: string, className: string): string
+	local suffix = PathHelpers.scriptSuffix(className)
+	local named = "init (" .. PathHelpers.encodeName(name) .. ")" .. suffix
+	if #named <= 255 then
+		return named
+	end
+	return "init" .. suffix
+end
+
 function PathHelpers.stripScriptSuffix(fragment: string): string
 	local suffixes = {
 		".server.luau",
@@ -2254,6 +2322,17 @@ function PathHelpers.lookupSegmentForPhysicalFragment(fragment: string, isDirect
 	return if isDirectory then fragment else PathHelpers.stripScriptSuffix(fragment)
 end
 
+function PathHelpers.isPortableDiskFragment(fragment): boolean
+	return type(fragment) == "string"
+		and fragment ~= ""
+		and #fragment <= 32 * 1024
+		and fragment ~= "."
+		and fragment ~= ".."
+		and not string.find(fragment, "\0", 1, true)
+		and not string.find(fragment, "/", 1, true)
+		and not string.find(fragment, "\\", 1, true)
+end
+
 function PathHelpers.sortKeyWithName(key: string?, name: string, mappedClass: string): string
 	local signature = mappedClass
 	if type(key) == "string" then
@@ -2273,7 +2352,9 @@ function PathHelpers.sortKeyWithName(key: string?, name: string, mappedClass: st
 end
 
 function PathHelpers.allocatePhysicalFragment(state, name: string, className: string, isDirectory: boolean): string
-	local encoded = PathHelpers.encodeName(name)
+	local encoded = if not isDirectory and SCRIPT_CLASSES[className]
+		then PathHelpers.leafScriptStem(name, className)
+		else PathHelpers.encodeName(name)
 	local extension = if isDirectory then "" else PathHelpers.scriptSuffix(className)
 	local base = encoded .. extension
 	local baseKey = string.lower(base)
@@ -2446,6 +2527,11 @@ end
 -- Changed signals that fire during (or within ~100ms after) the apply are
 -- correctly attributed to the remote apply rather than a user edit.
 local lastRemoteApplyClock: number = -math.huge
+local sourceSyncState = {
+	pending = {},
+	expected = {},
+	generation = {},
+}
 
 local function isEchoing(): boolean
 	return (os.clock() - lastRemoteApplyClock) < ECHO_GUARD_WINDOW
@@ -2467,6 +2553,44 @@ local function sourcesMatchForApply(currentSource: string, newSource: string): b
 	return normalizeSourceForCompare(currentSource) == normalizeSourceForCompare(newSource)
 end
 
+function sourceSyncState.expectRemoteSource(inst: Instance, source: string): number
+	local generation = (sourceSyncState.generation[inst] or 0) + 1
+	sourceSyncState.generation[inst] = generation
+	-- A filesystem write supersedes editor text captured before this exact
+	-- apply. The delayed callback validates this generation again at commit.
+	sourceSyncState.pending[inst] = nil
+	sourceSyncState.expected[inst] = {
+		sourceHash = sha256Hex(source),
+		normalizedHash = sha256Hex(normalizeSourceForCompare(source)),
+		generation = generation,
+	}
+	return generation
+end
+
+function sourceSyncState.clearExpected(inst: Instance, generation: number)
+	local expected = sourceSyncState.expected[inst]
+	if expected and expected.generation == generation then
+		sourceSyncState.expected[inst] = nil
+	end
+end
+
+function sourceSyncState.consumeExpected(inst: Instance, observed: string): boolean
+	local expected = sourceSyncState.expected[inst]
+	if not expected then
+		return false
+	end
+	local observedHash = sha256Hex(observed)
+	local matches = observedHash == expected.sourceHash
+		or sha256Hex(normalizeSourceForCompare(observed)) == expected.normalizedHash
+	if matches then
+		sourceSyncState.pending[inst] = nil
+		return true
+	end
+	-- A differing editor value is a real user edit after the remote apply.
+	sourceSyncState.expected[inst] = nil
+	return false
+end
+
 local function applyScriptSource(inst, newSource: string, suppressStudioEcho: boolean?): boolean
 	-- Only filesystem-originated writes are echoes. Remote CLI writes are
 	-- Studio-originated mutations and must be allowed through the normal
@@ -2474,10 +2598,14 @@ local function applyScriptSource(inst, newSource: string, suppressStudioEcho: bo
 	-- ChildAdded/Changed signal entirely (most visibly for `rosync new` with an
 	-- initial Source), leaving the new script live-only until reconnect.
 	local suppressEcho = suppressStudioEcho ~= false
+	local sourceGeneration = if suppressEcho then sourceSyncState.expectRemoteSource(inst, newSource) else nil
 	if suppressEcho then
 		lastRemoteApplyClock = os.clock()
 	end
 	if not ScriptEditorService then
+		if sourceGeneration then
+			sourceSyncState.clearExpected(inst, sourceGeneration)
+		end
 		warn("[Ro Sync] ScriptEditorService unavailable; source write was not applied")
 		return false
 	end
@@ -2496,20 +2624,35 @@ local function applyScriptSource(inst, newSource: string, suppressStudioEcho: bo
 		lastRemoteApplyClock = os.clock()
 	end
 	if not ok then
+		if sourceGeneration then
+			sourceSyncState.clearExpected(inst, sourceGeneration)
+		end
 		warn("[Ro Sync] UpdateSourceAsync failed; source write was not applied: " .. tostring(err))
 	end
 	return ok
 end
 
 local function writeScriptSource(inst, newSource: string, suppressStudioEcho: boolean?): boolean
-	if sourcesMatchForApply(readScriptSource(inst), newSource) then
+	-- Equality is authoritative only when it came from the live editor
+	-- document. The raw Source property can lag an open editor buffer; if that
+	-- read is unavailable, force UpdateSourceAsync and return its real result.
+	local currentSource = tryReadScriptSource(inst)
+	if currentSource ~= nil and sourcesMatchForApply(currentSource, newSource) then
+		if suppressStudioEcho ~= false then
+			sourceSyncState.expectRemoteSource(inst, newSource)
+		end
 		return true
 	end
 	return applyScriptSource(inst, newSource, suppressStudioEcho)
 end
 
 local function queueScriptSourceWrite(queue, inst, newSource: string): boolean
-	if sourcesMatchForApply(readScriptSource(inst), newSource) then
+	-- An unreadable editor document is never a successful no-op. Queue the
+	-- write so flushScriptSourceWrites attempts UpdateSourceAsync and reports
+	-- the failure through its failed-source count if Studio rejects it.
+	local currentSource = tryReadScriptSource(inst)
+	if currentSource ~= nil and sourcesMatchForApply(currentSource, newSource) then
+		sourceSyncState.expectRemoteSource(inst, newSource)
 		return false
 	end
 	table.insert(queue, {
@@ -2945,6 +3088,52 @@ function snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx, override)
 		return left.index < right.index
 	end)
 
+	-- GetChildren order is not durable across Studio sessions. Only when the
+	-- structural keys are truly tied, use normalized Source content to give
+	-- otherwise indistinguishable script siblings the same order as Rust's
+	-- snapshot diff. Existing disk-path cache entries still override the fresh
+	-- allocation below, so a later Source edit cannot reshuffle live identity.
+	local groupStart = 1
+	while groupStart <= #projectionEntries do
+		local groupEnd = groupStart
+		local first = projectionEntries[groupStart]
+		while
+			groupEnd + 1 <= #projectionEntries
+			and projectionEntries[groupEnd + 1].reserved == first.reserved
+			and projectionEntries[groupEnd + 1].key == first.key
+		do
+			groupEnd += 1
+		end
+		if groupEnd > groupStart and SCRIPT_CLASSES[first.projection.mappedClass] then
+			local tied = {}
+			local complete = true
+			for index = groupStart, groupEnd do
+				local entry = projectionEntries[index]
+				local source = tryReadScriptSource(entry.child)
+				if source == nil then
+					complete = false
+					break
+				end
+				tied[#tied + 1] = {
+					entry = entry,
+					sourceKey = sha256Hex((source:gsub("\r\n", "\n"))),
+				}
+			end
+			if complete then
+				table.sort(tied, function(left, right)
+					if left.sourceKey ~= right.sourceKey then
+						return left.sourceKey < right.sourceKey
+					end
+					return left.entry.index < right.entry.index
+				end)
+				for offset, item in ipairs(tied) do
+					projectionEntries[groupStart + offset - 1] = item.entry
+				end
+			end
+		end
+		groupStart = groupEnd + 1
+	end
+
 	local allocator = {
 		taken = {},
 		nextOrdinal = {},
@@ -2953,30 +3142,13 @@ function snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx, override)
 		taken = {},
 		nextOrdinal = {},
 	}
-	local byFragment = {}
-	local byInstance = {}
-	local byLookupSegment = {}
-	for _, entry in ipairs(projectionEntries) do
-		local projection = entry.projection
-		local fragment =
-			PathHelpers.allocatePhysicalFragment(allocator, entry.name, projection.mappedClass, projection.directory)
-		byFragment[string.lower(fragment)] = entry.child
-		local logicalSegment = PathHelpers.allocatePhysicalFragment(logicalAllocator, entry.name, "Folder", true)
-		byLookupSegment[logicalSegment] = entry.child
-		byInstance[entry.child] = {
-			fragment = fragment,
-			isDirectory = projection.directory,
-		}
-		if projection.boundary and SCRIPT_CLASSES[projection.mappedClass] then
-			local alternate = PathHelpers.allocatePhysicalFragment(
-				allocator,
-				entry.name,
-				projection.mappedClass,
-				not projection.directory
-			)
-			byFragment[string.lower(alternate)] = entry.child
-		end
-	end
+	-- Exact disk identities are durable once assigned. Reserve every usable
+	-- same-parent cache entry before allocating a fragment for a new sibling;
+	-- otherwise a newly inserted duplicate whose Source sorts first can take
+	-- the cached sibling's base fragment and make both Instances target the
+	-- same file.
+	local cachedFragmentByInstance = {}
+	local cachedFragmentOwner = {}
 	local parentDiskPath = snapshotApplyState.diskPathCache[parent]
 	if parentDiskPath and not override then
 		for _, entry in ipairs(projectionEntries) do
@@ -2992,12 +3164,73 @@ function snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx, override)
 			end
 			if sameParent then
 				local fragment = cached[#cached]
-				byFragment[string.lower(fragment)] = entry.child
-				byInstance[entry.child] = {
-					fragment = fragment,
-					isDirectory = entry.projection.directory,
-				}
+				local usable = type(fragment) == "string"
+					and fragment ~= ""
+					and not string.find(fragment, "/", 1, true)
+					and not string.find(fragment, "\\", 1, true)
+				if usable then
+					local fragmentKey = string.lower(fragment)
+					local owner = cachedFragmentOwner[fragmentKey]
+					if not owner then
+						cachedFragmentOwner[fragmentKey] = entry.child
+						cachedFragmentByInstance[entry.child] = fragment
+						allocator.taken[fragmentKey] = true
+					elseif owner ~= entry.child then
+						-- A prior buggy allocation may have cached the same
+						-- physical file for two Instances. Keep the first
+						-- canonical claimant and rebuild the losing subtree's
+						-- identity instead of silently overwriting a file.
+						snapshotApplyState.clearDiskPathSubtree(entry.child)
+						warn(
+							string.format(
+								"[Ro Sync] repaired duplicate cached disk fragment %q under %s",
+								fragment,
+								parent:GetFullName()
+							)
+						)
+					end
+				else
+					snapshotApplyState.clearDiskPathSubtree(entry.child)
+				end
 			end
+		end
+	end
+	local byFragment = {}
+	local byInstance = {}
+	local byLookupSegment = {}
+	local placementOwner = {}
+	for physicalOrder, entry in ipairs(projectionEntries) do
+		local projection = entry.projection
+		local fragment = cachedFragmentByInstance[entry.child]
+			or PathHelpers.allocatePhysicalFragment(allocator, entry.name, projection.mappedClass, projection.directory)
+		local fragmentKey = string.lower(fragment)
+		local priorOwner = placementOwner[fragmentKey]
+		if priorOwner and priorOwner ~= entry.child then
+			error(string.format("physical sibling fragment collision: %s", fragment), 0)
+		end
+		placementOwner[fragmentKey] = entry.child
+		byFragment[fragmentKey] = entry.child
+		local logicalSegment = PathHelpers.allocatePhysicalFragment(logicalAllocator, entry.name, "Folder", true)
+		byLookupSegment[logicalSegment] = entry.child
+		byInstance[entry.child] = {
+			fragment = fragment,
+			isDirectory = projection.directory,
+			order = physicalOrder,
+		}
+		if projection.boundary and SCRIPT_CLASSES[projection.mappedClass] then
+			local alternate = PathHelpers.allocatePhysicalFragment(
+				allocator,
+				entry.name,
+				projection.mappedClass,
+				not projection.directory
+			)
+			local alternateKey = string.lower(alternate)
+			local alternateOwner = placementOwner[alternateKey]
+			if alternateOwner and alternateOwner ~= entry.child then
+				error(string.format("physical sibling fragment collision: %s", alternate), 0)
+			end
+			placementOwner[alternateKey] = entry.child
+			byFragment[alternateKey] = entry.child
 		end
 	end
 	return {
@@ -3126,6 +3359,15 @@ function snapshotApplyState.diskPathForInstanceShape(inst: Instance, isDirectory
 		end
 	end
 	local stem = if SCRIPT_CLASSES[mappedClass] then PathHelpers.stripScriptSuffix(currentFragment) else currentFragment
+	local encodedDirectoryStem = PathHelpers.encodeName(inst.Name)
+	local encodedLeafStem = PathHelpers.leafScriptStem(inst.Name, mappedClass)
+	if SCRIPT_CLASSES[mappedClass] and encodedDirectoryStem ~= encodedLeafStem then
+		local fromStem = if isDirectory then encodedLeafStem else encodedDirectoryStem
+		local toStem = if isDirectory then encodedDirectoryStem else encodedLeafStem
+		if stem == fromStem or stem:sub(1, #fromStem + 2) == fromStem .. " [" then
+			stem = toStem .. stem:sub(#fromStem + 1)
+		end
+	end
 	local preferred = stem .. (if isDirectory then "" else PathHelpers.scriptSuffix(mappedClass))
 	local fragment
 	if not taken[string.lower(preferred)] then
@@ -3144,7 +3386,38 @@ function snapshotApplyState.diskPathForInstanceShape(inst: Instance, isDirectory
 	return path
 end
 
-function snapshotApplyState.seedDiskPathsForService(service: Instance)
+function snapshotApplyState.sourceDiskPathForInstance(inst: Instance): { string }?
+	if not inst:IsA("LuaSourceContainer") then
+		return nil
+	end
+	local diskPath = snapshotApplyState.diskPathForInstance(inst)
+	if not diskPath then
+		return nil
+	end
+	local parent = inst.Parent
+	if not parent or parent == game then
+		return diskPath
+	end
+	local ctx = snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
+	local siblings = snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx)
+	local placement = siblings.byInstance[inst]
+	if not placement or not placement.isDirectory then
+		return diskPath
+	end
+	local sourcePath = table.clone(diskPath)
+	sourcePath[#sourcePath + 1] = PathHelpers.portableInitFileName(inst.Name, inst.ClassName)
+	return sourcePath
+end
+
+function snapshotApplyState.seedDiskPathsForService(service: Instance, exactIdentities)
+	if exactIdentities then
+		-- Initial comparison receipts are daemon-authored from the exact disk
+		-- snapshot that was compared. Discard every inferred/stale descendant
+		-- identity before installing them.
+		snapshotApplyState.clearDiskPathSubtree(service)
+	end
 	local servicePath = { service.Name }
 	snapshotApplyState.diskPathCache[service] = servicePath
 	local ctx = snapshotApplyState.newContext({
@@ -3159,13 +3432,32 @@ function snapshotApplyState.seedDiskPathsForService(service: Instance)
 	while #stack > 0 do
 		snapshotApplyState.checkpoint(ctx)
 		local frame = table.remove(stack)
-		-- An empty override disables stale cache overlays while retaining the
-		-- exact allocator used for the just-pushed guarded Studio snapshot.
-		local siblings = snapshotApplyState.buildPhysicalSiblingIndex(frame.parent, ctx, {})
+		if exactIdentities then
+			-- Preseed every exact direct-child fragment before allocation so
+			-- cached identities reserve their physical filenames and any
+			-- Studio-only reservation is placed around them.
+			for _, child in ipairs(frame.parent:GetChildren()) do
+				local identity = exactIdentities[child]
+				if identity then
+					local childPath = table.clone(frame.path)
+					childPath[#childPath + 1] = identity.fragment
+					snapshotApplyState.diskPathCache[child] = childPath
+				end
+			end
+		end
+		local siblings = if exactIdentities
+			then snapshotApplyState.buildPhysicalSiblingIndex(frame.parent, ctx)
+			-- An empty override disables stale cache overlays while retaining
+			-- the allocator used for a just-pushed guarded Studio snapshot.
+			else snapshotApplyState.buildPhysicalSiblingIndex(frame.parent, ctx, {})
 		for child, placement in pairs(siblings.byInstance) do
 			local childPath = table.clone(frame.path)
 			childPath[#childPath + 1] = placement.fragment
 			snapshotApplyState.diskPathCache[child] = childPath
+			local exact = exactIdentities and exactIdentities[child]
+			if exact and (placement.fragment ~= exact.fragment or placement.isDirectory ~= exact.isDirectory) then
+				error("daemon-authored disk identity does not match Studio projection", 0)
+			end
 			if placement.isDirectory then
 				stack[#stack + 1] = {
 					parent = child,
@@ -4356,7 +4648,6 @@ end
 
 local pendingOps = {}
 local pushPending = false
-local pendingEditorSourceByScript: { [Instance]: { source: string, serial: number } } = {}
 local EDITOR_SOURCE_DEBOUNCE = 0.35
 -- Group scale-related helpers/state behind one top-level register. This file is
 -- intentionally close to Luau's 200-register chunk limit.
@@ -4570,8 +4861,8 @@ flushPush = function()
 	end
 end
 
-local function queueOp(op)
-	if isEchoing() then
+local function queueOp(op, bypassClockEchoGuard: boolean?)
+	if not bypassClockEchoGuard and isEchoing() then
 		return
 	end
 	local generation = wsGeneration
@@ -4600,11 +4891,16 @@ local function queueScriptUpdateOp(inst: Instance, source: string)
 		path = pathFromRoot(inst),
 		properties = { Source = source },
 	}
-	local diskPath = snapshotApplyState.diskPathForInstance(inst)
+	-- A script with projected children is represented by a directory. Source
+	-- belongs to its init marker file, never to that directory itself.
+	local diskPath = snapshotApplyState.sourceDiskPathForInstance(inst)
 	if diskPath then
 		op.diskPath = diskPath
 	end
-	queueOp(op)
+	-- Source echo suppression is per-script and exact-value based. Never let
+	-- an unrelated long-running remote apply's global structure clock discard
+	-- a genuine editor commit.
+	queueOp(op, true)
 end
 
 local function scriptFromDocument(document): Instance?
@@ -4630,44 +4926,71 @@ local function sourceFromDocument(document, scriptInst: Instance): string?
 	if okText and type(text) == "string" then
 		return text
 	end
-	return readScriptSource(scriptInst)
+	local source = tryReadScriptSource(scriptInst)
+	return source
 end
 
 local function queueEditorSourceChanged(scriptInst: Instance, source: string)
-	local pending = pendingEditorSourceByScript[scriptInst]
-	if pending and pending.source == source then
+	if sourceSyncState.consumeExpected(scriptInst, source) then
+		return
+	end
+	local sourceHash = sha256Hex(source)
+	local pending = sourceSyncState.pending[scriptInst]
+	if pending and pending.sourceHash == sourceHash then
 		return
 	end
 	local serial = pending and (pending.serial + 1) or 1
-	pendingEditorSourceByScript[scriptInst] = {
-		source = source,
+	sourceSyncState.pending[scriptInst] = {
+		sourceHash = sourceHash,
 		serial = serial,
+		generation = sourceSyncState.generation[scriptInst] or 0,
 	}
 	task.delay(EDITOR_SOURCE_DEBOUNCE, function()
-		local latest = pendingEditorSourceByScript[scriptInst]
-		if not latest or latest.serial ~= serial then
-			return
-		end
-		pendingEditorSourceByScript[scriptInst] = nil
-		if isEchoing() then
+		local latest = sourceSyncState.pending[scriptInst]
+		if
+			not latest
+			or latest.serial ~= serial
+			or latest.generation ~= (sourceSyncState.generation[scriptInst] or 0)
+		then
 			return
 		end
 		if scriptInst.Parent == nil then
+			sourceSyncState.pending[scriptInst] = nil
 			return
 		end
 		if not isUnderWatched(scriptInst) then
+			sourceSyncState.pending[scriptInst] = nil
 			return
 		end
 		if isGeneratedDiskRoot(scriptInst) then
+			sourceSyncState.pending[scriptInst] = nil
 			return
 		end
 		if isAvoidSyncBlocked(scriptInst) then
+			sourceSyncState.pending[scriptInst] = nil
 			return
 		end
 		if not scriptInst:IsA("LuaSourceContainer") then
+			sourceSyncState.pending[scriptInst] = nil
 			return
 		end
-		queueScriptUpdateOp(scriptInst, latest.source)
+		-- TextDocumentDidChange may fire many times before this callback. Commit
+		-- the editor's current text, not the stale text captured by the first
+		-- event in the debounce window.
+		local currentSource, sourceErr = tryReadScriptSource(scriptInst)
+		if currentSource == nil then
+			sourceSyncState.pending[scriptInst] = nil
+			log("editor Source read failed: " .. tostring(sourceErr))
+			if connected then
+				scaleState.requestControlledLiveResync("Studio editor Source became unreadable")
+			end
+			return
+		end
+		sourceSyncState.pending[scriptInst] = nil
+		if sourceSyncState.consumeExpected(scriptInst, currentSource) then
+			return
+		end
+		queueScriptUpdateOp(scriptInst, currentSource)
 	end)
 end
 
@@ -4891,8 +5214,12 @@ scaleState.serializeLiveInstance = function(inst: Instance)
 			and not scaleState.liveResyncPending
 	end
 	local node, serializeErr = serializeInstance(inst, shouldContinue)
-	if not node and serializeErr == "oversized" and shouldContinue() then
-		scaleState.requestControlledLiveResync("large Studio subtree requires the bounded bootstrap stream")
+	if not node and serializeErr and serializeErr ~= "cancelled" and shouldContinue() then
+		if serializeErr == "oversized" then
+			scaleState.requestControlledLiveResync("large Studio subtree requires the bounded bootstrap stream")
+		else
+			scaleState.requestControlledLiveResync("Studio subtree Source read failed: " .. tostring(serializeErr))
+		end
 	end
 	return node
 end
@@ -5175,7 +5502,8 @@ onChanged = function(inst, prop)
 			scaleState.markAvoidSyncPathsDirty()
 		end
 	end
-	if isEchoing() then
+	local sourceChange = prop == "Source" and inst:IsA("LuaSourceContainer")
+	if not sourceChange and isEchoing() then
 		return
 	end
 	if not isUnderWatched(inst) then
@@ -5185,6 +5513,18 @@ onChanged = function(inst, prop)
 		return
 	end
 	if isAvoidSyncBlocked(inst) then
+		return
+	end
+	if sourceChange then
+		local source, sourceErr = tryReadScriptSource(inst)
+		if source == nil then
+			log("Source change could not read the Studio editor buffer: " .. tostring(sourceErr))
+			if connected then
+				scaleState.requestControlledLiveResync("Studio Source change could not be read")
+			end
+			return
+		end
+		queueEditorSourceChanged(inst, source)
 		return
 	end
 	if prop == "Name" then
@@ -5219,10 +5559,6 @@ onChanged = function(inst, prop)
 			renameOp.toDiskPath = newDiskPath
 		end
 		queueOp(renameOp)
-		return
-	end
-	if prop == "Source" and inst:IsA("LuaSourceContainer") then
-		queueScriptUpdateOp(inst, readScriptSource(inst))
 		return
 	end
 	-- Every other property is Studio-authoritative. No op, no tree push —
@@ -5265,6 +5601,9 @@ onAvoidSyncChanged = function(inst)
 end
 
 disconnectInstance = function(inst)
+	sourceSyncState.pending[inst] = nil
+	sourceSyncState.expected[inst] = nil
+	sourceSyncState.generation[inst] = nil
 	local bucket = connections[inst]
 	if not bucket then
 		return
@@ -5481,7 +5820,9 @@ disconnectHooks = function()
 	end
 	serviceConnections = {}
 	scaleState.itemChangedAvailable = false
-	pendingEditorSourceByScript = {}
+	sourceSyncState.pending = {}
+	sourceSyncState.expected = {}
+	sourceSyncState.generation = {}
 	while next(connections) do
 		local inst = next(connections)
 		disconnectInstance(inst)
@@ -5672,9 +6013,6 @@ local function installHooks(shouldContinue): boolean
 		table.insert(
 			serviceConnections,
 			ScriptEditorService.TextDocumentDidChange:Connect(function(document, _changes)
-				if isEchoing() then
-					return
-				end
 				local scriptInst = scriptFromDocument(document)
 				if not scriptInst then
 					return
@@ -6088,7 +6426,7 @@ scaleState.collectStudioStatsWithGuard = function(guard)
 	return stats, progress
 end
 
--- Protocol 5 emits source-free, parent-linked records directly from the
+-- Protocol 6 emits source-free, parent-linked records directly from the
 -- projection index. It never materializes a nested service table, and keeps
 -- each JSON request bounded even when one service owns the whole project.
 scaleState.streamStudioServiceStructure = function(service: Instance, guard, sendChunk)
@@ -6096,8 +6434,12 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	if type(projectionInfo) ~= "table" or not projectionInfo[service] then
 		return nil, "Studio projection index is unavailable"
 	end
+	local orderingContext = snapshotApplyState.newContext({
+		indexAvoidSyncCarriers = true,
+	})
 	local records = {}
 	local sourceInstances = {}
+	local instanceById = {}
 	local nextId = 0
 	local chunkIndex = 0
 	local function flush(finalChunk)
@@ -6142,6 +6484,7 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 			frame.entered = true
 			frame.id = nextId
 			nextId += 1
+			instanceById[frame.id + 1] = frame.inst
 			if nextId % scaleState.studioScanYieldEvery == 0 then
 				task.wait()
 				if guard and guard.dirty then
@@ -6176,19 +6519,34 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 				}
 			end
 			frame.children = {}
+			local physicalSiblings = snapshotApplyState.buildPhysicalSiblingIndex(frame.inst, orderingContext, {})
 			for _, child in ipairs(frame.inst:GetChildren()) do
 				if projectionInfo[child] then
-					frame.children[#frame.children + 1] = child
+					local placement = physicalSiblings.byInstance[child]
+					if not placement then
+						return nil, "Studio projection could not allocate a canonical child identity"
+					end
+					frame.children[#frame.children + 1] = {
+						inst = child,
+						fragment = placement.fragment,
+						order = placement.order,
+					}
 				end
 			end
+			table.sort(frame.children, function(left, right)
+				if left.order ~= right.order then
+					return left.order < right.order
+				end
+				return left.fragment < right.fragment
+			end)
 			frame.nextChild = 1
 		end
-		local child = frame.children[frame.nextChild]
-		if child then
+		local childEntry = frame.children[frame.nextChild]
+		if childEntry then
 			local childIndex = frame.nextChild - 1
 			frame.nextChild += 1
 			stack[#stack + 1] = {
-				inst = child,
+				inst = childEntry.inst,
 				parentId = frame.id,
 				childIndex = childIndex,
 				depth = frame.depth + 1,
@@ -6202,15 +6560,18 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	if not ok then
 		return nil, err
 	end
-	return sourceInstances, nil
+	return sourceInstances, nil, instanceById
 end
 
-scaleState.normalizedSourceHash = function(inst: Instance): string
-	local source = readScriptSource(inst)
+scaleState.normalizedSourceHash = function(inst: Instance): (string?, string?)
+	local source, sourceErr = tryReadScriptSource(inst)
+	if source == nil then
+		return nil, sourceErr
+	end
 	if string.find(source, "\r\n", 1, true) then
 		source = string.gsub(source, "\r\n", "\n")
 	end
-	return sha256Hex(source)
+	return sha256Hex(source), nil
 end
 
 scaleState.collectStudioState = function()
@@ -9923,6 +10284,8 @@ do
 		return {
 			pluginVersion = PLUGIN_VERSION_STRING,
 			protocolVersion = PLUGIN_PROTOCOL_VERSION,
+			buildCommit = PLUGIN_BUILD_COMMIT,
+			buildDirty = PLUGIN_BUILD_DIRTY,
 			hostDataModelType = hostType,
 			placeId = tostring(game.PlaceId),
 			gameId = tostring(game.GameId),
@@ -10590,6 +10953,8 @@ do
 		return {
 			plugin_version = PLUGIN_VERSION_STRING,
 			protocol = PLUGIN_PROTOCOL_VERSION,
+			build_commit = PLUGIN_BUILD_COMMIT,
+			build_dirty = PLUGIN_BUILD_DIRTY,
 			studio_version = studioVersion,
 		}
 	end
@@ -11619,6 +11984,8 @@ reconnectState.refreshHello = function()
 			candidateUrl = tostring(discovered.url or ""):gsub("/+$", "")
 			candidatePort = tostring(discovered.port or candidatePort or "?")
 			hello, helloError = readHello(candidateUrl)
+		elseif type(discovered) == "table" and discovered.ambiguous == true then
+			return false, "multiple Ro Sync projects match this place; enter the intended daemon URL manually", true
 		end
 	end
 
@@ -11805,16 +12172,36 @@ local function wsLoop(gen)
 					elseif kind == "ping" then
 						wsSend(client, { type = "pong" })
 					elseif kind == "push-result" then
-						if msg.ok == false or (msg.errors and #msg.errors > 0) then
+						local skipped = tonumber(msg.skipped) or 0
+						local conflictCount = if type(msg.conflicts) == "table"
+							then #msg.conflicts
+							else tonumber(msg.conflicts) or 0
+						local errorCount = if type(msg.errors) == "table"
+							then #msg.errors
+							else tonumber(msg.errors) or 0
+						if msg.ok == false or skipped > 0 or conflictCount > 0 or errorCount > 0 then
 							log(
 								string.format(
-									"ws push-result: ok=%s applied=%s skipped=%s errs=%s",
+									"ws push-result incomplete: ok=%s applied=%s skipped=%d conflicts=%d errors=%d",
 									tostring(msg.ok),
 									tostring(msg.applied),
-									tostring(msg.skipped),
-									tostring(msg.errors and #msg.errors or 0)
+									skipped,
+									conflictCount,
+									errorCount
 								)
 							)
+							recoveryContext = string.format(
+								"daemon did not fully apply a Studio update (%d skipped, %d conflict(s), %d error(s))",
+								skipped,
+								conflictCount,
+								errorCount
+							)
+							setBanner(
+								"A Studio update was not fully written to disk. Ro Sync is reconciling before continuing."
+							)
+							pcall(function()
+								client:Close()
+							end)
 						end
 					elseif kind == "request" then
 						remoteState.handleRemoteRequest(client, msg)
@@ -12471,7 +12858,17 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				if not shouldContinue() then
 					return false
 				end
-				local source = readScriptSource(sourceEntry.inst)
+				local source, sourceErr = tryReadScriptSource(sourceEntry.inst)
+				if source == nil then
+					log(
+						string.format(
+							"push Source %s could not read the Studio editor buffer: %s",
+							pathOf(sourceEntry.inst),
+							tostring(sourceErr)
+						)
+					)
+					return false
+				end
 				if #source > scaleState.maxScriptSourceBytes then
 					log(
 						string.format(
@@ -13901,7 +14298,11 @@ runInitialCompare = function()
 		reconnectState.stopTerminal("daemon returned a malformed initial-compare response")
 		return
 	end
+	local comparedDiskIdentities = nil
+	local comparedDiskIdentityServices = nil
 	if tostring(resp.action) == "compare" then
+		comparedDiskIdentities = setmetatable({}, { __mode = "k" })
+		comparedDiskIdentityServices = {}
 		if scanBecameDirty("Studio changed before streamed comparison") then
 			return
 		end
@@ -14034,7 +14435,7 @@ runInitialCompare = function()
 				reconnectState.retryInitialCompare("could not read Studio service " .. tostring(serviceName))
 				return
 			end
-			local sourceInstances, streamErr = scaleState.streamStudioServiceStructure(
+			local sourceInstances, streamErr, instanceById = scaleState.streamStudioServiceStructure(
 				service,
 				scanGuard,
 				function(_suggestedChunkIndex, finalChunk, records)
@@ -14173,19 +14574,150 @@ runInitialCompare = function()
 					tostring(resp.action) ~= "compare"
 					or resp.compareId ~= compareId
 					or resp.nextService ~= serviceName
-					or resp.phase ~= "hashes"
+					or resp.phase ~= "identities"
 					or tonumber(resp.nextChunk) ~= 0
 				then
 					disposeScanGuard()
-					reconnectState.retryInitialCompare("daemon disk preparation did not advance to script hashes")
+					reconnectState.retryInitialCompare("daemon disk preparation did not advance to disk identities")
 					return
 				end
 			end
-			if resp.nextService ~= serviceName or resp.phase ~= "hashes" or tonumber(resp.nextChunk) ~= 0 then
+			local identityCount = tonumber(resp.identityCount)
+			if
+				resp.nextService ~= serviceName
+				or resp.phase ~= "identities"
+				or tonumber(resp.nextChunk) ~= 0
+				or not identityCount
+				or identityCount < 0
+				or identityCount % 1 ~= 0
+				or identityCount > scaleState.maxStreamNodes
+				or type(instanceById) ~= "table"
+			then
 				disposeScanGuard()
-				reconnectState.retryInitialCompare("daemon did not start the script hash stream")
+				reconnectState.retryInitialCompare("daemon did not start a valid disk identity stream")
 				return
 			end
+			local identitySeen = {}
+			local fragmentOwners = setmetatable({}, { __mode = "k" })
+			local receivedIdentities = 0
+			while true do
+				local identityChunk = tonumber(resp.nextChunk)
+				if not identityChunk or identityChunk < 0 or identityChunk % 1 ~= 0 then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare("daemon advanced disk identities out of order")
+					return
+				end
+				local identityOk, identityErr = postCompareChunk(
+					serviceName,
+					"identities",
+					identityChunk,
+					false,
+					{},
+					{}
+				)
+				if not identityOk then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare(identityErr or "disk identity stream failed")
+					return
+				end
+				local identities = resp.identities
+				local finalIdentityChunk = resp.finalChunk
+				if
+					tostring(resp.action) ~= "compare"
+					or resp.compareId ~= compareId
+					or resp.nextService ~= serviceName
+					or resp.phase ~= "identities"
+					or tonumber(resp.chunkIndex) ~= identityChunk
+					or tonumber(resp.identityCount) ~= identityCount
+					or type(identities) ~= "table"
+					or #identities > scaleState.structureChunkRecords
+					or type(finalIdentityChunk) ~= "boolean"
+					or (#identities == 0 and not finalIdentityChunk)
+				then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare("daemon returned a malformed disk identity chunk")
+					return
+				end
+				for _, identity in ipairs(identities) do
+					local id = type(identity) == "table" and tonumber(identity.id) or nil
+					local fragment = type(identity) == "table" and identity.diskFragment or nil
+					local isDirectory = type(identity) == "table" and identity.diskFragmentIsDir or nil
+					local inst = id and id % 1 == 0 and id > 0 and instanceById[id + 1] or nil
+					local info = inst and scanGuard.projectionInfo[inst] or nil
+					local expectedDirectory = info and (info.class == "Folder" or info.hasChildren == true) or nil
+					if
+						not id
+						or identitySeen[id]
+						or not inst
+						or not info
+						or info.avoidSync == true
+						or info.avoidSyncCarrier == true
+						or not PathHelpers.isPortableDiskFragment(fragment)
+						or type(isDirectory) ~= "boolean"
+						or isDirectory ~= expectedDirectory
+					then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare("daemon returned an invalid disk identity")
+						return
+					end
+					local parent = inst.Parent
+					if not parent then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare("disk identity target lost its parent")
+						return
+					end
+					local owners = fragmentOwners[parent]
+					if not owners then
+						owners = {}
+						fragmentOwners[parent] = owners
+					end
+					local fragmentKey = string.lower(fragment)
+					if owners[fragmentKey] and owners[fragmentKey] ~= inst then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare("daemon returned colliding sibling disk identities")
+						return
+					end
+					owners[fragmentKey] = inst
+					identitySeen[id] = true
+					comparedDiskIdentities[inst] = {
+						fragment = fragment,
+						isDirectory = isDirectory,
+					}
+					receivedIdentities += 1
+					if receivedIdentities > identityCount then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare("daemon exceeded its declared disk identity count")
+						return
+					end
+				end
+				if finalIdentityChunk then
+					if
+						receivedIdentities ~= identityCount
+						or resp.nextPhase ~= "hashes"
+						or tonumber(resp.nextChunk) ~= 0
+					then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare("daemon ended an incomplete disk identity stream")
+						return
+					end
+					break
+				end
+				if tonumber(resp.nextChunk) ~= identityChunk + 1 then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare("daemon did not acknowledge the exact disk identity cursor")
+					return
+				end
+			end
+			comparedDiskIdentityServices[serviceName] = true
+			-- The final identity page advances daemon state to hashes. Keep the
+			-- local cursor explicit rather than asking for an unbounded receipt.
+			resp = {
+				action = "compare",
+				compareId = compareId,
+				nextService = serviceName,
+				phase = "hashes",
+				nextChunk = 0,
+			}
 
 			local sourceIndex = 1
 			local hashChunkIndex = 0
@@ -14193,9 +14725,17 @@ runInitialCompare = function()
 				local hashes = {}
 				while sourceIndex <= #sourceInstances and #hashes < scaleState.compareHashChunkRecords do
 					local sourceEntry = sourceInstances[sourceIndex]
+					local sourceHash, sourceErr = scaleState.normalizedSourceHash(sourceEntry.inst)
+					if sourceHash == nil then
+						disposeScanGuard()
+						reconnectState.retryInitialCompare(
+							"Studio Source could not be read coherently: " .. tostring(sourceErr)
+						)
+						return
+					end
 					hashes[#hashes + 1] = {
 						id = sourceEntry.id,
-						sha256 = scaleState.normalizedSourceHash(sourceEntry.inst),
+						sha256 = sourceHash,
 					}
 					sourceIndex += 1
 					if sourceIndex % scaleState.compareHashChunkRecords == 0 then
@@ -14262,9 +14802,42 @@ runInitialCompare = function()
 	end
 	local action = tostring(resp.action)
 	if action == "in-sync" then
-		-- Daemon says disk and Studio already match within tolerance — skip
-		-- the overwrite prompt and start hooks directly.
+		-- Seed only daemon-authored physical identities from the exact disk
+		-- snapshot that produced this clean comparison. Re-deriving duplicate
+		-- filenames from mutable Studio ordering would make future live writes
+		-- target an inferred sibling rather than the file that was compared.
 		log("initial-compare: already in sync, skipping decision modal")
+		for _, serviceName in ipairs(WATCHED_SERVICES) do
+			if
+				not comparedDiskIdentities
+				or not comparedDiskIdentityServices
+				or comparedDiskIdentityServices[serviceName] ~= true
+			then
+				disposeScanGuard()
+				reconnectState.retryInitialCompare("clean comparison omitted daemon-authored disk identities")
+				return
+			end
+		end
+		for _, serviceName in ipairs(WATCHED_SERVICES) do
+			local serviceOk, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if serviceOk and service then
+				local seeded, seedErr = pcall(function()
+					snapshotApplyState.seedDiskPathsForService(service, comparedDiskIdentities)
+				end)
+				if not seeded then
+					disposeScanGuard()
+					reconnectState.retryInitialCompare(
+						"daemon-authored disk identity installation failed: " .. tostring(seedErr)
+					)
+					return
+				end
+			end
+		end
+		if scanBecameDirty("Studio changed while seeding live disk identities") then
+			return
+		end
 		completeInitialCompare()
 	elseif action == "push" then
 		-- Empty-disk bootstrap streams one service at a time.
@@ -14499,8 +15072,9 @@ local function projectInitUnavailableMessage(hello)
 end
 
 reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
-	-- Probe concurrently, but choose the lowest-port exact match and initializer
-	-- deterministically after all completed probes have been collected.
+	-- Probe concurrently. A PlaceId match may select one project among several
+	-- daemons for the same experience, but never guess by lowest port when
+	-- multiple exact project candidates remain.
 	if not quiet then
 		setPill("probing")
 		log(string.format("probing ports %d..%d for GameId %s", PORT_RANGE_START, PORT_RANGE_END, gameId))
@@ -14510,6 +15084,8 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		url = nil,
 		port = nil,
 		sawWrongGame = false,
+		ambiguous = false,
+		candidateCount = 0,
 		initializer = nil,
 		initializerError = nil,
 	}
@@ -14536,14 +15112,17 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 
 	local probes = probeRange(PORT_RANGE_START, PORT_RANGE_END)
 	local daemonInitializer = nil
+	local gameMatches = {}
 
 	for port = PORT_RANGE_START, PORT_RANGE_END do
 		local probe = probes[port]
 		if probe then
-			if probe.matched and not result.found then
-				result.found = true
-				result.url = probe.url
-				result.port = port
+			if probe.matched then
+				gameMatches[#gameMatches + 1] = {
+					url = probe.url,
+					port = port,
+					hello = probe.hello,
+				}
 			elseif probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
@@ -14553,12 +15132,35 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		end
 	end
 
+	local currentPlaceId = tostring(game.PlaceId)
+	local exactPlaceMatches = {}
+	for _, candidate in ipairs(gameMatches) do
+		local placeIds = candidate.hello and candidate.hello.placeIds
+		if type(placeIds) == "table" then
+			for _, placeId in ipairs(placeIds) do
+				if tostring(placeId) == currentPlaceId then
+					exactPlaceMatches[#exactPlaceMatches + 1] = candidate
+					break
+				end
+			end
+		end
+	end
+	local candidates = if #exactPlaceMatches > 0 then exactPlaceMatches else gameMatches
+	result.candidateCount = #candidates
+	if #candidates == 1 then
+		result.found = true
+		result.url = candidates[1].url
+		result.port = candidates[1].port
+	elseif #candidates > 1 then
+		result.ambiguous = true
+	end
+
 	-- The Desktop broker is deliberately outside the project-daemon range. It
 	-- exists even when there are no projects yet, so inspect it only after no
 	-- matching GameId daemon was found. Prefer it over a wrong-game daemon's
 	-- initializer because Desktop owns the configured projects root and daemon
 	-- lifecycle handoff.
-	if not result.found and includeInitializer ~= false then
+	if not result.found and not result.ambiguous and includeInitializer ~= false then
 		if not quiet then
 			log(string.format("probing Desktop broker ports %d..%d", BROKER_PORT_START, BROKER_PORT_END))
 		end
@@ -14772,6 +15374,14 @@ local function createProjectAndWait(candidate, attempt)
 			log(string.format("Desktop daemon ready at %s", tostring(result.url)))
 			beginDaemonConnection(result.url, result.port)
 			return
+		elseif result.ambiguous then
+			busy = false
+			setPill("error", "multiple projects")
+			setBanner(
+				"Multiple Ro Sync projects now match this place. Enter the intended daemon URL manually to finish connecting."
+			)
+			log("project-init: daemon discovery became ambiguous")
+			return
 		end
 		task.wait(1)
 	end
@@ -14910,7 +15520,20 @@ startConnect = function()
 				return
 			end
 			if not result.found then
-				if result.initializer ~= nil then
+				if result.ambiguous then
+					setPill("error", "multiple projects")
+					setBanner(
+						"Multiple Ro Sync projects match this place. Enter the intended daemon URL manually instead of choosing by port."
+					)
+					log(
+						string.format(
+							"daemon discovery is ambiguous: %d project(s) match GameId %s and PlaceId %s",
+							tonumber(result.candidateCount) or 0,
+							gameId,
+							tostring(game.PlaceId)
+						)
+					)
+				elseif result.initializer ~= nil then
 					projectInitCandidate = result.initializer
 					setPill("project_init")
 					setBanner(

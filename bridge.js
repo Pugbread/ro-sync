@@ -42,6 +42,57 @@ const pending = new Map();          // id -> {resolve, reject, timer}
 const listeners = new Map();        // t64 event type -> Set<fn>
 let daemonAuthToken = null;
 const daemonAuthTokensByBase = new Map();
+const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+
+async function runFetchWithDeadline(
+  url,
+  init = {},
+  defaultTimeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
+  consume = (response) => response,
+) {
+  const { timeoutMs: requestedTimeout, signal: sourceSignal, ...fetchInit } = init || {};
+  const parsedTimeout = Number(requestedTimeout ?? defaultTimeoutMs);
+  const timeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0
+    ? parsedTimeout
+    : defaultTimeoutMs;
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(sourceSignal?.reason);
+  if (sourceSignal?.aborted) {
+    forwardAbort();
+  } else if (sourceSignal) {
+    sourceSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException(`fetch timed out after ${timeoutMs}ms`, "TimeoutError"));
+  }, timeoutMs);
+  try {
+    const response = await fetch(url, { ...fetchInit, signal: controller.signal });
+    return await consume(response);
+  } finally {
+    clearTimeout(timer);
+    if (sourceSignal) sourceSignal.removeEventListener("abort", forwardAbort);
+  }
+}
+
+export function fetchWithDeadline(url, init = {}, defaultTimeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
+  return runFetchWithDeadline(url, init, defaultTimeoutMs);
+}
+
+export function fetchJsonWithDeadline(url, init = {}, defaultTimeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
+  return runFetchWithDeadline(
+    url,
+    init,
+    defaultTimeoutMs,
+    async (response) => {
+      // Parsing is part of the same deadline. In particular, do not convert an
+      // AbortError from a stalled body into a successful response with null
+      // JSON; lifecycle callers must treat malformed or incomplete bodies as
+      // an unreachable daemon.
+      const json = await response.json();
+      return { response, json };
+    },
+  );
+}
 
 function daemonBaseKey(base) {
   if (!base) return null;
@@ -256,8 +307,13 @@ export const host = Object.freeze({
 
   async readResourceText(path) {
     try {
-      const response = await fetch(path);
-      if (response.ok) return await response.text();
+      const text = await runFetchWithDeadline(
+        path,
+        { timeoutMs: 5000 },
+        5000,
+        async (response) => (response.ok ? response.text() : null),
+      );
+      if (text != null) return text;
     } catch {}
     if (IS_DESKTOP_HOST) {
       return unwrapText(await invokeDesktop("read_resource_file", { path }));
@@ -444,7 +500,7 @@ export function daemonURL(base, path = "", authToken) {
 
 export async function daemonFetch(base, path, init = {}) {
   const url = daemonURL(base, path);
-  const res = await fetch(url, {
+  const res = await fetchWithDeadline(url, {
     ...init,
     headers: { "content-type": "application/json", ...(init.headers || {}) },
   });
@@ -452,10 +508,20 @@ export async function daemonFetch(base, path, init = {}) {
 }
 
 export async function daemonJson(base, path, init) {
-  const res = await daemonFetch(base, path, init);
-  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
-  const ct = res.headers.get("content-type") || "";
-  return ct.includes("json") ? res.json() : res.text();
+  const url = daemonURL(base, path);
+  return runFetchWithDeadline(
+    url,
+    {
+      ...(init || {}),
+      headers: { "content-type": "application/json", ...(init?.headers || {}) },
+    },
+    DEFAULT_FETCH_TIMEOUT_MS,
+    async (res) => {
+      if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+      const ct = res.headers.get("content-type") || "";
+      return ct.includes("json") ? res.json() : res.text();
+    },
+  );
 }
 
 // Thin SSE wrapper. handlers = { open, message, error, [customEventName]: fn }.
@@ -524,7 +590,7 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
           type: "hello",
           clientId: "terminal64-widget",
           role: "watch",
-          protocol: 5,
+          protocol: 6,
         }));
       } catch {}
       if (handlers.open) { try { handlers.open(e); } catch (err) { console.error(err); } }

@@ -7,10 +7,12 @@
 //
 // Wire framing: serde-tagged JSON over `Message::Text`.
 //   ClientMsg (tag "type", lowercase):
-//     {"type":"hello","clientId":"<string>","role":"plugin","protocol":5}
+//     {"type":"hello","clientId":"<string>","role":"plugin","protocol":6}
 //     {"type":"push","ops":[<plugin-shape op>, ...]}
 //     {"type":"ping"}   // server replies with pong
 //     {"type":"pong"}   // reply to server ping (no-op)
+//     {"type":"request","request_id":1,"op":"get","args":{},"timeout_ms":5000}
+//                         // timeout is optional for backward-compatible clients
 //
 //   ServerMsg (tag "type", kebab-case):
 //     {"type":"op","op":<plugin-shape op>}
@@ -18,7 +20,6 @@
 //     {"type":"pong"}            // reply to client ping
 //     {"type":"shutdown","reason":"...","code":"...","retryable":true}
 //                                      // daemon/plugin session is closing
-//     {"type":"lagged"}          // broadcast overflow; close follows
 //     {"type":"push-result", ok, applied, skipped, conflicts, errors}
 //     {"type":"error","error":"..."}
 //   Pre-existing event strings from `AppState::events` are passed through
@@ -37,14 +38,23 @@ use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::http::{apply_push_ops, event_to_plugin_op, is_authorized_widget_browser_request};
 use crate::AppState;
 
-pub(crate) const PLUGIN_PROTOCOL_VERSION: u64 = 5;
+pub(crate) const PLUGIN_PROTOCOL_VERSION: u64 = 6;
 const PLUGIN_INBOUND_TIMEOUT: Duration = Duration::from_secs(45);
+const PLUGIN_POST_WAKE_GRACE: Duration = Duration::from_secs(30);
+const UNIDENTIFIED_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_ROUTES: usize = 1024;
+const MAX_PENDING_ROUTES_PER_CONNECTION: usize = 64;
+const DEFAULT_PENDING_ROUTE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const PENDING_ROUTE_COMPLETION_GRACE: Duration = Duration::from_secs(10);
+const PENDING_ROUTE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Routing table for in-flight request/response pairs, keyed by a daemon-owned
 /// correlation id. Client-provided ids are retained only for translating the
@@ -55,11 +65,87 @@ pub type PendingRoutes = Arc<Mutex<HashMap<u64, PendingRoute>>>;
 pub struct PendingRoute {
     client_request_id: u64,
     origin_conn_id: u64,
-    sink: UnboundedSender<Message>,
+    sink: OutboundHandle,
     activity_op: String,
     activity_detail: Value,
     activity_started_at: Instant,
+    expires_at: Instant,
     publish_activity: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingRouteLimit {
+    Global,
+    Connection,
+}
+
+impl PendingRouteLimit {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Global => "pending-route-capacity",
+            Self::Connection => "connection-route-capacity",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Global => "the daemon has reached its pending Studio request capacity",
+            Self::Connection => "this connection has reached its pending Studio request capacity",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionClose {
+    reason: String,
+    code: &'static str,
+    retryable: bool,
+}
+
+impl ConnectionClose {
+    fn new(reason: impl Into<String>, code: &'static str, retryable: bool) -> Self {
+        Self {
+            reason: reason.into(),
+            code,
+            retryable,
+        }
+    }
+}
+
+/// Bounded normal-priority queue plus an independent close signal. A stalled
+/// peer can fill the data queue, but overload still wakes the send task and
+/// cannot retain unbounded messages or block connection/plugin cleanup.
+#[derive(Clone)]
+struct OutboundHandle {
+    tx: mpsc::Sender<Message>,
+    close_tx: watch::Sender<Option<ConnectionClose>>,
+}
+
+impl OutboundHandle {
+    fn send(&self, message: Message) -> Result<(), ()> {
+        match self.tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.close(ConnectionClose::new(
+                    "outbound WebSocket queue exceeded its bounded capacity",
+                    "outbound-overload",
+                    true,
+                ));
+                Err(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    fn close(&self, reason: ConnectionClose) {
+        if self.close_tx.borrow().is_none() {
+            self.close_tx.send_replace(Some(reason));
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 /// Broadcast envelope for a client-originated request. Every connection's
@@ -103,21 +189,52 @@ impl PeerKind {
 
 struct PeerState {
     kind: AtomicU8,
+    connected_at: Instant,
     last_inbound: Mutex<Instant>,
+}
+
+struct SendPeer {
+    conn_id: u64,
+    state: Arc<PeerState>,
+    enforce_hello_deadline: bool,
 }
 
 impl PeerState {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             kind: AtomicU8::new(PeerKind::Unidentified as u8),
-            last_inbound: Mutex::new(Instant::now()),
+            connected_at: now,
+            last_inbound: Mutex::new(now),
         }
     }
+}
+
+fn unidentified_hello_expired(
+    peer_kind: PeerKind,
+    enforce_deadline: bool,
+    connected_at: Instant,
+    now: Instant,
+) -> bool {
+    enforce_deadline
+        && peer_kind == PeerKind::Unidentified
+        && now.saturating_duration_since(connected_at) >= UNIDENTIFIED_HELLO_TIMEOUT
 }
 
 fn plugin_inbound_expired(peer_kind: PeerKind, last_seen: Instant, now: Instant) -> bool {
     peer_kind == PeerKind::Plugin
         && now.saturating_duration_since(last_seen) > PLUGIN_INBOUND_TIMEOUT
+}
+
+fn plugin_inbound_should_close(
+    peer_kind: PeerKind,
+    last_seen: Instant,
+    suspect_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    plugin_inbound_expired(peer_kind, last_seen, now)
+        && suspect_since
+            .is_some_and(|since| now.saturating_duration_since(since) > PLUGIN_POST_WAKE_GRACE)
 }
 
 /// Capability presented by the native Studio plugin during its WS hello.
@@ -158,6 +275,8 @@ pub enum ClientMsg {
         op: String,
         #[serde(default)]
         args: Value,
+        #[serde(default, alias = "timeoutMs")]
+        timeout_ms: Option<u64>,
     },
     Response {
         request_id: u64,
@@ -183,7 +302,6 @@ pub enum ServerMsg {
         code: &'static str,
         retryable: bool,
     },
-    Lagged,
     PushResult {
         ok: bool,
         applied: usize,
@@ -216,6 +334,7 @@ pub async fn ws_upgrade(
     // Every browser socket, including custom-scheme and opaque `null`
     // webviews, must carry the widget owner capability in its query string.
     // Native CLI and Roblox Studio clients send no Origin and remain allowed.
+    let enforce_hello_deadline = headers.get(header::ORIGIN).is_none();
     if let Some(origin) = headers.get(header::ORIGIN) {
         if !is_authorized_widget_browser_request(
             origin,
@@ -231,10 +350,10 @@ pub async fn ws_upgrade(
         }
     }
 
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+    ws.on_upgrade(move |socket| handle_ws(socket, state, enforce_hello_deadline))
 }
 
-async fn handle_ws(socket: WebSocket, state: AppState) {
+async fn handle_ws(socket: WebSocket, state: AppState, enforce_hello_deadline: bool) {
     let (sender, receiver) = socket.split();
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -247,13 +366,18 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     // mpsc funnels recv-side replies (pong, push-result, error, and response
     // frames that land on this connection's route) through the same SplitSink
     // the send-task owns; avoids an Arc<Mutex<_>> around it.
-    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    let (close_tx, close_rx) = watch::channel::<Option<ConnectionClose>>(None);
+    let outbound = OutboundHandle {
+        tx: out_tx,
+        close_tx,
+    };
     let peer = Arc::new(PeerState::new());
 
     let mut recv_task = tokio::spawn(recv_loop(
         receiver,
         state.clone(),
-        out_tx.clone(),
+        outbound.clone(),
         conn_id,
         peer.clone(),
     ));
@@ -261,20 +385,47 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         sender,
         state.clone(),
         out_rx,
+        close_rx,
         events_rx,
         request_rx,
-        conn_id,
-        peer,
+        SendPeer {
+            conn_id,
+            state: peer,
+            enforce_hello_deadline,
+        },
     ));
 
     tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
+        _ = &mut send_task => {
+            recv_task.abort();
+            let _ = recv_task.await;
+        },
+        _ = &mut recv_task => {
+            send_task.abort();
+            let _ = send_task.await;
+        },
     }
 
-    // On disconnect, purge any pending routes that pointed at this connection's
-    // out_tx so routes to dead senders don't leak. The check is "sender is
-    // closed", which the mpsc flags automatically once the receiver is dropped.
+    let disconnected_plugin = {
+        let mut active = state.active_plugin.lock().unwrap();
+        if *active == Some(conn_id) {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    };
+    if disconnected_plugin {
+        fail_all_pending_routes(
+            &state,
+            "plugin-disconnected",
+            "Roblox Studio plugin disconnected before responding",
+        );
+        publish_plugin_state(&state, false);
+    }
+
+    // On disconnect, purge any pending routes that originated at this
+    // connection or point at a queue whose receiver has gone away.
     let aborted_activities = {
         let mut routes = state.pending_routes.lock().unwrap();
         let mut events = Vec::new();
@@ -298,24 +449,12 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     for event in aborted_activities {
         let _ = state.events.send(event);
     }
-    let disconnected_plugin = {
-        let mut active = state.active_plugin.lock().unwrap();
-        if *active == Some(conn_id) {
-            *active = None;
-            true
-        } else {
-            false
-        }
-    };
-    if disconnected_plugin {
-        publish_plugin_state(&state, false);
-    }
 }
 
 async fn recv_loop(
     mut receiver: futures::stream::SplitStream<WebSocket>,
     state: AppState,
-    out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    out_tx: OutboundHandle,
     conn_id: u64,
     peer: Arc<PeerState>,
 ) {
@@ -477,6 +616,7 @@ async fn recv_loop(
                     request_id,
                     op,
                     args,
+                    timeout_ms,
                 }) => {
                     if peer_kind != PeerKind::Client {
                         let _ = send_server_msg(
@@ -487,23 +627,69 @@ async fn recv_loop(
                         );
                         continue;
                     }
+                    if state.active_plugin.lock().unwrap().is_none() {
+                        let _ = send_server_msg(
+                            &out_tx,
+                            &ServerMsg::Response {
+                                request_id,
+                                ok: false,
+                                value: Value::Null,
+                                error: Some(serde_json::json!({
+                                    "code": "plugin-unavailable",
+                                    "message": "Roblox Studio plugin is not connected",
+                                    "retryable": true,
+                                })),
+                            },
+                        );
+                        continue;
+                    }
                     // Stash the route so whoever responds later can find us.
-                    let daemon_request_id = register_pending_route(
+                    let daemon_request_id = match register_pending_route(
                         &state.pending_routes,
                         request_id,
                         conn_id,
                         out_tx.clone(),
                         &op,
                         &args,
-                    );
+                        timeout_ms,
+                    ) {
+                        Ok(request_id) => request_id,
+                        Err(limit) => {
+                            let _ = send_server_msg(
+                                &out_tx,
+                                &ServerMsg::Response {
+                                    request_id,
+                                    ok: false,
+                                    value: Value::Null,
+                                    error: Some(serde_json::json!({
+                                        "code": limit.code(),
+                                        "message": limit.message(),
+                                        "retryable": true,
+                                    })),
+                                },
+                            );
+                            continue;
+                        }
+                    };
                     publish_command_activity_started(&state, daemon_request_id);
                     // Broadcast to every other connection's send-loop.
-                    let _ = state.request_tx.send(RequestEnvelope {
-                        origin: conn_id,
-                        request_id: daemon_request_id,
-                        op,
-                        args,
-                    });
+                    let broadcast_failed = state
+                        .request_tx
+                        .send(RequestEnvelope {
+                            origin: conn_id,
+                            request_id: daemon_request_id,
+                            op,
+                            args,
+                        })
+                        .is_err();
+                    if broadcast_failed || state.active_plugin.lock().unwrap().is_none() {
+                        fail_pending_route(
+                            &state,
+                            daemon_request_id,
+                            "request-broadcast-unavailable",
+                            "request could not be delivered to the Studio plugin",
+                        );
+                    }
                 }
                 Ok(ClientMsg::Response {
                     request_id,
@@ -540,8 +726,12 @@ async fn recv_loop(
                             value,
                             error,
                         };
-                        if let Ok(s) = serde_json::to_string(&msg) {
-                            let _ = route.sink.send(Message::Text(s));
+                        if send_server_msg(&route.sink, &msg).is_err() {
+                            route.sink.close(ConnectionClose::new(
+                                "response could not enter the bounded outbound queue",
+                                "response-delivery-overload",
+                                true,
+                            ));
                         }
                     }
                 }
@@ -566,21 +756,68 @@ async fn recv_loop(
 async fn send_loop(
     mut sender: futures::stream::SplitSink<WebSocket, Message>,
     state: AppState,
-    mut out_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    mut out_rx: mpsc::Receiver<Message>,
+    mut close_rx: watch::Receiver<Option<ConnectionClose>>,
     mut events_rx: broadcast::Receiver<String>,
     mut request_rx: broadcast::Receiver<RequestEnvelope>,
-    conn_id: u64,
-    peer: Arc<PeerState>,
+    peer: SendPeer,
 ) {
+    let conn_id = peer.conn_id;
+    let enforce_hello_deadline = peer.enforce_hello_deadline;
+    let peer = peer.state;
     let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut route_sweep_interval = tokio::time::interval(PENDING_ROUTE_SWEEP_INTERVAL);
+    route_sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let hello_deadline_at = peer
+        .connected_at
+        .checked_add(UNIDENTIFIED_HELLO_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let hello_deadline = tokio::time::sleep_until(hello_deadline_at.into());
+    tokio::pin!(hello_deadline);
     // Skip the immediate first tick so we don't blast a ping at connect time.
     ping_interval.tick().await;
+    // Likewise, the first pending-route sweep should happen after one full
+    // interval instead of on every connection's first poll.
+    route_sweep_interval.tick().await;
+    let mut plugin_suspect_since = None;
 
     loop {
         tokio::select! {
+            _ = &mut hello_deadline, if enforce_hello_deadline
+                && PeerKind::load(&peer.kind) == PeerKind::Unidentified => {
+                if unidentified_hello_expired(
+                    PeerKind::load(&peer.kind),
+                    enforce_hello_deadline,
+                    peer.connected_at,
+                    Instant::now(),
+                ) {
+                    close_connection(
+                        &mut sender,
+                        conn_id,
+                        &ConnectionClose::new(
+                            "originless WebSocket did not authenticate with a hello before the deadline",
+                            "hello-timeout",
+                            true,
+                        ),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            close_changed = close_rx.changed() => {
+                if close_changed.is_err() {
+                    break;
+                }
+                let close = close_rx.borrow().clone();
+                if let Some(close) = close {
+                    close_connection(&mut sender, conn_id, &close).await;
+                    break;
+                }
+            }
             outgoing = out_rx.recv() => {
                 let Some(msg) = outgoing else { break };
-                if sender.send(msg).await.is_err() { break; }
+                if !send_ws_frame(&mut sender, msg, conn_id).await { break; }
             }
             req_res = request_rx.recv() => {
                 match req_res {
@@ -596,10 +833,43 @@ async fn send_loop(
                             op: env.op,
                             args: env.args,
                         };
-                        if !send_ws_msg(&mut sender, &msg).await { break; }
+                        if !send_ws_msg(&mut sender, &msg, conn_id).await {
+                            fail_pending_route(
+                                &state,
+                                env.request_id,
+                                "plugin-write-failed",
+                                "request could not be written to the Studio plugin",
+                            );
+                            break;
+                        }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        if PeerKind::load(&peer.kind) == PeerKind::Plugin
+                            && *state.active_plugin.lock().unwrap() == Some(conn_id)
+                        {
+                            fail_all_pending_routes(
+                                &state,
+                                "request-broadcast-lagged",
+                                &format!(
+                                    "Studio plugin missed {skipped} request broadcast frame(s)"
+                                ),
+                            );
+                            close_connection(
+                                &mut sender,
+                                conn_id,
+                                &ConnectionClose::new(
+                                    format!(
+                                        "Studio plugin missed {skipped} request broadcast frame(s)"
+                                    ),
+                                    "request-broadcast-lagged",
+                                    true,
+                                ),
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             ev_res = events_rx.recv() => {
@@ -609,17 +879,18 @@ async fn send_loop(
                             let current_peer = PeerKind::load(&peer.kind);
                             if current_peer == PeerKind::Plugin {
                                 if *state.active_plugin.lock().unwrap() == Some(conn_id)
-                                    && !send_ws_msg(&mut sender, &ServerMsg::Op { op }).await
+                                    && !send_ws_msg(&mut sender, &ServerMsg::Op { op }, conn_id).await
                                 {
                                     break;
                                 }
                             } else if current_peer == PeerKind::Watch {
                                 if let Some(activity) = sanitized_sync_activity(&op) {
-                                    if sender
-                                        .send(Message::Text(activity.to_string()))
-                                        .await
-                                        .is_err()
-                                    {
+                                    if !send_ws_frame(
+                                        &mut sender,
+                                        Message::Text(activity.to_string()),
+                                        conn_id,
+                                    )
+                                    .await {
                                         break;
                                     }
                                 }
@@ -630,18 +901,33 @@ async fn send_loop(
                         if !is_shutdown && PeerKind::load(&peer.kind) != PeerKind::Watch {
                             continue;
                         }
-                        if sender.send(Message::Text(s)).await.is_err() { break; }
+                        if !send_ws_frame(&mut sender, Message::Text(s), conn_id).await { break; }
                         if is_shutdown {
-                            let _ = sender.send(Message::Close(None)).await;
+                            let _ = send_ws_frame(&mut sender, Message::Close(None), conn_id).await;
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = send_ws_msg(&mut sender, &ServerMsg::Lagged).await;
-                        let _ = sender.send(Message::Close(None)).await;
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        close_connection(
+                            &mut sender,
+                            conn_id,
+                            &ConnectionClose::new(
+                                format!("WebSocket peer missed {skipped} daemon event frame(s)"),
+                                "event-broadcast-lagged",
+                                true,
+                            ),
+                        )
+                        .await;
                         break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = route_sweep_interval.tick() => {
+                if PeerKind::load(&peer.kind) == PeerKind::Plugin
+                    && *state.active_plugin.lock().unwrap() == Some(conn_id)
+                {
+                    fail_expired_pending_routes(&state, Instant::now());
                 }
             }
             _ = ping_interval.tick() => {
@@ -651,13 +937,38 @@ async fn send_loop(
                     .last_inbound
                     .lock()
                     .map_or(current_peer == PeerKind::Plugin, |seen| {
-                        plugin_inbound_expired(current_peer, *seen, now)
+                        plugin_inbound_should_close(
+                            current_peer,
+                            *seen,
+                            plugin_suspect_since,
+                            now,
+                        )
                     });
                 if plugin_timed_out {
-                    let _ = sender.send(Message::Close(None)).await;
+                    close_connection(
+                        &mut sender,
+                        conn_id,
+                        &ConnectionClose::new(
+                            "Studio plugin heartbeat remained silent after the post-wake grace period",
+                            "plugin-heartbeat-timeout",
+                            true,
+                        ),
+                    )
+                    .await;
                     break;
                 }
-                if !send_ws_msg(&mut sender, &ServerMsg::Ping).await {
+                let inbound_expired = peer
+                    .last_inbound
+                    .lock()
+                    .map_or(current_peer == PeerKind::Plugin, |seen| {
+                        plugin_inbound_expired(current_peer, *seen, now)
+                    });
+                if inbound_expired {
+                    plugin_suspect_since.get_or_insert(now);
+                } else {
+                    plugin_suspect_since = None;
+                }
+                if !send_ws_msg(&mut sender, &ServerMsg::Ping, conn_id).await {
                     break;
                 }
             }
@@ -1082,14 +1393,34 @@ fn register_pending_route(
     routes: &PendingRoutes,
     client_request_id: u64,
     origin_conn_id: u64,
-    sink: UnboundedSender<Message>,
+    sink: OutboundHandle,
     op: &str,
     args: &Value,
-) -> u64 {
+    timeout_ms: Option<u64>,
+) -> Result<u64, PendingRouteLimit> {
     let activity_op = sanitized_command_op(op);
     let activity_detail = sanitized_command_detail(op, args);
     let publish_activity = should_publish_command_activity(op);
+    let activity_started_at = Instant::now();
+    let expires_at = activity_started_at
+        .checked_add(
+            pending_route_timeout(timeout_ms)
+                .checked_add(PENDING_ROUTE_COMPLETION_GRACE)
+                .expect("bounded pending-route grace must fit Duration"),
+        )
+        .expect("bounded pending-route timeout must fit the monotonic clock");
     let mut routes = routes.lock().unwrap();
+    if routes.len() >= MAX_PENDING_ROUTES {
+        return Err(PendingRouteLimit::Global);
+    }
+    if routes
+        .values()
+        .filter(|route| route.origin_conn_id == origin_conn_id)
+        .count()
+        >= MAX_PENDING_ROUTES_PER_CONNECTION
+    {
+        return Err(PendingRouteLimit::Connection);
+    }
     loop {
         let candidate = NEXT_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
         if candidate == 0 {
@@ -1102,11 +1433,83 @@ fn register_pending_route(
                 sink,
                 activity_op: activity_op.clone(),
                 activity_detail: activity_detail.clone(),
-                activity_started_at: Instant::now(),
+                activity_started_at,
+                expires_at,
                 publish_activity,
             });
-            return candidate;
+            return Ok(candidate);
         }
+    }
+}
+
+fn pending_route_timeout(timeout_ms: Option<u64>) -> Duration {
+    timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_PENDING_ROUTE_TIMEOUT)
+        .clamp(Duration::from_millis(1), MAX_REQUEST_TIMEOUT)
+}
+
+fn fail_expired_pending_routes(state: &AppState, now: Instant) {
+    let expired_request_ids = {
+        let routes = state.pending_routes.lock().unwrap();
+        routes
+            .iter()
+            .filter_map(|(request_id, route)| (now >= route.expires_at).then_some(*request_id))
+            .collect::<Vec<_>>()
+    };
+    for request_id in expired_request_ids {
+        fail_pending_route(
+            state,
+            request_id,
+            "request-timeout",
+            "Studio did not respond before this request's bounded deadline",
+        );
+    }
+}
+
+fn fail_pending_route(state: &AppState, request_id: u64, code: &str, message: &str) {
+    let route = {
+        let mut routes = state.pending_routes.lock().unwrap();
+        routes.remove(&request_id)
+    };
+    let Some(route) = route else {
+        return;
+    };
+    if let Some(event) = command_activity_event(
+        state.boot_id.as_str(),
+        request_id,
+        &route,
+        CommandActivityPhase::Completed,
+        Some(false),
+    ) {
+        let _ = state.events.send(event);
+    }
+    let response = ServerMsg::Response {
+        request_id: route.client_request_id,
+        ok: false,
+        value: Value::Null,
+        error: Some(serde_json::json!({
+            "code": code,
+            "message": message,
+            "retryable": true,
+        })),
+    };
+    if send_server_msg(&route.sink, &response).is_err() {
+        route.sink.close(ConnectionClose::new(
+            "request failure could not enter the bounded outbound queue",
+            "response-delivery-overload",
+            true,
+        ));
+    }
+}
+
+fn fail_all_pending_routes(state: &AppState, code: &str, message: &str) {
+    let request_ids = {
+        let routes = state.pending_routes.lock().unwrap();
+        routes.keys().copied().collect::<Vec<_>>()
+    };
+    for request_id in request_ids {
+        fail_pending_route(state, request_id, code, message);
     }
 }
 
@@ -1125,10 +1528,7 @@ fn constant_time_capability_matches(candidate: Option<&str>) -> bool {
     difference == 0
 }
 
-fn send_server_msg(
-    out_tx: &tokio::sync::mpsc::UnboundedSender<Message>,
-    msg: &ServerMsg,
-) -> Result<(), ()> {
+fn send_server_msg(out_tx: &OutboundHandle, msg: &ServerMsg) -> Result<(), ()> {
     let s = serde_json::to_string(msg).map_err(|_| ())?;
     out_tx.send(Message::Text(s)).map_err(|_| ())
 }
@@ -1162,11 +1562,55 @@ fn publish_plugin_state(state: &AppState, connected: bool) {
 async fn send_ws_msg(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     msg: &ServerMsg,
+    conn_id: u64,
 ) -> bool {
     let Ok(s) = serde_json::to_string(msg) else {
         return true;
     };
-    sender.send(Message::Text(s)).await.is_ok()
+    send_ws_frame(sender, Message::Text(s), conn_id).await
+}
+
+async fn send_ws_frame(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    conn_id: u64,
+) -> bool {
+    match tokio::time::timeout(WS_WRITE_TIMEOUT, sender.send(message)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            eprintln!("WebSocket connection {conn_id} write failed: {error}");
+            false
+        }
+        Err(_) => {
+            eprintln!(
+                "WebSocket connection {conn_id} write timed out after {}s",
+                WS_WRITE_TIMEOUT.as_secs()
+            );
+            false
+        }
+    }
+}
+
+async fn close_connection(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    conn_id: u64,
+    close: &ConnectionClose,
+) {
+    eprintln!(
+        "WebSocket connection {conn_id} closing [{}]: {}",
+        close.code, close.reason
+    );
+    let _ = send_ws_msg(
+        sender,
+        &ServerMsg::Shutdown {
+            reason: close.reason.clone(),
+            code: close.code,
+            retryable: close.retryable,
+        },
+        conn_id,
+    )
+    .await;
+    let _ = send_ws_frame(sender, Message::Close(None), conn_id).await;
 }
 
 /// Cheap, parse-only probe for the top-level `"type"` field of a JSON object
@@ -1232,9 +1676,205 @@ mod tests {
             last_seen,
             expired_at
         ));
+        assert!(!plugin_inbound_should_close(
+            PeerKind::Plugin,
+            last_seen,
+            None,
+            expired_at,
+        ));
+        assert!(!plugin_inbound_should_close(
+            PeerKind::Plugin,
+            last_seen,
+            Some(expired_at),
+            expired_at + PLUGIN_POST_WAKE_GRACE,
+        ));
+        assert!(plugin_inbound_should_close(
+            PeerKind::Plugin,
+            last_seen,
+            Some(expired_at),
+            expired_at + PLUGIN_POST_WAKE_GRACE + Duration::from_millis(1),
+        ));
     }
 
-    async fn start_server_with_widget(widget_owned: bool) -> TestHarness {
+    #[test]
+    fn bounded_outbound_queue_signals_typed_overload_without_growing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (close_tx, close_rx) = watch::channel(None);
+        let outbound = OutboundHandle { tx, close_tx };
+        assert!(outbound.send(Message::Text("first".into())).is_ok());
+        assert!(outbound.send(Message::Text("second".into())).is_err());
+        assert_eq!(rx.try_recv().unwrap(), Message::Text("first".into()));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let close = close_rx.borrow().clone().expect("typed overload close");
+        assert_eq!(close.code, "outbound-overload");
+        assert!(close.retryable);
+    }
+
+    #[test]
+    fn only_unidentified_originless_peers_hit_the_hello_deadline() {
+        let connected_at = Instant::now();
+        assert!(!unidentified_hello_expired(
+            PeerKind::Unidentified,
+            true,
+            connected_at,
+            connected_at + UNIDENTIFIED_HELLO_TIMEOUT - Duration::from_millis(1),
+        ));
+        assert!(unidentified_hello_expired(
+            PeerKind::Unidentified,
+            true,
+            connected_at,
+            connected_at + UNIDENTIFIED_HELLO_TIMEOUT,
+        ));
+        assert!(!unidentified_hello_expired(
+            PeerKind::Client,
+            true,
+            connected_at,
+            connected_at + UNIDENTIFIED_HELLO_TIMEOUT,
+        ));
+        assert!(!unidentified_hello_expired(
+            PeerKind::Unidentified,
+            false,
+            connected_at,
+            connected_at + UNIDENTIFIED_HELLO_TIMEOUT,
+        ));
+    }
+
+    fn test_outbound() -> (
+        OutboundHandle,
+        mpsc::Receiver<Message>,
+        watch::Receiver<Option<ConnectionClose>>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let (close_tx, close_rx) = watch::channel(None);
+        (OutboundHandle { tx, close_tx }, rx, close_rx)
+    }
+
+    #[test]
+    fn pending_routes_are_bounded_per_connection_and_globally() {
+        let per_connection_routes = Arc::new(Mutex::new(HashMap::new()));
+        let (outbound, _rx, _close_rx) = test_outbound();
+        for request_id in 0..MAX_PENDING_ROUTES_PER_CONNECTION {
+            register_pending_route(
+                &per_connection_routes,
+                request_id as u64,
+                7,
+                outbound.clone(),
+                "get",
+                &serde_json::json!({"path": "Workspace"}),
+                None,
+            )
+            .expect("route below the per-connection limit");
+        }
+        assert_eq!(
+            register_pending_route(
+                &per_connection_routes,
+                999,
+                7,
+                outbound.clone(),
+                "get",
+                &serde_json::json!({}),
+                None,
+            ),
+            Err(PendingRouteLimit::Connection),
+        );
+        register_pending_route(
+            &per_connection_routes,
+            1000,
+            8,
+            outbound.clone(),
+            "get",
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("a separate connection retains its own capacity");
+
+        let global_routes = Arc::new(Mutex::new(HashMap::new()));
+        for request_id in 0..MAX_PENDING_ROUTES {
+            register_pending_route(
+                &global_routes,
+                request_id as u64,
+                request_id as u64 + 1,
+                outbound.clone(),
+                "get",
+                &serde_json::json!({}),
+                None,
+            )
+            .expect("route below the global limit");
+        }
+        assert_eq!(
+            register_pending_route(
+                &global_routes,
+                2000,
+                5000,
+                outbound,
+                "get",
+                &serde_json::json!({}),
+                None,
+            ),
+            Err(PendingRouteLimit::Global),
+        );
+    }
+
+    #[test]
+    fn long_pending_route_survives_five_minutes_then_expires_at_its_deadline() {
+        let (state, _tmp) = test_state_with_widget(false);
+        let (outbound, mut rx, _close_rx) = test_outbound();
+        let request_id = register_pending_route(
+            &state.pending_routes,
+            41,
+            7,
+            outbound,
+            "get",
+            &serde_json::json!({"path": "Workspace/Long"}),
+            Some(10 * 60 * 1_000),
+        )
+        .unwrap();
+        let (started_at, expires_at) = {
+            let routes = state.pending_routes.lock().unwrap();
+            let route = routes.get(&request_id).unwrap();
+            (route.activity_started_at, route.expires_at)
+        };
+        assert_eq!(
+            expires_at.saturating_duration_since(started_at),
+            Duration::from_secs(10 * 60) + PENDING_ROUTE_COMPLETION_GRACE
+        );
+
+        fail_expired_pending_routes(&state, started_at + DEFAULT_PENDING_ROUTE_TIMEOUT);
+        assert!(rx.try_recv().is_err());
+        assert!(state
+            .pending_routes
+            .lock()
+            .unwrap()
+            .contains_key(&request_id));
+
+        fail_expired_pending_routes(&state, expires_at - Duration::from_millis(1));
+        assert!(rx.try_recv().is_err());
+        assert!(state
+            .pending_routes
+            .lock()
+            .unwrap()
+            .contains_key(&request_id));
+
+        fail_expired_pending_routes(&state, expires_at);
+
+        let Message::Text(response) = rx.try_recv().expect("explicit timeout response") else {
+            panic!("timeout response must be a text frame");
+        };
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_id"], 41);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "request-timeout");
+        let routes = state.pending_routes.lock().unwrap();
+        assert!(!routes.contains_key(&request_id));
+        assert_eq!(pending_route_timeout(None), DEFAULT_PENDING_ROUTE_TIMEOUT);
+        assert_eq!(pending_route_timeout(Some(u64::MAX)), MAX_REQUEST_TIMEOUT);
+    }
+
+    fn test_state_with_widget(widget_owned: bool) -> (AppState, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().to_path_buf();
         let canonical = std::fs::canonicalize(&project).unwrap();
@@ -1282,7 +1922,11 @@ mod tests {
             widget_last_seen: Arc::new(Mutex::new(None)),
             shutdown_tx,
         };
+        (state, tmp)
+    }
 
+    async fn start_server_with_widget(widget_owned: bool) -> TestHarness {
+        let (state, tmp) = test_state_with_widget(widget_owned);
         let app = crate::http::router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1827,9 +2471,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_request_without_plugin_fails_immediately_without_leaking_route() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+        let (mut cli, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        cli.send(client_hello("cli", "cli")).await.unwrap();
+        cli.send(tungstenite::Message::Text(
+            r#"{"type":"request","request_id":77,"op":"get","args":{"path":"Workspace"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let response = recv_until_type(&mut cli, "response", Duration::from_secs(1))
+            .await
+            .expect("missing plugin should fail immediately");
+        assert_eq!(response["request_id"], 77);
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "plugin-unavailable");
+        assert!(h.state.pending_routes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn requester_disconnect_publishes_sanitized_aborted_activity() {
         let h = start_server().await;
         let url = format!("ws://{}/ws", h.addr);
+        let (mut plugin, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        plugin.send(plugin_hello("plugin")).await.unwrap();
+        wait_for_active_plugin(&h).await;
         let (mut watch, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         watch.send(client_hello("widget", "watch")).await.unwrap();
         watch

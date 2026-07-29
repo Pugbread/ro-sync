@@ -24,6 +24,11 @@ struct CachedTreeNode {
     diff_relevant: bool,
     mapped_class: Option<String>,
     sibling_sort_signature: Option<CachedSortSignature>,
+    /// Content is deliberately only a final tiebreaker for structurally
+    /// indistinguishable script siblings. This mirrors the Studio allocator:
+    /// ordinary nodes keep the stable structural ordering, while duplicate
+    /// leaves no longer depend on GetChildren()/directory enumeration order.
+    source_sort_hash: Option<Hash>,
 }
 
 /// A compact rope for the legacy recursive sibling key.
@@ -272,6 +277,10 @@ impl ComparisonCache {
         } else {
             None
         };
+        let source_sort_hash = mapped_class
+            .as_deref()
+            .filter(|class| SCRIPT_CLASSES.contains(class))
+            .map(|_| source_hash_from_node(node));
 
         self.nodes.insert(
             node_id,
@@ -279,6 +288,7 @@ impl ComparisonCache {
                 diff_relevant,
                 mapped_class,
                 sibling_sort_signature,
+                source_sort_hash,
             },
         );
     }
@@ -339,16 +349,27 @@ impl ComparisonCache {
 
         let mut left_bytes = SortByteIter::new(self, left);
         let mut right_bytes = SortByteIter::new(self, right);
-        loop {
+        let structural_order = loop {
             match (left_bytes.next(), right_bytes.next()) {
                 (Some(left), Some(right)) => match left.cmp(&right) {
                     Ordering::Equal => {}
-                    ordering => return ordering,
+                    ordering => break ordering,
                 },
-                (None, Some(_)) => return Ordering::Less,
-                (Some(_), None) => return Ordering::Greater,
-                (None, None) => return Ordering::Equal,
+                (None, Some(_)) => break Ordering::Less,
+                (Some(_), None) => break Ordering::Greater,
+                (None, None) => break Ordering::Equal,
             }
+        };
+        if structural_order != Ordering::Equal {
+            return structural_order;
+        }
+
+        match (
+            self.cached_by_id(left).source_sort_hash.as_ref(),
+            self.cached_by_id(right).source_sort_hash.as_ref(),
+        ) {
+            (Some(left), Some(right)) => left.cmp(right),
+            _ => Ordering::Equal,
         }
     }
 
@@ -1286,6 +1307,54 @@ mod tests {
         assert!(local.contains_key("Workspace/SellNPC [1]/Animate"));
         assert!(studio.contains_key("Workspace/SellNPC/Animate"));
         assert!(studio.contains_key("Workspace/SellNPC [1]/Animate"));
+        assert!(compare(&local, &studio).is_clean());
+    }
+
+    #[test]
+    fn indistinguishable_duplicate_scripts_pair_by_source_not_enumeration_order() {
+        let local_services = vec![json!({
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "properties": {},
+            "children": [{
+                "class": "ModuleScript",
+                "name": "Same",
+                "properties": { "Source": "return 'alpha'\r\n" },
+                "children": []
+            }, {
+                "class": "ModuleScript",
+                "name": "Same",
+                "properties": { "Source": "return 'beta'\n" },
+                "children": []
+            }]
+        })];
+        let studio_tree = json!({
+            "class": "DataModel",
+            "name": "game",
+            "children": [{
+                "class": "ReplicatedStorage",
+                "name": "ReplicatedStorage",
+                "children": [{
+                    "class": "ModuleScript",
+                    "name": "Same",
+                    "properties": { "Source": "return 'beta'\r\n" },
+                    "children": []
+                }, {
+                    "class": "ModuleScript",
+                    "name": "Same",
+                    "properties": { "Source": "return 'alpha'\n" },
+                    "children": []
+                }]
+            }]
+        });
+
+        let local = collect_local_nodes(&local_services);
+        let studio = collect_studio_tree_nodes(&studio_tree);
+
+        assert_eq!(local.len(), 2);
+        assert_eq!(studio.len(), 2);
+        assert!(local.contains_key("ReplicatedStorage/Same"));
+        assert!(local.contains_key("ReplicatedStorage/Same [1]"));
         assert!(compare(&local, &studio).is_clean());
     }
 

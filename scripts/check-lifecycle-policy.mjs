@@ -438,8 +438,13 @@ const healthSource = appSource.slice(
 );
 assert.match(
   healthSource,
-  /host\.daemonList\(\)[\s\S]*?const nativeClaim = nativeByProject\.get[\s\S]*?if \(!nativeClaim\) \{[\s\S]*?await ensureDaemon\(projectId\)/,
+  /const nativeClaim = nativeByProject\.get[\s\S]*?if \(!nativeClaim\) \{[\s\S]*?await ensureDaemon\(projectId\)/,
   "a renderer reload must reattach every persisted project claim to native exit cleanup",
+);
+assert.match(
+  healthSource,
+  /host\.daemonList\(\)[\s\S]*?Promise\.allSettled\([\s\S]*?healthTickDesktopProject\(projectId, nativeClaims, nativeByProject\)/,
+  "Desktop health must enumerate native claims once and check every served project independently",
 );
 const closeSource = appSource.slice(
   appSource.indexOf("function notifyWidgetClosing"),
@@ -558,6 +563,29 @@ assert.match(
 const portReleaseSource = appSource.slice(
   appSource.indexOf("async function waitForPortRelease"),
   appSource.indexOf("function makeOwnerToken"),
+);
+const probePortSource = appSource.slice(
+  appSource.indexOf("async function probePort"),
+  appSource.indexOf("async function getPortOwner"),
+);
+assert.match(
+  probePortSource,
+  /fetchJsonWithDeadline[\s\S]*?typeof json\.version !== "string"[\s\S]*?typeof json\.project !== "string"[\s\S]*?typeof json\.bootId !== "string"[\s\S]*?Number\(json\.port\) !== Number\(port\)/,
+  "port discovery must reject malformed, incomplete, or unrelated HTTP 200 responses",
+);
+const fetchJsonSource = bridgeSource.slice(
+  bridgeSource.indexOf("export function fetchJsonWithDeadline"),
+  bridgeSource.indexOf("function daemonBaseKey"),
+);
+assert.match(
+  fetchJsonSource,
+  /const json = await response\.json\(\)/,
+  "JSON body parsing must remain inside the fetch deadline",
+);
+assert.equal(
+  fetchJsonSource.includes("catch"),
+  false,
+  "JSON parse and AbortError failures must not be converted into a successful null body",
 );
 assert.match(
   portReleaseSource,

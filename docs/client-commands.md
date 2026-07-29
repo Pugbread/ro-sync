@@ -190,7 +190,7 @@ rosync capabilities --project . --raw
 
 **Notes**
 
-- The protocol 5 / plugin 2.4.0 document reports feature flags for exact physical-path identity, stats-first bounded per-service bootstrap, selective initial Disk-to-Studio sync, native instance clipboard copy/paste, screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.instanceClipboard` advertises `rosync copy`/`paste`. Photo feature flags and limits remain independent of Studio screenshot authorization.
+- The protocol 6 / plugin 2.4.1 document reports feature flags for exact physical-path identity, stats-first bounded per-service bootstrap with daemon-authored identity receipts, selective initial Disk-to-Studio sync, native instance clipboard copy/paste, screen capture, the locally packaged Photo engine, playtesting, runtime execution, virtual input, UI inspection, artifacts, and workflows. `features.instanceClipboard` advertises `rosync copy`/`paste`. Photo feature flags and limits remain independent of Studio screenshot authorization.
 - Use this cheap read before relying on optional Studio APIs; Studio version and permission differences are reported instead of guessed.
 - `--raw` prints the complete correlated response envelope for machine use.
 
@@ -1161,7 +1161,7 @@ rosync ping --project .
 ---
 ### `rosync version`
 
-Prints the daemon build version and, when reachable, the plugin version.
+Prints the daemon version and build identity and, when reachable, the plugin version.
 
 **Category:** Live diagnostics
 
@@ -1179,7 +1179,7 @@ rosync version --project .
 
 **Notes**
 
-- Useful when checking for mismatched widget, daemon, or plugin installs.
+- Human and raw output include the daemon build commit and dirty state. The connected plugin reports its own build identity in the nested version response.
 
 ---
 ### `rosync refresh`

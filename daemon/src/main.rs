@@ -3332,6 +3332,12 @@ fn print_auth_result(
 struct DaemonLifecycleStatus {
     ok: bool,
     running: bool,
+    /// The recorded listener still owns its port, but its authenticated
+    /// `/hello` identity could not be read before the local HTTP deadline.
+    /// This is deliberately distinct from a stopped/stale daemon: lifecycle
+    /// callers must preserve the record and retry rather than launch a
+    /// duplicate process.
+    unresponsive: bool,
     managed: bool,
     managed_by: Option<String>,
     project: String,
@@ -3681,6 +3687,7 @@ fn daemon_status_from_record(
     DaemonLifecycleStatus {
         ok: true,
         running,
+        unresponsive: false,
         managed: true,
         managed_by: Some(record.managed_by.clone()),
         project: record.project.clone(),
@@ -3701,6 +3708,22 @@ fn daemon_status_from_record(
     }
 }
 
+fn unresponsive_daemon_status(
+    record: &lifecycle::RuntimeRecord,
+    error: &str,
+) -> DaemonLifecycleStatus {
+    let mut status = daemon_status_from_record(record, None, true, false);
+    status.unresponsive = true;
+    // Keep the transport detail in the process log/human diagnostic rather
+    // than the lifecycle JSON. The typed boolean is sufficient for callers
+    // and avoids turning unstable OS error strings into an API contract.
+    eprintln!(
+        "Ro Sync daemon boot {} on port {} is unresponsive: {error}",
+        record.boot_id, record.port
+    );
+    status
+}
+
 fn external_daemon_status(
     canonical_project: &std::path::Path,
     port: u16,
@@ -3718,6 +3741,7 @@ fn external_daemon_status(
     DaemonLifecycleStatus {
         ok: true,
         running: true,
+        unresponsive: false,
         managed,
         managed_by: hello
             .get("managedBy")
@@ -3762,6 +3786,7 @@ fn stopped_daemon_status(canonical_project: &std::path::Path) -> DaemonLifecycle
     DaemonLifecycleStatus {
         ok: true,
         running: false,
+        unresponsive: false,
         managed: false,
         managed_by: None,
         project: canonical_project.display().to_string(),
@@ -3775,6 +3800,38 @@ fn stopped_daemon_status(canonical_project: &std::path::Path) -> DaemonLifecycle
         plugin_connected: None,
         stale: false,
         externally_managed: false,
+    }
+}
+
+enum ManagedRecordProbe {
+    Exact(serde_json::Value),
+    Different(serde_json::Value),
+    Unresponsive(String),
+    Stale(String),
+}
+
+fn probe_managed_record(
+    record: &lifecycle::RuntimeRecord,
+    canonical_project: &std::path::Path,
+) -> ManagedRecordProbe {
+    match fetch_daemon_hello(record.port) {
+        Ok(hello) if daemon_record_matches_hello(record, &hello, canonical_project) => {
+            ManagedRecordProbe::Exact(hello)
+        }
+        Ok(hello) => ManagedRecordProbe::Different(hello),
+        Err(error) => {
+            // A successful bind is positive evidence that no listener owns
+            // the recorded port. Any bind failure is ambiguous (the exact
+            // daemon may merely be busy, or a foreign process may now own the
+            // port), so preserve the capability-bearing runtime record.
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, record.port)) {
+                Ok(listener) => {
+                    drop(listener);
+                    ManagedRecordProbe::Stale(error)
+                }
+                Err(_) => ManagedRecordProbe::Unresponsive(error),
+            }
+        }
     }
 }
 
@@ -3814,17 +3871,12 @@ fn daemon_status(
             )
             .into());
         }
-        let hello = fetch_daemon_hello(record.port).ok();
-        if hello
-            .as_ref()
-            .is_some_and(|hello| daemon_record_matches_hello(&record, hello, canonical_project))
-        {
-            return Ok(daemon_status_from_record(
-                &record,
-                hello.as_ref(),
-                true,
-                false,
-            ));
+        let probe = probe_managed_record(&record, canonical_project);
+        if let ManagedRecordProbe::Exact(hello) = &probe {
+            return Ok(daemon_status_from_record(&record, Some(hello), true, false));
+        }
+        if let ManagedRecordProbe::Unresponsive(error) = &probe {
+            return Ok(unresponsive_daemon_status(&record, error));
         }
         if clean_stale {
             lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
@@ -3835,14 +3887,27 @@ fn daemon_status(
         // same project, either on the recorded port or elsewhere in the
         // discovery range. Prefer that live identity so `daemon start` stays
         // idempotent instead of launching a duplicate.
-        if let Some(status) = hello.as_ref().and_then(|hello| {
-            matching_external_daemon_status(canonical_project, record.port, hello)
-        }) {
-            return Ok(status);
+        if let ManagedRecordProbe::Different(hello) = &probe {
+            if let Some(status) =
+                matching_external_daemon_status(canonical_project, record.port, hello)
+            {
+                return Ok(status);
+            }
         }
         if let Some((port, hello)) = find_daemon_for_project(canonical_project) {
             return Ok(external_daemon_status(canonical_project, port, &hello));
         }
+        let hello = match probe {
+            ManagedRecordProbe::Different(hello) => Some(hello),
+            ManagedRecordProbe::Stale(error) => {
+                eprintln!(
+                    "Ro Sync daemon boot {} on port {} is stale: {error}",
+                    record.boot_id, record.port
+                );
+                None
+            }
+            ManagedRecordProbe::Exact(_) | ManagedRecordProbe::Unresponsive(_) => unreachable!(),
+        };
         return Ok(daemon_status_from_record(
             &record,
             hello.as_ref(),
@@ -3905,6 +3970,13 @@ async fn daemon_start(
     };
     let mut current = daemon_status(&canonical_project, &paths, true)?;
     classify_running_daemon_for_manager(&mut current, args.managed_by.trim());
+    if current.unresponsive {
+        return Err(format!(
+            "daemon start: managed daemon on port {} is unresponsive; its runtime record was preserved and no duplicate was launched",
+            current.port.unwrap_or_default()
+        )
+        .into());
+    }
     if current.running {
         if current.externally_managed {
             return Ok(current);
@@ -4297,19 +4369,29 @@ async fn daemon_stop(
         )
         .into());
     }
-    let hello = fetch_daemon_hello(record.port).ok();
-    if !hello
-        .as_ref()
-        .is_some_and(|hello| daemon_record_matches_hello(&record, hello, canonical_project))
-    {
-        lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
-        return Ok(daemon_status_from_record(
-            &record,
-            hello.as_ref(),
-            false,
-            true,
-        ));
-    }
+    let _hello = match probe_managed_record(&record, canonical_project) {
+        ManagedRecordProbe::Exact(hello) => hello,
+        ManagedRecordProbe::Unresponsive(error) => {
+            return Err(format!(
+                "daemon stop: managed daemon on port {} is unresponsive ({error}); its runtime record was preserved",
+                record.port
+            )
+            .into())
+        }
+        ManagedRecordProbe::Different(hello) => {
+            lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
+            return Ok(daemon_status_from_record(
+                &record,
+                Some(&hello),
+                false,
+                true,
+            ));
+        }
+        ManagedRecordProbe::Stale(_) => {
+            lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
+            return Ok(daemon_status_from_record(&record, None, false, true));
+        }
+    };
 
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -4327,9 +4409,10 @@ async fn daemon_stop(
     }
 
     loop {
-        let exact_still_running = fetch_daemon_hello(record.port)
-            .ok()
-            .is_some_and(|hello| daemon_record_matches_hello(&record, &hello, canonical_project));
+        let exact_still_running = matches!(
+            probe_managed_record(&record, canonical_project),
+            ManagedRecordProbe::Exact(_) | ManagedRecordProbe::Unresponsive(_)
+        );
         if !exact_still_running {
             lifecycle::remove_record_if_boot(&paths.record, &record.boot_id)?;
             let mut status = daemon_status_from_record(&record, None, false, false);
@@ -4358,6 +4441,17 @@ fn print_daemon_status(
         return Ok(());
     }
     if status.running {
+        if status.unresponsive {
+            println!(
+                "Ro Sync has an unresponsive managed daemon for {} on {}; its runtime state was preserved.",
+                status.canonical_project,
+                status
+                    .base_url
+                    .as_deref()
+                    .unwrap_or("the recorded local port")
+            );
+            return Ok(());
+        }
         let ownership = if status.externally_managed {
             "external"
         } else if status.managed {
@@ -13297,8 +13391,15 @@ async fn run_transmit(args: TransmitArgs) -> Result<(), Box<dyn std::error::Erro
             "transmit: provide --source/--source-file, --from, or at least one --path".into(),
         );
     }
-    if args.timeout <= 0.0 {
-        return Err("transmit: --timeout must be greater than zero".into());
+    if !args.timeout.is_finite()
+        || args.timeout <= 0.0
+        || args.timeout > ws::MAX_REQUEST_TIMEOUT.as_secs_f64()
+    {
+        return Err(format!(
+            "transmit: --timeout must be finite, greater than zero, and at most {} seconds",
+            ws::MAX_REQUEST_TIMEOUT.as_secs()
+        )
+        .into());
     }
 
     let mut req = serde_json::Map::new();
@@ -13850,6 +13951,8 @@ async fn run_ping(args: PingArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let daemon = env!("CARGO_PKG_VERSION");
+    let build_commit = env!("ROSYNC_BUILD_COMMIT");
+    let build_dirty = env!("ROSYNC_BUILD_DIRTY") == "true";
     // Plugin may be offline — treat failures as "no plugin connected" rather
     // than aborting the subcommand.
     let value = match fetch_plugin_version(args.port).await {
@@ -13858,10 +13961,19 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
             if args.raw {
                 println!(
                     "{}",
-                    serde_json::json!({ "daemon": daemon, "plugin": null, "error": e })
+                    serde_json::json!({
+                        "daemon": daemon,
+                        "buildCommit": build_commit,
+                        "buildDirty": build_dirty,
+                        "plugin": null,
+                        "error": e,
+                    })
                 );
             } else {
-                println!("daemon: rosync {daemon}");
+                println!(
+                    "daemon: {}",
+                    daemon_build_label(daemon, build_commit, build_dirty)
+                );
                 println!("plugin: (not connected — {e})");
             }
             return Ok(());
@@ -13870,11 +13982,19 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
     if args.raw {
         println!(
             "{}",
-            serde_json::json!({ "daemon": daemon, "plugin": value })
+            serde_json::json!({
+                "daemon": daemon,
+                "buildCommit": build_commit,
+                "buildDirty": build_dirty,
+                "plugin": value,
+            })
         );
         return Ok(());
     }
-    println!("daemon: rosync {daemon}");
+    println!(
+        "daemon: {}",
+        daemon_build_label(daemon, build_commit, build_dirty)
+    );
     let pv = value
         .get("plugin_version")
         .and_then(|v| v.as_str())
@@ -13886,6 +14006,13 @@ async fn run_version(args: VersionArgs) -> Result<(), Box<dyn std::error::Error>
         .unwrap_or("unknown");
     println!("plugin: {pv} (protocol {proto}, Studio {sv})");
     Ok(())
+}
+
+fn daemon_build_label(version: &str, commit: &str, dirty: bool) -> String {
+    format!(
+        "rosync {version} ({commit}{})",
+        if dirty { ", dirty" } else { "" }
+    )
 }
 
 async fn fetch_plugin_version(port: u16) -> Result<serde_json::Value, String> {
@@ -15633,7 +15760,15 @@ fn spawn_watch_bridge(
         // exist in Studio and the plugin has no safe way to infer it.
         let mut pending_parent_dirs = initial_parent_dirs;
         let mut hydration_validation = hydration_validation;
+        let mut destructive_batch_grace_active = false;
+        let mut rescanned_added_dirs: HashSet<PathBuf> = HashSet::new();
         loop {
+            // The watcher publishes one debounced batch synchronously. Keep
+            // the destructive grace armed until that receiver backlog drains,
+            // regardless of how long a very large batch takes to process.
+            if rx.is_empty() {
+                destructive_batch_grace_active = false;
+            }
             match rx.recv().await {
                 Ok(watch::WatchEvent::Op(mut op)) => {
                     if is_synced_service_root_op(&op, &root) {
@@ -15656,6 +15791,7 @@ fn spawn_watch_bridge(
                             &root,
                             &mut pending_parent_dirs,
                         );
+                        rescanned_added_dirs.clear();
                         let _ = events.send(watcher_hydration_shutdown(&error));
                         continue;
                     }
@@ -15666,11 +15802,18 @@ fn spawn_watch_bridge(
                                 from,
                                 &op.path,
                             );
+                            rescanned_added_dirs.retain(|candidate| !candidate.starts_with(from));
                         }
+                        rescanned_added_dirs.retain(|candidate| !candidate.starts_with(&op.path));
+                    } else if op.kind == OpKind::Delete && op.is_dir != Some(false) {
+                        rescanned_added_dirs.retain(|candidate| !candidate.starts_with(&op.path));
                     }
                     if op.kind == OpKind::Add && op.content.is_none() && op.is_dir == Some(true) {
                         pending_parent_dirs.insert(op.path.clone());
                     }
+                    let added_directory = (op.kind == OpKind::Add && op.is_dir == Some(true))
+                        .then(|| op.path.clone())
+                        .filter(|directory| !rescanned_added_dirs.remove(directory));
                     for parent in
                         take_pending_parent_materializations(&op, &root, &mut pending_parent_dirs)
                     {
@@ -15698,6 +15841,7 @@ fn spawn_watch_bridge(
                                 &root,
                                 &mut pending_parent_dirs,
                             );
+                            rescanned_added_dirs.clear();
                             let _ = events.send(watcher_hydration_shutdown(&error));
                             let _ = http::write_log_entry(axum::Json(serde_json::json!({
                                 "source": "filesystem-sync-conflict",
@@ -15714,11 +15858,17 @@ fn spawn_watch_bridge(
                             continue;
                         }
                         // ScriptDocument callbacks and filesystem notifications
-                        // are independent streams. Hold destructive ops briefly
-                        // so an already-in-flight Studio source push can prove
-                        // whether Studio still matches the agreed baseline.
-                        tokio::time::sleep(Duration::from_millis(FS_DESTRUCTIVE_PREFLIGHT_MS))
-                            .await;
+                        // are independent streams. Hold the first destructive
+                        // op in a burst briefly so an already-in-flight Studio
+                        // source push can prove whether Studio still matches
+                        // the agreed baseline. Arm the receiver batch after
+                        // that one wait: every delete/rename already queued in
+                        // the same burst then proceeds without another sleep.
+                        if destructive_batch_needs_grace(destructive_batch_grace_active) {
+                            destructive_batch_grace_active = true;
+                            tokio::time::sleep(Duration::from_millis(FS_DESTRUCTIVE_PREFLIGHT_MS))
+                                .await;
+                        }
                     }
                     if let Some(blocked) = handle_op(op, &events, &conflicts) {
                         let _ = http::write_log_entry(axum::Json(serde_json::json!({
@@ -15729,6 +15879,56 @@ fn spawn_watch_bridge(
                             "outcome": "blocked-conflict",
                         })));
                     }
+                    if let Some(directory) = added_directory {
+                        match collect_added_directory_descendants(
+                            &directory,
+                            &mut hydration_validation,
+                        ) {
+                            Ok(descendants) => {
+                                if !descendants.is_empty() {
+                                    pending_parent_dirs.remove(&directory);
+                                }
+                                for descendant in descendants {
+                                    if descendant.is_dir == Some(true) {
+                                        // The directory op is filtered when
+                                        // this descendant is empty. Retain it
+                                        // as a future parent candidate; a
+                                        // later file descendant in this same
+                                        // rescan removes/materializes it.
+                                        pending_parent_dirs.insert(descendant.path.clone());
+                                        rescanned_added_dirs.insert(descendant.path.clone());
+                                    }
+                                    for parent in take_pending_parent_materializations(
+                                        &descendant,
+                                        &root,
+                                        &mut pending_parent_dirs,
+                                    ) {
+                                        emit_op(
+                                            &events,
+                                            &Op {
+                                                kind: OpKind::Update,
+                                                path: parent,
+                                                from: None,
+                                                content: None,
+                                                is_dir: Some(true),
+                                            },
+                                        );
+                                    }
+                                    let _ = handle_op(descendant, &events, &conflicts);
+                                }
+                            }
+                            Err(error) => {
+                                reset_watch_bridge_after_barrier(
+                                    &_watcher,
+                                    &mut rx,
+                                    &root,
+                                    &mut pending_parent_dirs,
+                                );
+                                rescanned_added_dirs.clear();
+                                let _ = events.send(watcher_hydration_shutdown(&error));
+                            }
+                        }
+                    }
                 }
                 Ok(watch::WatchEvent::Resync { reason }) => {
                     reset_watch_bridge_after_barrier(
@@ -15737,6 +15937,7 @@ fn spawn_watch_bridge(
                         &root,
                         &mut pending_parent_dirs,
                     );
+                    rescanned_added_dirs.clear();
                     let _ =
                         events.send(watcher_resync_shutdown("WATCHER_BATCH_AMBIGUOUS", &reason));
                 }
@@ -15747,6 +15948,7 @@ fn spawn_watch_bridge(
                         &root,
                         &mut pending_parent_dirs,
                     );
+                    rescanned_added_dirs.clear();
                     let _ = events.send(watcher_lag_shutdown(skipped));
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -15779,6 +15981,10 @@ fn refresh_parent_candidates_after_barrier(
 // plugin. Keep this slightly above that bound so an edit and a filesystem
 // delete/rename started together are ordered deterministically in practice.
 const FS_DESTRUCTIVE_PREFLIGHT_MS: u64 = 500;
+
+fn destructive_batch_needs_grace(grace_active: bool) -> bool {
+    !grace_active
+}
 
 fn deleted_sync_path_is_dir(path: &std::path::Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -15844,6 +16050,90 @@ fn hydrate_watcher_op(
         op.content = Some(read_stable_watcher_file(&op.path, validation)?);
     }
     Ok(())
+}
+
+fn collect_added_directory_descendants(
+    directory: &std::path::Path,
+    validation: &mut fs_safety::SyncedPathValidationCache,
+) -> Result<Vec<Op>, String> {
+    let root_index = fs_safety::PortableDirectoryIndex::read(directory).map_err(|error| {
+        format!(
+            "scan newly added directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let mut stack = root_index
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry.kind == fs_safety::SafeEntryKind::Directory
+                || fs_map::classify_script_file(&entry.fragment).is_some()
+                || fs_map::is_init_file(&entry.fragment)
+        })
+        .map(|entry| (entry.path.clone(), entry.kind, entry.fragment.clone()))
+        .collect::<Vec<_>>();
+    stack.sort_by(|left, right| {
+        added_subtree_priority(&left.2, left.1)
+            .cmp(&added_subtree_priority(&right.2, right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    stack.reverse();
+
+    let mut ops = Vec::new();
+    while let Some((path, kind, _fragment)) = stack.pop() {
+        match kind {
+            fs_safety::SafeEntryKind::File => {
+                let content = read_stable_watcher_file(&path, validation)?;
+                ops.push(Op {
+                    kind: OpKind::Add,
+                    path,
+                    from: None,
+                    content: Some(content),
+                    is_dir: Some(false),
+                });
+            }
+            fs_safety::SafeEntryKind::Directory => {
+                ops.push(Op {
+                    kind: OpKind::Add,
+                    path: path.clone(),
+                    from: None,
+                    content: None,
+                    is_dir: Some(true),
+                });
+                let index = fs_safety::PortableDirectoryIndex::read(&path).map_err(|error| {
+                    format!("scan newly added directory {}: {error}", path.display())
+                })?;
+                let mut children = index
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        entry.kind == fs_safety::SafeEntryKind::Directory
+                            || fs_map::classify_script_file(&entry.fragment).is_some()
+                            || fs_map::is_init_file(&entry.fragment)
+                    })
+                    .map(|entry| (entry.path.clone(), entry.kind, entry.fragment.clone()))
+                    .collect::<Vec<_>>();
+                children.sort_by(|left, right| {
+                    added_subtree_priority(&left.2, left.1)
+                        .cmp(&added_subtree_priority(&right.2, right.1))
+                        .then_with(|| left.2.cmp(&right.2))
+                });
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    Ok(ops)
+}
+
+fn added_subtree_priority(fragment: &str, kind: fs_safety::SafeEntryKind) -> u8 {
+    if kind == fs_safety::SafeEntryKind::File && fs_map::is_init_file(fragment) {
+        0
+    } else if kind == fs_safety::SafeEntryKind::Directory {
+        1
+    } else {
+        2
+    }
 }
 
 fn begin_fs_destructive_preflight(
@@ -16063,18 +16353,11 @@ fn is_push_quiet(
         guard.retain(|_, deadline| *deadline > now);
     }
 
-    let service_root = project_root.join(service);
-    let mut candidate = Some(path);
-    while let Some(current) = candidate {
-        if guard.get(current).is_some_and(|deadline| *deadline > now) {
-            return true;
-        }
-        if current == service_root {
-            break;
-        }
-        candidate = current.parent();
-    }
-    false
+    // Quiet entries describe exact daemon-authored paths, not subtrees. A
+    // service commit may mark its root while a user concurrently saves a
+    // descendant; treating the root as an ancestor wildcard permanently loses
+    // that genuine edit because watcher notifications are edge-triggered.
+    guard.get(path).is_some_and(|deadline| *deadline > now)
 }
 
 /// Watch `<project>/ro-sync.json` itself. On change, re-parse and if gameId,
@@ -16739,14 +17022,15 @@ mod tier2_tests {
     }
 
     #[test]
-    fn service_root_quiet_entry_suppresses_descendants_only_until_deadline() {
+    fn service_root_quiet_entry_does_not_suppress_genuine_descendant_edit() {
         let root = PathBuf::from("/project");
         let quiet = Arc::new(Mutex::new(HashMap::new()));
         quiet.lock().unwrap().insert(
             root.join("Workspace"),
             Instant::now() + Duration::from_secs(1),
         );
-        assert!(is_push_quiet(
+        assert!(is_push_quiet(&quiet, &root.join("Workspace"), &root));
+        assert!(!is_push_quiet(
             &quiet,
             &root.join("Workspace/Deep/Main.luau"),
             &root
@@ -16771,6 +17055,82 @@ mod tier2_tests {
             &root.join("ReplicatedStorage/Main.luau"),
             &root
         ));
+    }
+
+    #[test]
+    fn large_destructive_burst_uses_one_preflight_grace_window() {
+        let mut grace_active = false;
+        let mut waits = 0;
+        for _ in 0..10_000 {
+            if destructive_batch_needs_grace(grace_active) {
+                waits += 1;
+                grace_active = true;
+            }
+        }
+        assert_eq!(waits, 1);
+        assert!(!destructive_batch_needs_grace(grace_active));
+        grace_active = false;
+        assert!(destructive_batch_needs_grace(grace_active));
+    }
+
+    #[test]
+    fn added_directory_rescan_is_parent_first_and_hydrates_complete_subtree() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = temp.path().join("ReplicatedStorage");
+        let root = service.join("Misc");
+        let nested = root.join("Nested");
+        let empty = root.join("Empty");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(root.join("init (Notifications).luau"), "return {}\n").unwrap();
+        std::fs::write(nested.join("Child.luau"), "return 42\n").unwrap();
+        let mut validation = fs_safety::SyncedPathValidationCache::new(temp.path()).unwrap();
+
+        let ops = collect_added_directory_descendants(&root, &mut validation).unwrap();
+        let init_index = ops
+            .iter()
+            .position(|op| op.path == root.join("init (Notifications).luau"))
+            .unwrap();
+        let nested_index = ops.iter().position(|op| op.path == nested).unwrap();
+        let child_index = ops
+            .iter()
+            .position(|op| op.path == nested.join("Child.luau"))
+            .unwrap();
+        assert_eq!(
+            init_index, 0,
+            "init source should classify the carrier first"
+        );
+        assert!(
+            nested_index < child_index,
+            "parent directory must precede child"
+        );
+        assert_eq!(
+            ops[child_index].content.as_deref(),
+            Some(b"return 42\n".as_slice())
+        );
+
+        let mut pending = HashSet::new();
+        for op in &ops {
+            if op.is_dir == Some(true) {
+                pending.insert(op.path.clone());
+            }
+            let _ = take_pending_parent_materializations(op, temp.path(), &mut pending);
+        }
+        assert!(
+            pending.contains(&empty),
+            "empty rescan descendants must remain future parent candidates"
+        );
+        let future_child = Op {
+            kind: OpKind::Add,
+            path: empty.join("Later.luau"),
+            from: None,
+            content: Some(b"return true\n".to_vec()),
+            is_dir: Some(false),
+        };
+        assert_eq!(
+            take_pending_parent_materializations(&future_child, temp.path(), &mut pending),
+            vec![empty]
+        );
     }
 
     #[test]
@@ -17206,10 +17566,84 @@ mod tier2_tests {
     }
 
     #[test]
+    fn transient_hello_timeout_preserves_live_runtime_record_as_unresponsive() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(project.path()).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let paths = lifecycle::runtime_paths(state.path().to_path_buf(), &canonical);
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let record = lifecycle::RuntimeRecord {
+            version: lifecycle::RUNTIME_RECORD_VERSION,
+            project: canonical.display().to_string(),
+            canonical_project: canonical.display().to_string(),
+            pid: std::process::id(),
+            port,
+            boot_id: "busy-boot".into(),
+            control_token: "0123456789abcdef".into(),
+            managed_by: "desktop".into(),
+            log_path: state.path().join("daemon.log").display().to_string(),
+            started_at: 1,
+        };
+        lifecycle::write_record(&paths.record, &record).unwrap();
+        let server = std::thread::spawn(move || {
+            let (_connection, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        });
+
+        let status = daemon_status(&canonical, &paths, true).unwrap();
+        assert!(status.running);
+        assert!(status.unresponsive);
+        assert!(!status.stale);
+        assert_eq!(
+            lifecycle::read_record(&paths.record)
+                .unwrap()
+                .unwrap()
+                .boot_id,
+            "busy-boot"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn definitively_free_runtime_port_is_cleaned_as_stale() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(project.path()).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let paths = lifecycle::runtime_paths(state.path().to_path_buf(), &canonical);
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        lifecycle::write_record(
+            &paths.record,
+            &lifecycle::RuntimeRecord {
+                version: lifecycle::RUNTIME_RECORD_VERSION,
+                project: canonical.display().to_string(),
+                canonical_project: canonical.display().to_string(),
+                pid: u32::MAX,
+                port,
+                boot_id: "stale-boot".into(),
+                control_token: "0123456789abcdef".into(),
+                managed_by: "desktop".into(),
+                log_path: state.path().join("daemon.log").display().to_string(),
+                started_at: 1,
+            },
+        )
+        .unwrap();
+
+        let status = daemon_status(&canonical, &paths, true).unwrap();
+        assert!(!status.running);
+        assert!(!status.unresponsive);
+        assert!(status.stale);
+        assert!(lifecycle::read_record(&paths.record).unwrap().is_none());
+    }
+
+    #[test]
     fn cross_manager_daemon_is_external_before_capability_validation() {
         let mut status = DaemonLifecycleStatus {
             ok: true,
             running: true,
+            unresponsive: false,
             managed: true,
             managed_by: Some("cli".into()),
             project: "/game".into(),
@@ -17412,6 +17846,7 @@ mod tier2_tests {
         let status = DaemonLifecycleStatus {
             ok: true,
             running: true,
+            unresponsive: false,
             managed: true,
             managed_by: Some("desktop".into()),
             project: "/tmp/project".into(),
@@ -17487,6 +17922,18 @@ mod tier2_tests {
             Some("ROSYNC_DAEMON_CONTROL_TOKEN")
         );
         assert!(args.control_token.is_none());
+    }
+
+    #[test]
+    fn daemon_build_label_distinguishes_commit_and_dirty_tree() {
+        assert_eq!(
+            daemon_build_label("0.3.0", "abc123def456", false),
+            "rosync 0.3.0 (abc123def456)"
+        );
+        assert_eq!(
+            daemon_build_label("0.3.0", "abc123def456", true),
+            "rosync 0.3.0 (abc123def456, dirty)"
+        );
     }
 
     #[test]

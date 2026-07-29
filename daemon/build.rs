@@ -58,6 +58,10 @@ fn watch_git_identity_inputs(repo: &Path) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
+
+    // buildDirty is derived from the complete tracked worktree, not just this
+    // Cargo package. Watching each tracked path prevents Cargo from reusing a
+    // clean/dirty identity after an unrelated tracked file changes.
     if let Some(files) = git_tracked_files(repo) {
         for file in files {
             println!("cargo:rerun-if-changed={}", file.display());
@@ -68,11 +72,7 @@ fn watch_git_identity_inputs(repo: &Path) {
 fn main() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(Path::parent)
-        .expect("desktop Tauri crate must live two levels below the repository root");
-    if let Ok(target) = std::env::var("TARGET") {
-        println!("cargo:rustc-env=ROSYNC_TARGET_TRIPLE={target}");
-    }
+        .expect("daemon crate must live under the repository root");
     println!("cargo:rerun-if-env-changed=ROSYNC_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ROSYNC_BUILD_DIRTY");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
@@ -99,5 +99,4 @@ fn main() {
         "cargo:rustc-env=ROSYNC_BUILD_DIRTY={}",
         if dirty { "true" } else { "false" }
     );
-    tauri_build::build()
 }

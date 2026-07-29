@@ -15,18 +15,18 @@ The Studio plugin first reads `/hello`, retains the process-local
 announces both the protocol version and capability:
 
 ```json
-{"type":"hello","clientId":"123456789","role":"plugin","protocol":5,"pluginCapability":"<64 hex characters>"}
+{"type":"hello","clientId":"123456789","role":"plugin","protocol":6,"pluginCapability":"<64 hex characters>"}
 ```
 
 The daemon rejects a missing/incompatible protocol or capability with a
-`shutdown` frame. Every socket sends exactly one hello using protocol 5;
+`shutdown` frame. Every socket sends exactly one hello using protocol 6;
 `plugin`, command-capable CLI/agent, and read-only widget/watch roles receive
 only the traffic appropriate to that role. The daemon replaces caller request
 IDs with private correlation IDs before routing them to Studio.
 Origin-bearing browser HTTP/WebSocket requests must also carry the owning
 widget's capability as `?widgetToken=...`; native loopback Studio/CLI clients
 do not send an Origin header.
-Protocol 5 corresponds to Studio plugin 2.4.0 and replaces place-sized initial
+Protocol 6 corresponds to Studio plugin 2.4.1 and replaces place-sized initial
 snapshots with bounded, ordered structure/hash/Source streams in both
 directions. It retains exact physical-path identity, selective initial
 Disk-to-Studio sync, structured errors, capability discovery, artifact-backed
@@ -45,7 +45,7 @@ first service's `structure` phase.
 {
   "studioStats": {"scriptCount": 12000, "instanceCount": 18000},
   "studioSnapshot": [],
-  "pluginProtocol": 5,
+  "pluginProtocol": 6,
   "compareId": "opaque-session-id",
   "service": "ReplicatedStorage",
   "phase": "structure",
@@ -71,10 +71,37 @@ first service's `structure` phase.
 Structure is a source-free, dense depth-first preorder. Each request carries
 at most 512 records and must encode to at most 512 KiB; a single record that
 cannot fit is rejected instead of silently exceeding the bound. After a
-service's final structure chunk, the daemon requests `hashes` chunks. Each
-contains at most 64 `{id, sha256}` records for the script IDs declared by that
-structure. IDs, parent/child counts, cursor order, class, generated disk
-fragments, and the complete hash set are validated before comparison.
+service's final structure chunk, `diskPrepare` continuation ticks let the
+daemon capture the exact disk projection. The daemon then pages an
+`identities` receipt before requesting `hashes` chunks:
+
+```json
+{
+  "action": "compare",
+  "compareId": "opaque-session-id",
+  "nextService": "ReplicatedStorage",
+  "phase": "identities",
+  "chunkIndex": 0,
+  "finalChunk": true,
+  "nextPhase": "hashes",
+  "nextChunk": 0,
+  "identityCount": 1,
+  "identities": [
+    {"id": 1, "diskFragment": "Config.luau", "diskFragmentIsDir": false}
+  ]
+}
+```
+
+Identity pages contain at most 512 records and 512 KiB. They bind each dense
+Studio record ID to the exact daemon-observed sibling fragment without
+repeating full ancestry. The plugin validates IDs, shapes, portable fragments,
+counts, and case-insensitive sibling uniqueness, stages the receipt, and
+installs it only if the terminal comparison is clean. A clean comparison with
+an incomplete receipt is rejected; the plugin never reconstructs an in-sync
+disk cache from mutable Studio ordering. Hash chunks contain at most 64
+`{id, sha256}` records for the script IDs declared by that structure. IDs,
+parent/child counts, cursor order, class, generated disk fragments, and the
+complete hash set are validated before comparison.
 `/initial-compare` and `/push` reject request bodies over 512 KiB before JSON
 deserialization. A record name or `diskFragment` is limited to 32 KiB and its
 class to 128 bytes. Exact encoded structure accounting is limited to 64 MiB per
@@ -329,8 +356,8 @@ CLI commands use correlated WebSocket frames:
 
 ```json
 {"type":"request","request_id":42,"op":"get","args":{"path":"Workspace/Part"}}
-{"type":"response","request_id":42,"ok":true,"value":{"class":"Part"},"meta":{"op":"get","durationMs":1,"protocol":2}}
-{"type":"response","request_id":43,"ok":false,"error":{"code":"NOT_FOUND","message":"instance not found: Workspace/Missing","retryable":false,"details":{"op":"get"}},"meta":{"op":"get","durationMs":0,"protocol":2}}
+{"type":"response","request_id":42,"ok":true,"value":{"class":"Part"},"meta":{"op":"get","durationMs":1,"protocol":6}}
+{"type":"response","request_id":43,"ok":false,"error":{"code":"NOT_FOUND","message":"instance not found: Workspace/Missing","retryable":false,"details":{"op":"get"}},"meta":{"op":"get","durationMs":0,"protocol":6}}
 ```
 
 Every response repeats the numeric `request_id`. Successful responses carry a
@@ -373,9 +400,11 @@ The read-only `capabilities` operation is the feature-negotiation entrypoint:
 {"type":"request","request_id":1,"op":"capabilities","args":{}}
 ```
 
-Its value identifies `pluginVersion` (`2.4.0`), `protocolVersion` (`5`), the
-Studio/host DataModel and place/game IDs, limits, current screenshot permission,
-and feature flags. `features.photo`, `features.photoTransparent`,
+Its value identifies `pluginVersion` (`2.4.1`), `protocolVersion` (`6`),
+`buildCommit`, `buildDirty`, the Studio/host DataModel and place/game IDs,
+limits, current screenshot permission, and feature flags. The `version`
+operation exposes the same build identity as `build_commit` / `build_dirty`.
+`features.photo`, `features.photoTransparent`,
 `features.photoUiOnly`, `features.photoCameraCFrame`,
 `features.photoUiTarget`, `features.photoInstanceTightCrop`, and the `photoAxis`,
 `photoPixels`, and
@@ -674,7 +703,7 @@ required completion record.
 
 The workflow schema is a CLI contract (`rosync run --file`), not a second wire
 format. The CLI validates all schema-v1 steps and references, opens one
-persistent WebSocket session, then maps each step onto ordinary protocol 5
+persistent WebSocket session, then maps each step onto ordinary protocol 6
 requests. Three operations add safe workflow semantics:
 
 - `inspect_ref` checks a live target and rejects mismatched `expectedClass` or

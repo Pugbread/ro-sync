@@ -354,7 +354,7 @@ const appSource = await readFile(new URL("../app.js", import.meta.url), "utf8");
 const bridgeSource = await readFile(new URL("../bridge.js", import.meta.url), "utf8");
 assert.match(
   bridgeSource,
-  /role: "watch",\s*protocol: 5/,
+  /role: "watch",\s*protocol: 6/,
   "the app event stream must speak the current daemon protocol",
 );
 assert.match(

@@ -27,9 +27,10 @@ use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
 use crate::diff;
 use crate::fs_map::{
     classify_script_file, encode_name, instance_to_path, is_empty_plain_folder, is_init_file,
-    normalize_line_endings, parse_disambiguated, parse_init_file, parse_plain_init_file,
-    path_to_instance_meta, portable_init_file_name, InstanceDescriptor, PathFragmentAllocator,
-    PathInstance, ScriptClass, META_FILE,
+    logical_names_equivalent, normalize_line_endings, parse_disambiguated, parse_init_file,
+    parse_plain_init_file, parse_reserved_init_filename, path_to_instance_meta,
+    portable_init_file_name, script_with_children_source, InstanceDescriptor,
+    PathFragmentAllocator, PathInstance, ScriptClass, META_FILE,
 };
 
 /// Roblox classes the daemon will materialize on disk. Everything else is
@@ -76,14 +77,14 @@ pub fn router(state: AppState) -> Router {
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
 
-    // Protocol 5 streams large payloads through route-specific bounded chunks.
+    // Protocol 6 streams large payloads through route-specific bounded chunks.
     // Keep every unclassified localhost route well below whole-place size.
     const MAX_BODY: usize = 4 * 1024 * 1024;
 
     const ARTIFACT_CONTROL_BODY: usize = 4 * 1024;
     const ARTIFACT_CHUNK_BODY: usize = 768 * 1024;
     const PROJECT_INIT_BODY: usize = 16 * 1024;
-    // Protocol-5 bootstrap records are deliberately bounded. Keep malformed
+    // Protocol-6 bootstrap records are deliberately bounded. Keep malformed
     // requests from allocating against the much larger legacy snapshot cap
     // before record-count validation gets a chance to run.
     const INITIAL_COMPARE_BODY: usize = STREAM_REQUEST_BODY_BYTES;
@@ -888,6 +889,10 @@ fn set_avoid_sync_paths(root: &Path, paths: Vec<Vec<String>>) {
 struct Hello {
     name: String,
     version: &'static str,
+    #[serde(rename = "buildCommit")]
+    build_commit: &'static str,
+    #[serde(rename = "buildDirty")]
+    build_dirty: bool,
     project: String,
     #[serde(rename = "gameId")]
     game_id: Option<String>,
@@ -938,6 +943,8 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
     Json(Hello {
         name: state.project_name.read().unwrap().clone(),
         version: env!("CARGO_PKG_VERSION"),
+        build_commit: env!("ROSYNC_BUILD_COMMIT"),
+        build_dirty: env!("ROSYNC_BUILD_DIRTY") == "true",
         project: state.project.display().to_string(),
         game_id: state.game_id.read().unwrap().clone(),
         group_id: state.group_id.read().unwrap().clone(),
@@ -1293,7 +1300,16 @@ struct InitialCompareAccumulator {
 enum InitialCompareStreamPhase {
     Structure,
     DiskPrepare,
+    Identities,
     Hashes,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamDiskIdentity {
+    id: u64,
+    disk_fragment: String,
+    disk_fragment_is_dir: bool,
 }
 
 type InitialComparePrepareResult = (
@@ -1315,6 +1331,9 @@ struct InitialCompareServiceStream {
     local_source_paths_by_path: HashMap<String, PathBuf>,
     studio_nodes: Option<BTreeMap<String, diff::DiffNode>>,
     studio_paths_by_id: HashMap<u64, String>,
+    identities: Vec<StreamDiskIdentity>,
+    identity_offset: usize,
+    identity_complete: bool,
     expected_hash_ids: HashSet<u64>,
     received_hash_ids: HashSet<u64>,
 }
@@ -1564,8 +1583,8 @@ async fn initial_compare(
         }));
     }
 
-    // Protocol 5 is mandatory above. Retain the monolithic shape only for
-    // early protocol-5 clients that already supplied it; current clients are
+    // Protocol 6 is mandatory above. Retain the monolithic shape only for
+    // early bounded-stream clients that already supplied it; current clients are
     // always instructed to use bounded service/chunk streaming.
     match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot) {
         Ok(comparison) => {
@@ -1829,6 +1848,9 @@ fn process_streamed_initial_compare_chunk(
             local_source_paths_by_path: HashMap::new(),
             studio_nodes: None,
             studio_paths_by_id: HashMap::new(),
+            identities: Vec::new(),
+            identity_offset: 0,
+            identity_complete: false,
             expected_hash_ids: HashSet::new(),
             received_hash_ids: HashSet::new(),
         });
@@ -1988,26 +2010,45 @@ fn process_streamed_initial_compare_chunk(
                     stream.local_source_paths_by_path = prepared.local_source_paths_by_path;
                     stream.studio_nodes = Some(prepared.studio_nodes);
                     stream.studio_paths_by_id = prepared.studio_paths_by_id;
+                    stream.identities = prepared.identities;
+                    stream.identity_offset = 0;
+                    stream.identity_complete = prepared.identity_complete;
                     stream.expected_hash_ids = prepared.expected_hash_ids;
+                    let identity_count = stream.identities.len();
                     session
                         .staged_service_generations
                         .push(prepared.service_generation);
-                    stream.phase = InitialCompareStreamPhase::Hashes;
+                    stream.phase = InitialCompareStreamPhase::Identities;
                     stream.next_chunk = 0;
                     session.started_at = Instant::now();
                     Ok(json!({
                         "action": "compare",
                         "compareId": session.compare_id,
                         "nextService": service,
-                        "phase": "hashes",
+                        "phase": "identities",
                         "nextChunk": 0,
+                        "identityCount": identity_count,
                     }))
                 }
             }
         }
+        InitialCompareStreamPhase::Identities => {
+            if phase != "identities"
+                || !body.records.is_empty()
+                || !body.hashes.is_empty()
+                || !body.studio_snapshot.is_empty()
+                || body.final_chunk
+            {
+                return Err("identity chunks accept only empty continuation ticks".into());
+            }
+            let response =
+                produce_initial_compare_identity_response(&session.compare_id, service, stream)?;
+            session.started_at = Instant::now();
+            Ok(response)
+        }
         InitialCompareStreamPhase::Hashes => {
             if phase != "hashes" {
-                return Err("service hash phase cannot return to structure".into());
+                return Err("service hash phase cannot return to an earlier phase".into());
             }
             if !body.records.is_empty() || !body.studio_snapshot.is_empty() {
                 return Err("hash chunks may contain only script hashes".into());
@@ -2163,6 +2204,11 @@ fn process_streamed_initial_compare_chunk(
                 .take()
                 .ok_or("stream hash phase has no Studio comparison")?;
             let report = diff::compare(&local_nodes, &studio_nodes);
+            if report.is_clean() && !stream.identity_complete {
+                return Err(
+                    "clean comparison is missing exact daemon-authored disk identities".into(),
+                );
+            }
             session.comparison.merge(InitialComparison {
                 summary: InitialComparisonSummary {
                     new_files: report.summary.added,
@@ -2195,6 +2241,8 @@ struct PreparedStreamedComparison {
     service_generation: crate::fs_safety::TreeGeneration,
     studio_nodes: BTreeMap<String, diff::DiffNode>,
     studio_paths_by_id: HashMap<u64, String>,
+    identities: Vec<StreamDiskIdentity>,
+    identity_complete: bool,
     expected_hash_ids: HashSet<u64>,
 }
 
@@ -2208,6 +2256,7 @@ fn prepare_streamed_initial_service_comparison(
         .and_then(Value::as_str)
         .ok_or("flat Studio service is missing its name")?
         .to_string();
+    reject_legacy_reserved_init_leafs(root, std::slice::from_ref(&service))?;
     let service_generation = crate::fs_safety::capture_tree_metadata(root, &service)?;
     let disk = snapshot::emit_flat_service(root, &service)
         .map_err(|error| format!("scan {}: {error}", root.join(&service).display()))?;
@@ -2250,6 +2299,42 @@ fn prepare_streamed_initial_service_comparison(
         .iter()
         .filter_map(|(path, node)| node.stream_id.map(|id| (id, path.clone())))
         .collect::<HashMap<_, _>>();
+    let local_snapshot_entries = diff::collect_local_snapshot_entries(&local_services);
+    let mut identities = Vec::with_capacity(studio_nodes.len());
+    let mut identity_complete = true;
+    for (path, studio_node) in &studio_nodes {
+        let Some(id) = studio_node.stream_id else {
+            identity_complete = false;
+            continue;
+        };
+        let Some(local_node) = local_nodes.get(path) else {
+            identity_complete = false;
+            continue;
+        };
+        if local_node.class != studio_node.class || local_node.kind != studio_node.kind {
+            identity_complete = false;
+            continue;
+        }
+        let Some(entry) = local_snapshot_entries.get(path) else {
+            identity_complete = false;
+            continue;
+        };
+        let Some(fragment) = entry.disk_path.last() else {
+            identity_complete = false;
+            continue;
+        };
+        let Some(is_dir) = entry.node.get("diskFragmentIsDir").and_then(Value::as_bool) else {
+            identity_complete = false;
+            continue;
+        };
+        identities.push(StreamDiskIdentity {
+            id,
+            disk_fragment: fragment.clone(),
+            disk_fragment_is_dir: is_dir,
+        });
+    }
+    identities.sort_by_key(|identity| identity.id);
+    identity_complete &= identities.len() == studio_nodes.len();
     let expected_hash_ids = studio.script_ids.into_iter().collect::<HashSet<_>>();
     for source_id in &expected_hash_ids {
         if !studio_paths_by_id.contains_key(source_id) {
@@ -2264,8 +2349,92 @@ fn prepare_streamed_initial_service_comparison(
         service_generation,
         studio_nodes,
         studio_paths_by_id,
+        identities,
+        identity_complete,
         expected_hash_ids,
     })
+}
+
+fn initial_compare_identity_response(
+    compare_id: &str,
+    service: &str,
+    chunk_index: u64,
+    final_chunk: bool,
+    next_chunk: u64,
+    identity_count: usize,
+    identities: &[StreamDiskIdentity],
+) -> Value {
+    let mut response = json!({
+        "action": "compare",
+        "compareId": compare_id,
+        "nextService": service,
+        "phase": "identities",
+        "chunkIndex": chunk_index,
+        "finalChunk": final_chunk,
+        "nextChunk": next_chunk,
+        "identityCount": identity_count,
+        "identities": identities,
+    });
+    if final_chunk {
+        response["nextPhase"] = Value::String("hashes".into());
+    }
+    response
+}
+
+fn produce_initial_compare_identity_response(
+    compare_id: &str,
+    service: &str,
+    stream: &mut InitialCompareServiceStream,
+) -> Result<Value, String> {
+    let chunk_index = stream.next_chunk;
+    let identity_count = stream.identities.len();
+    let mut chunk = Vec::new();
+    while stream.identity_offset + chunk.len() < stream.identities.len()
+        && chunk.len() < STREAM_STRUCTURE_CHUNK_NODES
+    {
+        chunk.push(stream.identities[stream.identity_offset + chunk.len()].clone());
+        let final_chunk = stream.identity_offset + chunk.len() == stream.identities.len();
+        let candidate = initial_compare_identity_response(
+            compare_id,
+            service,
+            chunk_index,
+            final_chunk,
+            if final_chunk { 0 } else { chunk_index + 1 },
+            identity_count,
+            &chunk,
+        );
+        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
+            chunk.pop();
+            break;
+        }
+    }
+    if chunk.is_empty() && stream.identity_offset < stream.identities.len() {
+        return Err(format!(
+            "one disk identity for {service} exceeds the encoded response limit"
+        ));
+    }
+    stream.identity_offset += chunk.len();
+    let final_chunk = stream.identity_offset == stream.identities.len();
+    let next_chunk = if final_chunk { 0 } else { chunk_index + 1 };
+    let response = initial_compare_identity_response(
+        compare_id,
+        service,
+        chunk_index,
+        final_chunk,
+        next_chunk,
+        identity_count,
+        &chunk,
+    );
+    if encoded_stream_response_len(&response)? > STREAM_SOURCE_CHUNK_BYTES {
+        return Err("encoded disk identity response exceeds 512 KiB".into());
+    }
+    if final_chunk {
+        stream.phase = InitialCompareStreamPhase::Hashes;
+        stream.next_chunk = 0;
+    } else {
+        stream.next_chunk += 1;
+    }
+    Ok(response)
 }
 
 fn parse_sha256_hex(value: &str) -> Result<crate::conflict::Hash, String> {
@@ -2534,6 +2703,13 @@ fn initial_snapshot_comparison(
 ) -> Result<InitialComparison, String> {
     validate_bootstrap_service_roots(studio_services, false)?;
     validate_bootstrap_services(studio_services)?;
+    reject_legacy_reserved_init_leafs(
+        root,
+        &snapshot::SYNCED_SERVICES
+            .iter()
+            .map(|service| service.to_string())
+            .collect::<Vec<_>>(),
+    )?;
     let local_services =
         snapshot::emit_services(root).map_err(|e| format!("scan {}: {e}", root.display()))?;
     initial_snapshot_comparison_with_local(root, local_services, studio_services)
@@ -2552,6 +2728,7 @@ fn initial_service_snapshot_comparison(
     if !snapshot::SYNCED_SERVICES.contains(&service) {
         return Err(format!("unsupported Studio service snapshot: {service}"));
     }
+    reject_legacy_reserved_init_leafs(root, &[service.to_string()])?;
     let local_services = vec![snapshot::emit_service(root, service)
         .map_err(|error| format!("scan {}: {error}", root.join(service).display()))?];
     initial_snapshot_comparison_with_local(
@@ -2559,6 +2736,76 @@ fn initial_service_snapshot_comparison(
         local_services,
         std::slice::from_ref(studio_service),
     )
+}
+
+fn reject_legacy_reserved_init_leafs(root: &Path, services: &[String]) -> Result<(), String> {
+    for service in services {
+        let service_path = root.join(service);
+        let Some(metadata) = crate::fs_safety::metadata_no_follow(&service_path)
+            .map_err(|error| format!("inspect service {}: {error}", service_path.display()))?
+        else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let mut stack = vec![(service_path, 0usize)];
+        let mut visited = 0usize;
+        while let Some((directory, depth)) = stack.pop() {
+            if depth > crate::fs_safety::MAX_SERVICE_TREE_DEPTH {
+                return Err(format!(
+                    "legacy projection scan exceeds maximum depth at {}",
+                    directory.display()
+                ));
+            }
+            let index = crate::fs_safety::PortableDirectoryIndex::read(&directory)
+                .map_err(|error| format!("scan {}: {error}", directory.display()))?;
+            for entry in index.entries() {
+                visited = visited.saturating_add(1);
+                if visited > crate::fs_safety::MAX_SERVICE_TREE_NODES {
+                    return Err(format!(
+                        "legacy projection scan exceeds node limit in {service}"
+                    ));
+                }
+                if entry.kind == crate::fs_safety::SafeEntryKind::Directory {
+                    stack.push((entry.path.clone(), depth + 1));
+                    continue;
+                }
+                if parse_reserved_init_filename(&entry.fragment).is_none() {
+                    continue;
+                }
+                let Some(instance) = path_to_instance_meta(&entry.path)
+                    .map_err(|error| format!("inspect {}: {error}", entry.path.display()))?
+                else {
+                    continue;
+                };
+                let taken = index
+                    .entries()
+                    .iter()
+                    .filter(|candidate| candidate.path != entry.path)
+                    .map(|candidate| candidate.fragment.clone())
+                    .collect::<Vec<_>>();
+                let canonical = instance_to_path(
+                    &InstanceDescriptor {
+                        class: &instance.class,
+                        name: &instance.name,
+                        has_children: false,
+                    },
+                    &taken,
+                );
+                let relative = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+                let canonical_path = directory.join(&canonical.fragment);
+                let canonical_relative =
+                    canonical_path.strip_prefix(root).unwrap_or(&canonical_path);
+                return Err(format!(
+                    "legacy leaf script {} uses the reserved init-marker filename grammar; rename it to {} before syncing",
+                    relative.display(),
+                    canonical_relative.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn initial_snapshot_comparison_with_local(
@@ -4938,10 +5185,17 @@ struct ReceivingSource {
     hasher: Sha256,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExactTreeFingerprint {
     metadata: crate::fs_safety::TreeGeneration,
     content_hash: crate::conflict::Hash,
+}
+
+#[derive(Debug)]
+struct PreparedStreamBaseline {
+    path: PathBuf,
+    source_hash: crate::conflict::Hash,
+    fs_mtime: u64,
 }
 
 #[derive(Debug)]
@@ -4949,6 +5203,8 @@ struct StreamCommitResult {
     applied: usize,
     backup: Option<PathBuf>,
     created: bool,
+    installed_fingerprint: ExactTreeFingerprint,
+    baselines: Vec<PreparedStreamBaseline>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -4965,6 +5221,8 @@ struct CommittedStreamService {
     created: bool,
     backup: Option<PathBuf>,
     recovery_action: StreamRecoveryAction,
+    #[serde(skip)]
+    installed_fingerprint: ExactTreeFingerprint,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -5040,6 +5298,7 @@ impl Drop for PushServiceStream {
 }
 
 struct PushStreamAccumulator {
+    rollback_state: AppState,
     stream_id: String,
     strict: bool,
     force_prune: bool,
@@ -5048,12 +5307,87 @@ struct PushStreamAccumulator {
     applied: usize,
     backups: Vec<PathBuf>,
     committed_services: Vec<CommittedStreamService>,
+    prepared_baselines: Vec<PreparedStreamBaseline>,
+    conflict_checkpoint: Option<crate::conflict::ConflictCheckpoint>,
     accepted_stream_bytes: usize,
     accepted_source_bytes: u64,
     last_request_hash: Option<crate::conflict::Hash>,
     last_response: Option<Value>,
     last_activity: Instant,
     completed_at: Option<Instant>,
+}
+
+impl Drop for PushStreamAccumulator {
+    fn drop(&mut self) {
+        if self.conflict_checkpoint.is_none() {
+            return;
+        }
+
+        // Cancel a worker that has not crossed its commit fence. If it already
+        // committed while the session was being evicted, recover its receipt
+        // before rolling back the generation.
+        let (current_committed, current_partial_failure, current_retained_backup) = self
+            .service_stream
+            .commit_control
+            .as_ref()
+            .map(|control| {
+                let mut control = control.lock().unwrap();
+                if !control.committed && !control.partial_failure {
+                    control.cancelled = true;
+                }
+                (
+                    control.committed,
+                    control.partial_failure,
+                    control.retained_backup.clone(),
+                )
+            })
+            .unwrap_or((false, false, None));
+        let mut receipt_error = None;
+        if current_committed || current_partial_failure {
+            if let Some(receiver) = self.service_stream.commit_result.take() {
+                match receiver.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Ok(result)) => {
+                        let service = self.service_stream.service.clone();
+                        retain_stream_commit_result(self, &service, result);
+                    }
+                    Ok(Err(error)) => receipt_error = Some(error),
+                    Err(error) => {
+                        receipt_error = Some(format!("recover committed service receipt: {error}"));
+                    }
+                }
+            } else {
+                receipt_error = Some("committed service receipt is missing".into());
+            }
+        }
+
+        let state = self.rollback_state.clone();
+        let mut report = rollback_stream_generation(&state, self);
+        if let Some(backup) = current_retained_backup.as_ref() {
+            if !self.backups.contains(backup) {
+                self.backups.push(backup.clone());
+            }
+        }
+        if let Some(error) = receipt_error {
+            report.errors.push(error);
+        }
+        let recovery_required = current_partial_failure
+            || current_retained_backup.is_some()
+            || !self.committed_services.is_empty()
+            || !report.errors.is_empty();
+        let event = json!({
+            "type": "stream-push-abandoned",
+            "streamId": self.stream_id,
+            "rolledBackServices": report.rolled_back_services,
+            "rollbackWarnings": report.warnings,
+            "rollbackErrors": report.errors,
+            "partialFailure": current_partial_failure,
+            "backups": self.backups,
+            "recoveryRequired": recovery_required,
+        });
+        if let Ok(serialized) = serde_json::to_string(&event) {
+            let _ = state.events.send(serialized);
+        }
+    }
 }
 
 static PUSH_STREAM_ACCUMULATORS: OnceLock<
@@ -6602,6 +6936,41 @@ fn retain_stream_commit_backup(
     }
 }
 
+fn prepare_stream_baselines(
+    stage_root: &Path,
+    stage_service: &Path,
+    live_service: &Path,
+) -> Result<Vec<PreparedStreamBaseline>, String> {
+    let Some(fence) = capture_synced_subtree(stage_root, stage_service)? else {
+        return Ok(Vec::new());
+    };
+    let mut baselines = Vec::new();
+    for entry in &fence.entries {
+        if entry.kind != crate::fs_safety::SafeEntryKind::File {
+            continue;
+        }
+        let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if classify_script_file(name).is_none() && !is_init_file(name) {
+            continue;
+        }
+        let relative = entry.path.strip_prefix(stage_service).map_err(|error| {
+            format!(
+                "prepare streamed baseline path {}: {error}",
+                entry.path.display()
+            )
+        })?;
+        let bytes = read_synced_file(stage_root, &entry.path)?;
+        baselines.push(PreparedStreamBaseline {
+            path: live_service.join(relative),
+            source_hash: hash(&normalize_line_endings(&bytes)),
+            fs_mtime: fs_mtime(&entry.path),
+        });
+    }
+    Ok(baselines)
+}
+
 fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResult, String> {
     let StreamCommitInput {
         state,
@@ -6646,8 +7015,9 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
 
     let stage_service = stage.path().join(&service);
     let stage_quiet = Mutex::new(HashMap::new());
+    let stage_conflicts = crate::conflict::ConflictEngine::new();
     let stage_ctx = PushCtx {
-        conflicts: state.conflict.as_ref(),
+        conflicts: &stage_conflicts,
         push_quiet: &stage_quiet,
         force_overwrite: true,
         strict,
@@ -6672,16 +7042,14 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         &mut source_provider,
     ) {
         Ok(applied) => applied,
-        Err(error) => {
-            state.conflict.forget_path(&stage_service);
-            return Err(format!("apply staged service {service}: {error}"));
-        }
+        Err(error) => return Err(format!("apply staged service {service}: {error}")),
     };
 
     let staged_fingerprint = capture_exact_tree_fingerprint(stage.path(), &service)?;
+    let live_service = root.join(&service);
+    let prepared_baselines = prepare_stream_baselines(stage.path(), &stage_service, &live_service)?;
     let final_fingerprint = capture_exact_tree_fingerprint(root, &service)?;
     if final_fingerprint != initial_fingerprint {
-        state.conflict.forget_path(&stage_service);
         return Err(format!(
             "disk service {service} changed before atomic commit; no files were replaced"
         ));
@@ -6689,10 +7057,8 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
 
     let mut commit_control = commit_control.lock().unwrap();
     if commit_control.cancelled {
-        state.conflict.forget_path(&stage_service);
         return Err("streamed service commit was cancelled before disk replacement".into());
     }
-    let live_service = root.join(&service);
     let mut backup_transaction = None;
     if initial_fingerprint.metadata.present {
         let (destination, transaction) = create_stream_backup_destination(root, &service)?;
@@ -6750,7 +7116,6 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         let (live_parent_guard, backup_parent_guard, stage_parent_guard) = match prepare {
             Ok(guards) => guards,
             Err(error) => {
-                state.conflict.forget_path(&stage_service);
                 return Err(
                     match cleanup_empty_stream_backup_transaction(root, &transaction) {
                         Ok(()) => error,
@@ -6858,7 +7223,6 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
                     &backup_parent_guard,
                 )
             };
-            state.conflict.forget_path(&stage_service);
             return Err(match rollback {
                 Ok(cleanup_warning) => format!(
                     "streamed service commit failed: {failure}; live files were restored{}",
@@ -6928,10 +7292,6 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         let _ = live_parent_guard.verify();
     }
 
-    state.conflict.forget_path(&live_service);
-    state
-        .conflict
-        .commit_fs_rename(&stage_service, &live_service);
     commit_control.committed = true;
     drop(commit_control);
     let live_ctx = PushCtx {
@@ -6948,6 +7308,8 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         applied,
         backup: backup_transaction,
         created,
+        installed_fingerprint: staged_fingerprint,
+        baselines: prepared_baselines,
     })
 }
 
@@ -7050,6 +7412,29 @@ fn push_stream_response(
         "phase": phase,
         "nextChunk": next_chunk,
     })
+}
+
+fn retain_stream_commit_result(
+    session: &mut PushStreamAccumulator,
+    service: &str,
+    result: StreamCommitResult,
+) {
+    session.applied += result.applied;
+    if let Some(backup) = result.backup.as_ref() {
+        session.backups.push(backup.clone());
+    }
+    session.prepared_baselines.extend(result.baselines);
+    session.committed_services.push(CommittedStreamService {
+        service: service.to_string(),
+        created: result.created,
+        backup: result.backup,
+        recovery_action: if result.created {
+            StreamRecoveryAction::RemoveCreatedService
+        } else {
+            StreamRecoveryAction::RestoreBackup
+        },
+        installed_fingerprint: result.installed_fingerprint,
+    });
 }
 
 fn append_source_parts_atomically(
@@ -7456,20 +7841,7 @@ fn process_streamed_push_chunk(
                 }
                 Ok(Err(error)) => Err(error),
                 Ok(Ok(result)) => {
-                    session.applied += result.applied;
-                    if let Some(backup) = result.backup.as_ref() {
-                        session.backups.push(backup.clone());
-                    }
-                    session.committed_services.push(CommittedStreamService {
-                        service: service.to_string(),
-                        created: result.created,
-                        backup: result.backup,
-                        recovery_action: if result.created {
-                            StreamRecoveryAction::RemoveCreatedService
-                        } else {
-                            StreamRecoveryAction::RestoreBackup
-                        },
-                    });
+                    retain_stream_commit_result(session, service, result);
                     session.next_service += 1;
                     if let Some(next_service) =
                         snapshot::SYNCED_SERVICES.get(session.next_service).copied()
@@ -7543,6 +7915,167 @@ fn finalize_successful_stream_backups(
     warnings
 }
 
+#[derive(Default)]
+struct StreamGenerationRollback {
+    rolled_back_services: Vec<String>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn rollback_created_stream_service(
+    state: &AppState,
+    committed: &CommittedStreamService,
+) -> Result<(), String> {
+    let root = state.canonical_project.as_path();
+    let live_service = root.join(&committed.service);
+    if crate::fs_safety::metadata_no_follow(&live_service)
+        .map_err(|error| format!("inspect created rollback target: {error}"))?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let current = capture_exact_tree_fingerprint(root, &committed.service)?;
+    if !relocated_fingerprint_matches(&committed.installed_fingerprint, &current) {
+        return Err(format!(
+            "refusing to remove created service because it changed after commit: {}",
+            live_service.display()
+        ));
+    }
+    let expected = capture_synced_subtree(root, &live_service)?
+        .ok_or_else(|| format!("created service disappeared: {}", live_service.display()))?;
+    let revalidated = capture_exact_tree_fingerprint(root, &committed.service)?;
+    if !relocated_fingerprint_matches(&committed.installed_fingerprint, &revalidated) {
+        return Err(format!(
+            "refusing to remove created service because it changed during rollback: {}",
+            live_service.display()
+        ));
+    }
+    let ctx = PushCtx {
+        conflicts: state.conflict.as_ref(),
+        push_quiet: state.push_quiet.as_ref(),
+        force_overwrite: true,
+        strict: false,
+        force_prune: false,
+        project_root: root,
+        backup_forced_removals: false,
+    };
+    if !remove_synced_subtree(&live_service, &ctx, Some(&expected))? {
+        return Err(format!(
+            "created service disappeared before rollback: {}",
+            live_service.display()
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_replaced_stream_service(
+    state: &AppState,
+    committed: &CommittedStreamService,
+) -> Result<Option<String>, String> {
+    let root = state.canonical_project.as_path();
+    let transaction = committed.backup.as_ref().ok_or_else(|| {
+        format!(
+            "committed service {} is missing its recovery backup",
+            committed.service
+        )
+    })?;
+    let backup_service = transaction.join(&committed.service);
+    let live_service = root.join(&committed.service);
+    let stage_parent = root.parent().ok_or_else(|| {
+        format!(
+            "project root has no same-volume rollback parent: {}",
+            root.display()
+        )
+    })?;
+    let rollback_stage = tempfile::Builder::new()
+        .prefix(".rosync-generation-rollback-")
+        .tempdir_in(stage_parent)
+        .map_err(|error| format!("create same-volume rollback stage: {error}"))?;
+    let stage_service = rollback_stage.path().join(&committed.service);
+    let live_parent_guard = crate::fs_safety::guard_synced_parent_chain(root, &live_service, false)
+        .map_err(|error| format!("guard live rollback service: {error}"))?;
+    let backup_parent_guard =
+        crate::fs_safety::guard_descendant_parent_chain(root, &backup_service, false)
+            .map_err(|error| format!("guard generation backup: {error}"))?;
+    let stage_parent_guard = crate::fs_safety::guard_descendant_parent_chain(
+        rollback_stage.path(),
+        &stage_service,
+        true,
+    )
+    .map_err(|error| format!("guard generation rollback stage: {error}"))?;
+    let result = restore_stream_backup_after_install(InstalledStreamRollback {
+        root,
+        service: &committed.service,
+        live_service: &live_service,
+        backup_service: &backup_service,
+        backup_transaction: transaction,
+        stage_service: &stage_service,
+        staged_fingerprint: &committed.installed_fingerprint,
+        live_parent_guard: &live_parent_guard,
+        backup_parent_guard: &backup_parent_guard,
+        stage_parent_guard: &stage_parent_guard,
+    })?;
+    PushCtx {
+        conflicts: state.conflict.as_ref(),
+        push_quiet: state.push_quiet.as_ref(),
+        force_overwrite: true,
+        strict: false,
+        force_prune: false,
+        project_root: root,
+        backup_forced_removals: false,
+    }
+    .mark_quiet(&live_service);
+    Ok(result)
+}
+
+fn rollback_stream_generation(
+    state: &AppState,
+    session: &mut PushStreamAccumulator,
+) -> StreamGenerationRollback {
+    let mut report = StreamGenerationRollback::default();
+    let mut still_committed = Vec::new();
+    for committed in std::mem::take(&mut session.committed_services)
+        .into_iter()
+        .rev()
+    {
+        let result = if committed.created {
+            rollback_created_stream_service(state, &committed).map(|()| None)
+        } else {
+            rollback_replaced_stream_service(state, &committed)
+        };
+        match result {
+            Ok(warning) => {
+                report.rolled_back_services.push(committed.service.clone());
+                if let Some(warning) = warning {
+                    report.warnings.push(warning);
+                }
+            }
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("rollback {}: {error}", committed.service));
+                still_committed.push(committed);
+            }
+        }
+    }
+    still_committed.reverse();
+    report.rolled_back_services.reverse();
+    session.committed_services = still_committed;
+    session.backups = session
+        .committed_services
+        .iter()
+        .filter_map(|committed| committed.backup.clone())
+        .collect();
+    if session.committed_services.is_empty() {
+        session.applied = 0;
+        session.prepared_baselines.clear();
+    }
+    if let Some(checkpoint) = session.conflict_checkpoint.take() {
+        state.conflict.restore_checkpoint(checkpoint);
+    }
+    report
+}
+
 fn audit_stream_push_partial(
     state: &AppState,
     session: &PushStreamAccumulator,
@@ -7573,6 +8106,37 @@ fn audit_stream_push_partial(
             "backups": session.backups,
             "committedServices": session.committed_services,
             "recoveryRequired": true,
+        })));
+    }
+}
+
+fn audit_stream_push_rolled_back(
+    state: &AppState,
+    session: &PushStreamAccumulator,
+    failed_service: &str,
+    error: &str,
+    rollback: &StreamGenerationRollback,
+) {
+    let event = json!({
+        "type": "stream-push-rolled-back",
+        "streamId": session.stream_id,
+        "failedService": failed_service,
+        "error": error,
+        "rolledBackServices": rollback.rolled_back_services,
+        "rollbackWarnings": rollback.warnings,
+    });
+    if let Ok(serialized) = serde_json::to_string(&event) {
+        let _ = state.events.send(serialized);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = write_log_entry(Json(json!({
+            "action": "stream-push-rolled-back",
+            "streamId": session.stream_id,
+            "failedService": failed_service,
+            "error": error,
+            "rolledBackServices": rollback.rolled_back_services,
+            "rollbackWarnings": rollback.warnings,
         })));
     }
 }
@@ -7658,6 +8222,7 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                     }));
                 }
                 let session = Arc::new(Mutex::new(PushStreamAccumulator {
+                    rollback_state: state.clone(),
                     stream_id: stream_id.to_string(),
                     strict: body.strict,
                     force_prune: body.force_prune || body.strict,
@@ -7666,6 +8231,8 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                     applied: 0,
                     backups: Vec::new(),
                     committed_services: Vec::new(),
+                    prepared_baselines: Vec::new(),
+                    conflict_checkpoint: Some(state.conflict.checkpoint()),
                     accepted_stream_bytes: 0,
                     accepted_source_bytes: 0,
                     last_request_hash: None,
@@ -7724,6 +8291,15 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                 // still observe the committed outcome.
                 return Json(json!({ "ok": false, "error": error }));
             }
+            let had_prior_commits = !session.committed_services.is_empty();
+            let rollback = if had_prior_commits {
+                rollback_stream_generation(state, &mut session)
+            } else {
+                if let Some(checkpoint) = session.conflict_checkpoint.take() {
+                    state.conflict.restore_checkpoint(checkpoint);
+                }
+                StreamGenerationRollback::default()
+            };
             if partial_failure {
                 if let Some(backup) = retained_backup.as_ref() {
                     if !session.backups.contains(backup) {
@@ -7731,7 +8307,7 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                     }
                 }
             }
-            if partial_failure || !session.committed_services.is_empty() {
+            if partial_failure || !rollback.errors.is_empty() {
                 let response = json!({
                     "ok": false,
                     "action": "partial",
@@ -7741,12 +8317,40 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                     "recoveryRequired": true,
                     "backups": session.backups,
                     "committedServices": session.committed_services,
+                    "rolledBackServices": rollback.rolled_back_services,
+                    "rollbackWarnings": rollback.warnings,
+                    "rollbackErrors": rollback.errors,
                 });
                 session.last_request_hash = Some(request_hash);
                 session.last_response = Some(response.clone());
                 session.last_activity = Instant::now();
                 session.completed_at = Some(Instant::now());
                 audit_stream_push_partial(state, &session, &failed_service, &error);
+                schedule_push_stream_cleanup(
+                    project.clone(),
+                    &session_handle,
+                    STREAM_COMPLETED_TTL,
+                );
+                return Json(response);
+            }
+            if had_prior_commits {
+                let response = json!({
+                    "ok": false,
+                    "action": "rolled-back",
+                    "streamId": session.stream_id,
+                    "error": error,
+                    "failedService": failed_service,
+                    "recoveryRequired": false,
+                    "backups": session.backups,
+                    "committedServices": session.committed_services,
+                    "rolledBackServices": rollback.rolled_back_services,
+                    "rollbackWarnings": rollback.warnings,
+                });
+                session.last_request_hash = Some(request_hash);
+                session.last_response = Some(response.clone());
+                session.last_activity = Instant::now();
+                session.completed_at = Some(Instant::now());
+                audit_stream_push_rolled_back(state, &session, &failed_service, &error, &rollback);
                 schedule_push_stream_cleanup(
                     project.clone(),
                     &session_handle,
@@ -7767,6 +8371,15 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
     };
     let complete = response.get("action").and_then(Value::as_str) == Some("complete");
     if complete {
+        let roots = snapshot::SYNCED_SERVICES
+            .iter()
+            .map(|service| state.canonical_project.join(service))
+            .collect::<Vec<_>>();
+        let baselines = std::mem::take(&mut session.prepared_baselines)
+            .into_iter()
+            .map(|baseline| (baseline.path, baseline.source_hash, baseline.fs_mtime));
+        state.conflict.commit_generation(&roots, baselines);
+        session.conflict_checkpoint = None;
         let retention_warnings =
             finalize_successful_stream_backups(state.canonical_project.as_path(), &mut session);
         if let Some(object) = response.as_object_mut() {
@@ -9268,9 +9881,65 @@ fn exact_disk_path_from_op(
     let path = fragments
         .iter()
         .fold(root.to_path_buf(), |path, fragment| path.join(fragment));
-    crate::fs_safety::validate_synced_path(root, &path, true)
-        .map(|_| Some(path.clone()))
-        .map_err(|error| format!("unsafe {field} path {}: {error}", path.display()))
+    match crate::fs_safety::validate_synced_path(root, &path, true) {
+        Ok(_) => Ok(Some(path)),
+        Err(error) => {
+            // A canonical update path can alias the already-existing legacy
+            // parent marker on a case-insensitive or Unicode-normalizing
+            // filesystem. Preserve exact-path validation everywhere else,
+            // and resolve this one ambiguity through the parent's unique,
+            // class/name-checked script source.
+            if field == "diskPath" && op_kind(op) == "update" {
+                if let Some(existing) =
+                    equivalent_init_update_target(root, &fragments).map_err(|reason| {
+                        format!(
+                            "unsafe {field} path {}: {error}; reconcile init marker: {reason}",
+                            path.display()
+                        )
+                    })?
+                {
+                    return Ok(Some(existing));
+                }
+            }
+            Err(format!("unsafe {field} path {}: {error}", path.display()))
+        }
+    }
+}
+
+fn equivalent_init_update_target(
+    root: &Path,
+    fragments: &[String],
+) -> Result<Option<PathBuf>, String> {
+    let Some(requested_fragment) = fragments.last() else {
+        return Ok(None);
+    };
+    let requested = parse_init_file(requested_fragment)
+        .map(|(class, name)| (class, Some(name)))
+        .or_else(|| parse_plain_init_file(requested_fragment).map(|class| (class, None)));
+    let Some((requested_class, requested_name)) = requested else {
+        return Ok(None);
+    };
+    if fragments.len() < 2 {
+        return Ok(None);
+    }
+    let parent = fragments[..fragments.len() - 1]
+        .iter()
+        .fold(root.to_path_buf(), |path, fragment| path.join(fragment));
+    crate::fs_safety::validate_synced_path(root, &parent, false)
+        .map_err(|error| format!("validate parent {}: {error}", parent.display()))?;
+    let Some((actual_class, actual_name, actual_path)) = script_with_children_source(&parent)
+        .map_err(|error| format!("inspect parent {}: {error}", parent.display()))?
+    else {
+        return Ok(None);
+    };
+    if actual_class != requested_class
+        || requested_name
+            .as_ref()
+            .is_some_and(|name| !logical_names_equivalent(name, &actual_name))
+    {
+        return Ok(None);
+    }
+    Ok(Some(actual_path))
 }
 
 fn disk_fragment_matches_node(fragment: &str, node: &Value) -> bool {
@@ -10008,7 +10677,7 @@ fn find_existing_init_source(
             continue;
         }
         if let Some((class, name)) = parse_init_file(&entry.fragment) {
-            if class == expected_class && name == expected_name {
+            if class == expected_class && logical_names_equivalent(&name, expected_name) {
                 named_matches.push(entry.path.clone());
             }
             continue;
@@ -11052,9 +11721,77 @@ fn apply_update(
     ctx: &PushCtx<'_>,
 ) -> Result<ApplyOutcome, String> {
     let Some(target) = resolve_segments_to_path(root, segs)? else {
+        if update_source_bytes(&properties)?.is_some() {
+            return Err(format!(
+                "update: Source target does not exist: {}",
+                segs.join("/")
+            ));
+        }
         return Ok(ApplyOutcome::Skipped);
     };
     apply_update_target(target, properties, ctx)
+}
+
+fn update_source_bytes(properties: &Option<Value>) -> Result<Option<Vec<u8>>, String> {
+    let Some(props) = properties.as_ref().and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(source) = props.get("Source") else {
+        return Ok(None);
+    };
+    let source = source
+        .as_str()
+        .ok_or_else(|| "update: properties.Source must be a string".to_string())?;
+    Ok(Some(normalize_line_endings(source.as_bytes()).into_owned()))
+}
+
+fn source_write_outcome(outcome: SourceWriteOutcome) -> ApplyOutcome {
+    match outcome {
+        SourceWriteOutcome::Applied => ApplyOutcome::Applied(1),
+        // The requested source is already present. This is an accepted,
+        // idempotent write rather than an unapplied mutation.
+        SourceWriteOutcome::Skipped => ApplyOutcome::Applied(0),
+        SourceWriteOutcome::Conflict(path) => ApplyOutcome::Conflict(path),
+    }
+}
+
+fn resolve_legacy_init_update_target(target: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(file_name) = target.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let requested = parse_init_file(file_name)
+        .map(|(class, name)| (class, Some(name)))
+        .or_else(|| parse_plain_init_file(file_name).map(|class| (class, None)));
+    let Some((requested_class, requested_name)) = requested else {
+        return Ok(None);
+    };
+    let Some(parent) = target.parent() else {
+        return Ok(None);
+    };
+    let Some(parent_metadata) = crate::fs_safety::metadata_no_follow(parent)
+        .map_err(|error| format!("inspect legacy init parent {}: {error}", parent.display()))?
+    else {
+        return Ok(None);
+    };
+    if !parent_metadata.is_dir() {
+        return Ok(None);
+    }
+    let Some((actual_class, actual_name, actual_path)) = script_with_children_source(parent)
+        .map_err(|error| format!("inspect legacy init source {}: {error}", parent.display()))?
+    else {
+        return Ok(None);
+    };
+    if actual_class != requested_class
+        || requested_name
+            .as_ref()
+            .is_some_and(|requested_name| !logical_names_equivalent(requested_name, &actual_name))
+    {
+        return Err(format!(
+            "update: requested init source identity does not match {}",
+            parent.display()
+        ));
+    }
+    Ok(Some(actual_path))
 }
 
 fn apply_update_target(
@@ -11062,34 +11799,53 @@ fn apply_update_target(
     properties: Option<Value>,
     ctx: &PushCtx<'_>,
 ) -> Result<ApplyOutcome, String> {
-    let Some(metadata) = crate::fs_safety::metadata_no_follow(&target)
-        .map_err(|error| format!("inspect update target {}: {error}", target.display()))?
-    else {
+    let Some(bytes) = update_source_bytes(&properties)? else {
         return Ok(ApplyOutcome::Skipped);
     };
-    let Some(props) = properties.and_then(|v| v.as_object().cloned()) else {
-        return Ok(ApplyOutcome::Skipped);
+    let metadata = crate::fs_safety::metadata_no_follow(&target)
+        .map_err(|error| format!("inspect update target {}: {error}", target.display()))?
+        .map(|metadata| (target.clone(), metadata));
+    let (target, metadata) = match metadata {
+        Some(target) => target,
+        None => {
+            let Some(legacy_target) = resolve_legacy_init_update_target(&target)? else {
+                return Err(format!(
+                    "update: Source target does not exist: {}",
+                    target.display()
+                ));
+            };
+            let metadata =
+                crate::fs_safety::require_metadata_no_follow(&legacy_target).map_err(|error| {
+                    format!(
+                        "inspect resolved legacy init source {}: {error}",
+                        legacy_target.display()
+                    )
+                })?;
+            (legacy_target, metadata)
+        }
     };
 
     // Script leaf: properties.Source replaces file contents.
     if metadata.is_file() {
-        if let Some(source) = props.get("Source").and_then(|v| v.as_str()) {
-            let raw_bytes = source.as_bytes().to_vec();
-            let bytes = normalize_line_endings(&raw_bytes).into_owned();
-            return match apply_source_bytes(&target, &bytes, ctx)? {
-                SourceWriteOutcome::Applied => Ok(ApplyOutcome::Applied(1)),
-                SourceWriteOutcome::Skipped => Ok(ApplyOutcome::Skipped),
-                SourceWriteOutcome::Conflict(path) => Ok(ApplyOutcome::Conflict(path)),
-            };
-        }
-        return Ok(ApplyOutcome::Skipped);
+        return apply_source_bytes(&target, &bytes, ctx).map(source_write_outcome);
     }
 
-    // Directory-backed instances (folders / script-with-children dirs) no
-    // longer carry property updates. Script-source-in-dir updates arrive via
-    // `set`, not `update` — scripts-with-children have their init file set in
-    // apply_set. Anything else is Studio-authoritative.
-    Ok(ApplyOutcome::Skipped)
+    if metadata.is_dir() {
+        let Some((_class, _name, init_source)) = script_with_children_source(&target)
+            .map_err(|error| format!("inspect update directory {}: {error}", target.display()))?
+        else {
+            return Err(format!(
+                "update: Source target is not a script-with-children directory: {}",
+                target.display()
+            ));
+        };
+        return apply_source_bytes(&init_source, &bytes, ctx).map(source_write_outcome);
+    }
+
+    Err(format!(
+        "update: Source target is not a regular file or script-with-children directory: {}",
+        target.display()
+    ))
 }
 
 fn apply_rename(
@@ -11278,6 +12034,269 @@ fn init_rename_temp_path(dir: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitRenameStage {
+    Unchanged,
+    Temporary,
+    Renamed,
+}
+
+#[derive(Debug)]
+struct InitRenameRollbackPaths {
+    old: PathBuf,
+    temporary: PathBuf,
+    renamed: PathBuf,
+    old_relative: PathBuf,
+    temporary_relative: PathBuf,
+    renamed_relative: PathBuf,
+}
+
+struct RenameRollbackContext<'a> {
+    project_root: &'a Path,
+    target: &'a Path,
+    new_path: &'a Path,
+    source_fence: &'a SafeSubtreeFence,
+    source_directory_identity: Option<&'a crate::fs_safety::FileIdentity>,
+    source_parent_guard: &'a crate::fs_safety::PathParentGuard,
+    destination_parent_guard: &'a crate::fs_safety::PathParentGuard,
+    init_paths: Option<&'a InitRenameRollbackPaths>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenamePathAndInitCheckpoint {
+    PostOuterSourceParentVerify,
+    PostOuterDestinationParentVerify,
+    MovedFenceCapture,
+    MovedDirectoryGuardCreate,
+    MovedDirectoryGuardVerify,
+    DestinationMetadataInspect,
+    FinalMovedDirectoryVerify,
+}
+
+fn relocated_subtree_matches_init_stage(
+    source: &SafeSubtreeFence,
+    current: &SafeSubtreeFence,
+    init_paths: Option<&InitRenameRollbackPaths>,
+    stage: InitRenameStage,
+) -> bool {
+    if source.entries.len() != current.entries.len() {
+        return false;
+    }
+    let current_by_relative = current
+        .entries
+        .iter()
+        .map(|entry| (entry.relative.as_path(), entry))
+        .collect::<HashMap<_, _>>();
+    source.entries.iter().all(|source_entry| {
+        let expected_relative = match (init_paths, stage) {
+            (Some(paths), InitRenameStage::Temporary)
+                if source_entry.relative == paths.old_relative =>
+            {
+                &paths.temporary_relative
+            }
+            (Some(paths), InitRenameStage::Renamed)
+                if source_entry.relative == paths.old_relative =>
+            {
+                &paths.renamed_relative
+            }
+            _ => &source_entry.relative,
+        };
+        current_by_relative
+            .get(expected_relative.as_path())
+            .is_some_and(|current_entry| {
+                source_entry.kind == current_entry.kind
+                    && source_entry.file_generation == current_entry.file_generation
+            })
+    })
+}
+
+fn rollback_destination_is_available(
+    destination: &Path,
+    current_source: &Path,
+) -> Result<(), String> {
+    match crate::fs_safety::metadata_no_follow(destination) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) if paths_refer_to_same_entry(destination, current_source) => Ok(()),
+        Ok(Some(_)) => Err(format!(
+            "rollback destination appeared and is not the current source: {}",
+            destination.display()
+        )),
+        Err(error) => Err(format!(
+            "inspect rollback destination {}: {error}",
+            destination.display()
+        )),
+    }
+}
+
+fn verify_renamed_tree_for_rollback(
+    context: &RenameRollbackContext<'_>,
+    stage: InitRenameStage,
+) -> Result<(), String> {
+    context.source_parent_guard.verify().map_err(|error| {
+        format!(
+            "source parent changed before rollback {}: {error}",
+            context.target.display()
+        )
+    })?;
+    context.destination_parent_guard.verify().map_err(|error| {
+        format!(
+            "destination parent changed before rollback {}: {error}",
+            context.new_path.display()
+        )
+    })?;
+    rollback_destination_is_available(context.target, context.new_path)
+        .map_err(|reason| format!("outer {reason}"))?;
+    if let Some(expected_identity) = context.source_directory_identity {
+        let current = crate::fs_safety::directory_generation_no_follow(context.new_path)
+            .map_err(|error| format!("inspect renamed directory identity: {error}"))?;
+        if &current.identity != expected_identity {
+            return Err(format!(
+                "renamed directory identity changed before rollback: {}",
+                context.new_path.display()
+            ));
+        }
+    }
+    let current =
+        capture_synced_subtree(context.project_root, context.new_path)?.ok_or_else(|| {
+            format!(
+                "renamed path disappeared before rollback: {}",
+                context.new_path.display()
+            )
+        })?;
+    if !relocated_subtree_matches_init_stage(
+        context.source_fence,
+        &current,
+        context.init_paths,
+        stage,
+    ) {
+        return Err(format!(
+            "renamed tree changed before rollback at stage {stage:?}: {}",
+            context.new_path.display()
+        ));
+    }
+    context.source_parent_guard.verify().map_err(|error| {
+        format!(
+            "source parent changed while preparing rollback {}: {error}",
+            context.target.display()
+        )
+    })?;
+    context.destination_parent_guard.verify().map_err(|error| {
+        format!(
+            "destination parent changed while preparing rollback {}: {error}",
+            context.new_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn rollback_renamed_path_and_init<R>(
+    context: &RenameRollbackContext<'_>,
+    stage: InitRenameStage,
+    rename: &mut R,
+) -> String
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    if let Err(reason) = verify_renamed_tree_for_rollback(context, stage) {
+        return format!("init rollback: refused; outer rollback: refused: {reason}");
+    }
+
+    let init_status = match stage {
+        InitRenameStage::Unchanged => "not needed".to_string(),
+        InitRenameStage::Temporary | InitRenameStage::Renamed => {
+            let Some(paths) = context.init_paths else {
+                return "init rollback: refused: missing init paths; outer rollback: refused"
+                    .to_string();
+            };
+            let current = match stage {
+                InitRenameStage::Temporary => &paths.temporary,
+                InitRenameStage::Renamed => &paths.renamed,
+                InitRenameStage::Unchanged => unreachable!(),
+            };
+            if let Err(reason) = rollback_destination_is_available(&paths.old, current) {
+                return format!("init rollback: refused: {reason}; outer rollback: refused");
+            }
+            if let Err(error) = rename(current, &paths.old) {
+                return format!(
+                    "init rollback: failed {} → {}: {error}; outer rollback: refused",
+                    current.display(),
+                    paths.old.display()
+                );
+            }
+            "ok".to_string()
+        }
+    };
+
+    if let Err(reason) = verify_renamed_tree_for_rollback(context, InitRenameStage::Unchanged) {
+        return format!("init rollback: {init_status}; outer rollback: refused: {reason}");
+    }
+    if let Err(error) = rename(context.new_path, context.target) {
+        return format!(
+            "init rollback: {init_status}; outer rollback: failed {} → {}: {error}",
+            context.new_path.display(),
+            context.target.display()
+        );
+    }
+
+    let verification = (|| {
+        context.source_parent_guard.verify().map_err(|error| {
+            format!(
+                "source parent changed after outer rollback {}: {error}",
+                context.target.display()
+            )
+        })?;
+        context.destination_parent_guard.verify().map_err(|error| {
+            format!(
+                "destination parent changed after outer rollback {}: {error}",
+                context.new_path.display()
+            )
+        })?;
+        if let Some(expected_identity) = context.source_directory_identity {
+            let restored = crate::fs_safety::directory_generation_no_follow(context.target)
+                .map_err(|error| format!("inspect restored directory identity: {error}"))?;
+            if &restored.identity != expected_identity {
+                return Err(format!(
+                    "restored directory identity changed: {}",
+                    context.target.display()
+                ));
+            }
+        }
+        let restored =
+            capture_synced_subtree(context.project_root, context.target)?.ok_or_else(|| {
+                format!(
+                    "outer rollback target disappeared: {}",
+                    context.target.display()
+                )
+            })?;
+        if !relocated_subtree_matches(context.source_fence, &restored) {
+            return Err(format!(
+                "restored tree differs from the pre-rename tree: {}",
+                context.target.display()
+            ));
+        }
+        Ok::<(), String>(())
+    })();
+    match verification {
+        Ok(()) => format!("init rollback: {init_status}; outer rollback: ok"),
+        Err(reason) => format!(
+            "init rollback: {init_status}; outer rollback: completed but verification failed: {reason}"
+        ),
+    }
+}
+
+fn rename_failure_after_outer<R>(
+    primary: String,
+    context: &RenameRollbackContext<'_>,
+    stage: InitRenameStage,
+    rename: &mut R,
+) -> String
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let rollback = rollback_renamed_path_and_init(context, stage, rename);
+    format!("{primary}; {rollback}")
+}
+
 fn rename_path_and_init(
     target: &Path,
     new_path: &Path,
@@ -11301,13 +12320,55 @@ fn rename_path_and_init_with<R>(
     new_instance_name: &str,
     script_with_children: bool,
     ctx: &PushCtx<'_>,
-    mut rename: R,
+    rename: R,
 ) -> Result<(), String>
 where
     R: FnMut(&Path, &Path) -> std::io::Result<()>,
 {
+    rename_path_and_init_with_checkpoints(
+        target,
+        new_path,
+        new_instance_name,
+        script_with_children,
+        ctx,
+        rename,
+        |_| Ok(()),
+    )
+}
+
+fn rename_path_and_init_with_checkpoints<R, C>(
+    target: &Path,
+    new_path: &Path,
+    new_instance_name: &str,
+    script_with_children: bool,
+    ctx: &PushCtx<'_>,
+    mut rename: R,
+    mut checkpoint: C,
+) -> Result<(), String>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+    C: FnMut(RenamePathAndInitCheckpoint) -> Result<(), String>,
+{
     let source_fence = capture_synced_subtree(ctx.project_root, target)?
         .ok_or_else(|| format!("rename source disappeared: {}", target.display()))?;
+    let source_directory_identity = if source_fence
+        .entries
+        .first()
+        .is_some_and(|entry| entry.kind == crate::fs_safety::SafeEntryKind::Directory)
+    {
+        Some(
+            crate::fs_safety::directory_generation_no_follow(target)
+                .map_err(|error| {
+                    format!(
+                        "inspect rename source directory identity {}: {error}",
+                        target.display()
+                    )
+                })?
+                .identity,
+        )
+    } else {
+        None
+    };
     let source_parent = target
         .parent()
         .ok_or_else(|| format!("rename source has no parent: {}", target.display()))?;
@@ -11344,6 +12405,28 @@ where
     } else {
         None
     };
+    let init_rollback_paths =
+        init_plan
+            .as_ref()
+            .zip(temp_name.as_ref())
+            .map(|(plan, temp_name)| InitRenameRollbackPaths {
+                old: new_path.join(&plan.old_name),
+                temporary: new_path.join(temp_name),
+                renamed: new_path.join(&plan.new_name),
+                old_relative: PathBuf::from(&plan.old_name),
+                temporary_relative: PathBuf::from(temp_name),
+                renamed_relative: PathBuf::from(&plan.new_name),
+            });
+    let rollback_context = RenameRollbackContext {
+        project_root: ctx.project_root,
+        target,
+        new_path,
+        source_fence: &source_fence,
+        source_directory_identity: source_directory_identity.as_ref(),
+        source_parent_guard: &source_parent_guard,
+        destination_parent_guard: &destination_parent_guard,
+        init_paths: init_rollback_paths.as_ref(),
+    };
     ctx.mark_quiet(target);
     ctx.mark_quiet(new_path);
     source_parent_guard.verify().map_err(|error| {
@@ -11365,118 +12448,193 @@ where
             new_path.display()
         )
     })?;
-    source_parent_guard.verify().map_err(|error| {
-        format!(
-            "rename source parent changed during commit {}: {error}",
-            source_parent.display()
-        )
-    })?;
-    destination_parent_guard.verify().map_err(|error| {
-        format!(
-            "rename destination parent changed during commit {}: {error}",
-            destination_parent.display()
-        )
-    })?;
-    let moved_fence = capture_synced_subtree(ctx.project_root, new_path)?
-        .ok_or_else(|| format!("renamed path disappeared: {}", new_path.display()))?;
+    let post_outer_source = checkpoint(RenamePathAndInitCheckpoint::PostOuterSourceParentVerify)
+        .and_then(|()| {
+            source_parent_guard.verify().map_err(|error| {
+                format!(
+                    "rename source parent changed during commit {}: {error}",
+                    source_parent.display()
+                )
+            })
+        });
+    if let Err(error) = post_outer_source {
+        return Err(rename_failure_after_outer(
+            error,
+            &rollback_context,
+            InitRenameStage::Unchanged,
+            &mut rename,
+        ));
+    }
+    let post_outer_destination =
+        checkpoint(RenamePathAndInitCheckpoint::PostOuterDestinationParentVerify).and_then(|()| {
+            destination_parent_guard.verify().map_err(|error| {
+                format!(
+                    "rename destination parent changed during commit {}: {error}",
+                    destination_parent.display()
+                )
+            })
+        });
+    if let Err(error) = post_outer_destination {
+        return Err(rename_failure_after_outer(
+            error,
+            &rollback_context,
+            InitRenameStage::Unchanged,
+            &mut rename,
+        ));
+    }
+    let moved_fence = match checkpoint(RenamePathAndInitCheckpoint::MovedFenceCapture)
+        .and_then(|()| capture_synced_subtree(ctx.project_root, new_path))
+    {
+        Ok(Some(fence)) => fence,
+        Ok(None) => {
+            return Err(rename_failure_after_outer(
+                format!("renamed path disappeared: {}", new_path.display()),
+                &rollback_context,
+                InitRenameStage::Unchanged,
+                &mut rename,
+            ));
+        }
+        Err(error) => {
+            return Err(rename_failure_after_outer(
+                error,
+                &rollback_context,
+                InitRenameStage::Unchanged,
+                &mut rename,
+            ));
+        }
+    };
     if !relocated_subtree_matches(&source_fence, &moved_fence) {
-        return Err(format!(
-            "renamed subtree changed during commit: {}",
-            new_path.display()
+        return Err(rename_failure_after_outer(
+            format!(
+                "renamed subtree changed during commit: {}",
+                new_path.display()
+            ),
+            &rollback_context,
+            InitRenameStage::Unchanged,
+            &mut rename,
         ));
     }
 
-    let Some(init_plan) = init_plan else {
+    if init_plan.is_none() {
         return Ok(());
-    };
-    let old_init = new_path.join(&init_plan.old_name);
-    let new_init = new_path.join(&init_plan.new_name);
-    let temp_init = new_path.join(temp_name.expect("init plan allocates a temporary name"));
-    ctx.mark_quiet(&old_init);
-    ctx.mark_quiet(&new_init);
-    ctx.mark_quiet(&temp_init);
+    }
+    let init_paths = init_rollback_paths
+        .as_ref()
+        .expect("init plan allocates rollback paths");
+    let old_init = &init_paths.old;
+    let new_init = &init_paths.renamed;
+    let temp_init = &init_paths.temporary;
+    ctx.mark_quiet(old_init);
+    ctx.mark_quiet(new_init);
+    ctx.mark_quiet(temp_init);
     let moved_directory_guard =
-        crate::fs_safety::guard_synced_directory_chain(ctx.project_root, new_path)
-            .map_err(|error| format!("guard renamed directory {}: {error}", new_path.display()))?;
-    moved_directory_guard.verify().map_err(|error| {
-        format!(
-            "renamed directory changed before init update {}: {error}",
-            new_path.display()
-        )
-    })?;
-
-    if let Err(init_error) = rename(&old_init, &temp_init) {
-        let rollback = rename(new_path, target);
-        return match rollback {
-            Ok(()) => Err(format!(
-                "rename init {} → {}: {init_error}; outer rename was rolled back",
-                old_init.display(),
-                new_init.display()
-            )),
-            Err(rollback_error) => Err(format!(
-                "rename init {} → {}: {init_error}; rollback {} → {} also failed: {rollback_error}",
-                old_init.display(),
-                new_init.display(),
-                new_path.display(),
-                target.display()
-            )),
+        match checkpoint(RenamePathAndInitCheckpoint::MovedDirectoryGuardCreate).and_then(|()| {
+            crate::fs_safety::guard_synced_directory_chain(ctx.project_root, new_path)
+                .map_err(|error| format!("guard renamed directory {}: {error}", new_path.display()))
+        }) {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Err(rename_failure_after_outer(
+                    error,
+                    &rollback_context,
+                    InitRenameStage::Unchanged,
+                    &mut rename,
+                ));
+            }
         };
+    let pre_init_verify = checkpoint(RenamePathAndInitCheckpoint::MovedDirectoryGuardVerify)
+        .and_then(|()| {
+            moved_directory_guard.verify().map_err(|error| {
+                format!(
+                    "renamed directory changed before init update {}: {error}",
+                    new_path.display()
+                )
+            })
+        });
+    if let Err(error) = pre_init_verify {
+        return Err(rename_failure_after_outer(
+            error,
+            &rollback_context,
+            InitRenameStage::Unchanged,
+            &mut rename,
+        ));
+    }
+
+    if let Err(init_error) = rename(old_init, temp_init) {
+        return Err(rename_failure_after_outer(
+            format!(
+                "rename init {} → {}: {init_error}",
+                old_init.display(),
+                temp_init.display()
+            ),
+            &rollback_context,
+            InitRenameStage::Unchanged,
+            &mut rename,
+        ));
     }
 
     // Check only after moving the old file aside. On case-insensitive
     // filesystems a case-only destination aliases the old path and disappears
     // at this point; on case-sensitive filesystems a genuinely distinct
     // destination remains and must never be overwritten.
-    if crate::fs_safety::metadata_no_follow(&new_init)
-        .map_err(|error| format!("inspect init destination {}: {error}", new_init.display()))?
-        .is_some()
-    {
-        let restore_init = rename(&temp_init, &old_init);
-        let rollback_outer = rename(new_path, target);
-        return Err(format!(
-            "rename: init destination already exists: {}; init rollback: {}; outer rollback: {}",
-            new_init.display(),
-            restore_init
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "ok".to_string()),
-            rollback_outer
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "ok".to_string())
+    let destination_metadata = checkpoint(RenamePathAndInitCheckpoint::DestinationMetadataInspect)
+        .and_then(|()| {
+            crate::fs_safety::metadata_no_follow(new_init).map_err(|error| {
+                format!("inspect init destination {}: {error}", new_init.display())
+            })
+        });
+    let destination_metadata = match destination_metadata {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(rename_failure_after_outer(
+                error,
+                &rollback_context,
+                InitRenameStage::Temporary,
+                &mut rename,
+            ));
+        }
+    };
+    if destination_metadata.is_some() {
+        return Err(rename_failure_after_outer(
+            format!(
+                "rename: init destination already exists: {}",
+                new_init.display()
+            ),
+            &rollback_context,
+            InitRenameStage::Temporary,
+            &mut rename,
         ));
     }
 
-    if let Err(init_error) = rename(&temp_init, &new_init) {
-        let restore_init = rename(&temp_init, &old_init);
-        let rollback_outer = rename(new_path, target);
-        if restore_init.is_ok() && rollback_outer.is_ok() {
-            return Err(format!(
-                "rename init {} → {}: {init_error}; init and outer rename were rolled back",
-                old_init.display(),
+    if let Err(init_error) = rename(temp_init, new_init) {
+        return Err(rename_failure_after_outer(
+            format!(
+                "rename init {} → {}: {init_error}",
+                temp_init.display(),
                 new_init.display()
-            ));
-        }
-        return Err(format!(
-            "rename init {} → {}: {init_error}; init rollback: {}; outer rollback: {}",
-            old_init.display(),
-            new_init.display(),
-            restore_init
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "ok".to_string()),
-            rollback_outer
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "ok".to_string())
+            ),
+            &rollback_context,
+            InitRenameStage::Temporary,
+            &mut rename,
         ));
     }
-    moved_directory_guard.verify().map_err(|error| {
-        format!(
-            "renamed directory changed during init update {}: {error}",
-            new_path.display()
-        )
-    })?;
+    let final_verify =
+        checkpoint(RenamePathAndInitCheckpoint::FinalMovedDirectoryVerify).and_then(|()| {
+            moved_directory_guard.verify().map_err(|error| {
+                format!(
+                    "renamed directory changed during init update {}: {error}",
+                    new_path.display()
+                )
+            })
+        });
+    if let Err(error) = final_verify {
+        return Err(rename_failure_after_outer(
+            error,
+            &rollback_context,
+            InitRenameStage::Renamed,
+            &mut rename,
+        ));
+    }
     Ok(())
 }
 
@@ -11898,16 +13056,18 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
         }
         OpKind::Add | OpKind::Update => {
             let fname = segs.last()?.clone();
-            // Skip init files — they describe their parent dir.
+            // Canonical init files describe their parent directory. A legacy
+            // mismatched named init is instead a literal leaf script; let it
+            // fall through to the regular file projection below.
             if is_init_file(&fname) {
-                // Translate into an update of the parent dir (Source on the script-with-children).
-                let parent_path = op.path.parent()?;
-                let parent_inst = path_to_instance_meta(parent_path).ok().flatten()?;
-                if let Some(PathInstance {
-                    is_script_with_children: true,
-                    ..
-                }) = Some(&parent_inst).filter(|i| i.is_script_with_children)
+                if let Some(parent_inst) = op
+                    .path
+                    .parent()
+                    .and_then(|parent| path_to_instance_meta(parent).ok().flatten())
+                    .filter(|instance| instance.is_script_with_children)
                 {
+                    // Translate into an update of the parent dir (Source on
+                    // the script-with-children).
                     let parent_segs_fs: Vec<String> = segs[..segs.len() - 1].to_vec();
                     let inst_lookup_segs = segs_to_lookup_path(&parent_segs_fs)?;
                     let inst_naming_segs = segs_to_naming_path(&parent_segs_fs)?;
@@ -11927,7 +13087,6 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
                         "properties": { "Source": source },
                     }));
                 }
-                return None;
             }
             // `.meta.json` is blacklisted at the watcher — if one still slips
             // through, swallow it here.
@@ -11984,32 +13143,21 @@ fn script_identity_from_segments(
     let fname = segs.last()?;
     if let Some((script_class, _)) = parse_init_file(fname) {
         let parent_segs = &segs[..segs.len().saturating_sub(1)];
-        let mut naming_path = if let Some(parent) = fs_path.parent() {
-            path_to_instance_meta(parent)
-                .ok()
-                .flatten()
-                .and_then(|inst| {
-                    let mut out = segs_to_naming_path(parent_segs)?;
-                    let last = out.last_mut()?;
-                    *last = inst.name;
-                    Some(out)
-                })
-                .or_else(|| segs_to_naming_path(parent_segs))
-        } else {
-            segs_to_naming_path(parent_segs)
-        }?;
-        if let Some(parent) = fs_path.parent() {
-            if let Ok(Some(inst)) = path_to_instance_meta(parent) {
-                if let Some(last) = naming_path.last_mut() {
-                    *last = inst.name;
-                }
+        if let Some(inst) = fs_path
+            .parent()
+            .and_then(|parent| path_to_instance_meta(parent).ok().flatten())
+            .filter(|instance| instance.is_script_with_children)
+        {
+            let mut naming_path = segs_to_naming_path(parent_segs)?;
+            if let Some(last) = naming_path.last_mut() {
+                *last = inst.name;
             }
+            return Some((
+                segs_to_lookup_path(parent_segs)?,
+                naming_path,
+                script_class.class_name().to_string(),
+            ));
         }
-        return Some((
-            segs_to_lookup_path(parent_segs)?,
-            naming_path,
-            script_class.class_name().to_string(),
-        ));
     }
 
     if let Some((script_class, _)) = classify_script_file(fname) {
@@ -12569,28 +13717,45 @@ mod tests {
         mut response: Value,
     ) -> Value {
         for _ in 0..10_000 {
-            if response["phase"].as_str() != Some("diskPrepare") {
-                return response;
+            match response["phase"].as_str() {
+                Some("identities") if response["finalChunk"] == true => {
+                    assert_eq!(response["nextPhase"], "hashes", "{response}");
+                    assert_eq!(response["nextChunk"], 0, "{response}");
+                    response["phase"] = Value::String("hashes".into());
+                    return response;
+                }
+                Some("diskPrepare" | "identities") => {}
+                _ => return response,
             }
             let chunk_index = response["nextChunk"].as_u64().unwrap();
-            response = initial_compare(
-                State(state.clone()),
-                Json(InitialCompareBody {
-                    studio_stats,
-                    studio_snapshot: Vec::new(),
-                    compare_id: Some(compare_id.to_string()),
-                    service: Some(service.to_string()),
-                    plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
-                    phase: Some("diskPrepare".into()),
-                    chunk_index: Some(chunk_index),
-                    final_chunk: false,
-                    records: Vec::new(),
-                    hashes: Vec::new(),
-                }),
-            )
-            .await
-            .0;
+            let phase = response["phase"].as_str().unwrap().to_string();
+            let request = || InitialCompareBody {
+                studio_stats,
+                studio_snapshot: Vec::new(),
+                compare_id: Some(compare_id.to_string()),
+                service: Some(service.to_string()),
+                plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
+                phase: Some(phase.clone()),
+                chunk_index: Some(chunk_index),
+                final_chunk: false,
+                records: Vec::new(),
+                hashes: Vec::new(),
+            };
+            response = initial_compare(State(state.clone()), Json(request()))
+                .await
+                .0;
+            let replay = initial_compare(State(state.clone()), Json(request()))
+                .await
+                .0;
+            assert_eq!(
+                replay, response,
+                "initial compare exact cursor retry diverged"
+            );
             assert_ne!(response["ok"], false, "{response}");
+            assert!(
+                serde_json::to_vec(&response).unwrap().len() <= STREAM_SOURCE_CHUNK_BYTES,
+                "initial compare response exceeded 512 KiB"
+            );
             if response["phase"].as_str() == Some("diskPrepare") {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -12946,6 +14111,12 @@ mod tests {
             .unwrap();
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let hello: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(hello["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello["buildCommit"], env!("ROSYNC_BUILD_COMMIT"));
+        assert_eq!(
+            hello["buildDirty"],
+            Value::Bool(env!("ROSYNC_BUILD_DIRTY") == "true")
+        );
         assert_eq!(hello["projectInit"]["available"], true);
         assert_eq!(hello["projectInit"]["endpoint"], "/projects/init");
         assert_eq!(
@@ -13676,6 +14847,215 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_legacy_parent_marker_is_migrated_by_atomic_parent_rename() {
+        let d = TempDir::new("rename-equivalent-legacy-init");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("notifications");
+        let new_path = parent.join("Alerts");
+        let old_marker = old_path.join("INIT (Notifications).luau");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(&old_marker, "return 42\n").unwrap();
+
+        rename_path_and_init(&old_path, &new_path, "Alerts", true, &ctx).unwrap();
+
+        assert!(!old_path.exists());
+        assert!(!new_path.join("INIT (Notifications).luau").exists());
+        assert_eq!(
+            std::fs::read_to_string(new_path.join("init (Alerts).luau")).unwrap(),
+            "return 42\n"
+        );
+    }
+
+    fn assert_script_rename_checkpoint_rolls_back(
+        tag: &str,
+        failure: RenamePathAndInitCheckpoint,
+        expected_rename_calls: usize,
+        expected_init_status: &str,
+    ) {
+        let d = TempDir::new(tag);
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("Old");
+        let new_path = parent.join("New");
+        let old_init = old_path.join("init (Old).luau");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(&old_init, "return 'preserved'\n").unwrap();
+        std::fs::write(old_path.join("Child.luau"), "return 'child'\n").unwrap();
+
+        let mut rename_calls = 0usize;
+        let error = rename_path_and_init_with_checkpoints(
+            &old_path,
+            &new_path,
+            "New",
+            true,
+            &ctx,
+            |from, to| {
+                rename_calls += 1;
+                std::fs::rename(from, to)
+            },
+            |checkpoint| {
+                if checkpoint == failure {
+                    Err(format!("injected checkpoint failure: {checkpoint:?}"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected checkpoint failure"), "{error}");
+        assert!(
+            error.contains(&format!("init rollback: {expected_init_status}")),
+            "{error}"
+        );
+        assert!(error.contains("outer rollback: ok"), "{error}");
+        assert_eq!(rename_calls, expected_rename_calls);
+        assert!(old_path.is_dir());
+        assert!(!new_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&old_init).unwrap(),
+            "return 'preserved'\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old_path.join("Child.luau")).unwrap(),
+            "return 'child'\n"
+        );
+        assert!(std::fs::read_dir(&old_path).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".rosync-init-rename-")));
+    }
+
+    #[test]
+    fn script_with_children_rename_rolls_back_after_post_outer_check_failure() {
+        assert_script_rename_checkpoint_rolls_back(
+            "rename-post-outer-check-rollback",
+            RenamePathAndInitCheckpoint::PostOuterSourceParentVerify,
+            2,
+            "not needed",
+        );
+    }
+
+    #[test]
+    fn script_with_children_rename_rolls_back_after_destination_inspection_failure() {
+        assert_script_rename_checkpoint_rolls_back(
+            "rename-destination-inspection-rollback",
+            RenamePathAndInitCheckpoint::DestinationMetadataInspect,
+            4,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn script_with_children_rename_rolls_back_after_final_verify_failure() {
+        assert_script_rename_checkpoint_rolls_back(
+            "rename-final-verify-rollback",
+            RenamePathAndInitCheckpoint::FinalMovedDirectoryVerify,
+            5,
+            "ok",
+        );
+    }
+
+    #[test]
+    fn rename_rollback_accepts_a_destination_that_is_the_same_physical_entry() {
+        let d = TempDir::new("rename-same-entry-destination");
+        let current = d.path().join("Current.luau");
+        let alias = d.path().join("Alias.luau");
+        let occupied = d.path().join("Occupied.luau");
+        std::fs::write(&current, "return true\n").unwrap();
+        std::fs::hard_link(&current, &alias).unwrap();
+        std::fs::write(&occupied, "return false\n").unwrap();
+
+        assert!(paths_refer_to_same_entry(&alias, &current));
+        assert!(rollback_destination_is_available(&alias, &current).is_ok());
+        assert!(rollback_destination_is_available(&occupied, &current).is_err());
+    }
+
+    #[test]
+    fn case_only_script_rename_rolls_back_after_final_verify_failure() {
+        let d = TempDir::new("rename-case-only-rollback");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("Controller");
+        let new_path = parent.join("controller");
+        let old_init = old_path.join("init (Controller).luau");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(&old_init, "return 'preserved'\n").unwrap();
+
+        let error = rename_path_and_init_with_checkpoints(
+            &old_path,
+            &new_path,
+            "controller",
+            true,
+            &ctx,
+            |from, to| std::fs::rename(from, to),
+            |checkpoint| {
+                if checkpoint == RenamePathAndInitCheckpoint::FinalMovedDirectoryVerify {
+                    Err("injected case-only final verification failure".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("init rollback: ok"), "{error}");
+        assert!(error.contains("outer rollback: ok"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&old_init).unwrap(),
+            "return 'preserved'\n"
+        );
+    }
+
+    #[test]
+    fn script_with_children_rename_refuses_rollback_of_a_changed_relocated_tree() {
+        let d = TempDir::new("rename-changed-tree-refusal");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("Old");
+        let new_path = parent.join("New");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(old_path.join("init (Old).luau"), "return 'preserved'\n").unwrap();
+
+        let error = rename_path_and_init_with_checkpoints(
+            &old_path,
+            &new_path,
+            "New",
+            true,
+            &ctx,
+            |from, to| std::fs::rename(from, to),
+            |checkpoint| {
+                if checkpoint == RenamePathAndInitCheckpoint::PostOuterSourceParentVerify {
+                    std::fs::write(new_path.join("Concurrent.luau"), "return 'new edit'\n")
+                        .unwrap();
+                    Err("injected post-outer failure after concurrent edit".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("init rollback: refused"), "{error}");
+        assert!(error.contains("outer rollback: refused"), "{error}");
+        assert!(!old_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(new_path.join("Concurrent.luau")).unwrap(),
+            "return 'new edit'\n"
+        );
+    }
+
+    #[test]
     fn studio_rename_rebases_leaf_baseline_for_followup_clean_delete() {
         let d = TempDir::new("rename-leaf-rebases-baseline");
         let engine = ConflictEngine::new();
@@ -13735,7 +15115,8 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error.contains("init and outer rename were rolled back"));
+        assert!(error.contains("init rollback: ok"), "{error}");
+        assert!(error.contains("outer rollback: ok"), "{error}");
         assert_eq!(rename_calls, 5);
         assert!(old_path.is_dir());
         assert!(!new_path.exists());
@@ -14138,6 +15519,34 @@ mod tests {
     }
 
     #[test]
+    fn fs_mismatched_legacy_init_update_remains_a_literal_leaf_script() {
+        let d = TempDir::new("fs-legacy-init-leaf-op");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        let literal = misc.join("init (Notifications).luau");
+        let source = "return 'literal child'\n";
+        std::fs::write(&literal, source).unwrap();
+        let op = Op {
+            kind: OpKind::Update,
+            path: literal,
+            from: None,
+            content: Some(source.as_bytes().to_vec()),
+            is_dir: Some(false),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("literal leaf set op");
+
+        assert_eq!(plugin_op["op"], "set");
+        assert_eq!(
+            plugin_op["path"],
+            serde_json::json!(["ReplicatedStorage", "Misc"])
+        );
+        assert_eq!(plugin_op["node"]["name"], "init (Notifications)");
+        assert_eq!(plugin_op["node"]["class"], "ModuleScript");
+        assert_eq!(plugin_op["node"]["properties"]["Source"], source);
+    }
+
+    #[test]
     fn fs_empty_folder_op_is_ignored_and_cannot_shadow_script() {
         let d = TempDir::new("fs-empty-folder-shadow");
         let root = d.path().join("ReplicatedStorage");
@@ -14243,6 +15652,258 @@ mod tests {
             std::fs::read_to_string(second).unwrap(),
             "return 'updated second'\n"
         );
+    }
+
+    #[test]
+    fn exact_update_targets_script_with_children_init_source() {
+        let d = TempDir::new("studio-update-script-directory");
+        let controller = d.path().join("Workspace").join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        let init = controller.join("init (Controller).luau");
+        let child = controller.join("Child.luau");
+        std::fs::write(&init, "return 'old root'\n").unwrap();
+        std::fs::write(&child, "return 'child'\n").unwrap();
+        let engine = ConflictEngine::new();
+        engine.record_sync(&init, hash(b"return 'old root'\n"), fs_mtime(&init));
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+
+        let outcome = apply_op(
+            d.path(),
+            &serde_json::json!({
+                "op": "update",
+                "path": ["Workspace", "Controller"],
+                "diskPath": ["Workspace", "Controller"],
+                "properties": { "Source": "return 'updated root'\r\n" }
+            }),
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied(1)));
+        assert_eq!(
+            std::fs::read_to_string(init).unwrap(),
+            "return 'updated root'\n"
+        );
+        assert_eq!(std::fs::read_to_string(child).unwrap(), "return 'child'\n");
+    }
+
+    #[test]
+    fn exact_update_reuses_legacy_unicode_named_init_source() {
+        let d = TempDir::new("studio-update-legacy-unicode-init");
+        let controller = d.path().join("Workspace").join("É");
+        std::fs::create_dir_all(&controller).unwrap();
+        let legacy_init = controller.join("init (É).luau");
+        std::fs::write(&legacy_init, "return 'old'\n").unwrap();
+        let engine = ConflictEngine::new();
+        engine.record_sync(
+            &legacy_init,
+            hash(b"return 'old'\n"),
+            fs_mtime(&legacy_init),
+        );
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+
+        let outcome = apply_op(
+            d.path(),
+            &serde_json::json!({
+                "op": "update",
+                "path": ["Workspace", "É"],
+                "diskPath": ["Workspace", "É", "init (%C3%89).luau"],
+                "properties": { "Source": "return 'updated'\n" }
+            }),
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied(1)));
+        assert_eq!(
+            std::fs::read_to_string(&legacy_init).unwrap(),
+            "return 'updated'\n"
+        );
+        assert!(
+            !controller.join("init (%C3%89).luau").exists(),
+            "update must reuse the unique legacy marker"
+        );
+    }
+
+    #[test]
+    fn exact_updates_reuse_case_and_normalization_equivalent_parent_markers() {
+        for (tag, directory_fragment, studio_name, marker_fragment, requested_fragment) in [
+            (
+                "case",
+                "notifications",
+                "notifications",
+                "INIT (Notifications).luau",
+                "init (notifications).luau",
+            ),
+            (
+                "normalization",
+                "%C3%89",
+                "\u{00c9}",
+                "init (E\u{0301}).luau",
+                "init (%C3%89).luau",
+            ),
+        ] {
+            let d = TempDir::new(tag);
+            let directory = d.path().join("Workspace").join(directory_fragment);
+            std::fs::create_dir_all(&directory).unwrap();
+            let legacy_marker = directory.join(marker_fragment);
+            std::fs::write(&legacy_marker, "return 'old'\n").unwrap();
+            let engine = ConflictEngine::new();
+            engine.record_sync(
+                &legacy_marker,
+                hash(b"return 'old'\n"),
+                fs_mtime(&legacy_marker),
+            );
+            let quiet = push_quiet();
+            let ctx = harness(&engine, &quiet, d.path());
+
+            let outcome = apply_op(
+                d.path(),
+                &serde_json::json!({
+                    "op": "update",
+                    "path": ["Workspace", studio_name],
+                    "diskPath": ["Workspace", directory_fragment, requested_fragment],
+                    "properties": { "Source": "return 'updated'\n" }
+                }),
+                &ctx,
+            )
+            .unwrap();
+
+            assert!(matches!(outcome, ApplyOutcome::Applied(1)), "{tag}");
+            assert_eq!(
+                std::fs::read_to_string(&legacy_marker).unwrap(),
+                "return 'updated'\n",
+                "{tag}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&directory).unwrap().count(),
+                1,
+                "{tag}: update must not create a second marker"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_update_reuses_plain_init_source() {
+        let d = TempDir::new("studio-update-plain-init");
+        let controller = d.path().join("Workspace").join("Controller");
+        std::fs::create_dir_all(&controller).unwrap();
+        let plain_init = controller.join("init.lua");
+        std::fs::write(&plain_init, "return 'old'\n").unwrap();
+        let engine = ConflictEngine::new();
+        engine.record_sync(&plain_init, hash(b"return 'old'\n"), fs_mtime(&plain_init));
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+
+        let outcome = apply_op(
+            d.path(),
+            &serde_json::json!({
+                "op": "update",
+                "path": ["Workspace", "Controller"],
+                "diskPath": ["Workspace", "Controller", "init (Controller).luau"],
+                "properties": { "Source": "return 'updated'\n" }
+            }),
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied(1)));
+        assert_eq!(
+            std::fs::read_to_string(&plain_init).unwrap(),
+            "return 'updated'\n"
+        );
+        assert!(
+            !controller.join("init (Controller).luau").exists(),
+            "update must not create a second init marker"
+        );
+    }
+
+    #[test]
+    fn source_update_to_plain_folder_is_an_error_not_a_skip() {
+        let d = TempDir::new("studio-update-folder-source");
+        let folder = d.path().join("Workspace").join("Misc");
+        std::fs::create_dir_all(&folder).unwrap();
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let mut result = PushApplyResult::default();
+
+        apply_ops_into(
+            d.path(),
+            &[serde_json::json!({
+                "op": "update",
+                "path": ["Workspace", "Misc"],
+                "diskPath": ["Workspace", "Misc"],
+                "properties": { "Source": "return 'must not disappear'\n" }
+            })],
+            &ctx,
+            &mut result,
+        );
+
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("not a script-with-children directory"));
+    }
+
+    #[test]
+    fn source_update_to_missing_exact_path_is_an_error_not_a_skip() {
+        let d = TempDir::new("studio-update-missing-source");
+        std::fs::create_dir_all(d.path().join("Workspace")).unwrap();
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let mut result = PushApplyResult::default();
+
+        apply_ops_into(
+            d.path(),
+            &[serde_json::json!({
+                "op": "update",
+                "path": ["Workspace", "Missing"],
+                "diskPath": ["Workspace", "Missing.luau"],
+                "properties": { "Source": "return 'must not disappear'\n" }
+            })],
+            &ctx,
+            &mut result,
+        );
+
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("Source target does not exist"));
+    }
+
+    #[test]
+    fn idempotent_source_update_is_accepted_without_counting_as_skipped() {
+        let d = TempDir::new("studio-update-idempotent-source");
+        let workspace = d.path().join("Workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = workspace.join("Config.luau");
+        std::fs::write(&script, "return 'same'\n").unwrap();
+        let engine = ConflictEngine::new();
+        engine.record_sync(&script, hash(b"return 'same'\n"), fs_mtime(&script));
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let mut result = PushApplyResult::default();
+
+        apply_ops_into(
+            d.path(),
+            &[serde_json::json!({
+                "op": "update",
+                "path": ["Workspace", "Config"],
+                "diskPath": ["Workspace", "Config.luau"],
+                "properties": { "Source": "return 'same'\r\n" }
+            })],
+            &ctx,
+            &mut result,
+        );
+
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.skipped, 0);
+        assert!(result.errors.is_empty());
+        assert!(result.conflicts.is_empty());
     }
 
     #[test]
@@ -16251,6 +17912,7 @@ mod tests {
         service_stream.commit_result = Some(receive);
         service_stream.commit_control = Some(control);
         let session = Arc::new(Mutex::new(PushStreamAccumulator {
+            rollback_state: state.clone(),
             stream_id: stream_id.into(),
             strict: true,
             force_prune: true,
@@ -16259,6 +17921,8 @@ mod tests {
             applied: 0,
             backups: Vec::new(),
             committed_services: Vec::new(),
+            prepared_baselines: Vec::new(),
+            conflict_checkpoint: Some(state.conflict.checkpoint()),
             accepted_stream_bytes: 0,
             accepted_source_bytes: 0,
             last_request_hash: None,
@@ -16308,11 +17972,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_push_reports_prior_created_service_when_later_service_fails() {
-        let project = TempDir::new("streamed-push-prior-created-partial");
+    async fn streamed_push_rolls_back_prior_service_and_baseline_when_later_service_fails() {
+        let project = TempDir::new("streamed-push-generation-rollback");
         let state = test_state(&project, None);
         let mut events = state.events.subscribe();
-        let stream_id = "prior-created-partial";
+        let stream_id = "generation-rollback";
+        let first_service = "ReplicatedStorage";
+        let replicated = project.path().join(first_service);
+        std::fs::create_dir_all(&replicated).unwrap();
+        let config = replicated.join("Config.luau");
+        let original = b"return 'original'\n";
+        let replacement = "return 'studio generation'\n";
+        std::fs::write(&config, original).unwrap();
+        state
+            .conflict
+            .record_sync(&config, hash(original), fs_mtime(&config));
+        let replacement_sha = hash(replacement.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        let structure = push(
+            State(state.clone()),
+            Json(streamed_push_test_body(
+                stream_id,
+                first_service,
+                "structure",
+                0,
+                true,
+                streamed_service_records(first_service, Some(("Config", "ModuleScript"))),
+                Vec::new(),
+            )),
+        )
+        .await
+        .0;
+        let sources =
+            advance_streamed_push_worker(&state, stream_id, first_service, structure).await;
+        assert_eq!(sources["phase"], "sources");
+        let revalidate = push(
+            State(state.clone()),
+            Json(streamed_push_test_body(
+                stream_id,
+                first_service,
+                "sources",
+                0,
+                true,
+                Vec::new(),
+                vec![StreamSourcePart {
+                    id: 1,
+                    part_index: 0,
+                    offset: 0,
+                    total_bytes: replacement.len() as u64,
+                    data: replacement.into(),
+                    final_part: true,
+                    sha256: replacement_sha,
+                }],
+            )),
+        )
+        .await
+        .0;
+        let next = advance_streamed_push_worker(&state, stream_id, first_service, revalidate).await;
+        assert_eq!(next["nextService"], "ServerScriptService");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), replacement);
+        assert!(
+            state.conflict.matches_baseline(&config, original),
+            "a per-service commit must not publish the generation baseline early"
+        );
+
+        let invalid = streamed_push_test_body(
+            stream_id,
+            "ServerScriptService",
+            "structure",
+            0,
+            true,
+            Vec::new(),
+            Vec::new(),
+        );
+        let response = push(State(state.clone()), Json(invalid.clone())).await.0;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["action"], "rolled-back");
+        assert_eq!(response["failedService"], "ServerScriptService");
+        assert_eq!(response["recoveryRequired"], false);
+        assert_eq!(response["backups"], json!([]));
+        assert_eq!(response["committedServices"], json!([]));
+        assert_eq!(response["rolledBackServices"], json!([first_service]));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(
+            state.conflict.matches_baseline(&config, original),
+            "generation rollback must restore the pre-generation baseline"
+        );
+        assert!(!state
+            .conflict
+            .matches_baseline(&config, replacement.as_bytes()));
+
+        assert_eq!(
+            push(State(state.clone()), Json(invalid)).await.0,
+            response,
+            "the exact later-service failure must replay its terminal receipt"
+        );
+        let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "stream-push-rolled-back");
+        assert_eq!(event["failedService"], "ServerScriptService");
+        assert_eq!(event["rolledBackServices"], response["rolledBackServices"]);
+
+        PUSH_STREAM_ACCUMULATORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(state.canonical_project.as_path());
+    }
+
+    #[tokio::test]
+    async fn abandoned_streamed_push_rolls_back_committed_services() {
+        let project = TempDir::new("streamed-push-abandoned-rollback");
+        let state = test_state(&project, None);
+        let mut events = state.events.subscribe();
+        let stream_id = "abandoned-generation";
         let first_service = "ReplicatedStorage";
 
         let structure = push(
@@ -16329,9 +18104,8 @@ mod tests {
         )
         .await
         .0;
-        let sources =
+        let _sources =
             advance_streamed_push_worker(&state, stream_id, first_service, structure).await;
-        assert_eq!(sources["phase"], "sources");
         let revalidate = push(
             State(state.clone()),
             Json(streamed_push_test_body(
@@ -16350,44 +18124,73 @@ mod tests {
         assert_eq!(next["nextService"], "ServerScriptService");
         assert!(project.path().join(first_service).is_dir());
 
-        let invalid = streamed_push_test_body(
-            stream_id,
-            "ServerScriptService",
-            "structure",
-            0,
-            true,
-            Vec::new(),
-            Vec::new(),
-        );
-        let response = push(State(state.clone()), Json(invalid.clone())).await.0;
-        let expected_commit = json!({
-            "service": first_service,
-            "created": true,
-            "backup": null,
-            "recoveryAction": "removeCreatedService",
-        });
-        assert_eq!(response["ok"], false);
-        assert_eq!(response["action"], "partial");
-        assert_eq!(response["failedService"], "ServerScriptService");
-        assert_eq!(response["recoveryRequired"], true);
-        assert_eq!(response["backups"], json!([]));
-        assert_eq!(response["committedServices"], json!([expected_commit]));
-
-        assert_eq!(
-            push(State(state.clone()), Json(invalid)).await.0,
-            response,
-            "the exact later-service failure must replay its terminal receipt"
-        );
-        let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
-        assert_eq!(event["type"], "stream-push-partial");
-        assert_eq!(event["failedService"], "ServerScriptService");
-        assert_eq!(event["committedServices"], response["committedServices"]);
-
-        PUSH_STREAM_ACCUMULATORS
+        let removed = PUSH_STREAM_ACCUMULATORS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap()
-            .remove(state.canonical_project.as_path());
+            .remove(state.canonical_project.as_path())
+            .expect("active streamed generation");
+        drop(removed);
+
+        assert!(
+            !project.path().join(first_service).exists(),
+            "abandoning a generation must remove its newly-created service"
+        );
+        let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "stream-push-abandoned");
+        assert_eq!(event["rolledBackServices"], json!([first_service]));
+        assert_eq!(event["recoveryRequired"], false);
+    }
+
+    #[test]
+    fn abandoned_streamed_push_reports_partial_current_service_recovery() {
+        let project = TempDir::new("streamed-push-abandoned-partial");
+        let state = test_state(&project, None);
+        let mut events = state.events.subscribe();
+        let retained_backup = project.path().join(".rosync-backups").join("retained");
+        std::fs::create_dir_all(&retained_backup).unwrap();
+        let control = Arc::new(Mutex::new(StreamCommitControl {
+            retained_backup: Some(retained_backup.clone()),
+            partial_failure: true,
+            ..StreamCommitControl::default()
+        }));
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        send.send(Err("injected partial commit".into())).unwrap();
+        let mut service_stream = new_push_service_stream("ReplicatedStorage");
+        service_stream.phase = PushStreamPhase::DiskRevalidate;
+        service_stream.commit_result = Some(receive);
+        service_stream.commit_control = Some(control);
+
+        let session = PushStreamAccumulator {
+            rollback_state: state.clone(),
+            stream_id: "abandoned-partial".into(),
+            strict: true,
+            force_prune: true,
+            next_service: 0,
+            service_stream,
+            applied: 0,
+            backups: Vec::new(),
+            committed_services: Vec::new(),
+            prepared_baselines: Vec::new(),
+            conflict_checkpoint: Some(state.conflict.checkpoint()),
+            accepted_stream_bytes: 0,
+            accepted_source_bytes: 0,
+            last_request_hash: None,
+            last_response: None,
+            last_activity: Instant::now(),
+            completed_at: None,
+        };
+        drop(session);
+
+        let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "stream-push-abandoned");
+        assert_eq!(event["partialFailure"], true);
+        assert_eq!(event["backups"], json!([retained_backup]));
+        assert_eq!(event["recoveryRequired"], true);
+        assert!(event["rollbackErrors"][0]
+            .as_str()
+            .unwrap()
+            .contains("injected partial commit"));
     }
 
     #[test]
@@ -17760,6 +19563,11 @@ mod tests {
     async fn streamed_compare_disk_prepare_failure_restores_structure_cursor() {
         let project = TempDir::new("initial-compare-disk-prepare-cursor");
         std::fs::create_dir_all(project.path().join("ReplicatedStorage")).unwrap();
+        std::fs::write(
+            project.path().join("ReplicatedStorage/DiskOnly.luau"),
+            "return true\n",
+        )
+        .unwrap();
         let state = test_state(&project, None);
         let studio_stats = Stats {
             script_count: 1,
@@ -18194,6 +20002,113 @@ mod tests {
     }
 
     #[test]
+    fn streamed_initial_compare_receipts_preserve_exact_duplicate_fragments() {
+        let project = TempDir::new("initial-compare-exact-duplicate-identities");
+        let storage = project.path().join("ReplicatedStorage");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("Same.luau"), "return 'same'\n").unwrap();
+        std::fs::write(storage.join("Same [1].luau"), "return 'same'\n").unwrap();
+
+        let disk = snapshot::emit_flat_service(project.path(), "ReplicatedStorage").unwrap();
+        let expected = disk
+            .records
+            .iter()
+            .skip(1)
+            .map(|record| {
+                (
+                    record.id,
+                    (
+                        record.disk_fragment.clone().unwrap(),
+                        record.disk_fragment_is_dir.unwrap(),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(expected.len(), 2);
+
+        let mut studio_records = disk.records;
+        for record in &mut studio_records {
+            record.disk_fragment = None;
+            record.disk_fragment_is_dir = None;
+        }
+        let studio = validate_flat_snapshot(&studio_records, "ReplicatedStorage", false).unwrap();
+        let prepared = prepare_streamed_initial_service_comparison(project.path(), studio).unwrap();
+
+        assert!(prepared.identity_complete);
+        assert_eq!(prepared.identities.len(), expected.len());
+        for identity in prepared.identities {
+            let (fragment, is_dir) = expected.get(&identity.id).unwrap();
+            assert_eq!(&identity.disk_fragment, fragment);
+            assert_eq!(identity.disk_fragment_is_dir, *is_dir);
+        }
+        assert!(expected
+            .values()
+            .any(|(fragment, _)| fragment == "Same.luau"));
+        assert!(expected
+            .values()
+            .any(|(fragment, _)| fragment == "Same [1].luau"));
+    }
+
+    #[test]
+    fn initial_compare_identity_responses_are_count_and_byte_bounded() {
+        let wide_fragment = "x".repeat(MAX_STREAM_NAME_BYTES - 3);
+        let identities = (1..=40)
+            .map(|id| StreamDiskIdentity {
+                id,
+                disk_fragment: format!("{id:02}-{wide_fragment}"),
+                disk_fragment_is_dir: false,
+            })
+            .collect::<Vec<_>>();
+        let mut stream = InitialCompareServiceStream {
+            service: "ReplicatedStorage".into(),
+            phase: InitialCompareStreamPhase::Identities,
+            next_chunk: 0,
+            records: Vec::new(),
+            accepted_structure_bytes: 0,
+            final_structure_len: 0,
+            final_structure_bytes: 0,
+            final_structure_chunk: 0,
+            prepare_result: None,
+            local_nodes: None,
+            local_source_paths_by_path: HashMap::new(),
+            studio_nodes: None,
+            studio_paths_by_id: HashMap::new(),
+            identities,
+            identity_offset: 0,
+            identity_complete: true,
+            expected_hash_ids: HashSet::new(),
+            received_hash_ids: HashSet::new(),
+        };
+        let mut responses = 0u64;
+        let mut received = 0usize;
+        loop {
+            let response = produce_initial_compare_identity_response(
+                "compare",
+                "ReplicatedStorage",
+                &mut stream,
+            )
+            .unwrap();
+            assert_eq!(response["chunkIndex"], responses);
+            assert_eq!(response["identityCount"], 40);
+            assert!(
+                serde_json::to_vec(&response).unwrap().len() <= STREAM_SOURCE_CHUNK_BYTES,
+                "{response}"
+            );
+            received += response["identities"].as_array().unwrap().len();
+            responses += 1;
+            if response["finalChunk"] == true {
+                assert_eq!(response["nextPhase"], "hashes");
+                assert_eq!(response["nextChunk"], 0);
+                break;
+            }
+            assert_eq!(response["nextChunk"], responses);
+        }
+        assert!(responses > 1);
+        assert_eq!(received, 40);
+        assert!(matches!(stream.phase, InitialCompareStreamPhase::Hashes));
+    }
+
+    #[test]
     fn streamed_clean_finish_commits_staged_baselines_without_source_rereads() {
         let project = TempDir::new("initial-compare-staged-baselines");
         let storage = project.path().join("ReplicatedStorage");
@@ -18346,6 +20261,7 @@ mod tests {
             MAX_STREAM_SERVICE_STRUCTURE_BYTES - chunk_bytes + 1;
         let service_counter_before = service_stream.accepted_structure_bytes;
         let mut push_session = PushStreamAccumulator {
+            rollback_state: state.clone(),
             stream_id: "wide-name-service-budget".into(),
             strict: true,
             force_prune: true,
@@ -18354,6 +20270,8 @@ mod tests {
             applied: 0,
             backups: Vec::new(),
             committed_services: Vec::new(),
+            prepared_baselines: Vec::new(),
+            conflict_checkpoint: Some(state.conflict.checkpoint()),
             accepted_stream_bytes: 0,
             accepted_source_bytes: 0,
             last_request_hash: None,
@@ -18405,6 +20323,9 @@ mod tests {
                 local_source_paths_by_path: HashMap::new(),
                 studio_nodes: None,
                 studio_paths_by_id: HashMap::new(),
+                identities: Vec::new(),
+                identity_offset: 0,
+                identity_complete: false,
                 expected_hash_ids: HashSet::new(),
                 received_hash_ids: HashSet::new(),
             }),
@@ -18686,6 +20607,100 @@ mod tests {
         })];
 
         assert!(initial_snapshots_match(d.path(), &studio).unwrap());
+    }
+
+    #[test]
+    fn initial_snapshot_compare_requires_reserved_leaf_filename_migration() {
+        let d = TempDir::new("initial-legacy-reserved-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        std::fs::write(misc.join("init (Notifications).luau"), "return 'literal'\n").unwrap();
+        let studio = vec![json!({
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "properties": {},
+            "children": [{
+                "class": "Folder",
+                "name": "Misc",
+                "properties": {},
+                "children": [{
+                    "class": "ModuleScript",
+                    "name": "init (Notifications)",
+                    "properties": { "Source": "return 'literal'\n" },
+                    "children": []
+                }]
+            }]
+        })];
+
+        let error = initial_snapshot_comparison(d.path(), &studio).unwrap_err();
+
+        assert!(error.contains("reserved init-marker filename grammar"));
+        assert!(error.contains("ReplicatedStorage/Misc/init (Notifications).luau"));
+        assert!(error.contains("ReplicatedStorage/Misc/%69nit (Notifications).luau"));
+    }
+
+    #[test]
+    fn legacy_reserved_leaf_gate_covers_case_ordinals_and_all_script_classes() {
+        for (file_name, canonical_name) in [
+            ("INIT.luau", "%49NIT.luau"),
+            ("Init (Other).lua", "%49nit (Other).luau"),
+            ("INIT (Other).server.luau", "%49NIT (Other).server.luau"),
+            ("init [3].server.lua", "%69nit.server.luau"),
+            ("INIT (Other).client.luau", "%49NIT (Other).client.luau"),
+            ("init (Other) [2].client.lua", "%69nit (Other).client.luau"),
+        ] {
+            let d = TempDir::new("legacy-reserved-variant");
+            let misc = d.path().join("ReplicatedStorage").join("Misc");
+            std::fs::create_dir_all(&misc).unwrap();
+            std::fs::write(misc.join(file_name), "return true\n").unwrap();
+
+            let error = reject_legacy_reserved_init_leafs(d.path(), &["ReplicatedStorage".into()])
+                .unwrap_err();
+
+            assert!(error.contains("reserved init-marker filename grammar"));
+            assert!(error.contains(file_name), "{file_name}: {error}");
+            assert!(error.contains(canonical_name), "{file_name}: {error}");
+        }
+    }
+
+    #[test]
+    fn initial_snapshot_accepts_case_and_normalization_equivalent_parent_markers() {
+        for (tag, directory_fragment, marker_fragment, studio_name) in [
+            (
+                "case-equivalent-parent-marker",
+                "notifications",
+                "INIT (Notifications).luau",
+                "notifications",
+            ),
+            (
+                "normalization-equivalent-parent-marker",
+                "%C3%89",
+                "init (E\u{0301}).luau",
+                "\u{00c9}",
+            ),
+        ] {
+            let d = TempDir::new(tag);
+            let directory = d.path().join("ReplicatedStorage").join(directory_fragment);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(marker_fragment), "return true\n").unwrap();
+            let studio = vec![json!({
+                "class": "ReplicatedStorage",
+                "name": "ReplicatedStorage",
+                "properties": {},
+                "children": [{
+                    "class": "ModuleScript",
+                    "name": studio_name,
+                    "properties": { "Source": "return true\n" },
+                    "children": []
+                }]
+            })];
+
+            let comparison = initial_snapshot_comparison(d.path(), &studio).unwrap();
+            assert!(
+                comparison.is_clean(),
+                "{tag}: equivalent parent marker must not be prescribed as a leaf: {comparison:?}"
+            );
+        }
     }
 
     #[test]

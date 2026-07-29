@@ -37,6 +37,10 @@ assert.equal(desktop.HOST_KIND, "tauri");
 assert.equal(desktop.host.isDesktop, true);
 assert.equal(desktop.host.supports.spawnSession, false);
 assert.equal(Object.hasOwn(desktop.host, "exec"), false, "desktop adapter must not expose raw exec");
+await assert.rejects(
+  desktop.fetchJsonWithDeadline("data:application/json,%7B", {}, 1000),
+  "malformed JSON must reject instead of masquerading as a successful daemon response",
+);
 
 desktop.setDaemonAuthToken("token-a", "http://127.0.0.1:7878");
 desktop.setDaemonAuthToken("token-b", "http://127.0.0.1:7879");

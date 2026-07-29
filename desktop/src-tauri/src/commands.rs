@@ -36,6 +36,9 @@ const ROBLOX_CLOUD_SECRET_ENV: &str = "ROSYNC_OPEN_CLOUD_CREDENTIAL";
 pub(crate) struct AppInfo {
     kind: &'static str,
     version: String,
+    build_commit: &'static str,
+    build_dirty: bool,
+    target: &'static str,
     platform: &'static str,
     resource_dir: String,
     data_dir: String,
@@ -66,6 +69,9 @@ pub(crate) fn app_info(app: AppHandle, state: State<'_, AppState>) -> AppInfo {
     AppInfo {
         kind: "tauri",
         version: app.package_info().version.to_string(),
+        build_commit: env!("ROSYNC_BUILD_COMMIT"),
+        build_dirty: env!("ROSYNC_BUILD_DIRTY") == "true",
+        target: env!("ROSYNC_TARGET_TRIPLE"),
         platform: platform_name(),
         resource_dir: resources.resource_dir,
         data_dir: resources.data_dir,

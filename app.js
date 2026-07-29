@@ -8,6 +8,8 @@ import {
   daemonJson,
   daemonWS,
   daemonURL,
+  fetchJsonWithDeadline,
+  fetchWithDeadline,
   setDaemonAuthToken,
   emit,
   on,
@@ -309,8 +311,9 @@ const DAEMON_HEARTBEAT_INTERVAL_MS = 5000;
 
 let daemonHeartbeatTimer = null;
 const desktopHeartbeatTimers = new Map();
+const heartbeatInFlightByProject = new Set();
+const heartbeatFailureNoticeByProject = new Map();
 let widgetCloseSent = false;
-let lastHeartbeatFailureNoticeAt = 0;
 const pendingDesktopOwnershipByProject = new Map();
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
@@ -556,12 +559,25 @@ async function stopDuplicateTrackedSessions(keepProject, keepPort) {
 
 async function probePort(port) {
   try {
-    const r = await fetch(daemonURL(`http://127.0.0.1:${port}`, "/hello"), {
-      method: "GET",
-      signal: AbortSignal.timeout(500),
-    });
+    const { response: r, json } = await fetchJsonWithDeadline(
+      daemonURL(`http://127.0.0.1:${port}`, "/hello"),
+      {
+        method: "GET",
+        timeoutMs: 500,
+      },
+    );
     if (!r.ok) return null;
-    const info = await r.json().catch(() => ({}));
+    if (
+      !json
+      || typeof json !== "object"
+      || Array.isArray(json)
+      || typeof json.version !== "string"
+      || typeof json.project !== "string"
+      || typeof json.bootId !== "string"
+      || Number(json.port) !== Number(port)
+      || !Number.isInteger(Number(json.pluginProtocol))
+    ) return null;
+    const info = json;
     return { port, info };
   } catch {
     return null;
@@ -638,6 +654,7 @@ async function daemonLifecycleRequest(
   reason,
   token = app.state.daemonOwnerToken,
   exactIdentity = null,
+  timeoutMs = 4000,
 ) {
   if (!base || !token) return { sent: false, ok: false, error: "missing daemon owner token" };
   const destructive = path === "/manager-close" || path === "/widget-close";
@@ -647,13 +664,13 @@ async function daemonLifecycleRequest(
   const url = daemonURL(base, path, token);
   const body = JSON.stringify({ token, reason, ...(exactIdentity || {}) });
   try {
-    const res = await fetch(url, {
+    const { response: res, json } = await fetchJsonWithDeadline(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
       keepalive: true,
+      timeoutMs,
     });
-    const json = await res.json().catch(() => null);
     return {
       sent: true,
       ok: !!(res.ok && json && json.ok !== false),
@@ -686,11 +703,12 @@ function daemonLifecyclePost(
       if (navigator.sendBeacon(url, blob)) return true;
     } catch {}
   }
-  fetch(url, {
+  fetchWithDeadline(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
     keepalive: true,
+    timeoutMs: 4000,
   }).catch(() => {});
   return true;
 }
@@ -711,9 +729,13 @@ function stopDaemonHeartbeat(projectId = null) {
       const timer = desktopHeartbeatTimers.get(projectId);
       if (timer) clearInterval(timer);
       desktopHeartbeatTimers.delete(projectId);
+      heartbeatFailureNoticeByProject.delete(`project:${projectId}`);
     } else {
       for (const timer of desktopHeartbeatTimers.values()) clearInterval(timer);
       desktopHeartbeatTimers.clear();
+      for (const key of heartbeatFailureNoticeByProject.keys()) {
+        if (key.startsWith("project:")) heartbeatFailureNoticeByProject.delete(key);
+      }
     }
     return;
   }
@@ -721,25 +743,33 @@ function stopDaemonHeartbeat(projectId = null) {
     clearInterval(daemonHeartbeatTimer);
     daemonHeartbeatTimer = null;
   }
+  heartbeatFailureNoticeByProject.delete("terminal64");
 }
 
-function sendDaemonHeartbeat(projectId = null) {
+async function sendDaemonHeartbeat(projectId = null) {
   const session = IS_DESKTOP_HOST && projectId
     ? app.state.daemonSessions?.[projectId]
     : null;
   const base = session?.base || app.daemonBase;
   const ownerToken = session?.ownerToken || app.state.daemonOwnerToken;
   if (!base || !ownerToken) return;
+  const requestKey = IS_DESKTOP_HOST ? `project:${projectId}` : "terminal64";
+  if (heartbeatInFlightByProject.has(requestKey)) return;
+  heartbeatInFlightByProject.add(requestKey);
   const endpoint = IS_DESKTOP_HOST ? "/manager-heartbeat" : "/widget-heartbeat";
   const reason = IS_DESKTOP_HOST ? "desktop heartbeat" : "widget heartbeat";
-  daemonLifecycleRequest(base, endpoint, reason, ownerToken).then((result) => {
+  try {
+    const result = await daemonLifecycleRequest(base, endpoint, reason, ownerToken);
     if (result.ok) return;
     const now = Date.now();
-    if (now - lastHeartbeatFailureNoticeAt > 30_000) {
-      lastHeartbeatFailureNoticeAt = now;
+    const lastNotice = heartbeatFailureNoticeByProject.get(requestKey) || 0;
+    if (now - lastNotice > 30_000) {
+      heartbeatFailureNoticeByProject.set(requestKey, now);
       console.warn("daemon heartbeat failed", result);
     }
-  });
+  } finally {
+    heartbeatInFlightByProject.delete(requestKey);
+  }
 }
 
 function startDaemonHeartbeat(projectId = null) {
@@ -748,17 +778,17 @@ function startDaemonHeartbeat(projectId = null) {
     stopDaemonHeartbeat(projectId);
     const session = app.state.daemonSessions?.[projectId];
     if (!session?.base || !session?.ownerToken) return;
-    sendDaemonHeartbeat(projectId);
+    void sendDaemonHeartbeat(projectId);
     desktopHeartbeatTimers.set(
       projectId,
-      setInterval(() => sendDaemonHeartbeat(projectId), DAEMON_HEARTBEAT_INTERVAL_MS),
+      setInterval(() => { void sendDaemonHeartbeat(projectId); }, DAEMON_HEARTBEAT_INTERVAL_MS),
     );
     return;
   }
   stopDaemonHeartbeat();
   if (!app.daemonBase || !app.state.daemonOwnerToken) return;
-  sendDaemonHeartbeat();
-  daemonHeartbeatTimer = setInterval(sendDaemonHeartbeat, DAEMON_HEARTBEAT_INTERVAL_MS);
+  void sendDaemonHeartbeat();
+  daemonHeartbeatTimer = setInterval(() => { void sendDaemonHeartbeat(); }, DAEMON_HEARTBEAT_INTERVAL_MS);
 }
 
 function notifyWidgetClosing() {
@@ -1647,19 +1677,14 @@ async function killDaemon(projectIdOrOptions = null, maybeOptions = {}) {
 }
 
 // ---------- Health loop ----------
-async function healthTickDesktop() {
-  const ids = servedProjectIds();
-  const nativeList = await host.daemonList().catch(() => null);
-  const nativeClaims = Array.isArray(nativeList?.daemons) ? nativeList.daemons : null;
-  const nativeByProject = new Map(
-    (nativeClaims || [])
-      .filter((item) => item?.project)
-      .map((item) => [item.project, item]),
-  );
+const desktopHealthInFlightByProject = new Set();
 
-  for (const projectId of ids) {
+async function healthTickDesktopProject(projectId, nativeClaims, nativeByProject) {
+  if (desktopHealthInFlightByProject.has(projectId)) return;
+  desktopHealthInFlightByProject.add(projectId);
+  try {
     const project = projectById(projectId);
-    if (!project) continue;
+    if (!project) return;
     const session = app.state.daemonSessions?.[projectId] || null;
     const cfg = project.settings || {};
     if (!session?.base || !session?.ownerToken || !session?.bootId) {
@@ -1668,7 +1693,7 @@ async function healthTickDesktop() {
           && cfg.AutoReconnect !== "off") {
         await ensureDaemon(projectId);
       }
-      continue;
+      return;
     }
 
     // A renderer reload can restore an authenticated persisted session before
@@ -1682,7 +1707,7 @@ async function healthTickDesktop() {
     if (!nativeClaim) {
       if (nativeClaims) {
         await ensureDaemon(projectId);
-        continue;
+        return;
       }
     }
 
@@ -1716,7 +1741,23 @@ async function healthTickDesktop() {
       }
       if (cfg.AutoReconnect !== "off") await ensureDaemon(projectId);
     }
+  } finally {
+    desktopHealthInFlightByProject.delete(projectId);
   }
+}
+
+async function healthTickDesktop() {
+  const ids = servedProjectIds();
+  const nativeList = await host.daemonList().catch(() => null);
+  const nativeClaims = Array.isArray(nativeList?.daemons) ? nativeList.daemons : null;
+  const nativeByProject = new Map(
+    (nativeClaims || [])
+      .filter((item) => item?.project)
+      .map((item) => [item.project, item]),
+  );
+  await Promise.allSettled(
+    ids.map((projectId) => healthTickDesktopProject(projectId, nativeClaims, nativeByProject)),
+  );
   refreshDesktopDaemonPresentation();
 }
 
@@ -1795,7 +1836,14 @@ async function hydrateHostPresentation() {
     document.documentElement.dataset.platform = platform;
     document.body.dataset.platform = platform;
     const context = document.querySelector(".desktop-titlebar-context");
-    if (context && info?.version) context.textContent = `Studio bridge · v${info.version}`;
+    if (context && info?.version) {
+      const commit = typeof info.buildCommit === "string" && info.buildCommit
+        ? ` · ${info.buildCommit}${info.buildDirty ? " dirty" : ""}`
+        : "";
+      context.textContent = `Studio bridge · v${info.version}${commit}`;
+      if (info.target) context.title = `Build target: ${info.target}`;
+      document.title = `Ro Sync v${info.version}${commit}`;
+    }
   } catch {
     document.documentElement.dataset.platform = PLATFORM;
   }

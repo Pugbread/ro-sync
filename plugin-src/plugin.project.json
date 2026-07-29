@@ -4,6 +4,9 @@
     "$className": "Folder",
     "RoSync": {
       "$path": "src/RoSync.server.luau",
+      "BuildInfo": {
+        "$path": "src/BuildInfo.luau"
+      },
       "Photo": {
         "$path": "src/Photo.luau"
       },

@@ -51,7 +51,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Check Luau formatting
-        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/Playscript.luau plugin/Photo.luau plugin-src/src/App.luau
+        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/Playscript.luau plugin/Photo.luau plugin-src/src/App.luau plugin-src/src/BuildInfo.luau
 
       - name: Install pinned Luau compiler
         run: |
@@ -90,6 +90,7 @@ jobs:
           node scripts/check-luau-bytecode.mjs plugin/Playscript.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
+          node scripts/check-luau-bytecode.mjs plugin-src/src/BuildInfo.luau
 
       - name: Analyze native clipboard Luau
         run: >-
@@ -167,8 +168,11 @@ jobs:
           node --check project-init.js
           node --check platform.js
           node --check scripts/install-luau-compiler.mjs
+          node --check scripts/check-build-identity-policy.mjs
+          node --check scripts/verify-build-identity.mjs
           for file in views/*.js; do node --check "$file"; done
           node scripts/check-host-adapter.mjs
+          node scripts/check-build-identity-policy.mjs
           node scripts/check-lifecycle-policy.mjs
           node scripts/check-platform-commands.mjs
           node scripts/check-windows-release-policy.mjs
@@ -185,14 +189,25 @@ jobs:
           cargo install --locked --version 7.5.1 rojo
 
       - name: Check generated Studio plugin
+        env:
+          ROSYNC_BUILD_COMMIT: source
+          ROSYNC_BUILD_DIRTY: "false"
         run: |
           node plugin/build-plugin.mjs
-          git diff --exit-code -- plugin/Plugin.rbxm
+          git diff --exit-code -- plugin/Plugin.rbxm plugin/Plugin.build.json
 
       - name: Check generated command docs
         run: |
           node scripts/build-command-docs.mjs
           git diff --exit-code -- docs/client-commands.generated.json docs/client-commands.md
+
+      - name: Check generated project context
+        run: |
+          cargo run --quiet --locked --manifest-path daemon/Cargo.toml -- refresh --project .
+          git diff --exit-code -- \
+            ro-sync.md AGENTS.md CLAUDE.md .codex/config.toml \
+            .stylua.toml aftman.toml .luaurc \
+            tools/luau-lsp/roblox/globalTypes.d.luau
 
   test:
     strategy:

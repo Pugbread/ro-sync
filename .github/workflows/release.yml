@@ -51,6 +51,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       ROSYNC_TAGGED_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+      ROSYNC_BUILD_COMMIT: ${{ github.sha }}
+      ROSYNC_BUILD_DIRTY: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -151,6 +153,29 @@ jobs:
           & $env:WINDOWS_SIGNTOOL verify /pa /all /tw $binary
           if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $binary" }
 
+      - name: Verify standalone daemon build identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          daemon_version="$(node -e '
+            const fs = require("node:fs");
+            const version = fs.readFileSync("daemon/Cargo.toml", "utf8")
+              .match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
+            if (!version) throw new Error("daemon Cargo version is missing");
+            process.stdout.write(version);
+          ')"
+          if [[ "$ROSYNC_TAGGED_RELEASE" == "1" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            test "$tag_version" = "$daemon_version" || {
+              echo "tag version $tag_version does not match daemon $daemon_version" >&2
+              exit 1
+            }
+          fi
+          node scripts/verify-build-identity.mjs \
+            --daemon "daemon/target/${{ matrix.target }}/release/${{ matrix.src_bin }}" \
+            --commit "$GITHUB_SHA" \
+            --version "$daemon_version"
+
       - name: Install checksum-pinned Luau compiler
         run: node scripts/install-luau-compiler.mjs --target ${{ matrix.tool_target }}
 
@@ -231,8 +256,13 @@ jobs:
 
   plugin:
     runs-on: ubuntu-22.04
+    env:
+      ROSYNC_BUILD_COMMIT: ${{ github.sha }}
+      ROSYNC_BUILD_DIRTY: "false"
     steps:
       - uses: actions/checkout@v4
+      - name: Check cross-runtime protocol constants
+        run: node scripts/check-plugin-reconnect-policy.mjs
       - uses: dtolnay/rust-toolchain@stable
       - name: Install pinned Luau compiler
         run: |
@@ -249,6 +279,7 @@ jobs:
           node scripts/check-luau-bytecode.mjs plugin/Clipboard.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
+          node scripts/check-luau-bytecode.mjs plugin-src/src/BuildInfo.luau
       - name: Install plugin build tools
         run: |
           cargo install --locked --version 0.3.2 wally
@@ -258,7 +289,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: RoSyncPlugin.rbxm
-          path: plugin/Plugin.rbxm
+          path: |
+            plugin/Plugin.rbxm
+            plugin/Plugin.build.json
 
   desktop:
     needs: [build, plugin, updater-smoke]
@@ -291,6 +324,8 @@ jobs:
       LUAU_LSP_VERSION: "1.68.1"
       LUAU_LSP_LICENSE_SHA256: 5bf374ce7ab54c8d75f14e21f04932cae10708189afaec95321aed1a47701935
       ROSYNC_TAGGED_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+      ROSYNC_BUILD_COMMIT: ${{ github.sha }}
+      ROSYNC_BUILD_DIRTY: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -330,9 +365,11 @@ jobs:
           sidecar="$(find .release-input/daemon -type f -name '${{ matrix.sidecar }}' -print -quit)"
           sidecar_checksum="$(find .release-input/daemon -type f -name '${{ matrix.sidecar }}.sha256' -print -quit)"
           studio_plugin="$(find .release-input/plugin -type f -name Plugin.rbxm -print -quit)"
+          plugin_manifest="$(find .release-input/plugin -type f -name Plugin.build.json -print -quit)"
           test -n "$sidecar"
           test -n "$sidecar_checksum"
           test -n "$studio_plugin"
+          test -n "$plugin_manifest"
           (
             cd "$(dirname "$sidecar_checksum")"
             if command -v sha256sum >/dev/null 2>&1; then
@@ -343,6 +380,7 @@ jobs:
           )
           cp "$sidecar" "daemon/${{ matrix.sidecar }}"
           cp "$studio_plugin" plugin/Plugin.rbxm
+          cp "$plugin_manifest" plugin/Plugin.build.json
           if [[ "$RUNNER_OS" != "Windows" ]]; then
             chmod +x "daemon/${{ matrix.sidecar }}"
           fi
@@ -412,10 +450,25 @@ jobs:
           node -e '
             const fs = require("node:fs");
             const config = require("./desktop/src-tauri/tauri.conf.json");
+            const desktopPackage = require("./desktop/package.json");
+            const daemonCargo = fs.readFileSync("./daemon/Cargo.toml", "utf8")
+              .match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
+            const desktopCargo = fs.readFileSync("./desktop/src-tauri/Cargo.toml", "utf8")
+              .match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
             const tagged = process.env.ROSYNC_TAGGED_RELEASE === "1";
             const version = tagged ? process.env.GITHUB_REF_NAME.replace(/^v/, "") : config.version;
             const semver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
             if (!semver.test(version)) throw new Error(`invalid desktop release version: ${version}`);
+            for (const [label, embedded] of [
+              ["Tauri config", config.version],
+              ["desktop package", desktopPackage.version],
+              ["desktop Cargo package", desktopCargo],
+              ["daemon Cargo package", daemonCargo],
+            ]) {
+              if (embedded !== version) {
+                throw new Error(`${label} version ${embedded} does not match release ${version}`);
+              }
+            }
             fs.appendFileSync(process.env.GITHUB_ENV, `ROSYNC_DESKTOP_VERSION=${version}\n`);
           '
 
@@ -542,6 +595,23 @@ jobs:
             build_args+=(--no-sign)
           fi
           npm run build -- "${build_args[@]}"
+
+      - name: Verify same-commit desktop, daemon, and plugin identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          desktop_binary="desktop/src-tauri/target/${{ matrix.target }}/release/ro-sync-desktop"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            desktop_binary="${desktop_binary}.exe"
+          fi
+          test -x "$desktop_binary" || test -f "$desktop_binary"
+          node scripts/verify-build-identity.mjs \
+            --desktop "$desktop_binary" \
+            --sidecar "daemon/${{ matrix.sidecar }}" \
+            --plugin plugin/Plugin.rbxm \
+            --plugin-manifest plugin/Plugin.build.json \
+            --commit "$GITHUB_SHA" \
+            --version "$ROSYNC_DESKTOP_VERSION"
 
       - name: Stage desktop release assets
         shell: bash
@@ -710,6 +780,12 @@ jobs:
               (.version | type == "string" and length > 0) and
               (.prepared.schemaVersion == 1) and
               (.prepared.sidecar.sha256 | test("^[a-f0-9]{64}$")) and
+              .prepared.sidecar.version == .version and
+              .prepared.sidecar.buildCommit == ($commit[0:12]) and
+              .prepared.sidecar.buildDirty == false and
+              (.prepared.plugin.sha256 | test("^[a-f0-9]{64}$")) and
+              .prepared.plugin.buildCommit == ($commit[0:12]) and
+              .prepared.plugin.buildDirty == false and
               (.prepared.frontend | length > 0) and
               (.prepared.resources | length > 0) and
               any(.prepared.resources[]; .path == "tools/luau-lsp/LICENSE.md")

@@ -16,6 +16,11 @@ process lifecycle operations. CLI-only installations do not load the frontend.
 
 ## Components
 
+The behavioral contract for projection, reconciliation, editor events,
+transport, and lifecycle handling is defined in
+[`SYNC_INVARIANTS.md`](./SYNC_INVARIANTS.md). Implementations and compatibility
+changes must preserve those invariants across both Rust and Luau.
+
 ### Rust engine
 
 The `rosync` executable contains both the foreground server (`rosync serve`) and

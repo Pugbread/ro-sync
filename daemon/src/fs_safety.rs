@@ -638,7 +638,17 @@ fn looks_like_init_source(fragment: &str) -> bool {
     else {
         return false;
     };
-    stem == "init" || (stem.starts_with("init (") && stem.ends_with(')'))
+    if stem.eq_ignore_ascii_case("init") {
+        return true;
+    }
+    let Some(prefix) = stem.get(..6) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("init (") || !stem.ends_with(')') {
+        return false;
+    }
+    stem.get(6..stem.len().saturating_sub(1))
+        .is_some_and(|inner| !inner.is_empty())
 }
 
 fn normal_components(path: &Path) -> io::Result<Vec<String>> {
@@ -1542,6 +1552,31 @@ mod tests {
         fs::write(temp.path().join("init.lua"), "").unwrap();
         fs::write(temp.path().join("init (Pkg).luau"), "").unwrap();
         let error = PortableDirectoryIndex::read(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("multiple init"));
+    }
+
+    #[test]
+    fn init_marker_safety_grammar_is_case_insensitive_and_requires_named_content() {
+        assert!(looks_like_init_source("INIT (Pkg).server.luau"));
+        assert!(looks_like_init_source("Init.client.lua"));
+        assert!(!looks_like_init_source("init ().luau"));
+        assert!(!looks_like_init_source("init (Pkg) [1].luau"));
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("init ().luau"), "").unwrap();
+        fs::write(temp.path().join("init.lua"), "").unwrap();
+        let index = PortableDirectoryIndex::read(temp.path()).unwrap();
+        assert_eq!(
+            index
+                .unique_init_source()
+                .map(|entry| entry.fragment.as_str()),
+            Some("init.lua")
+        );
+
+        let duplicate = tempfile::tempdir().unwrap();
+        fs::write(duplicate.path().join("INIT (Pkg).luau"), "").unwrap();
+        fs::write(duplicate.path().join("init.server.lua"), "").unwrap();
+        let error = PortableDirectoryIndex::read(duplicate.path()).unwrap_err();
         assert!(error.to_string().contains("multiple init"));
     }
 

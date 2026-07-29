@@ -14,7 +14,7 @@
   <a href="https://github.com/Pugbread/ro-sync/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Pugbread/ro-sync/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/Pugbread/ro-sync/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Pugbread/ro-sync?display_name=tag&sort=semver" /></a>
   <img alt="Rust" src="https://img.shields.io/badge/engine-Rust-438af5" />
-  <img alt="Protocol" src="https://img.shields.io/badge/plugin_protocol-5-26364f" />
+  <img alt="Protocol" src="https://img.shields.io/badge/plugin_protocol-6-26364f" />
 </p>
 
 <p align="center">
@@ -154,10 +154,11 @@ When both sides differ on first connect, Ro Sync always asks before writing:
 lets you move individual divergent paths into the Studio queue and leaves the
 rest untouched.
 
-Protocol 5 keeps first-connect memory bounded for projects with tens of
+Protocol 6 keeps first-connect memory bounded for projects with tens of
 thousands of instances. Structure requests contain at most 512 flat records
 and 512 KiB of encoded JSON; comparison hashes use at most 64 records per
-chunk, and script Sources travel separately in validated parts. Names and disk
+chunk, exact daemon-authored disk identities are returned in equally bounded
+pages, and script Sources travel separately in validated parts. Names and disk
 fragments are limited to 32 KiB, classes to 128 bytes, and retained encoded
 structure to 64 MiB per service / 128 MiB per transfer. Sources are limited to
 32 MiB per script, 64 MiB per service, and 128 MiB per transfer. The final

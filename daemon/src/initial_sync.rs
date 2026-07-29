@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::fs_map::{classify_script_file, is_init_file, META_FILE};
+use crate::fs_map::{path_to_instance_meta, META_FILE};
 use crate::fs_safety::{
     metadata_no_follow, validate_rojo_project_in_index, validate_service_path,
     PortableDirectoryIndex, SafeEntryKind, MAX_SERVICE_TREE_DEPTH, MAX_SERVICE_TREE_NODES,
@@ -143,9 +143,11 @@ pub fn compute_disk_stats(root: &Path) -> std::io::Result<Stats> {
             ));
         }
 
-        checked_increment(&mut instance_count, "instance count exceeds u32")?;
         let mut visited = 0usize;
-        // `(path, depth, count_directory)`; service roots were counted above.
+        // `(path, depth, count_directory)`. Service roots are transport
+        // containers, not projected instances: Studio stats deliberately
+        // exclude DataModel services, and counting an otherwise-empty service
+        // would make an empty disk look populated during initial bootstrap.
         let mut stack = vec![(service_path, 0usize, false)];
         while let Some((directory, depth, count_directory)) = stack.pop() {
             if depth > MAX_SERVICE_TREE_DEPTH {
@@ -195,8 +197,8 @@ pub fn compute_disk_stats(root: &Path) -> std::io::Result<Stats> {
                 match entry.kind {
                     SafeEntryKind::File
                         if !is_control
-                            && classify_script_file(name).is_some()
-                            && !is_init_file(name) =>
+                            && path_to_instance_meta(&entry.path)?
+                                .is_some_and(|instance| instance.script_class.is_some()) =>
                     {
                         checked_increment(&mut script_count, "script count exceeds u32")?;
                         checked_increment(&mut instance_count, "instance count exceeds u32")?;
@@ -291,8 +293,9 @@ mod tests {
 
         let s = compute_disk_stats(d.path()).unwrap();
         assert_eq!(s.script_count, 4);
-        // instances: ReplicatedStorage, Config, Main, React, Shared, Util = 6
-        assert_eq!(s.instance_count, 6);
+        // Service roots are not projected instances.
+        // instances: Config, Main, React, Shared, Util = 5
+        assert_eq!(s.instance_count, 5);
     }
 
     #[test]
@@ -307,7 +310,7 @@ mod tests {
 
         let stats = compute_disk_stats(d.path()).unwrap();
         assert_eq!(stats.script_count, WIDTH);
-        assert_eq!(stats.instance_count, WIDTH + 1);
+        assert_eq!(stats.instance_count, WIDTH);
     }
 
     #[test]
@@ -343,8 +346,8 @@ mod tests {
 
         let s = compute_disk_stats(d.path()).unwrap();
         assert_eq!(s.script_count, 1);
-        // ReplicatedStorage + Util = 2; .meta.json and RandomTool excluded.
-        assert_eq!(s.instance_count, 2);
+        // Util = 1; service roots, .meta.json and RandomTool are excluded.
+        assert_eq!(s.instance_count, 1);
     }
 
     #[test]
@@ -360,8 +363,32 @@ mod tests {
         let s = compute_disk_stats(d.path()).unwrap();
         // scripts: Helper.luau only (init file describes parent dir).
         assert_eq!(s.script_count, 1);
-        // instances: ServerScriptService, Net, Helper = 3
-        assert_eq!(s.instance_count, 3);
+        // instances: Net, Helper = 2; the service root is not projected.
+        assert_eq!(s.instance_count, 2);
+    }
+
+    #[test]
+    fn mismatched_named_init_counts_as_a_literal_leaf_script() {
+        let d = TempDir::new("literal-init-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        fs::create_dir_all(&misc).unwrap();
+        fs::write(misc.join("init (Notifications).luau"), "return 'literal'\n").unwrap();
+
+        let stats = compute_disk_stats(d.path()).unwrap();
+
+        assert_eq!(stats.script_count, 1);
+        assert_eq!(stats.instance_count, 2);
+    }
+
+    #[test]
+    fn existing_empty_service_directory_is_empty_projection() {
+        let d = TempDir::new("empty-service");
+        fs::create_dir_all(d.path().join("ReplicatedStorage")).unwrap();
+        fs::create_dir_all(d.path().join("ServerScriptService")).unwrap();
+
+        let stats = compute_disk_stats(d.path()).unwrap();
+        assert_eq!(stats, Stats::default());
+        assert!(stats.is_empty());
     }
 
     #[cfg(unix)]

@@ -2,12 +2,12 @@
   "name": "version",
   "title": "rosync version",
   "category": "Live diagnostics",
-  "description": "Prints the daemon build version and, when reachable, the plugin version.",
+  "description": "Prints the daemon version and build identity and, when reachable, the plugin version.",
   "usage": "rosync version [--project <path>] [--port <port>] [--raw]",
   "examples": [
     "rosync version --project ."
   ],
   "notes": [
-    "Useful when checking for mismatched widget, daemon, or plugin installs."
+    "Human and raw output include the daemon build commit and dirty state. The connected plugin reports its own build identity in the nested version response."
   ]
 }

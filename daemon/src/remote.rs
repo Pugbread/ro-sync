@@ -38,6 +38,35 @@ fn next_request_id() -> u64 {
     NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn validate_request_timeout(timeout: Duration) -> Result<(), String> {
+    if timeout.is_zero() {
+        return Err("request timeout must be greater than zero".into());
+    }
+    if timeout > crate::ws::MAX_REQUEST_TIMEOUT {
+        return Err(format!(
+            "request timeout must not exceed {} seconds",
+            crate::ws::MAX_REQUEST_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(())
+}
+
+fn request_timeout_millis(timeout: Duration) -> u64 {
+    let rounded_up =
+        timeout.as_millis() + u128::from(!timeout.subsec_nanos().is_multiple_of(1_000_000));
+    rounded_up.min(u128::from(u64::MAX)) as u64
+}
+
+fn request_frame(request_id: u64, op: &str, args: Value, timeout: Duration) -> Value {
+    json!({
+        "type": "request",
+        "request_id": request_id,
+        "op": op,
+        "args": args,
+        "timeout_ms": request_timeout_millis(timeout),
+    })
+}
+
 /// Send `{type:"request",request_id,op,args}` to the daemon and return the
 /// response `Value` (the full frame, including `ok`/`value`/`error`). Times
 /// out after 5s.
@@ -51,11 +80,17 @@ pub async fn request_with_timeout(
     args: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    let mut session = RemoteSession::connect(port).await?;
-    let result = session.request(op, args, timeout).await;
+    validate_request_timeout(timeout)?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "request timeout overflow".to_string())?;
+    let mut session = RemoteSession::connect_until(port, deadline).await?;
+    let result = session.request_until(op, args, deadline, timeout).await;
     // Best-effort close; a short-lived command must not turn close-handshake
-    // failures into command failures after the response has arrived.
-    let _ = session.close().await;
+    // failures into command failures after the response has arrived. It still
+    // shares the absolute operation deadline, so a stalled close can never
+    // extend the caller's timeout.
+    let _ = session.close_until(deadline).await;
     result
 }
 
@@ -197,18 +232,37 @@ pub struct RemoteSession {
 impl RemoteSession {
     /// Connect to the local daemon and perform the CLI hello handshake.
     pub async fn connect(port: u16) -> Result<Self, String> {
-        let url = format!("ws://127.0.0.1:{port}/ws");
-        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .map_err(|e| format!("connect {url}: {e}"))?;
+        Self::connect_with_timeout(port, Duration::from_secs(5)).await
+    }
 
-        socket
-            .send(Message::Text(format!(
+    pub async fn connect_with_timeout(port: u16, timeout: Duration) -> Result<Self, String> {
+        if timeout.is_zero() {
+            return Err("WebSocket connect timeout must be greater than zero".into());
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "WebSocket connect timeout overflow".to_string())?;
+        Self::connect_until(port, deadline).await
+    }
+
+    async fn connect_until(port: u16, deadline: tokio::time::Instant) -> Result<Self, String> {
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let (mut socket, _) =
+            tokio::time::timeout_at(deadline, tokio_tungstenite::connect_async(&url))
+                .await
+                .map_err(|_| format!("connect/handshake {url} timed out"))?
+                .map_err(|e| format!("connect {url}: {e}"))?;
+
+        tokio::time::timeout_at(
+            deadline,
+            socket.send(Message::Text(format!(
                 r#"{{"type":"hello","clientId":"rosync-cli","role":"cli","protocol":{}}}"#,
                 crate::ws::PLUGIN_PROTOCOL_VERSION
-            )))
-            .await
-            .map_err(|e| format!("send hello: {e}"))?;
+            ))),
+        )
+        .await
+        .map_err(|_| "send WebSocket hello timed out".to_string())?
+        .map_err(|e| format!("send hello: {e}"))?;
 
         Ok(Self { socket })
     }
@@ -224,13 +278,22 @@ impl RemoteSession {
         args: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        validate_request_timeout(timeout)?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "request timeout overflow".to_string())?;
+        self.request_until(op, args, deadline, timeout).await
+    }
+
+    async fn request_until(
+        &mut self,
+        op: &str,
+        args: Value,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let request_id = next_request_id();
-        let request = json!({
-            "type": "request",
-            "request_id": request_id,
-            "op": op,
-            "args": args,
-        });
+        let request = request_frame(request_id, op, args, timeout);
 
         let exchange = async {
             self.socket
@@ -240,12 +303,14 @@ impl RemoteSession {
             self.wait_for_response(request_id).await
         };
 
-        tokio::time::timeout(timeout, exchange).await.map_err(|_| {
-            format!(
-                "request timed out after {:.0}s (plugin unresponsive?)",
-                timeout.as_secs_f64()
-            )
-        })?
+        tokio::time::timeout_at(deadline, exchange)
+            .await
+            .map_err(|_| {
+                format!(
+                    "request timed out after {:.0}s (plugin unresponsive?)",
+                    timeout.as_secs_f64()
+                )
+            })?
     }
 
     /// Execute a sequence over this connection, preserving response order.
@@ -271,9 +336,23 @@ impl RemoteSession {
 
     /// Gracefully close the persistent connection.
     pub async fn close(&mut self) -> Result<(), String> {
-        self.socket
-            .send(Message::Close(None))
+        self.close_with_timeout(Duration::from_secs(5)).await
+    }
+
+    pub async fn close_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("WebSocket close timeout must be greater than zero".into());
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "WebSocket close timeout overflow".to_string())?;
+        self.close_until(deadline).await
+    }
+
+    async fn close_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        tokio::time::timeout_at(deadline, self.socket.send(Message::Close(None)))
             .await
+            .map_err(|_| "close connection timed out".to_string())?
             .map_err(|e| format!("close connection: {e}"))
     }
 
@@ -355,6 +434,23 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use tokio_tungstenite::tungstenite;
+
+    #[test]
+    fn request_frame_carries_a_bounded_rounded_up_timeout() {
+        let frame = request_frame(
+            7,
+            "get",
+            json!({"path": "Workspace"}),
+            Duration::from_secs(10 * 60),
+        );
+        assert_eq!(frame["timeout_ms"], 600_000);
+        assert_eq!(request_timeout_millis(Duration::from_micros(1_001)), 2);
+        assert!(validate_request_timeout(crate::ws::MAX_REQUEST_TIMEOUT).is_ok());
+        assert!(validate_request_timeout(
+            crate::ws::MAX_REQUEST_TIMEOUT + Duration::from_millis(1)
+        )
+        .is_err());
+    }
 
     /// Bind a TCP listener, accept one WebSocket connection, echo back a
     /// response matching the request_id of whatever request the client sends,
@@ -1218,6 +1314,29 @@ mod tests {
         assert!(
             elapsed >= Duration::from_secs(4),
             "timeout fired too early: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_to_end_timeout_includes_websocket_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Keep the TCP connection open without completing the HTTP
+            // WebSocket upgrade.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let error = request_with_timeout(addr.port(), "get", json!({}), Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        assert!(error.contains("connect/handshake"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "handshake exceeded the end-to-end deadline: {:?}",
+            started.elapsed()
         );
     }
 }

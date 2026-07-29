@@ -688,6 +688,7 @@ fn preferred_port_collision(error: &str, port: u16) -> bool {
     [
         format!("daemon start: port {port} is already serving "),
         format!("daemon start: requested port {port} serves "),
+        format!("daemon start: requested port {port} is unavailable:"),
         format!("serve: bind 127.0.0.1:{port}:"),
     ]
     .iter()
@@ -1176,6 +1177,10 @@ mod tests {
         ));
         assert!(preferred_port_collision(
             "daemon start: child exited\nError: serve: bind 127.0.0.1:7878: Address already in use",
+            7878,
+        ));
+        assert!(preferred_port_collision(
+            "daemon start: requested port 7878 is unavailable: Address already in use",
             7878,
         ));
         assert!(!preferred_port_collision(

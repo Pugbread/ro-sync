@@ -33,7 +33,7 @@ cannot be reproduced outside Studio.
 
 | # | Scenario | Expected |
 | --- | --- | --- |
-| 11 | Connect an older plugin that omits protocol version 5 or reports protocol 4. | The daemon closes it with an incompatible-protocol message asking for plugin reinstall. |
+| 11 | Connect an older plugin that omits protocol version 6 or reports protocol 5. | The daemon closes it with an incompatible-protocol message asking for plugin reinstall. |
 | 12 | Run `rosync set --batch` with an entry whose `prop` is `Parent`. | The whole batch is rejected before any network write unless `--force-parent` is explicit. |
 | 13 | Create `Workspace/tools/Test.luau` locally. | It syncs normally; only a project-root `tools/` directory is watcher-ignored. |
 | 14 | Run `node scripts/build-command-docs.mjs` and inspect `git diff`. | Generated command docs remain unchanged. |
@@ -67,7 +67,7 @@ navigation, and daemon shutdown all remain responsive.
 
 | # | Scenario | Expected |
 | --- | --- | --- |
-| 15 | Run `rosync capabilities --project . --raw`. | Protocol 5, plugin 2.4.0, and explicit capture/playtest/runtime feature flags and limits are returned. |
+| 15 | Run `rosync capabilities --project . --raw`. | Protocol 6, plugin 2.4.1, and explicit capture/playtest/runtime feature flags and limits are returned. |
 | 16 | Run `rosync capture status --project . --raw` before authorization. | Status is read-only and no permission prompt appears. |
 | 17 | Run `rosync capture authorize`, then capture a custom `x,y,width,height` region and a resized output. | One explicit Studio prompt is shown; the CLI writes a verified PNG with matching dimensions, size, and SHA-256 metadata. |
 | 18 | Before screenshot authorization, run `rosync capture photo` for a viewport region and a focused target from each named view; repeat one focused capture through the `capture scene` alias. | No permission prompt appears; exact dimensions and valid RGBA/PNG metadata are returned, the target remains fully framed, and camera, UI, Lighting, and temporary-clone state are cleaned up after every success/failure. |

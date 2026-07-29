@@ -1,6 +1,6 @@
 [package]
 name = "rosync"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -28,6 +28,7 @@ base64 = "0.22"
 png = "0.17"
 toml_edit = "0.22"
 tempfile = "3"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 

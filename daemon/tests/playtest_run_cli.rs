@@ -130,7 +130,7 @@ async fn fake_hello(State(state): State<Arc<FakeState>>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "project": state.project,
-        "protocol": 2,
+        "pluginProtocol": 6,
         "pluginConnected": true,
     }))
 }

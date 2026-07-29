@@ -15,7 +15,7 @@ const RELEASES_URL = "https://github.com/Pugbread/ro-sync/releases";
 const RUSTUP_URL   = "https://rustup.rs";
 
 const DEFAULT_PORT = 7878;
-const EXPECTED_PLUGIN_PROTOCOL = 2;
+const EXPECTED_PLUGIN_PROTOCOL = 6;
 const PLUGIN_SOURCE_REL = "plugin/Plugin.luau";
 
 async function writeFileViaExec(api, absPath, text) {

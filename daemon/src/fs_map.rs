@@ -21,6 +21,7 @@ use std::io;
 use std::path::Path;
 
 use crate::fs_safety::{metadata_no_follow, PortableDirectoryIndex, SafeEntryKind};
+use unicode_normalization::UnicodeNormalization;
 
 pub const META_FILE: &str = ".meta.json";
 pub const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
@@ -119,20 +120,72 @@ pub fn classify_script_file(file_name: &str) -> Option<(ScriptClass, String)> {
     None
 }
 
-/// Parse an `init (<Name>).{server,client,}.{luau,lua}` file name. The returned name
-/// is the instance's *clean* name — any `[N]` disambiguation suffix inside the
-/// parentheses is stripped so the inner matches the Roblox instance name.
-pub fn parse_init_file(file_name: &str) -> Option<(ScriptClass, String)> {
-    let (class, stem) = classify_script_file(file_name)?;
-    let inner = stem.strip_prefix("init (")?.strip_suffix(')')?;
-    if inner.is_empty() {
+/// A filename whose script stem uses the reserved init-marker namespace.
+///
+/// `outer_ordinal` distinguishes canonical parent markers such as
+/// `init (Pkg [1]).luau` from allocator-shaped leaf names such as
+/// `init (Pkg) [1].luau`. The latter must never be silently reinterpreted as
+/// the source of its parent directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedInitFilename {
+    pub class: ScriptClass,
+    pub inner_name: Option<String>,
+    pub leaf_name: String,
+    pub outer_ordinal: Option<usize>,
+}
+
+fn named_init_inner(stem: &str) -> Option<&str> {
+    let prefix = stem.get(..6)?;
+    if !prefix.eq_ignore_ascii_case("init (") || !stem.ends_with(')') {
         return None;
     }
-    let encoded_name = match parse_disambiguated(inner) {
-        Some((n, _)) => n,
-        None => inner.to_string(),
+    let inner = stem.get(6..stem.len().saturating_sub(1))?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// Parse the complete, ASCII-case-insensitive reserved init namespace after
+/// stripping every supported script suffix and an optional allocator ordinal.
+///
+/// This is intentionally broader than `parse_init_file`: callers use it to
+/// find legacy leaf scripts that would alias parent markers on another
+/// filesystem. `init ().luau` is not reserved because the named marker grammar
+/// requires a non-empty inner name.
+pub fn parse_reserved_init_filename(file_name: &str) -> Option<ReservedInitFilename> {
+    let (class, raw_stem) = classify_script_file(file_name)?;
+    let (stem, outer_ordinal) = match parse_disambiguated(&raw_stem) {
+        Some((stem, ordinal)) => (stem, Some(ordinal)),
+        None => (raw_stem, None),
     };
-    Some((class, decode_name(&encoded_name)))
+    let inner_name = if stem.eq_ignore_ascii_case("init") {
+        None
+    } else {
+        let inner = named_init_inner(&stem)?;
+        let encoded_name = match parse_disambiguated(inner) {
+            Some((name, _)) => name,
+            None => inner.to_string(),
+        };
+        Some(decode_name(&encoded_name))
+    };
+    Some(ReservedInitFilename {
+        class,
+        inner_name,
+        leaf_name: decode_name(&stem),
+        outer_ordinal,
+    })
+}
+
+/// Parse an `init (<Name>).{server,client,}.{luau,lua}` parent-marker filename.
+/// The marker prefix is ASCII-case-insensitive for legacy portability. The
+/// returned name is the instance's *clean* name — any `[N]` disambiguation
+/// suffix inside the parentheses is stripped so the inner matches the Roblox
+/// instance name. An allocator ordinal outside the parentheses denotes a leaf,
+/// not a parent marker.
+pub fn parse_init_file(file_name: &str) -> Option<(ScriptClass, String)> {
+    let parsed = parse_reserved_init_filename(file_name)?;
+    if parsed.outer_ordinal.is_some() {
+        return None;
+    }
+    Some((parsed.class, parsed.inner_name?))
 }
 
 /// Parse a Wally/Rojo-style plain init file name.
@@ -150,6 +203,31 @@ pub fn parse_plain_init_file(file_name: &str) -> Option<ScriptClass> {
 /// emitted as standalone child ModuleScripts when that parent is a script.
 pub fn is_init_file(file_name: &str) -> bool {
     parse_init_file(file_name).is_some() || parse_plain_init_file(file_name).is_some()
+}
+
+/// Encode a leaf script name so its filename cannot alias the reserved
+/// script-with-children marker grammar.
+///
+/// This reservation is deliberately leaf-only: directories and their
+/// canonical `init (<Name>)` source markers retain the existing projection.
+/// ASCII-case-insensitive matching also prevents aliases on case-insensitive
+/// filesystems and agrees with legacy marker recognition.
+fn encode_leaf_script_name(name: &str) -> String {
+    let encoded = encode_name(name);
+    let reserved_stem = parse_disambiguated(&encoded)
+        .map(|(stem, _)| stem)
+        .unwrap_or_else(|| encoded.clone());
+    let folded = reserved_stem.to_ascii_lowercase();
+    let is_named_init = folded
+        .strip_prefix("init (")
+        .and_then(|inner| inner.strip_suffix(')'))
+        .is_some_and(|inner| !inner.is_empty());
+    if folded == "init" || is_named_init {
+        let first = encoded.as_bytes()[0];
+        format!("%{first:02X}{}", &encoded[1..])
+    } else {
+        encoded
+    }
 }
 
 /// Parse a `<Name> [N]` numeric disambiguation suffix off a stem. Returns the
@@ -387,9 +465,13 @@ impl PathFragmentAllocator {
     }
 
     pub fn allocate(&mut self, inst: &InstanceDescriptor<'_>) -> PathFragment {
-        let encoded = encode_name(inst.name);
         let script = ScriptClass::from_class(inst.class);
         let is_dir = script.is_none() || inst.has_children;
+        let encoded = if script.is_some() && !inst.has_children {
+            encode_leaf_script_name(inst.name)
+        } else {
+            encode_name(inst.name)
+        };
         let extension = match script {
             Some(sc) if !inst.has_children => sc.suffix(),
             _ => "",
@@ -432,6 +514,63 @@ fn fragments_equal(a: &str, b: &str) -> bool {
 // Path → instance
 // ---------------------------------------------------------------------------
 
+fn decoded_component_name(path: &Path) -> Option<String> {
+    let fragment = path.file_name()?.to_str()?;
+    let encoded = match parse_disambiguated(fragment) {
+        Some((name, _)) => name,
+        None => fragment.to_string(),
+    };
+    Some(decode_name(&encoded))
+}
+
+fn normalized_case_key(name: &str) -> String {
+    name.nfc()
+        .flat_map(char::to_lowercase)
+        .nfc()
+        .collect::<String>()
+}
+
+/// Compare logical Roblox names while tolerating only case and canonical
+/// Unicode-normalization differences. This is used narrowly for legacy parent
+/// markers: generated paths remain bytewise ASCII encodings.
+pub fn logical_names_equivalent(left: &str, right: &str) -> bool {
+    left == right || normalized_case_key(left) == normalized_case_key(right)
+}
+
+fn named_init_describes_parent(path: &Path, inner_name: &str) -> bool {
+    path.parent()
+        .and_then(decoded_component_name)
+        .is_some_and(|parent_name| logical_names_equivalent(&parent_name, inner_name))
+}
+
+/// Locate the unique source marker for a script-with-children directory.
+///
+/// A named marker is valid only when its decoded inner name matches the
+/// directory's decoded logical name (after removing a generated sibling
+/// ordinal), allowing case and canonical Unicode-normalization differences
+/// from legacy filesystems. The directory spelling remains authoritative.
+/// Genuinely different names still remain literal leaves, so
+/// `Misc/init (Notifications).luau` cannot silently redefine `Misc`.
+pub fn script_with_children_source(
+    path: &Path,
+) -> io::Result<Option<(ScriptClass, String, std::path::PathBuf)>> {
+    let Some(decoded_dir_name) = decoded_component_name(path) else {
+        return Ok(None);
+    };
+    let index = PortableDirectoryIndex::read(path)?;
+    let Some(entry) = index.unique_init_source() else {
+        return Ok(None);
+    };
+    if let Some((class, inner_name)) = parse_init_file(&entry.fragment) {
+        if logical_names_equivalent(&inner_name, &decoded_dir_name) {
+            return Ok(Some((class, decoded_dir_name, entry.path.clone())));
+        }
+        return Ok(None);
+    }
+    Ok(parse_plain_init_file(&entry.fragment)
+        .map(|class| (class, decoded_dir_name, entry.path.clone())))
+}
+
 /// Instance data extracted from a single filesystem node. Does not recurse into
 /// children — callers iterate directories themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,7 +604,11 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
     };
 
     if meta.is_file() {
-        if parse_init_file(file_name).is_some() {
+        if let Some((_class, inner_name)) = parse_init_file(file_name) {
+            if named_init_describes_parent(path, &inner_name) {
+                return Ok(None);
+            }
+        } else if parse_plain_init_file(file_name).is_some() {
             return Ok(None);
         }
         let Some((script, stem)) = classify_script_file(file_name) else {
@@ -495,13 +638,8 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
     };
     let decoded_dir_name = decode_name(&dir_display);
 
-    let index = PortableDirectoryIndex::read(path)?;
-    let init_entry = index.unique_init_source().and_then(|entry| {
-        parse_init_file(&entry.fragment).or_else(|| {
-            parse_plain_init_file(&entry.fragment).map(|sc| (sc, decoded_dir_name.clone()))
-        })
-    });
-    let (name, class, script_class) = if let Some((sc, inner)) = init_entry.clone() {
+    let init_entry = script_with_children_source(path)?;
+    let (name, class, script_class) = if let Some((sc, inner, _source_path)) = init_entry {
         (inner, sc.class_name().to_string(), Some(sc))
     } else {
         (decoded_dir_name, "Folder".to_string(), None)
@@ -511,7 +649,7 @@ pub fn path_to_instance_meta(path: &Path) -> io::Result<Option<PathInstance>> {
         name,
         class,
         is_dir: true,
-        is_script_with_children: init_entry.is_some(),
+        is_script_with_children: script_class.is_some(),
         script_class,
     }))
 }
@@ -631,6 +769,11 @@ mod tests {
         assert_eq!(parse_init_file("foo.luau"), None);
         assert_eq!(parse_init_file("init ().luau"), None);
         assert_eq!(
+            parse_init_file("INIT (Thing).luau"),
+            Some((ScriptClass::ModuleScript, "Thing".to_string()))
+        );
+        assert_eq!(parse_init_file("init (Thing) [1].luau"), None);
+        assert_eq!(
             parse_plain_init_file("init.lua"),
             Some(ScriptClass::ModuleScript)
         );
@@ -643,6 +786,66 @@ mod tests {
             Some(ScriptClass::Script)
         );
         assert!(is_init_file("init.lua"));
+    }
+
+    #[test]
+    fn reserved_init_parser_covers_case_ordinals_and_every_script_class() {
+        for (file_name, class, inner_name, leaf_name, outer_ordinal) in [
+            ("INIT.luau", ScriptClass::ModuleScript, None, "INIT", None),
+            (
+                "Init (Package).lua",
+                ScriptClass::ModuleScript,
+                Some("Package"),
+                "Init (Package)",
+                None,
+            ),
+            (
+                "INIT (Server).server.luau",
+                ScriptClass::Script,
+                Some("Server"),
+                "INIT (Server)",
+                None,
+            ),
+            (
+                "iNiT [7].server.lua",
+                ScriptClass::Script,
+                None,
+                "iNiT",
+                Some(7),
+            ),
+            (
+                "INIT (Client).client.luau",
+                ScriptClass::LocalScript,
+                Some("Client"),
+                "INIT (Client)",
+                None,
+            ),
+            (
+                "Init (Client) [2].client.lua",
+                ScriptClass::LocalScript,
+                Some("Client"),
+                "Init (Client)",
+                Some(2),
+            ),
+        ] {
+            let parsed = parse_reserved_init_filename(file_name)
+                .unwrap_or_else(|| panic!("expected reserved init parse for {file_name}"));
+            assert_eq!(parsed.class, class, "{file_name}");
+            assert_eq!(parsed.inner_name.as_deref(), inner_name, "{file_name}");
+            assert_eq!(parsed.leaf_name, leaf_name, "{file_name}");
+            assert_eq!(parsed.outer_ordinal, outer_ordinal, "{file_name}");
+        }
+
+        assert!(parse_reserved_init_filename("init ().luau").is_none());
+        assert!(parse_reserved_init_filename("%69nit (Package).luau").is_none());
+    }
+
+    #[test]
+    fn logical_name_equivalence_handles_case_and_canonical_unicode_only() {
+        assert!(logical_names_equivalent("Notifications", "notifications"));
+        assert!(logical_names_equivalent("\u{00c9}", "E\u{0301}"));
+        assert!(logical_names_equivalent("\u{00c9}", "e\u{0301}"));
+        assert!(!logical_names_equivalent("Misc", "Notifications"));
     }
 
     #[test]
@@ -693,6 +896,28 @@ mod tests {
         let name = "Hello World";
         assert_eq!(encode_name(name), "Hello World");
         assert_eq!(decode_name(&encode_name(name)), name);
+    }
+
+    #[test]
+    fn leaf_script_encoding_reserves_init_marker_grammar_only_for_leaves() {
+        for (name, expected) in [
+            ("init", "%69nit"),
+            ("INIT", "%49NIT"),
+            ("init (Notifications)", "%69nit (Notifications)"),
+            ("Init (Notifications)", "%49nit (Notifications)"),
+            ("init [1]", "init %5B1%5D"),
+            ("INIT (Notifications) [2]", "INIT (Notifications) %5B2%5D"),
+        ] {
+            assert_eq!(encode_leaf_script_name(name), expected);
+            assert_eq!(decode_name(&encode_leaf_script_name(name)), name);
+        }
+
+        // Empty named markers are not part of the reserved grammar, and
+        // script-with-children directories continue using the ordinary name
+        // encoder.
+        assert_eq!(encode_leaf_script_name("init ()"), "init ()");
+        assert_eq!(encode_name("init"), "init");
+        assert_eq!(encode_name("init (Notifications)"), "init (Notifications)");
     }
 
     #[test]
@@ -1069,6 +1294,45 @@ mod tests {
     }
 
     #[test]
+    fn instance_to_path_escapes_reserved_init_leaf_names_for_every_script_class() {
+        for (class, name, expected) in [
+            ("ModuleScript", "init", "%69nit.luau"),
+            (
+                "Script",
+                "init (Notifications)",
+                "%69nit (Notifications).server.luau",
+            ),
+            (
+                "LocalScript",
+                "INIT (Notifications)",
+                "%49NIT (Notifications).client.luau",
+            ),
+        ] {
+            let fragment = instance_to_path(
+                &InstanceDescriptor {
+                    class,
+                    name,
+                    has_children: false,
+                },
+                &[],
+            );
+            assert_eq!(fragment.fragment, expected);
+            assert!(!fragment.is_dir);
+        }
+
+        let directory = instance_to_path(
+            &InstanceDescriptor {
+                class: "ModuleScript",
+                name: "init (Notifications)",
+                has_children: true,
+            },
+            &[],
+        );
+        assert_eq!(directory.fragment, "init (Notifications)");
+        assert!(directory.is_dir);
+    }
+
+    #[test]
     fn fragment_allocator_preserves_case_insensitive_collision_rules() {
         let mut allocator = PathFragmentAllocator::from_taken(["Config.luau", "Thing [1].luau"]);
         let config = allocator.allocate(&InstanceDescriptor {
@@ -1355,9 +1619,75 @@ mod tests {
         fs::write(&meta_path, "{}").unwrap();
         assert!(path_to_instance_meta(&meta_path).unwrap().is_none());
 
-        let init_path = p.join("init (X).luau");
+        let script_dir = p.join("X");
+        fs::create_dir(&script_dir).unwrap();
+        let init_path = script_dir.join("init (X).luau");
         fs::write(&init_path, "--").unwrap();
         assert!(path_to_instance_meta(&init_path).unwrap().is_none());
+    }
+
+    #[test]
+    fn mismatched_legacy_named_init_is_a_literal_leaf_not_a_parent_marker() {
+        let d = TempDir::new("legacy-literal-init-leaf");
+        let misc = d.path().join("Misc");
+        fs::create_dir(&misc).unwrap();
+        let literal = misc.join("init (Notifications).luau");
+        fs::write(&literal, "return true").unwrap();
+
+        let parent = path_to_instance_meta(&misc).unwrap().unwrap();
+        assert_eq!(parent.name, "Misc");
+        assert_eq!(parent.class, "Folder");
+        assert!(!parent.is_script_with_children);
+
+        let child = path_to_instance_meta(&literal).unwrap().unwrap();
+        assert_eq!(child.name, "init (Notifications)");
+        assert_eq!(child.class, "ModuleScript");
+        assert!(!child.is_dir);
+    }
+
+    #[test]
+    fn matching_legacy_named_init_remains_a_parent_marker() {
+        let d = TempDir::new("legacy-canonical-init-marker");
+        let notifications = d.path().join("Notifications [1]");
+        fs::create_dir(&notifications).unwrap();
+        let marker = notifications.join("init (Notifications).luau");
+        fs::write(&marker, "return true").unwrap();
+
+        let parent = path_to_instance_meta(&notifications).unwrap().unwrap();
+        assert_eq!(parent.name, "Notifications");
+        assert_eq!(parent.class, "ModuleScript");
+        assert!(parent.is_script_with_children);
+        assert!(path_to_instance_meta(&marker).unwrap().is_none());
+    }
+
+    #[test]
+    fn case_and_unicode_equivalent_named_init_use_parent_identity() {
+        for (tag, directory_fragment, marker_fragment, expected_name) in [
+            (
+                "case",
+                "notifications",
+                "INIT (Notifications).luau",
+                "notifications",
+            ),
+            ("unicode", "%C3%89", "init (E\u{0301}).luau", "\u{00c9}"),
+        ] {
+            let d = TempDir::new(tag);
+            let directory = d.path().join(directory_fragment);
+            fs::create_dir(&directory).unwrap();
+            let marker = directory.join(marker_fragment);
+            fs::write(&marker, "return true").unwrap();
+
+            let parent = path_to_instance_meta(&directory).unwrap().unwrap();
+            assert_eq!(parent.name, expected_name);
+            assert_eq!(parent.class, "ModuleScript");
+            assert!(parent.is_script_with_children);
+            assert!(path_to_instance_meta(&marker).unwrap().is_none());
+
+            let (_, source_name, source_path) =
+                script_with_children_source(&directory).unwrap().unwrap();
+            assert_eq!(source_name, expected_name);
+            assert_eq!(source_path, marker);
+        }
     }
 
     // ----- round-trip --------------------------------------------------
@@ -1391,6 +1721,39 @@ mod tests {
         fs::write(&p, b"return {}").unwrap();
         let inst = path_to_instance_meta(&p).unwrap().unwrap();
         assert_eq!(inst.name, "a/b");
+    }
+
+    #[test]
+    fn roundtrip_reserved_init_leaf_names() {
+        for (class, name) in [
+            ("ModuleScript", "init"),
+            ("ModuleScript", "init (Notifications)"),
+            ("Script", "Init"),
+            ("Script", "INIT (Server)"),
+            ("LocalScript", "init"),
+            ("LocalScript", "init (Client)"),
+            ("ModuleScript", "init ()"),
+            ("ModuleScript", "init (a/b)"),
+            ("ModuleScript", "init [1]"),
+            ("LocalScript", "INIT (Client) [2]"),
+        ] {
+            let d = TempDir::new("rt-reserved-init");
+            let desc = InstanceDescriptor {
+                class,
+                name,
+                has_children: false,
+            };
+            let fragment = instance_to_path(&desc, &[]);
+            let path = d.path().join(&fragment.fragment);
+            fs::write(&path, "return true").unwrap();
+
+            let instance = path_to_instance_meta(&path)
+                .unwrap()
+                .expect("leaf script must not be swallowed as an init marker");
+            assert_eq!(instance.name, name);
+            assert_eq!(instance.class, class);
+            assert!(!instance.is_dir);
+        }
     }
 
     #[test]

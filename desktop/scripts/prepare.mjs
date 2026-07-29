@@ -91,10 +91,25 @@ if (!(await exists(sourceBinary))) {
   );
 }
 verifySidecarContract(sourceBinary);
+const sidecarIdentity = readSidecarBuildIdentity(sourceBinary);
+verifyExpectedBuildIdentity(sidecarIdentity, "daemon sidecar");
 const executableSuffix = target.includes("windows") ? ".exe" : "";
 const bundledBinary = path.join(binariesDir, `rosync-${target}${executableSuffix}`);
 await copyFile(sourceBinary, bundledBinary);
 if (!target.includes("windows")) await chmod(bundledBinary, 0o755);
+
+const pluginArtifact = path.join(rootDir, "plugin", "Plugin.rbxm");
+const pluginManifestPath = path.join(rootDir, "plugin", "Plugin.build.json");
+const pluginBuild = JSON.parse(await readFile(pluginManifestPath, "utf8"));
+const pluginSha256 = await hashFile(pluginArtifact);
+if (
+  pluginBuild.schemaVersion !== 1
+  || pluginBuild.artifact !== "Plugin.rbxm"
+  || pluginBuild.sha256 !== pluginSha256
+) {
+  throw new Error("The Studio plugin artifact does not match plugin/Plugin.build.json.");
+}
+verifyExpectedBuildIdentity(pluginBuild, "Studio plugin");
 
 const manifest = {
   schemaVersion: 1,
@@ -104,6 +119,17 @@ const manifest = {
   sidecar: {
     path: path.relative(desktopDir, bundledBinary).replaceAll(path.sep, "/"),
     sha256: await hashFile(bundledBinary),
+    version: sidecarIdentity.daemon,
+    buildCommit: sidecarIdentity.buildCommit,
+    buildDirty: sidecarIdentity.buildDirty,
+  },
+  plugin: {
+    path: "resources/plugin/Plugin.rbxm",
+    sha256: pluginSha256,
+    version: pluginBuild.pluginVersion,
+    protocolVersion: pluginBuild.protocolVersion,
+    buildCommit: pluginBuild.buildCommit,
+    buildDirty: pluginBuild.buildDirty,
   },
 };
 await writeFile(
@@ -224,5 +250,48 @@ function verifySidecarContract(binary) {
         `The staged Ro Sync sidecar is incompatible (${check.args.join(" ")}: ${reason}). Rebuild the daemon release artifact before packaging.`,
       );
     }
+  }
+}
+
+function readSidecarBuildIdentity(binary) {
+  const probe = spawnSync(binary, ["version", "--port", "1", "--raw"], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: { ...process.env },
+  });
+  if (probe.error || probe.status !== 0) {
+    throw new Error(
+      `Could not read the staged daemon build identity: ${
+        probe.error?.message || `exit ${probe.status}`
+      }`,
+    );
+  }
+  try {
+    const identity = JSON.parse(String(probe.stdout || "").trim());
+    if (
+      typeof identity.daemon !== "string"
+      || typeof identity.buildCommit !== "string"
+      || typeof identity.buildDirty !== "boolean"
+    ) {
+      throw new Error("required identity fields are missing");
+    }
+    return identity;
+  } catch (error) {
+    throw new Error(`The staged daemon returned invalid build identity JSON: ${error.message}`);
+  }
+}
+
+function verifyExpectedBuildIdentity(identity, label) {
+  const expectedCommit = String(process.env.ROSYNC_BUILD_COMMIT || "").slice(0, 12);
+  if (expectedCommit && identity.buildCommit !== expectedCommit) {
+    throw new Error(
+      `${label} commit mismatch: ${identity.buildCommit} != ${expectedCommit}`,
+    );
+  }
+  if (
+    process.env.ROSYNC_BUILD_DIRTY === "false"
+    && identity.buildDirty !== false
+  ) {
+    throw new Error(`${label} is marked dirty in a clean packaging build`);
   }
 }
