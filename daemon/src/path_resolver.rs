@@ -2,7 +2,8 @@
 
 use crate::fs_map::{
     classify_script_file, decode_name, encode_name, is_init_file, parse_disambiguated,
-    path_to_instance_meta, InstanceDescriptor, PathFragmentAllocator, META_FILE,
+    path_is_parent_init_source, path_to_instance_meta, InstanceDescriptor, PathFragmentAllocator,
+    META_FILE,
 };
 use crate::fs_safety::{metadata_no_follow, validate_synced_path, PortableDirectoryIndex};
 use crate::snapshot::{SYNCED_SERVICES, TREE_JSON};
@@ -153,7 +154,10 @@ fn fs_to_studio(
         let is_last = idx + 1 == components.len();
         let cur = project.join(components[..=idx].iter().collect::<PathBuf>());
 
-        if is_init_file(component) {
+        if is_init_file(component)
+            && path_is_parent_init_source(&cur)
+                .map_err(|error| format!("path: inspect init source {}: {error}", cur.display()))?
+        {
             if !is_last {
                 return Err(format!(
                     "path: init file {} describes its parent instance and cannot have children",
@@ -660,6 +664,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.studio_path_string(), "ReplicatedStorage/Net");
+    }
+
+    #[test]
+    fn mismatched_named_init_resolves_to_literal_child() {
+        let d = TempDir::new("mismatched-init-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        fs::create_dir_all(&misc).unwrap();
+        fs::write(misc.join("init (Misc).luau"), "return 'parent'").unwrap();
+        fs::write(
+            misc.join("init (Notifications).luau"),
+            "return 'literal child'",
+        )
+        .unwrap();
+        let tree = json!([{
+            "class": "ReplicatedStorage",
+            "name": "ReplicatedStorage",
+            "children": [{
+                "class": "ModuleScript",
+                "name": "Misc",
+                "children": [{
+                    "class": "ModuleScript",
+                    "name": "init (Notifications)",
+                    "children": []
+                }]
+            }]
+        }]);
+
+        let resolved = resolve_with_tree(
+            d.path(),
+            &tree,
+            "ReplicatedStorage/Misc/init (Notifications).luau",
+            PathInputKind::Fs,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.studio_path_string(),
+            "ReplicatedStorage/Misc/init (Notifications)"
+        );
+        assert_eq!(resolved.class, "ModuleScript");
     }
 
     #[test]

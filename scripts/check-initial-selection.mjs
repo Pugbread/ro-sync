@@ -369,7 +369,7 @@ assert.match(
 );
 assert.match(
   appSource,
-  /open: \(\) => \{ void replayPendingInitialChoice\(projectId, base, event\); \}/,
+  /open: \(\) => \{[\s\S]*?replayPendingInitialChoice\(projectId, base, event\)[\s\S]*?\},\s*message:/,
   "every successful event-stream reconnect must recover a missed choice",
 );
 assert.match(

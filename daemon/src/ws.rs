@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::http::{apply_push_ops, event_to_plugin_op, is_authorized_widget_browser_request};
+use crate::http::{apply_push_ops, event_to_plugin_ops, is_authorized_widget_browser_request};
 use crate::AppState;
 
 pub(crate) const PLUGIN_PROTOCOL_VERSION: u64 = 6;
@@ -875,24 +875,40 @@ async fn send_loop(
             ev_res = events_rx.recv() => {
                 match ev_res {
                     Ok(s) => {
-                        if let Some(op) = event_to_plugin_op(state.canonical_project.as_path(), &s) {
+                        let plugin_ops = event_to_plugin_ops(state.canonical_project.as_path(), &s);
+                        if !plugin_ops.is_empty() {
                             let current_peer = PeerKind::load(&peer.kind);
                             if current_peer == PeerKind::Plugin {
-                                if *state.active_plugin.lock().unwrap() == Some(conn_id)
-                                    && !send_ws_msg(&mut sender, &ServerMsg::Op { op }, conn_id).await
-                                {
+                                let is_active = *state.active_plugin.lock().unwrap() == Some(conn_id);
+                                let mut failed = false;
+                                if is_active {
+                                    for op in plugin_ops {
+                                        if !send_ws_msg(&mut sender, &ServerMsg::Op { op }, conn_id).await {
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if failed {
                                     break;
                                 }
                             } else if current_peer == PeerKind::Watch {
-                                if let Some(activity) = sanitized_sync_activity(&op) {
-                                    if !send_ws_frame(
-                                        &mut sender,
-                                        Message::Text(activity.to_string()),
-                                        conn_id,
-                                    )
-                                    .await {
-                                        break;
+                                let mut failed = false;
+                                for op in plugin_ops {
+                                    if let Some(activity) = sanitized_sync_activity(&op) {
+                                        if !send_ws_frame(
+                                            &mut sender,
+                                            Message::Text(activity.to_string()),
+                                            conn_id,
+                                        )
+                                        .await {
+                                            failed = true;
+                                            break;
+                                        }
                                     }
+                                }
+                                if failed {
+                                    break;
                                 }
                             }
                             continue;

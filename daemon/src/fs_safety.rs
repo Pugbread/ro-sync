@@ -339,7 +339,7 @@ impl PortableDirectoryIndex {
             }
             aliases.push(index);
             if policy == DirectoryPolicy::SyncedProjection
-                && looks_like_init_source(&entry.fragment)
+                && init_source_describes_directory(directory, &entry.fragment)
             {
                 if entry.kind != SafeEntryKind::File {
                     return Err(invalid_data(format!(
@@ -349,7 +349,7 @@ impl PortableDirectoryIndex {
                 }
                 if let Some(previous) = init_source.replace(index) {
                     return Err(invalid_data(format!(
-                        "multiple init source markers in {}: {:?} and {:?}",
+                        "multiple init source markers in {}: {:?} and {:?}; keep exactly one source marker (use plain init.* for Wally/Rojo packages, or init (<Name>).* for a Ro Sync script-with-children directory)",
                         directory.display(),
                         entries[previous].fragment,
                         entry.fragment
@@ -623,32 +623,19 @@ pub fn ascii_fold(fragment: &str) -> String {
     fragment.to_ascii_lowercase()
 }
 
-fn looks_like_init_source(fragment: &str) -> bool {
-    const SUFFIXES: &[&str] = &[
-        ".server.luau",
-        ".client.luau",
-        ".server.lua",
-        ".client.lua",
-        ".luau",
-        ".lua",
-    ];
-    let Some(stem) = SUFFIXES
-        .iter()
-        .find_map(|suffix| fragment.strip_suffix(suffix))
-    else {
+fn init_source_describes_directory(directory: &Path, fragment: &str) -> bool {
+    let Some(parsed) = crate::fs_map::parse_reserved_init_filename(fragment) else {
         return false;
     };
-    if stem.eq_ignore_ascii_case("init") {
-        return true;
-    }
-    let Some(prefix) = stem.get(..6) else {
-        return false;
-    };
-    if !prefix.eq_ignore_ascii_case("init (") || !stem.ends_with(')') {
+    if parsed.outer_ordinal.is_some() {
         return false;
     }
-    stem.get(6..stem.len().saturating_sub(1))
-        .is_some_and(|inner| !inner.is_empty())
+    match parsed.inner_name {
+        None => crate::fs_map::parse_plain_init_file(fragment).is_some(),
+        Some(inner_name) => {
+            crate::fs_map::named_init_describes_parent(&directory.join(fragment), &inner_name)
+        }
+    }
 }
 
 fn normal_components(path: &Path) -> io::Result<Vec<String>> {
@@ -1549,20 +1536,33 @@ mod tests {
     #[test]
     fn duplicate_init_markers_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("init.lua"), "").unwrap();
-        fs::write(temp.path().join("init (Pkg).luau"), "").unwrap();
-        let error = PortableDirectoryIndex::read(temp.path()).unwrap_err();
+        let package = temp.path().join("Pkg");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("init.lua"), "").unwrap();
+        fs::write(package.join("init (Pkg).luau"), "").unwrap();
+        let error = PortableDirectoryIndex::read(&package).unwrap_err();
         assert!(error.to_string().contains("multiple init"));
     }
 
     #[test]
     fn init_marker_safety_grammar_is_case_insensitive_and_requires_named_content() {
-        assert!(looks_like_init_source("INIT (Pkg).server.luau"));
-        assert!(looks_like_init_source("Init.client.lua"));
-        assert!(!looks_like_init_source("init ().luau"));
-        assert!(!looks_like_init_source("init (Pkg) [1].luau"));
-
         let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("Pkg");
+        fs::create_dir(&package).unwrap();
+        assert!(init_source_describes_directory(
+            &package,
+            "INIT (Pkg).server.luau"
+        ));
+        assert!(!init_source_describes_directory(
+            &package,
+            "Init.client.lua"
+        ));
+        assert!(!init_source_describes_directory(&package, "init ().luau"));
+        assert!(!init_source_describes_directory(
+            &package,
+            "init (Pkg) [1].luau"
+        ));
+
         fs::write(temp.path().join("init ().luau"), "").unwrap();
         fs::write(temp.path().join("init.lua"), "").unwrap();
         let index = PortableDirectoryIndex::read(temp.path()).unwrap();
@@ -1573,11 +1573,32 @@ mod tests {
             Some("init.lua")
         );
 
-        let duplicate = tempfile::tempdir().unwrap();
-        fs::write(duplicate.path().join("INIT (Pkg).luau"), "").unwrap();
-        fs::write(duplicate.path().join("init.server.lua"), "").unwrap();
-        let error = PortableDirectoryIndex::read(duplicate.path()).unwrap_err();
+        fs::write(package.join("INIT (Pkg).luau"), "").unwrap();
+        fs::write(package.join("init.server.lua"), "").unwrap();
+        let error = PortableDirectoryIndex::read(&package).unwrap_err();
         assert!(error.to_string().contains("multiple init"));
+    }
+
+    #[test]
+    fn mismatched_named_init_remains_a_literal_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let misc = temp.path().join("Misc");
+        fs::create_dir(&misc).unwrap();
+        fs::write(misc.join("init.luau"), "return \"misc\"").unwrap();
+        fs::write(
+            misc.join("init (Notifications).luau"),
+            "return \"notifications\"",
+        )
+        .unwrap();
+
+        let index = PortableDirectoryIndex::read(&misc).unwrap();
+        assert_eq!(
+            index
+                .unique_init_source()
+                .map(|entry| entry.fragment.as_str()),
+            Some("init.luau")
+        );
+        assert!(index.exact("init (Notifications).luau").is_some());
     }
 
     #[test]

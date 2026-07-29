@@ -57,8 +57,8 @@ const explicitDark = resolveAppearanceTheme("dark", {
   systemDark: false,
 });
 assert.equal(explicitDark.preference, "dark");
-assert.equal(explicitDark.tokens["--bg"], "#0e1116");
-assert.equal(explicitDark.tokens["--accent"], "#4f8ef7");
+assert.equal(explicitDark.tokens["--bg"], "#181818");
+assert.equal(explicitDark.tokens["--accent"], "#7aa2d6");
 
 const systemLight = resolveAppearanceTheme("system", { systemDark: false });
 assert.equal(systemLight.effective, "light");

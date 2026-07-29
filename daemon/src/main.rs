@@ -4192,6 +4192,11 @@ async fn spawn_managed_daemon(
     } = launch;
     let executable = std::env::current_exe()?;
     let stdout = lifecycle::open_private_log(&paths.log)?;
+    // The managed log intentionally survives daemon restarts, but startup
+    // diagnostics must describe only this child. Remember where this attempt
+    // begins so an old successful "listening" line or an earlier validation
+    // failure cannot be repeated in the lifecycle error shown by the UI.
+    let log_start_offset = stdout.metadata()?.len();
     let stderr = stdout.try_clone()?;
     let mut command = std::process::Command::new(executable);
     command
@@ -4299,16 +4304,8 @@ async fn spawn_managed_daemon(
         }
         if let Some(exit) = child.try_wait()? {
             lifecycle::remove_record_if_boot(&paths.record, boot_id)?;
-            let tail = read_log_tail(&paths.log, 20).unwrap_or_default();
-            return Err(format!(
-                "daemon start: child {child_pid} exited with {exit} before the exact handshake{}",
-                if tail.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{tail}")
-                }
-            )
-            .into());
+            let tail = read_log_tail_from(&paths.log, log_start_offset, 20).unwrap_or_default();
+            return Err(managed_start_exit_message(child_pid, &exit.to_string(), &tail).into());
         }
         if Instant::now() >= deadline {
             // This is the exact child handle created above, never a PID read
@@ -4316,7 +4313,7 @@ async fn spawn_managed_daemon(
             let _ = child.kill();
             let _ = child.wait();
             lifecycle::remove_record_if_boot(&paths.record, boot_id)?;
-            let tail = read_log_tail(&paths.log, 20).unwrap_or_default();
+            let tail = read_log_tail_from(&paths.log, log_start_offset, 20).unwrap_or_default();
             return Err(format!(
                 "daemon start: timed out waiting for project/boot handshake on port {port}{}",
                 if tail.is_empty() {
@@ -4329,6 +4326,28 @@ async fn spawn_managed_daemon(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn managed_start_exit_message(child_pid: u32, exit: &str, tail: &str) -> String {
+    // Normal validation failures are already rendered by the child as
+    // `Error: <actionable detail>`. Surface that detail directly instead of
+    // leading with process/handshake internals that obscure the actual fix.
+    if let Some(detail) = tail
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("Error: "))
+        .filter(|detail| !detail.is_empty())
+    {
+        return format!("daemon start: {detail}");
+    }
+    format!(
+        "daemon start: child {child_pid} exited with {exit} before the exact handshake{}",
+        if tail.is_empty() {
+            String::new()
+        } else {
+            format!("\n{tail}")
+        }
+    )
 }
 
 fn managed_daemon_close_request(
@@ -4476,10 +4495,31 @@ fn print_daemon_status(
 }
 
 fn read_log_tail(path: &std::path::Path, lines: usize) -> std::io::Result<String> {
-    let text = std::fs::read_to_string(path)?;
+    read_log_tail_from(path, 0, lines)
+}
+
+fn read_log_tail_from(
+    path: &std::path::Path,
+    start_offset: u64,
+    lines: usize,
+) -> std::io::Result<String> {
     if lines == 0 {
         return Ok(String::new());
     }
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    // A rotated/truncated log invalidates the old offset. In that case the
+    // replacement file contains only newer diagnostics, so read it from zero.
+    let effective_offset = if length < start_offset {
+        0
+    } else {
+        start_offset
+    };
+    file.seek(SeekFrom::Start(effective_offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut selected = text.lines().rev().take(lines).collect::<Vec<_>>();
     selected.reverse();
     Ok(selected.join("\n"))
@@ -15743,7 +15783,15 @@ fn spawn_watch_bridge(
     conflicts: Arc<ConflictEngine>,
     push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>>,
 ) -> Result<(), String> {
+    // Subscribe before the startup scans so a concurrent filesystem mutation
+    // is queued and validated after the captured generation instead of falling
+    // into a scan/subscribe gap.
     let mut rx = watcher.subscribe();
+    let synced_services = snapshot::SYNCED_SERVICES
+        .iter()
+        .map(|service| (*service).to_string())
+        .collect::<Vec<_>>();
+    http::reject_legacy_reserved_init_leafs(&root, &synced_services)?;
     let initial_parent_dirs = collect_existing_parent_candidates(&root)?;
     let hydration_validation = fs_safety::SyncedPathValidationCache::new(&root)
         .map_err(|error| format!("initialize watcher hydration safety cache: {error}"))?;
@@ -15794,6 +15842,46 @@ fn spawn_watch_bridge(
                         rescanned_added_dirs.clear();
                         let _ = events.send(watcher_hydration_shutdown(&error));
                         continue;
+                    }
+                    match watcher_legacy_reserved_leaf_migration(&root, &op) {
+                        Ok(Some(error)) => {
+                            emit_sync_error(&events, &op.path, &error);
+                            reset_watch_bridge_after_barrier(
+                                &_watcher,
+                                &mut rx,
+                                &root,
+                                &mut pending_parent_dirs,
+                            );
+                            rescanned_added_dirs.clear();
+                            let _ = events.send(watcher_projection_migration_shutdown(&error));
+                            let _ = http::write_log_entry(axum::Json(serde_json::json!({
+                                "source": "filesystem-sync-validation",
+                                "op": match op.kind {
+                                    OpKind::Add => "add",
+                                    OpKind::Update => "update",
+                                    OpKind::Rename => "rename",
+                                    OpKind::Delete => "delete",
+                                },
+                                "path": op.path,
+                                "from": op.from,
+                                "outcome": "blocked-projection-migration",
+                                "error": error,
+                            })));
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            emit_sync_error(&events, &op.path, &error);
+                            reset_watch_bridge_after_barrier(
+                                &_watcher,
+                                &mut rx,
+                                &root,
+                                &mut pending_parent_dirs,
+                            );
+                            rescanned_added_dirs.clear();
+                            let _ = events.send(watcher_hydration_shutdown(&error));
+                            continue;
+                        }
                     }
                     if op.kind == OpKind::Rename && op.is_dir == Some(true) {
                         if let Some(from) = &op.from {
@@ -15885,6 +15973,41 @@ fn spawn_watch_bridge(
                             &mut hydration_validation,
                         ) {
                             Ok(descendants) => {
+                                let mut projection_problem = None;
+                                for descendant in &descendants {
+                                    match watcher_legacy_reserved_leaf_migration(&root, descendant)
+                                    {
+                                        Ok(Some(error)) => {
+                                            projection_problem =
+                                                Some((descendant.path.clone(), error, true));
+                                            break;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            projection_problem =
+                                                Some((descendant.path.clone(), error, false));
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some((path, error, migration_required)) = projection_problem
+                                {
+                                    emit_sync_error(&events, &path, &error);
+                                    reset_watch_bridge_after_barrier(
+                                        &_watcher,
+                                        &mut rx,
+                                        &root,
+                                        &mut pending_parent_dirs,
+                                    );
+                                    rescanned_added_dirs.clear();
+                                    let shutdown = if migration_required {
+                                        watcher_projection_migration_shutdown(&error)
+                                    } else {
+                                        watcher_hydration_shutdown(&error)
+                                    };
+                                    let _ = events.send(shutdown);
+                                    continue;
+                                }
                                 if !descendants.is_empty() {
                                     pending_parent_dirs.remove(&directory);
                                 }
@@ -16244,6 +16367,28 @@ fn watcher_resync_shutdown(code: &str, reason: &str) -> String {
 
 fn watcher_hydration_shutdown(reason: &str) -> String {
     watcher_resync_shutdown("WATCHER_HYDRATION_FAILED", reason)
+}
+
+fn watcher_projection_migration_shutdown(reason: &str) -> String {
+    serde_json::json!({
+        "type": "shutdown",
+        "reason": reason,
+        "code": http::PROJECTION_MIGRATION_REQUIRED_CODE,
+        "retryable": false,
+    })
+    .to_string()
+}
+
+fn watcher_legacy_reserved_leaf_migration(
+    root: &std::path::Path,
+    op: &Op,
+) -> Result<Option<String>, String> {
+    if !matches!(op.kind, OpKind::Add | OpKind::Update | OpKind::Rename) || op.is_dir == Some(true)
+    {
+        return Ok(None);
+    }
+    fs_map::legacy_reserved_init_leaf_migration_message(root, &op.path)
+        .map_err(|error| format!("inspect watcher projection {}: {error}", op.path.display()))
 }
 
 fn collect_existing_parent_candidates(root: &std::path::Path) -> Result<HashSet<PathBuf>, String> {
@@ -16765,6 +16910,62 @@ mod tier2_tests {
     use clap::CommandFactory;
 
     #[test]
+    fn managed_start_log_tail_excludes_previous_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        std::fs::write(
+            &log,
+            "rosync listening on http://127.0.0.1:7878 (project: stale)\nold failure\n",
+        )
+        .unwrap();
+        let offset = std::fs::metadata(&log).unwrap().len();
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            file,
+            "Error: serve: validate watched filesystem: multiple init source markers"
+        )
+        .unwrap();
+
+        let tail = read_log_tail_from(&log, offset, 20).unwrap();
+        assert_eq!(
+            tail,
+            "Error: serve: validate watched filesystem: multiple init source markers"
+        );
+        assert!(!tail.contains("rosync listening"));
+        assert!(!tail.contains("old failure"));
+    }
+
+    #[test]
+    fn managed_start_log_tail_reads_replacement_log_from_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("daemon.log");
+        std::fs::write(&log, "a much longer previous daemon log\n").unwrap();
+        let stale_offset = std::fs::metadata(&log).unwrap().len();
+        std::fs::write(&log, "Error: replacement log\n").unwrap();
+
+        assert_eq!(
+            read_log_tail_from(&log, stale_offset, 20).unwrap(),
+            "Error: replacement log"
+        );
+    }
+
+    #[test]
+    fn managed_start_validation_error_leads_with_actionable_detail() {
+        let message = managed_start_exit_message(
+            61160,
+            "exit status: 1",
+            "Error: serve: validate watched filesystem: multiple init source markers",
+        );
+        assert_eq!(
+            message,
+            "daemon start: serve: validate watched filesystem: multiple init source markers"
+        );
+        assert!(!message.contains("child 61160"));
+        assert!(!message.contains("handshake"));
+    }
+
+    #[test]
     fn atomic_replace_bytes_replaces_existing_file() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("RoSync.rbxm");
@@ -17157,6 +17358,70 @@ mod tier2_tests {
 
         assert!(
             take_pending_parent_materializations(&script_op, &root, &mut HashSet::new()).is_empty()
+        );
+    }
+
+    #[test]
+    fn watcher_reserved_init_leaf_requires_terminal_canonical_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let misc = temp.path().join("ReplicatedStorage/Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        let legacy = misc.join("init (Notifications).luau");
+        std::fs::write(&legacy, "return true\n").unwrap();
+        let op = Op {
+            kind: OpKind::Update,
+            path: legacy,
+            from: None,
+            content: Some(b"return true\n".to_vec()),
+            is_dir: Some(false),
+        };
+
+        let message = watcher_legacy_reserved_leaf_migration(temp.path(), &op)
+            .unwrap()
+            .expect("legacy reserved leaf must require migration");
+        assert!(message.contains("ReplicatedStorage/Misc/init (Notifications).luau"));
+        assert!(message.contains("ReplicatedStorage/Misc/%69nit (Notifications).luau"));
+
+        let shutdown: serde_json::Value =
+            serde_json::from_str(&watcher_projection_migration_shutdown(&message)).unwrap();
+        assert_eq!(shutdown["type"], "shutdown");
+        assert_eq!(shutdown["code"], "WATCHER_PROJECTION_MIGRATION_REQUIRED");
+        assert_eq!(shutdown["retryable"], false);
+        assert_eq!(shutdown["reason"], message);
+    }
+
+    #[test]
+    fn watcher_parent_init_carrier_and_legacy_cleanup_do_not_require_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let misc = temp.path().join("ReplicatedStorage/Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        let carrier = misc.join("init (Misc).luau");
+        std::fs::write(&carrier, "return true\n").unwrap();
+        let carrier_update = Op {
+            kind: OpKind::Update,
+            path: carrier,
+            from: None,
+            content: Some(b"return true\n".to_vec()),
+            is_dir: Some(false),
+        };
+        assert!(
+            watcher_legacy_reserved_leaf_migration(temp.path(), &carrier_update)
+                .unwrap()
+                .is_none()
+        );
+
+        let legacy_delete = Op {
+            kind: OpKind::Delete,
+            path: misc.join("init (Notifications).luau"),
+            from: None,
+            content: None,
+            is_dir: Some(false),
+        };
+        assert!(
+            watcher_legacy_reserved_leaf_migration(temp.path(), &legacy_delete)
+                .unwrap()
+                .is_none(),
+            "deleting a legacy spelling must remain possible"
         );
     }
 

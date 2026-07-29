@@ -137,7 +137,15 @@ export function scrubActivityFrame(frame) {
     return { type, path: safePath(frame.path) };
   }
   if (type === "shutdown") {
-    return { type, reason: safeText(frame.reason, 120) || "Daemon stopped" };
+    const rawCode = safeText(frame.code, 96);
+    const code = /^[A-Za-z0-9._:-]+$/.test(rawCode) ? rawCode : "";
+    const safe = {
+      type,
+      reason: safeText(frame.reason, MAX_TECHNICAL_STRING) || "Daemon stopped",
+    };
+    if (code) safe.code = code;
+    if (typeof frame.retryable === "boolean") safe.retryable = frame.retryable;
+    return safe;
   }
   if (type === "busy") {
     const count = Number.isFinite(frame.count) ? Math.max(1, Math.round(frame.count)) : 0;
@@ -241,6 +249,30 @@ export function formatActivity(entry) {
         facts: [fact("Source", friendlyChoice(frame.choice))],
       };
     case "shutdown":
+      if (frame.retryable === false) {
+        return {
+          ...base,
+          category: "connection",
+          tone: "danger",
+          state: "failed",
+          stateLabel: "Action required",
+          title: "Sync stopped to protect this project",
+          intent: frame.reason,
+          facts: frame.code ? [fact("Code", frame.code)] : [],
+        };
+      }
+      if (frame.retryable === true) {
+        return {
+          ...base,
+          category: "connection",
+          tone: "warning",
+          state: "running",
+          stateLabel: "Reconnecting",
+          title: "Rebuilding the sync connection",
+          intent: frame.reason,
+          facts: frame.code ? [fact("Code", frame.code)] : [],
+        };
+      }
       return {
         ...base,
         category: "connection",
@@ -248,7 +280,7 @@ export function formatActivity(entry) {
         state: "info",
         stateLabel: "Stopped",
         title: "Project service stopped",
-        intent: "The daemon closed this project’s live connection.",
+        intent: frame.reason,
       };
     case "busy":
       return {

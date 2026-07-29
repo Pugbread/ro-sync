@@ -7,8 +7,8 @@
 //! plugin's responsibility and should be inspected through live CLI reads.
 
 use crate::fs_map::{
-    is_init_file, parse_init_file, parse_plain_init_file, path_to_instance_meta, PathInstance,
-    ScriptClass, META_FILE,
+    parse_init_file, parse_plain_init_file, path_is_parent_init_source, path_to_instance_meta,
+    PathInstance, ScriptClass, META_FILE,
 };
 use crate::fs_safety::{
     file_generation_no_follow, metadata_no_follow, read_to_string_no_follow,
@@ -2020,11 +2020,8 @@ fn flat_disk_candidate(path: &Path) -> io::Result<Option<FlatDiskCandidate>> {
     let mut name_override = None;
     if path_is_dir {
         if let Some(target) = default_project_path(path)? {
-            let target_is_own_init = target.parent() == Some(path)
-                && target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(is_init_file);
+            let target_is_own_init =
+                target.parent() == Some(path) && path_is_parent_init_source(&target)?;
             if !target_is_own_init && metadata_no_follow(&target)?.is_some() {
                 name_override = path_to_instance_meta(path)?
                     .map(|instance| instance.name)
@@ -2078,8 +2075,14 @@ fn collect_flat_disk_children(
     }
 
     let mut candidates = Vec::new();
-    for entry in PortableDirectoryIndex::read(dir)?.entries() {
-        if parent_is_script && is_init_file(&entry.fragment) {
+    let index = PortableDirectoryIndex::read(dir)?;
+    let parent_source = if parent_is_script {
+        index.unique_init_source().map(|entry| entry.path.as_path())
+    } else {
+        None
+    };
+    for entry in index.entries() {
+        if parent_source == Some(entry.path.as_path()) {
             continue;
         }
         if let Some(candidate) = flat_disk_candidate(&entry.path)? {
@@ -2192,12 +2195,18 @@ fn walk_children_at_depth(
         ));
     }
     let mut out = Vec::new();
-    for entry in PortableDirectoryIndex::read(dir)?.entries() {
+    let index = PortableDirectoryIndex::read(dir)?;
+    let parent_source = if parent_is_script {
+        index.unique_init_source().map(|entry| entry.path.as_path())
+    } else {
+        None
+    };
+    for entry in index.entries() {
         if entry.fragment == META_FILE {
             continue;
         }
         // The script-with-children init file describes the parent, not a child.
-        if parent_is_script && is_init_file(&entry.fragment) {
+        if parent_source == Some(entry.path.as_path()) {
             continue;
         }
         if let Some(node) = build_whitelisted_node(&entry.path, depth)? {
@@ -2225,11 +2234,8 @@ fn build_whitelisted_node(path: &Path, depth: usize) -> io::Result<Option<Value>
     let path_is_dir = path_metadata.is_dir();
     if path_is_dir {
         if let Some(target) = default_project_path(path)? {
-            let target_is_own_init = target.parent() == Some(path)
-                && target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(is_init_file);
+            let target_is_own_init =
+                target.parent() == Some(path) && path_is_parent_init_source(&target)?;
             if !target_is_own_init && metadata_no_follow(&target)?.is_some() {
                 let name = path_to_instance_meta(path)?
                     .map(|inst| inst.name)
@@ -3012,6 +3018,42 @@ mod tests {
         assert_eq!(net_node["children"].as_array().unwrap().len(), 1);
         let helper = find_child(net_node, "Helper").unwrap();
         assert_eq!(helper["class"], "ModuleScript");
+    }
+
+    #[test]
+    fn script_with_children_emits_mismatched_named_init_leaf() {
+        let d = TempDir::new("swc-mismatched-init-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        fs::create_dir_all(&misc).unwrap();
+        fs::write(misc.join("init (Misc).luau"), b"return 'parent'").unwrap();
+        fs::write(
+            misc.join("init (Notifications).luau"),
+            b"return 'literal child'",
+        )
+        .unwrap();
+
+        let services = emit_services(d.path()).unwrap();
+        let rs = find_service(&services, "ReplicatedStorage").unwrap();
+        let misc_node = find_child(rs, "Misc").unwrap();
+        assert_eq!(misc_node["properties"]["Source"], "return 'parent'");
+        let literal = find_child(misc_node, "init (Notifications)").unwrap();
+        assert_eq!(literal["class"], "ModuleScript");
+        assert_eq!(literal["properties"]["Source"], "return 'literal child'");
+
+        let flat = emit_flat_service(d.path(), "ReplicatedStorage").unwrap();
+        let misc_flat = flat
+            .records
+            .iter()
+            .find(|record| record.name == "Misc")
+            .unwrap();
+        let literal_flat = flat
+            .records
+            .iter()
+            .find(|record| {
+                record.parent_id == Some(misc_flat.id) && record.name == "init (Notifications)"
+            })
+            .unwrap();
+        assert_eq!(literal_flat.class, "ModuleScript");
     }
 
     #[test]

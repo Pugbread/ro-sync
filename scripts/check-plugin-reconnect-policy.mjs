@@ -48,6 +48,21 @@ assert.match(
   /not reconnectState\.desired or not connected or gen ~= wsGeneration/,
   "late WebSocket callbacks must not revive an explicitly cancelled connection",
 );
+assert.match(
+  wsLoop,
+  /local heartbeatSuspectClock = nil[\s\S]*?lastWatchdogClock = lastPing[\s\S]*?schedulerGap > WS_SCHEDULER_STALL_THRESHOLD[\s\S]*?lastPongClock = now[\s\S]*?not closed and now - lastPongClock > WS_HEARTBEAT_TIMEOUT[\s\S]*?heartbeatSuspectClock = now[\s\S]*?now - heartbeatSuspectClock > WS_POST_WAKE_GRACE/,
+  "a scheduler stall or silent heartbeat must receive a bounded post-wake probe window before timeout",
+);
+assert.ok(
+  wsLoop.indexOf("schedulerGap > WS_SCHEDULER_STALL_THRESHOLD")
+    < wsLoop.indexOf("not closed and now - lastPongClock > WS_HEARTBEAT_TIMEOUT"),
+  "wake/stall grace must run before the ordinary heartbeat timeout check",
+);
+assert.match(
+  wsLoop,
+  /lastPongClock = os\.clock\(\)[\s\S]*?heartbeatSuspectClock = nil[\s\S]*?heartbeat remained silent after post-wake grace/,
+  "any inbound daemon traffic must clear the heartbeat suspect window",
+);
 
 const shutdownBranch = wsLoop.slice(
   wsLoop.indexOf('elseif kind == "shutdown"'),
@@ -94,13 +109,23 @@ const refreshHello = source.slice(
 );
 assert.match(
   refreshHello,
-  /reconnectState\.discoverDaemon\(expectedGameId, true, false\)/,
-  "recovery must rediscover a matching daemon when Desktop changes ports",
+  /local pinnedProject = reconnectState\.pinnedProject[\s\S]*?matchesPinnedProject[\s\S]*?reconnectState\.discoverDaemon\(expectedGameId, true, false, pinnedProject\)/,
+  "recovery must rediscover only the explicitly selected canonical project when Desktop changes ports",
+);
+assert.doesNotMatch(
+  refreshHello,
+  /discoverDaemon[\s\S]{0,120}expectedGameId ~= "0"/,
+  "an unpublished place must still follow its exact pinned project to a new port",
 );
 assert.match(
   refreshHello,
   /reconnectState\.pluginCapability = capability/,
   "each successful /hello must rotate the in-memory plugin capability",
+);
+assert.match(
+  refreshHello,
+  /hello ~= nil and not matchesPinnedProject\(hello\)[\s\S]*?hello = nil[\s\S]*?not matchesPinnedProject\(hello\)[\s\S]*?different project during discovery/,
+  "both the current port and a rediscovered port must fail closed on a project identity mismatch",
 );
 assert.match(
   refreshHello,
@@ -116,6 +141,11 @@ assert.match(
   daemonDiscovery,
   /currentPlaceId = tostring\(game\.PlaceId\)[\s\S]*?candidate\.hello\.placeIds[\s\S]*?#exactPlaceMatches > 0 then exactPlaceMatches else gameMatches/,
   "daemon discovery must prefer candidates whose configured placeIds include the current PlaceId",
+);
+assert.match(
+  daemonDiscovery,
+  /function\(gameId, quiet, includeInitializer, expectedProject\)[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local currentPlaceId/,
+  "automatic discovery must restrict candidates by canonical project before applying PlaceId preference",
 );
 assert.match(
   daemonDiscovery,
@@ -172,6 +202,26 @@ assert.match(
   /resp\.phase ~= "identities"[\s\S]*?identityCount > scaleState\.maxStreamNodes[\s\S]*?postCompareChunk\([\s\S]*?"identities"[\s\S]*?PathHelpers\.isPortableDiskFragment\(fragment\)[\s\S]*?colliding sibling disk identities[\s\S]*?resp\.nextPhase ~= "hashes"/,
   "initial comparison must page, bound, and validate exact daemon-authored disk identity receipts",
 );
+assert.match(
+  initialCompare,
+  /local terminalCompareFailure = nil[\s\S]*?retryOrStopStreamedCompare[\s\S]*?reconnectState\.stopTerminal\(message\)/,
+  "streamed comparison must have a terminal path that does not enter retry backoff",
+);
+assert.match(
+  initialCompare,
+  /if nextResp\.retryable == false then[\s\S]*?terminalCompareFailure = \{[\s\S]*?code = tostring\(nextResp\.code[\s\S]*?break/,
+  "a non-retryable streamed comparison response must retain its typed terminal failure",
+);
+assert.match(
+  initialCompare,
+  /retryOrStopStreamedCompare\(streamErr[\s\S]*?retryOrStopStreamedCompare\(prepareErr[\s\S]*?retryOrStopStreamedCompare\(identityErr[\s\S]*?retryOrStopStreamedCompare\(hashErr/,
+  "every streamed comparison transport phase must honor a terminal daemon response",
+);
+assert.match(
+  source,
+  /message:lower\(\):find\("protocol"[\s\S]*?setPill\("error", "update Ro Sync"\)[\s\S]*?else[\s\S]*?setPill\("error", "action required"\)/,
+  "non-protocol terminal failures must not misleadingly ask the user to update Ro Sync",
+);
 
 const disconnect = source.slice(
   source.indexOf("local function disconnect(reason)"),
@@ -179,8 +229,38 @@ const disconnect = source.slice(
 );
 assert.match(
   disconnect,
-  /reconnectState\.desired = false/,
-  "explicit user disconnect and plugin unload must remain terminal",
+  /reconnectState\.desired = false[\s\S]*?reconnectState\.pinnedProject = nil/,
+  "explicit user disconnect and plugin unload must remain terminal and release the project pin",
+);
+
+const daemonValidation = source.slice(
+  source.indexOf("local function validateDaemonProtocol(url)"),
+  source.indexOf("-- Project-bootstrap constants"),
+);
+assert.match(
+  daemonValidation,
+  /daemonProject = hello\.project[\s\S]*?canonical project identity[\s\S]*?return true, nil, capability, daemonProject/,
+  "the initial Connect action must obtain a non-empty canonical project identity from /hello",
+);
+
+const beginDaemonConnection = source.slice(
+  source.indexOf("local function beginDaemonConnection"),
+  source.indexOf("local function projectInitErrorMessage"),
+);
+assert.match(
+  beginDaemonConnection,
+  /daemonPluginCapability, daemonProject = validateDaemonProtocol\(chosenUrl\)[\s\S]*?reconnectState\.pinnedProject = daemonProject[\s\S]*?runInitialCompare\(\)/,
+  "the selected canonical project must be pinned before the first comparison begins",
+);
+
+const startConnect = source.slice(
+  source.indexOf("startConnect = function()"),
+  source.indexOf("plugin.Unloading:Connect"),
+);
+assert.match(
+  startConnect,
+  /if busy then[\s\S]*?reconnectState\.pinnedProject = nil[\s\S]*?return[\s\S]*?Every explicit Connect\/Create Project action[\s\S]*?reconnectState\.pinnedProject = nil/,
+  "cancel and every subsequent explicit Connect action must reset the automatic-recovery project pin",
 );
 
 assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.1"/);

@@ -3,7 +3,7 @@
 //! The output intentionally follows the simple Rojo-style JSON shape consumed
 //! by luau-lsp: `{ name, className, filePaths?, children? }`.
 
-use crate::fs_map::{is_init_file, path_to_instance_meta};
+use crate::fs_map::{path_is_parent_init_source, path_to_instance_meta};
 use crate::fs_safety::{
     file_generation_no_follow, metadata_no_follow, read_to_string_no_follow,
     resolve_rojo_path_no_follow, validate_rojo_project_directory, validate_service_path,
@@ -203,8 +203,10 @@ fn walk_children(project: &Path, dir: &Path, depth: usize) -> io::Result<Vec<Val
         ));
     }
     let mut out = Vec::new();
-    for entry in PortableDirectoryIndex::read(dir)?.entries() {
-        if is_init_file(&entry.fragment) {
+    let index = PortableDirectoryIndex::read(dir)?;
+    let parent_source = index.unique_init_source().map(|entry| entry.path.as_path());
+    for entry in index.entries() {
+        if parent_source == Some(entry.path.as_path()) {
             continue;
         }
         if let Some(node) = build_node(project, &entry.path, depth)? {
@@ -221,11 +223,8 @@ fn build_node(project: &Path, path: &Path, depth: usize) -> io::Result<Option<Va
     };
     if metadata.is_dir() {
         if let Some(target) = default_project_path(path)? {
-            let target_is_own_init = target.parent() == Some(path)
-                && target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(is_init_file);
+            let target_is_own_init =
+                target.parent() == Some(path) && path_is_parent_init_source(&target)?;
             if !target_is_own_init && metadata_no_follow(&target)?.is_some() {
                 let name = path_to_instance_meta(path)?
                     .map(|inst| inst.name)
@@ -398,6 +397,31 @@ mod tests {
             "ReplicatedStorage/Net/init (Net).luau"
         );
         assert_eq!(net_node["children"][0]["className"], "LocalScript");
+    }
+
+    #[test]
+    fn script_with_children_keeps_mismatched_named_init_leaf() {
+        let d = TempDir::new("mismatched-init-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        fs::create_dir_all(&misc).unwrap();
+        fs::write(misc.join("init (Misc).luau"), "return 'parent'").unwrap();
+        fs::write(
+            misc.join("init (Notifications).luau"),
+            "return 'literal child'",
+        )
+        .unwrap();
+
+        let map = generate(d.path()).unwrap();
+        let misc_node = &map["children"][0]["children"][0];
+        assert_eq!(misc_node["name"], "Misc");
+        assert_eq!(
+            misc_node["filePaths"][0],
+            "ReplicatedStorage/Misc/init (Misc).luau"
+        );
+        let children = misc_node["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["name"], "init (Notifications)");
+        assert_eq!(children[0]["className"], "ModuleScript");
     }
 
     #[test]

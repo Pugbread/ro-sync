@@ -198,9 +198,12 @@ pub fn parse_plain_init_file(file_name: &str) -> Option<ScriptClass> {
     (stem == "init").then_some(class)
 }
 
-/// True for both Ro-Sync `init (<Name>).luau` and Wally/Rojo `init.lua`
-/// variants. These files describe their parent directory and should not be
-/// emitted as standalone child ModuleScripts when that parent is a script.
+/// True for filenames in the reserved init-marker grammar.
+///
+/// This is a lexical predicate only. A named `init (<Name>)` file describes
+/// its parent only when `<Name>` matches that directory. Path-aware callers
+/// must use [`path_is_parent_init_source`] before skipping or redirecting it;
+/// a mismatched marker is a literal leaf script.
 pub fn is_init_file(file_name: &str) -> bool {
     parse_init_file(file_name).is_some() || parse_plain_init_file(file_name).is_some()
 }
@@ -537,10 +540,28 @@ pub fn logical_names_equivalent(left: &str, right: &str) -> bool {
     left == right || normalized_case_key(left) == normalized_case_key(right)
 }
 
-fn named_init_describes_parent(path: &Path, inner_name: &str) -> bool {
+pub(crate) fn named_init_describes_parent(path: &Path, inner_name: &str) -> bool {
     path.parent()
         .and_then(decoded_component_name)
         .is_some_and(|parent_name| logical_names_equivalent(&parent_name, inner_name))
+}
+
+/// Whether this filename's grammar identifies it as a source carrier for its
+/// parent directory, without requiring the file itself to still exist.
+///
+/// Delete and rename notifications arrive after the source path has vanished,
+/// so they cannot use [`path_is_parent_init_source`]. This contextual lexical
+/// check still rejects legacy mismatches such as
+/// `Misc/init (Notifications).luau`.
+pub(crate) fn init_path_describes_parent(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if parse_plain_init_file(file_name).is_some() {
+        return true;
+    }
+    parse_init_file(file_name)
+        .is_some_and(|(_, inner_name)| named_init_describes_parent(path, &inner_name))
 }
 
 /// Locate the unique source marker for a script-with-children directory.
@@ -569,6 +590,82 @@ pub fn script_with_children_source(
     }
     Ok(parse_plain_init_file(&entry.fragment)
         .map(|class| (class, decoded_dir_name, entry.path.clone())))
+}
+
+/// Whether this exact existing file is the source carrier for its parent
+/// script-with-children directory.
+///
+/// Unlike [`is_init_file`], this resolves the directory context and therefore
+/// keeps `Misc/init (Notifications).luau` as a literal child even when `Misc`
+/// itself has an init source.
+pub fn path_is_parent_init_source(path: &Path) -> io::Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    Ok(script_with_children_source(parent)?.is_some_and(|(_, _, source_path)| source_path == path))
+}
+
+/// Return the canonical escaped path for a legacy leaf script that occupies
+/// the reserved init-marker namespace.
+///
+/// A raw mismatched marker such as `Misc/init (Notifications).luau` is
+/// unambiguously a literal leaf in its current directory, but keeping that raw
+/// spelling would break the projection's cross-platform bijection. Callers use
+/// this result to reject the legacy spelling with an exact migration target
+/// instead of silently treating it as a carrier or syncing a non-canonical
+/// path that will fail on the next reconnect.
+pub fn legacy_reserved_init_leaf_migration(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    if parse_reserved_init_filename(file_name).is_none() || init_path_describes_parent(path) {
+        return Ok(None);
+    }
+
+    let Some(instance) = path_to_instance_meta(path)? else {
+        return Ok(None);
+    };
+    if instance.is_dir || instance.script_class.is_none() {
+        return Ok(None);
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let index = PortableDirectoryIndex::read(parent)?;
+    let taken = index
+        .entries()
+        .iter()
+        .filter(|candidate| candidate.path != path)
+        .map(|candidate| candidate.fragment.clone())
+        .collect::<Vec<_>>();
+    let canonical = instance_to_path(
+        &InstanceDescriptor {
+            class: &instance.class,
+            name: &instance.name,
+            has_children: false,
+        },
+        &taken,
+    );
+    let canonical_path = parent.join(canonical.fragment);
+    Ok((canonical_path != path).then_some(canonical_path))
+}
+
+/// Build the single actionable diagnostic used by startup reconciliation and
+/// live watcher validation for a legacy reserved leaf filename.
+pub fn legacy_reserved_init_leaf_migration_message(
+    root: &Path,
+    path: &Path,
+) -> io::Result<Option<String>> {
+    let Some(canonical_path) = legacy_reserved_init_leaf_migration(path)? else {
+        return Ok(None);
+    };
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let canonical_relative = canonical_path.strip_prefix(root).unwrap_or(&canonical_path);
+    Ok(Some(format!(
+        "legacy leaf script {} uses the reserved init-marker filename grammar; rename it to {} before syncing",
+        relative.display(),
+        canonical_relative.display()
+    )))
 }
 
 /// Instance data extracted from a single filesystem node. Does not recurse into

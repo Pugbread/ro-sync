@@ -313,8 +313,31 @@ let daemonHeartbeatTimer = null;
 const desktopHeartbeatTimers = new Map();
 const heartbeatInFlightByProject = new Set();
 const heartbeatFailureNoticeByProject = new Map();
+const daemonFailureByProject = new Map();
 let widgetCloseSent = false;
 const pendingDesktopOwnershipByProject = new Map();
+let lastDaemonLaunchError = "";
+
+function getDaemonFailure(projectId) {
+  const sessionError = getDaemonSession(projectId)?.error;
+  return sessionError || daemonFailureByProject.get(projectId) || null;
+}
+
+function reportDaemonFailure(projectId, error) {
+  if (!projectId) return;
+  if (error) daemonFailureByProject.set(projectId, String(error));
+  else daemonFailureByProject.delete(projectId);
+}
+
+function runtimeShutdownDiagnostic(frame = {}) {
+  const code = typeof frame.code === "string" && frame.code.trim()
+    ? `${frame.code.trim()}: `
+    : "";
+  const reason = typeof frame.reason === "string" && frame.reason.trim()
+    ? frame.reason.trim()
+    : "Ro Sync stopped this project connection.";
+  return `Error: ${code}${reason}`;
+}
 
 // ---------- Sessions registry (per-user; mirrors Argon's src/sessions.rs) ----------
 // Persisted via t64:get-state/set-state under key "sessions". Shape:
@@ -884,6 +907,7 @@ function activeProjectPath() {
 
 async function launchDaemon(projectPath, port) {
   const proj = activeProject();
+  lastDaemonLaunchError = "";
   // Shell-level path — host expands $HOME / %USERPROFILE% at command time.
   const binaryPath = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
 
@@ -933,8 +957,9 @@ async function launchDaemon(projectPath, port) {
     const payload = sepIdx >= 0 ? (lines[sepIdx + 1] || "").trim() : "";
     const pid = parseInt(payload, 10);
     if (Number.isFinite(pid) && pid > 0) {
+      lastDaemonLaunchError = "";
       setState({ daemonPid: pid, daemonPort: port, daemonProject: projectPath });
-      return pid;
+      return { pid, logPath };
     }
 
     // If the PS try/catch caught it, `payload` starts with "ERROR:" — use it
@@ -943,19 +968,7 @@ async function launchDaemon(projectPath, port) {
     if (payload.startsWith("ERROR:")) {
       hint = payload.slice(6).trim();
     } else {
-      let logTail = "";
-      try {
-        const logRes = await t64("t64:exec", { command: tailLogCmd(logPath) });
-        logTail = (logRes && logRes.stdout) ? logRes.stdout.trim() : "";
-      } catch {}
-      // On Windows launchDaemonCmd redirects stderr to `<logPath>.err`, so
-      // daemon startup crashes never land in the main .log. Tail the .err
-      // file too — it's where panics / dll-load failures actually surface.
-      try {
-        const errRes = await t64("t64:exec", { command: tailLogCmd(logPath + ".err") });
-        const errTail = (errRes && errRes.stdout) ? errRes.stdout.trim() : "";
-        if (errTail) logTail = logTail ? `${logTail}\n${errTail}` : errTail;
-      } catch {}
+      const logTail = await readDaemonLaunchTail(logPath);
       const portOwner = await getPortOwner(port);
       hint =
         logTail ||
@@ -963,9 +976,11 @@ async function launchDaemon(projectPath, port) {
         cleanPsStderr(res && res.stderr) ||
         "no pid returned";
     }
+    lastDaemonLaunchError = hint;
     console.error("daemon launch failed", { stdout, payload, stderr: res?.stderr });
     setStatus(`daemon launch failed — ${hint.slice(0, 240)}`, "err");
   } catch (e) {
+    lastDaemonLaunchError = e?.message || String(e);
     console.error("launch daemon failed", e);
     setStatus(`daemon launch failed: ${e.message}`, "err");
   }
@@ -974,6 +989,8 @@ async function launchDaemon(projectPath, port) {
 
 async function scanFallbackPorts(project, preferred) {
   const trackedSessions = await loadSessions();
+  let attemptedFreePortLaunch = false;
+  let fallbackLaunchError = "";
   for (let p = preferred + 1; p <= PORT_SCAN_MAX; p++) {
     // Skip ports already occupied by a non-ours daemon.
     const occ = await probePort(p);
@@ -992,12 +1009,28 @@ async function scanFallbackPorts(project, preferred) {
       toast(`Port ${preferred} busy — started daemon on :${p}`);
       return occ;
     }
+    // Browser probing cannot identify a non-Ro-Sync listener. Confirm the OS
+    // port is actually free before counting this as a daemon launch attempt.
+    if (await getPortOwner(p)) continue;
+    attemptedFreePortLaunch = true;
     const hit = await launchAndWait(project, p);
     if (hit) {
       toast(`Port ${preferred} busy — started daemon on :${p}`);
       return hit;
     }
+    fallbackLaunchError = lastDaemonLaunchError
+      || `The daemon process on port ${p} did not complete its authenticated startup handshake.`;
+    // A filesystem/configuration/startup failure is independent of the port.
+    // Preserve that exact error instead of retrying every free port and
+    // replacing it with noise. Only a genuine bind race should continue.
+    if (!daemonLaunchErrorLooksPortBusy(fallbackLaunchError)) break;
   }
+  if (attemptedFreePortLaunch) {
+    lastDaemonLaunchError = fallbackLaunchError;
+    toast("Daemon startup failed on the available fallback ports. Open project details for the exact error.");
+    return null;
+  }
+  lastDaemonLaunchError = `All ports ${preferred}–${PORT_SCAN_MAX} are busy. Stop another daemon and retry.`;
   toast(`All ports ${preferred}–${PORT_SCAN_MAX} busy; stop another daemon first.`);
   return null;
 }
@@ -1043,8 +1076,9 @@ function isWidgetOwnedDaemon(info) {
 }
 
 async function launchAndWait(project, port) {
-  const launchedPid = await launchDaemon(project, port);
-  if (!launchedPid) return null;
+  const launch = await launchDaemon(project, port);
+  if (!launch) return null;
+  const launchedPid = launch.pid;
   for (let i = 0; i < 20; i++) {
     await sleep(200);
     const hit = await probePort(port);
@@ -1072,7 +1106,32 @@ async function launchAndWait(project, port) {
       daemonBootId: null,
     });
   }
+  const logTail = await readDaemonLaunchTail(launch.logPath);
+  lastDaemonLaunchError = logTail
+    || lastDaemonLaunchError
+    || `The daemon process on port ${port} exited or stopped responding before its authenticated startup handshake.`;
   return null;
+}
+
+async function readDaemonLaunchTail(logPath) {
+  let logTail = "";
+  try {
+    const logRes = await t64("t64:exec", { command: tailLogCmd(logPath) });
+    logTail = (logRes && logRes.stdout) ? logRes.stdout.trim() : "";
+  } catch {}
+  // On Windows launchDaemonCmd redirects stderr to `<logPath>.err`, so
+  // daemon startup crashes never land in the main .log. Tail the .err file
+  // too — it is where panics and DLL-load failures surface.
+  try {
+    const errRes = await t64("t64:exec", { command: tailLogCmd(logPath + ".err") });
+    const errTail = (errRes && errRes.stdout) ? errRes.stdout.trim() : "";
+    if (errTail) logTail = logTail ? `${logTail}\n${errTail}` : errTail;
+  } catch {}
+  return logTail;
+}
+
+function daemonLaunchErrorLooksPortBusy(error) {
+  return /address already in use|port\s+\d+.*(?:busy|in use|held by)|eaddrinuse/i.test(String(error || ""));
 }
 
 let ensureDaemonPromise = null;
@@ -1505,6 +1564,7 @@ async function ensureDaemonInner() {
   }
 
   if (hit) {
+    lastDaemonLaunchError = "";
     app.daemonBase = `http://127.0.0.1:${hit.port}`;
     app.daemonOk = true;
     setDaemonDot("ok", `:${hit.port}`);
@@ -1565,7 +1625,11 @@ async function ensureDaemonInner() {
     app.daemonOk = false;
     app.daemonBase = null;
     setDaemonDot("err", "daemon down");
-    emit("daemon:down", {});
+    emit("daemon:down", {
+      projectId: projectIdForPath(project) || app.state.activeProjectId,
+      project,
+      error: lastDaemonLaunchError || "The daemon did not become ready.",
+    });
   }
 }
 
@@ -2340,7 +2404,9 @@ function navigate(route) {
     getAppearanceTheme,
     setAppearanceTheme,
     getDaemonBase,
+    getDaemonFailure,
     getDaemonSession,
+    reportDaemonFailure,
     isProjectServed,
     ensureDaemon,
     killDaemon,
@@ -2383,8 +2449,16 @@ if (!IS_DESKTOP_HOST) {
 }
 
 // Re-render active view on daemon state changes (cheap).
-on("daemon:up", () => emit("view:refresh", app.currentView));
-on("daemon:down", () => emit("view:refresh", app.currentView));
+on("daemon:up", (event = {}) => {
+  const projectId = event.projectId || projectIdForPath(event.project) || app.state.activeProjectId;
+  reportDaemonFailure(projectId, null);
+  emit("view:refresh", app.currentView);
+});
+on("daemon:down", (event = {}) => {
+  const projectId = event.projectId || projectIdForPath(event.project) || app.state.activeProjectId;
+  reportDaemonFailure(projectId, event.error || null);
+  emit("view:refresh", app.currentView);
+});
 on("daemon:up", (event) => startDaemonHeartbeat(event?.projectId || null));
 on("daemon:down", (event) => stopDaemonHeartbeat(event?.projectId || null));
 on("daemon:up", (event) => conflictBadge.invalidate(event?.projectId || null));
@@ -2429,10 +2503,12 @@ function toast(msg) {
     el.setAttribute("aria-atomic", "true");
     document.body.appendChild(el);
   }
-  el.textContent = msg;
+  const text = String(msg || "");
+  el.textContent = text;
   el.classList.add("show");
   clearTimeout(toastT);
-  toastT = setTimeout(() => el.classList.remove("show"), 1800);
+  const readingTime = Math.min(6500, Math.max(2400, 1400 + text.length * 32));
+  toastT = setTimeout(() => el.classList.remove("show"), readingTime);
 }
 
 function applyHostThemePayload(payload) {
@@ -2554,10 +2630,31 @@ function openAppStream(event = {}) {
       resolvedId,
     );
   };
+  const resolveProjectId = () => (
+    projectId === "__single" ? app.state.activeProjectId : projectId
+  );
+  const resolveProjectPath = () => (
+    event.project || projectById(resolveProjectId())?.path || null
+  );
+  const publishPluginState = (connected) => {
+    const resolvedId = resolveProjectId();
+    if (connected) reportDaemonFailure(resolvedId, null);
+    emit("plugin:state", {
+      type: "plugin",
+      connected: connected === true,
+      projectId: resolvedId,
+      projectPath: resolveProjectPath(),
+    });
+  };
   try {
     const stream = daemonWS(base, "/ws", {
       skipRaw: shouldSkipRawAppFrame,
-      open: () => { void replayPendingInitialChoice(projectId, base, event); },
+      open: () => {
+        void replayPendingInitialChoice(projectId, base, event);
+        void daemonJson(base, "/hello")
+          .then((info) => publishPluginState(info?.pluginConnected === true))
+          .catch(() => {});
+      },
       message: (data) => {
         if (!data || typeof data !== "object") return;
         const t = data.type;
@@ -2569,6 +2666,23 @@ function openAppStream(event = {}) {
         }
         if (t === "sync-activity") {
           lastEditedStore.record(resolveMemoryKey(), data);
+          return;
+        }
+        if (t === "plugin") {
+          publishPluginState(data.connected === true);
+          return;
+        }
+        if (t === "shutdown") {
+          const resolvedId = resolveProjectId();
+          const shutdown = {
+            ...data,
+            projectId: resolvedId,
+            projectPath: resolveProjectPath(),
+          };
+          if (data.retryable === false) {
+            reportDaemonFailure(resolvedId, runtimeShutdownDiagnostic(data));
+          }
+          emit("plugin:shutdown", shutdown);
           return;
         }
         // Transport-only frames — not surfaced to views.
@@ -2745,7 +2859,9 @@ window.__rosync = {
   getAppearanceTheme,
   setAppearanceTheme,
   getDaemonBase,
+  getDaemonFailure,
   getDaemonSession,
+  reportDaemonFailure,
   serveProject,
   stopProject,
   restartProject,

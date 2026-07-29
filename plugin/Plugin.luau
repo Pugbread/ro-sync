@@ -4470,6 +4470,10 @@ local reconnectState = {
 	-- A different value at WebSocket time means the daemon changed between
 	-- snapshot reconciliation and live transport authentication.
 	comparedCapability = nil,
+	-- Canonical project identity selected by the explicit Connect action.
+	-- Recovery may follow that project to a new port/process, but must never
+	-- attach to another local clone that happens to share GameId/PlaceId.
+	pinnedProject = nil,
 }
 -- Forward-declared so wsLoop (below) can re-enter the initial-sync handshake
 -- after any established transport gap. The real function assignment happens
@@ -6669,6 +6673,11 @@ local WS_BACKOFF_START = 1
 local WS_BACKOFF_MAX = 30
 local WS_HEARTBEAT_INTERVAL = 20
 local WS_HEARTBEAT_TIMEOUT = 45
+local WS_POST_WAKE_GRACE = 30
+-- A scheduling gap longer than the normal liveness deadline usually means
+-- Studio or macOS was asleep/frozen. Send a fresh probe and grant one complete
+-- heartbeat window instead of immediately judging pre-stall traffic stale.
+local WS_SCHEDULER_STALL_THRESHOLD = WS_HEARTBEAT_TIMEOUT
 
 local wsBackoff = WS_BACKOFF_START
 
@@ -11934,10 +11943,11 @@ reconnectState.stopTerminal = function(reason)
 			toClose:Close()
 		end)
 	end
-	setPill("error", "update Ro Sync")
 	if message:lower():find("protocol", 1, true) then
+		setPill("error", "update Ro Sync")
 		setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
 	else
+		setPill("error", "action required")
 		setBanner("Ro Sync connection rejected: " .. message)
 	end
 	log("ws: terminal rejection — " .. message)
@@ -11970,6 +11980,15 @@ reconnectState.refreshHello = function()
 	end
 
 	local expectedGameId = tostring(game.GameId)
+	local pinnedProject = reconnectState.pinnedProject
+	if type(pinnedProject) ~= "string" or pinnedProject == "" then
+		return false, "selected daemon project identity is missing; reconnect explicitly", true
+	end
+	local function matchesPinnedProject(helloValue)
+		return type(helloValue) == "table"
+			and type(helloValue.project) == "string"
+			and helloValue.project == pinnedProject
+	end
 	local candidateUrl = tostring(baseUrl or ""):gsub("/+$", "")
 	local candidatePort = connectedPort
 	local hello, helloError = readHello(candidateUrl)
@@ -11977,9 +11996,13 @@ reconnectState.refreshHello = function()
 		hello = nil
 		helloError = "daemon now belongs to a different GameId"
 	end
+	if hello ~= nil and not matchesPinnedProject(hello) then
+		hello = nil
+		helloError = "daemon now belongs to a different project"
+	end
 
-	if hello == nil and type(reconnectState.discoverDaemon) == "function" and expectedGameId ~= "0" then
-		local discovered = reconnectState.discoverDaemon(expectedGameId, true, false)
+	if hello == nil and type(reconnectState.discoverDaemon) == "function" then
+		local discovered = reconnectState.discoverDaemon(expectedGameId, true, false, pinnedProject)
 		if type(discovered) == "table" and discovered.found == true then
 			candidateUrl = tostring(discovered.url or ""):gsub("/+$", "")
 			candidatePort = tostring(discovered.port or candidatePort or "?")
@@ -11994,6 +12017,9 @@ reconnectState.refreshHello = function()
 	end
 	if expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
 		return false, "daemon hello changed to a different GameId during discovery", false
+	end
+	if not matchesPinnedProject(hello) then
+		return false, "daemon hello changed to a different project during discovery", false
 	end
 	local protocol = tonumber(hello.pluginProtocol)
 	if protocol ~= PLUGIN_PROTOCOL_VERSION then
@@ -12066,6 +12092,7 @@ local function wsLoop(gen)
 			local accepted = false
 			local terminalReason = nil
 			local lastPongClock = os.clock()
+			local heartbeatSuspectClock = nil
 			local conns: { RBXScriptConnection } = {}
 			local function acceptTransport()
 				if accepted or not reconnectState.desired or not connected or gen ~= wsGeneration then
@@ -12102,6 +12129,7 @@ local function wsLoop(gen)
 					-- watchdog — the daemon pings every 10s on its own schedule,
 					-- so we don't need to see a pong specifically.
 					lastPongClock = os.clock()
+					heartbeatSuspectClock = nil
 					local kind = tostring(msg.type or "")
 					if
 						kind == "op"
@@ -12251,19 +12279,44 @@ local function wsLoop(gen)
 					end)
 				end
 				local lastPing = os.clock()
+				local lastWatchdogClock = lastPing
 				while connected and gen == wsGeneration and not closed do
 					task.wait(1)
 					local now = os.clock()
-					if now - lastPing >= WS_HEARTBEAT_INTERVAL then
+					local schedulerGap = now - lastWatchdogClock
+					lastWatchdogClock = now
+					if schedulerGap > WS_SCHEDULER_STALL_THRESHOLD then
+						-- Traffic timestamps from before a long scheduler pause
+						-- cannot prove the socket is dead. Start a new probe
+						-- window; ordinary scheduled ticks must then observe
+						-- server traffic before the normal timeout expires.
+						lastPongClock = now
+						lastPing = now
+						log(string.format("ws: scheduler stalled for %.1fs — probing before timeout", schedulerGap))
+						if not wsSend(client, { type = "ping" }) then
+							closed = true
+							pcall(function()
+								client:Close()
+							end)
+						end
+					elseif now - lastPing >= WS_HEARTBEAT_INTERVAL then
 						lastPing = now
 						wsSend(client, { type = "ping" })
 					end
-					if now - lastPongClock > WS_HEARTBEAT_TIMEOUT then
-						log("ws: heartbeat timeout — closing")
-						pcall(function()
-							client:Close()
-						end)
-						break
+					if not closed and now - lastPongClock > WS_HEARTBEAT_TIMEOUT then
+						if heartbeatSuspectClock == nil then
+							heartbeatSuspectClock = now
+							log("ws: heartbeat silent — probing during post-wake grace")
+							wsSend(client, { type = "ping" })
+						elseif now - heartbeatSuspectClock > WS_POST_WAKE_GRACE then
+							log("ws: heartbeat remained silent after post-wake grace — closing")
+							pcall(function()
+								client:Close()
+							end)
+							break
+						end
+					else
+						heartbeatSuspectClock = nil
 					end
 				end
 			else
@@ -14077,6 +14130,7 @@ local function disconnect(reason)
 	connectedPort = nil
 	reconnectState.pluginCapability = nil
 	reconnectState.comparedCapability = nil
+	reconnectState.pinnedProject = nil
 	projectInitCandidate = nil
 	connectionAttempt += 1
 	if reason then
@@ -14357,6 +14411,17 @@ runInitialCompare = function()
 			end
 			return #encoded, nil
 		end
+		local terminalCompareFailure = nil
+		local function retryOrStopStreamedCompare(reason)
+			if terminalCompareFailure ~= nil then
+				local code = tostring(terminalCompareFailure.code or "terminal-comparison-error")
+				local message = tostring(terminalCompareFailure.reason or reason or "daemon rejected comparison")
+				log(string.format("initial-compare: terminal %s — %s", code, message:sub(1, 200)))
+				reconnectState.stopTerminal(message)
+				return
+			end
+			reconnectState.retryInitialCompare(reason)
+		end
 		local function postCompareChunk(serviceName, phase, chunkIndex, finalChunk, records, hashes)
 			local requestBody = makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
 			local bodyBytes, encodeErr = encodedCompareBodySize(requestBody)
@@ -14390,6 +14455,13 @@ runInitialCompare = function()
 				end
 				if requestOk and type(nextResp) == "table" then
 					lastErr = tostring(nextResp.error or "daemon rejected comparison chunk")
+					if nextResp.retryable == false then
+						terminalCompareFailure = {
+							code = tostring(nextResp.code or "terminal-comparison-error"),
+							reason = lastErr,
+						}
+						break
+					end
 				else
 					lastErr = tostring(nextResp)
 				end
@@ -14511,7 +14583,7 @@ runInitialCompare = function()
 						tostring(streamErr):sub(1, 200)
 					)
 				)
-				reconnectState.retryInitialCompare(streamErr or "streamed comparison failed")
+				retryOrStopStreamedCompare(streamErr or "streamed comparison failed")
 				return
 			end
 			if
@@ -14543,7 +14615,7 @@ runInitialCompare = function()
 				local prepared, prepareErr = postCompareChunk(serviceName, "diskPrepare", prepareChunk, false, {}, {})
 				if not prepared then
 					disposeScanGuard()
-					reconnectState.retryInitialCompare(prepareErr or "disk preparation continuation failed")
+					retryOrStopStreamedCompare(prepareErr or "disk preparation continuation failed")
 					return
 				end
 				preparePolls += 1
@@ -14617,7 +14689,7 @@ runInitialCompare = function()
 				)
 				if not identityOk then
 					disposeScanGuard()
-					reconnectState.retryInitialCompare(identityErr or "disk identity stream failed")
+					retryOrStopStreamedCompare(identityErr or "disk identity stream failed")
 					return
 				end
 				local identities = resp.identities
@@ -14761,7 +14833,7 @@ runInitialCompare = function()
 					postCompareChunk(serviceName, "hashes", hashChunkIndex, finalHashChunk, {}, hashes)
 				if not hashOk then
 					disposeScanGuard()
-					reconnectState.retryInitialCompare(hashErr or "script hash stream failed")
+					retryOrStopStreamedCompare(hashErr or "script hash stream failed")
 					return
 				end
 				hashChunkIndex += 1
@@ -14999,6 +15071,10 @@ local function validateDaemonProtocol(url)
 	if not decOk or type(hello) ~= "table" then
 		return false, "daemon hello was malformed"
 	end
+	local expectedGameId = tostring(game.GameId)
+	if expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
+		return false, "daemon hello belongs to a different GameId"
+	end
 	local protocol = tonumber(hello.pluginProtocol)
 	if protocol ~= PLUGIN_PROTOCOL_VERSION then
 		return false,
@@ -15012,7 +15088,11 @@ local function validateDaemonProtocol(url)
 	if type(capability) ~= "string" or #capability ~= 64 or not capability:match("^[0-9a-fA-F]+$") then
 		return false, "daemon hello omitted a valid plugin capability"
 	end
-	return true, nil, capability
+	local daemonProject = hello.project
+	if type(daemonProject) ~= "string" or daemonProject == "" then
+		return false, "daemon hello omitted its canonical project identity"
+	end
+	return true, nil, capability, daemonProject
 end
 
 -- Project-bootstrap constants live in this late connection scope instead of at
@@ -15071,10 +15151,11 @@ local function projectInitUnavailableMessage(hello)
 	return "Set a Projects folder in Ro Sync Desktop Settings before creating this project."
 end
 
-reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
+reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expectedProject)
 	-- Probe concurrently. A PlaceId match may select one project among several
-	-- daemons for the same experience, but never guess by lowest port when
-	-- multiple exact project candidates remain.
+	-- daemons for the same experience. During automatic recovery, first restrict
+	-- candidates to the exact canonical project selected by the user; never
+	-- guess by lowest port when multiple exact candidates remain.
 	if not quiet then
 		setPill("probing")
 		log(string.format("probing ports %d..%d for GameId %s", PORT_RANGE_START, PORT_RANGE_END, gameId))
@@ -15084,11 +15165,15 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		url = nil,
 		port = nil,
 		sawWrongGame = false,
+		sawWrongProject = false,
 		ambiguous = false,
 		candidateCount = 0,
 		initializer = nil,
 		initializerError = nil,
 	}
+	local expectedProjectIdentity = if type(expectedProject) == "string" and expectedProject ~= ""
+		then expectedProject
+		else nil
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
 		local remaining = lastPort - firstPort + 1
@@ -15117,12 +15202,18 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 	for port = PORT_RANGE_START, PORT_RANGE_END do
 		local probe = probes[port]
 		if probe then
-			if probe.matched then
+			local exactProject = expectedProjectIdentity ~= nil
+				and type(probe.hello) == "table"
+				and probe.hello.project == expectedProjectIdentity
+			if probe.matched or (gameId == "0" and exactProject) then
 				gameMatches[#gameMatches + 1] = {
 					url = probe.url,
 					port = port,
 					hello = probe.hello,
 				}
+				if not probe.matched then
+					result.sawWrongGame = true
+				end
 			elseif probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
@@ -15130,6 +15221,22 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 				daemonInitializer = projectInitOffer(probe.url, port, probe.hello)
 			end
 		end
+	end
+
+	if expectedProjectIdentity ~= nil then
+		local projectMatches = {}
+		for _, candidate in ipairs(gameMatches) do
+			if
+				type(candidate.hello) == "table"
+				and type(candidate.hello.project) == "string"
+				and candidate.hello.project == expectedProjectIdentity
+			then
+				projectMatches[#projectMatches + 1] = candidate
+			else
+				result.sawWrongProject = true
+			end
+		end
+		gameMatches = projectMatches
 	end
 
 	local currentPlaceId = tostring(game.PlaceId)
@@ -15258,7 +15365,7 @@ local function collectProjectInitMetadata()
 end
 
 local function beginDaemonConnection(chosenUrl, chosenPort)
-	local protocolOk, protocolError, daemonPluginCapability = validateDaemonProtocol(chosenUrl)
+	local protocolOk, protocolError, daemonPluginCapability, daemonProject = validateDaemonProtocol(chosenUrl)
 	if not protocolOk then
 		reconnectState.desired = false
 		log("connect blocked: " .. tostring(protocolError))
@@ -15272,6 +15379,7 @@ local function beginDaemonConnection(chosenUrl, chosenPort)
 	reconnectState.desired = true
 	reconnectState.pluginCapability = daemonPluginCapability
 	reconnectState.comparedCapability = nil
+	reconnectState.pinnedProject = daemonProject
 	wsBackoff = WS_BACKOFF_START
 	baseUrl = trimTrailingSlash(chosenUrl)
 	connectedPort = tostring(chosenPort or "?")
@@ -15413,6 +15521,7 @@ startConnect = function()
 		reconnectState.compareRetryPending = false
 		reconnectState.pluginCapability = nil
 		reconnectState.comparedCapability = nil
+		reconnectState.pinnedProject = nil
 		busy = false
 		wsGeneration += 1
 		decisionGeneration += 1
@@ -15423,6 +15532,10 @@ startConnect = function()
 		log("cancelled")
 		return
 	end
+
+	-- Every explicit Connect/Create Project action selects a new daemon identity.
+	-- Automatic retries keep the pin; user intent is the only reset boundary.
+	reconnectState.pinnedProject = nil
 
 	if projectInitCandidate ~= nil then
 		local candidate = projectInitCandidate

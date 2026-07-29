@@ -110,6 +110,48 @@ assert.deepEqual(legacy, {
   name: "",
 });
 
+const terminalShutdown = scrubActivityFrame({
+  type: "shutdown",
+  reason: "legacy leaf script ReplicatedStorage/Misc/init (Notice).luau must be renamed",
+  code: "WATCHER_PROJECTION_MIGRATION_REQUIRED",
+  retryable: false,
+  token: "SECRET",
+});
+assert.deepEqual(terminalShutdown, {
+  type: "shutdown",
+  reason: "legacy leaf script ReplicatedStorage/Misc/init (Notice).luau must be renamed",
+  code: "WATCHER_PROJECTION_MIGRATION_REQUIRED",
+  retryable: false,
+});
+const terminalShutdownModel = formatActivity({
+  key: "shutdown:terminal",
+  at: 5000,
+  updatedAt: 5000,
+  frame: terminalShutdown,
+});
+assert.equal(terminalShutdownModel.stateLabel, "Action required");
+assert.equal(terminalShutdownModel.tone, "danger");
+assert.match(terminalShutdownModel.intent, /must be renamed/);
+assert.deepEqual(terminalShutdownModel.facts, [{
+  label: "Code",
+  value: "WATCHER_PROJECTION_MIGRATION_REQUIRED",
+}]);
+
+const retryableShutdownModel = formatActivity({
+  key: "shutdown:retryable",
+  at: 5001,
+  updatedAt: 5001,
+  frame: scrubActivityFrame({
+    type: "shutdown",
+    reason: "filesystem watcher lagged; reconnect to rebuild exact sync state",
+    code: "WATCHER_LAGGED",
+    retryable: true,
+  }),
+});
+assert.equal(retryableShutdownModel.stateLabel, "Reconnecting");
+assert.equal(retryableShutdownModel.state, "running");
+assert.match(retryableShutdownModel.intent, /rebuild exact sync state/);
+
 let semanticId = 100;
 for (const [op, expectedTitle] of [
   ["capabilities", "Check Studio capabilities"],

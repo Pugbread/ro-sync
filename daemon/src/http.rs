@@ -26,9 +26,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::conflict::{hash, Resolution, Resolved, StudioDecision};
 use crate::diff;
 use crate::fs_map::{
-    classify_script_file, encode_name, instance_to_path, is_empty_plain_folder, is_init_file,
+    classify_script_file, encode_name, init_path_describes_parent, instance_to_path,
+    is_empty_plain_folder, is_init_file, legacy_reserved_init_leaf_migration_message,
     logical_names_equivalent, normalize_line_endings, parse_disambiguated, parse_init_file,
-    parse_plain_init_file, parse_reserved_init_filename, path_to_instance_meta,
+    parse_plain_init_file, path_is_parent_init_source, path_to_instance_meta,
     portable_init_file_name, script_with_children_source, InstanceDescriptor,
     PathFragmentAllocator, PathInstance, ScriptClass, META_FILE,
 };
@@ -1485,6 +1486,30 @@ fn initial_compare_request_hash<T: Serialize>(
     Ok(writer.0.finalize().into())
 }
 
+pub(crate) const PROJECTION_MIGRATION_REQUIRED_CODE: &str = "WATCHER_PROJECTION_MIGRATION_REQUIRED";
+
+fn initial_compare_error_value(prefix: &str, error: &str) -> Value {
+    let message = if prefix.is_empty() {
+        error.to_string()
+    } else {
+        format!("{prefix}: {error}")
+    };
+    if error.starts_with("legacy leaf script ")
+        && error.contains("uses the reserved init-marker filename grammar")
+    {
+        return json!({
+            "ok": false,
+            "error": message,
+            "code": PROJECTION_MIGRATION_REQUIRED_CODE,
+            "retryable": false,
+        });
+    }
+    json!({
+        "ok": false,
+        "error": message,
+    })
+}
+
 async fn initial_compare(
     State(state): State<AppState>,
     Json(body): Json<InitialCompareBody>,
@@ -1590,10 +1615,7 @@ async fn initial_compare(
         Ok(comparison) => {
             finish_initial_comparison(&state, disk_stats, body.studio_stats, comparison, None)
         }
-        Err(error) => Json(json!({
-            "ok": false,
-            "error": format!("snapshot compare: {error}"),
-        })),
+        Err(error) => Json(initial_compare_error_value("snapshot compare", &error)),
     }
 }
 
@@ -1703,10 +1725,10 @@ fn initial_compare_service_chunk(state: &AppState, body: InitialCompareBody) -> 
         ) {
             Ok(response) => response,
             Err(error) => {
-                return Json(json!({
-                    "ok": false,
-                    "error": format!("streamed snapshot compare {service}: {error}"),
-                }));
+                return Json(initial_compare_error_value(
+                    &format!("streamed snapshot compare {service}"),
+                    &error,
+                ));
             }
         }
     } else {
@@ -1716,10 +1738,10 @@ fn initial_compare_service_chunk(state: &AppState, body: InitialCompareBody) -> 
         ) {
             Ok(comparison) => comparison,
             Err(error) => {
-                return Json(json!({
-                    "ok": false,
-                    "error": format!("snapshot compare {service}: {error}"),
-                }));
+                return Json(initial_compare_error_value(
+                    &format!("snapshot compare {service}"),
+                    &error,
+                ));
             }
         };
         session.comparison.merge(service_comparison);
@@ -2738,7 +2760,10 @@ fn initial_service_snapshot_comparison(
     )
 }
 
-fn reject_legacy_reserved_init_leafs(root: &Path, services: &[String]) -> Result<(), String> {
+pub(crate) fn reject_legacy_reserved_init_leafs(
+    root: &Path,
+    services: &[String],
+) -> Result<(), String> {
     for service in services {
         let service_path = root.join(service);
         let Some(metadata) = crate::fs_safety::metadata_no_follow(&service_path)
@@ -2771,37 +2796,12 @@ fn reject_legacy_reserved_init_leafs(root: &Path, services: &[String]) -> Result
                     stack.push((entry.path.clone(), depth + 1));
                     continue;
                 }
-                if parse_reserved_init_filename(&entry.fragment).is_none() {
-                    continue;
-                }
-                let Some(instance) = path_to_instance_meta(&entry.path)
+                let Some(message) = legacy_reserved_init_leaf_migration_message(root, &entry.path)
                     .map_err(|error| format!("inspect {}: {error}", entry.path.display()))?
                 else {
                     continue;
                 };
-                let taken = index
-                    .entries()
-                    .iter()
-                    .filter(|candidate| candidate.path != entry.path)
-                    .map(|candidate| candidate.fragment.clone())
-                    .collect::<Vec<_>>();
-                let canonical = instance_to_path(
-                    &InstanceDescriptor {
-                        class: &instance.class,
-                        name: &instance.name,
-                        has_children: false,
-                    },
-                    &taken,
-                );
-                let relative = entry.path.strip_prefix(root).unwrap_or(&entry.path);
-                let canonical_path = directory.join(&canonical.fragment);
-                let canonical_relative =
-                    canonical_path.strip_prefix(root).unwrap_or(&canonical_path);
-                return Err(format!(
-                    "legacy leaf script {} uses the reserved init-marker filename grammar; rename it to {} before syncing",
-                    relative.display(),
-                    canonical_relative.display()
-                ));
+                return Err(message);
             }
         }
     }
@@ -8668,8 +8668,9 @@ async fn poll(State(state): State<AppState>, Query(_params): Query<PollParams>) 
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    if let Some(op) = event_to_plugin_op(root, &event) {
-                        return Some(op);
+                    let ops = event_to_plugin_ops(root, &event);
+                    if !ops.is_empty() {
+                        return Some(ops);
                     }
                 }
                 Err(_) => return None,
@@ -8678,7 +8679,7 @@ async fn poll(State(state): State<AppState>, Query(_params): Query<PollParams>) 
     })
     .await;
     match first {
-        Ok(Some(op)) => out.push(op),
+        Ok(Some(ops)) => out.extend(ops),
         Ok(None) => {}
         Err(_) => {
             // Timeout — return empty, plugin re-polls immediately.
@@ -8688,24 +8689,46 @@ async fn poll(State(state): State<AppState>, Query(_params): Query<PollParams>) 
 
     // Brief drain window.
     while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-        if let Some(op) = event_to_plugin_op(root, &event) {
-            out.push(op);
-        }
+        out.extend(event_to_plugin_ops(root, &event));
     }
 
     Json(json!({ "ok": true, "ops": out }))
 }
 
-pub(crate) fn event_to_plugin_op(root: &Path, event: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(event).ok()?;
+fn flatten_plugin_op(op: Value) -> Vec<Value> {
+    if op.get("op").and_then(Value::as_str) != Some("batch") {
+        return vec![op];
+    }
+    op.get("ops")
+        .and_then(Value::as_array)
+        .filter(|ops| !ops.is_empty() && ops.len() <= 8)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub(crate) fn event_to_plugin_ops(root: &Path, event: &str) -> Vec<Value> {
+    let Ok(value) = serde_json::from_str::<Value>(event) else {
+        return Vec::new();
+    };
     if value.get("type").and_then(Value::as_str) == Some("plugin-op") {
-        return value.get("op").cloned();
+        return value
+            .get("op")
+            .cloned()
+            .map(flatten_plugin_op)
+            .unwrap_or_default();
     }
     if value.get("type").and_then(Value::as_str) != Some("op") {
-        return None;
+        return Vec::new();
     }
-    let op: Op = serde_json::from_value(value.get("op")?.clone()).ok()?;
+    let Some(raw_op) = value.get("op").cloned() else {
+        return Vec::new();
+    };
+    let Ok(op) = serde_json::from_value::<Op>(raw_op) else {
+        return Vec::new();
+    };
     fs_op_to_plugin_op(root, &op)
+        .map(flatten_plugin_op)
+        .unwrap_or_default()
 }
 
 fn broadcast_filtered_op(events: &broadcast::Sender<String>, op: &Op) -> Result<(), String> {
@@ -8718,12 +8741,14 @@ fn broadcast_filtered_op(events: &broadcast::Sender<String>, op: &Op) -> Result<
 }
 
 fn broadcast_plugin_op(events: &broadcast::Sender<String>, op: Value) -> Result<(), String> {
-    let payload = serde_json::to_string(&json!({ "type": "plugin-op", "op": op }))
-        .map_err(|error| format!("serialize plugin op: {error}"))?;
-    events
-        .send(payload)
-        .map(|_| ())
-        .map_err(|_| "no connected client can receive the resolved conflict".to_string())
+    for nested in flatten_plugin_op(op) {
+        let payload = serde_json::to_string(&json!({ "type": "plugin-op", "op": nested }))
+            .map_err(|error| format!("serialize plugin op: {error}"))?;
+        events
+            .send(payload)
+            .map_err(|_| "no connected client can receive the resolved conflict".to_string())?;
+    }
+    Ok(())
 }
 
 fn deliver_prepared_rename(
@@ -10842,6 +10867,7 @@ fn prune_dir_to_fragments(
     let mut removed = 0usize;
     let index = crate::fs_safety::PortableDirectoryIndex::read(&validated)
         .map_err(|error| format!("scan prune directory {}: {error}", dir.display()))?;
+    let parent_source = index.unique_init_source().map(|entry| entry.path.as_path());
     for entry in index.entries() {
         let path = entry.path.clone();
         let file_name = entry.fragment.as_str();
@@ -10851,7 +10877,7 @@ fn prune_dir_to_fragments(
         if wanted_fragments.contains(&file_name.to_ascii_lowercase()) {
             continue;
         }
-        if is_init_file(file_name) {
+        if parent_source == Some(path.as_path()) {
             if keep_init_files {
                 continue;
             }
@@ -11979,24 +12005,21 @@ fn prepare_init_rename(
     if !script_with_children {
         return Ok(None);
     }
-    let index = crate::fs_safety::PortableDirectoryIndex::read(dir)
-        .map_err(|error| format!("scan rename source {}: {error}", dir.display()))?;
-    let mut named = Vec::new();
-    for entry in index.entries() {
-        if entry.kind != crate::fs_safety::SafeEntryKind::File {
-            continue;
-        }
-        if let Some((class, _)) = parse_init_file(&entry.fragment) {
-            named.push((std::ffi::OsString::from(&entry.fragment), class));
-        }
-    }
-    if named.len() > 1 {
+    let Some((class, _, source_path)) = script_with_children_source(dir)
+        .map_err(|error| format!("scan rename source {}: {error}", dir.display()))?
+    else {
         return Err(format!(
-            "rename: multiple named init sources found in {}",
+            "rename: script-with-children has no init source in {}",
             dir.display()
         ));
-    }
-    let Some((old_name, class)) = named.pop() else {
+    };
+    let Some(old_name) = source_path.file_name() else {
+        return Err(format!(
+            "rename: init source has no filename: {}",
+            source_path.display()
+        ));
+    };
+    if parse_init_file(old_name.to_string_lossy().as_ref()).is_none() {
         // Plain Wally/Rojo `init.lua` roots derive their identity from the
         // directory name and therefore need no inner rename.
         return Ok(None);
@@ -12006,7 +12029,10 @@ fn prepare_init_rename(
         return Ok(None);
     }
 
-    Ok(Some(InitRenamePlan { old_name, new_name }))
+    Ok(Some(InitRenamePlan {
+        old_name: old_name.to_os_string(),
+        new_name,
+    }))
 }
 
 fn init_rename_temp_path(dir: &Path) -> Result<PathBuf, String> {
@@ -12951,6 +12977,125 @@ fn siblings_except(dir: &Path, except: Option<&str>) -> Result<Vec<String>, Stri
 // Filesystem op → plugin op translation
 // ---------------------------------------------------------------------------
 
+fn collapse_plugin_ops(mut ops: Vec<Value>) -> Option<Value> {
+    match ops.len() {
+        0 => None,
+        1 => ops.pop(),
+        _ => Some(json!({ "op": "batch", "ops": ops })),
+    }
+}
+
+/// Re-project one directory after its parent-source carrier was deleted or
+/// renamed. A non-empty directory becomes a Folder; a directory with a
+/// surviving source marker remains (or becomes) that script class. Empty plain
+/// directories are absent from the Studio projection.
+fn parent_projection_plugin_op(
+    root: &Path,
+    parent: &Path,
+    source_override: Option<&[u8]>,
+) -> Option<Value> {
+    let rel = parent.strip_prefix(root).ok()?;
+    let segs: Vec<String> = rel
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(String::from))
+        .collect();
+    // A service itself can never be replaced by a Folder or script.
+    if segs.len() < 2 || !is_synced_service_segment(&segs[0]) {
+        return None;
+    }
+
+    let inst = path_to_instance_meta(parent).ok().flatten()?;
+    let instance_path = segs_to_instance_path(&segs)?;
+    if path_is_avoid_synced(root, &instance_path) {
+        return None;
+    }
+    let lookup_path = segs_to_lookup_path(&segs)?;
+
+    if inst.class == "Folder" && is_empty_plain_folder(parent).ok() == Some(true) {
+        return Some(json!({
+            "op": "delete",
+            "path": lookup_path,
+            "diskPath": segs,
+            "diskFragmentIsDir": true,
+        }));
+    }
+
+    let mut properties = Map::new();
+    if inst.script_class.is_some() {
+        let source = if let Some(bytes) = source_override {
+            bytes.to_vec()
+        } else {
+            let (_, _, source_path) = script_with_children_source(parent).ok().flatten()?;
+            read_synced_file(root, &source_path).ok()?
+        };
+        properties.insert(
+            "Source".to_string(),
+            Value::String(String::from_utf8_lossy(&source).to_string()),
+        );
+    }
+
+    let parent_segs = &segs[..segs.len() - 1];
+    Some(json!({
+        "op": "set",
+        "path": segs_to_lookup_path(parent_segs)?,
+        "diskPath": segs,
+        "diskFragmentIsDir": true,
+        "node": {
+            "class": inst.class,
+            "name": inst.name,
+            "diskFragment": rel.file_name()?.to_str()?,
+            "diskFragmentIsDir": true,
+            "properties": Value::Object(properties),
+            "children": Value::Array(Vec::new()),
+        },
+    }))
+}
+
+fn init_carrier_rename_plugin_op(
+    root: &Path,
+    op: &Op,
+    from_path: &Path,
+    from_is_carrier: bool,
+    to_is_carrier: bool,
+) -> Option<Value> {
+    let source_parent = from_path.parent()?;
+    let destination_parent = op.path.parent()?;
+    let same_parent = source_parent == destination_parent;
+    let mut ops = Vec::with_capacity(2);
+
+    if from_is_carrier && (!to_is_carrier || !same_parent) {
+        ops.push(parent_projection_plugin_op(root, source_parent, None)?);
+    } else if !from_is_carrier {
+        let delete_source = Op {
+            kind: OpKind::Delete,
+            path: from_path.to_path_buf(),
+            from: None,
+            content: None,
+            is_dir: Some(false),
+        };
+        ops.push(fs_op_to_plugin_op(root, &delete_source)?);
+    }
+
+    if to_is_carrier {
+        ops.push(parent_projection_plugin_op(
+            root,
+            destination_parent,
+            op.content.as_deref(),
+        )?);
+    } else {
+        let set_destination = Op {
+            kind: OpKind::Update,
+            path: op.path.clone(),
+            from: None,
+            content: op.content.clone(),
+            is_dir: Some(false),
+        };
+        ops.push(fs_op_to_plugin_op(root, &set_destination)?);
+    }
+
+    collapse_plugin_ops(ops)
+}
+
 /// Convert a watcher `Op` into a plugin-facing op (`set` / `delete` / `update` /
 /// `rename`). Directories (add/update) produce `set` ops with a minimal node
 /// envelope; leaf scripts produce `set` ops carrying `properties.Source`.
@@ -12976,8 +13121,33 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
         return None;
     }
 
+    // Raw leaf names in the reserved init-marker namespace must be migrated to
+    // their escaped canonical fragment before they can cross the live
+    // transport. Startup and watcher validation surface the actionable error;
+    // this is a defense-in-depth guard for direct callers and conflict replay.
+    // Deletes and raw -> canonical cleanup renames remain allowed.
+    if matches!(op.kind, OpKind::Add | OpKind::Update | OpKind::Rename)
+        && op.is_dir != Some(true)
+        && !matches!(
+            legacy_reserved_init_leaf_migration_message(root, &op.path),
+            Ok(None)
+        )
+    {
+        return None;
+    }
+
     match op.kind {
         OpKind::Delete => {
+            // The carrier file describes its parent instance, not a literal
+            // child. Re-project that parent from the post-delete directory
+            // shape so Script -> Folder/absent transitions cannot leave a stale
+            // Studio class behind.
+            if op.is_dir != Some(true) && init_path_describes_parent(&op.path) {
+                return op
+                    .path
+                    .parent()
+                    .and_then(|parent| parent_projection_plugin_op(root, parent, None));
+            }
             let target_lookup_segs = segs_to_lookup_path(&segs)?;
             let target_name_segs = segs_to_instance_path(&segs)?;
             if deleted_path_is_shadowed_ignored_folder(root, &segs, &op.path) {
@@ -13009,6 +13179,18 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
             }
             if !is_synced_service_segment(&from_segs_fs[0]) {
                 return None;
+            }
+            let from_is_carrier = op.is_dir != Some(true) && init_path_describes_parent(from_path);
+            let to_is_carrier =
+                op.is_dir != Some(true) && path_is_parent_init_source(&op.path).ok() == Some(true);
+            if from_is_carrier || to_is_carrier {
+                return init_carrier_rename_plugin_op(
+                    root,
+                    op,
+                    from_path,
+                    from_is_carrier,
+                    to_is_carrier,
+                );
             }
             let from_lookup = segs_to_lookup_path(&from_segs_fs)?;
             let to_naming = segs_to_naming_path(&segs)?;
@@ -13056,10 +13238,9 @@ pub(crate) fn fs_op_to_plugin_op(root: &Path, op: &Op) -> Option<Value> {
         }
         OpKind::Add | OpKind::Update => {
             let fname = segs.last()?.clone();
-            // Canonical init files describe their parent directory. A legacy
-            // mismatched named init is instead a literal leaf script; let it
-            // fall through to the regular file projection below.
-            if is_init_file(&fname) {
+            // Canonical init files describe their parent directory. Legacy
+            // reserved leaf spellings were rejected by the guard above.
+            if is_init_file(&fname) && path_is_parent_init_source(&op.path).ok() == Some(true) {
                 if let Some(parent_inst) = op
                     .path
                     .parent()
@@ -13141,22 +13322,24 @@ fn script_identity_from_segments(
     fs_path: &Path,
 ) -> Option<(Vec<String>, Vec<String>, String)> {
     let fname = segs.last()?;
-    if let Some((script_class, _)) = parse_init_file(fname) {
+    if let Some((script_class, inner_name)) = parse_init_file(fname) {
         let parent_segs = &segs[..segs.len().saturating_sub(1)];
-        if let Some(inst) = fs_path
-            .parent()
-            .and_then(|parent| path_to_instance_meta(parent).ok().flatten())
-            .filter(|instance| instance.is_script_with_children)
-        {
-            let mut naming_path = segs_to_naming_path(parent_segs)?;
-            if let Some(last) = naming_path.last_mut() {
-                *last = inst.name;
+        if crate::fs_map::named_init_describes_parent(fs_path, &inner_name) {
+            if let Some(inst) = fs_path
+                .parent()
+                .and_then(|parent| path_to_instance_meta(parent).ok().flatten())
+                .filter(|instance| instance.is_script_with_children)
+            {
+                let mut naming_path = segs_to_naming_path(parent_segs)?;
+                if let Some(last) = naming_path.last_mut() {
+                    *last = inst.name;
+                }
+                return Some((
+                    segs_to_lookup_path(parent_segs)?,
+                    naming_path,
+                    script_class.class_name().to_string(),
+                ));
             }
-            return Some((
-                segs_to_lookup_path(parent_segs)?,
-                naming_path,
-                script_class.class_name().to_string(),
-            ));
         }
     }
 
@@ -13410,6 +13593,33 @@ mod tests {
     use tower::ServiceExt as _;
 
     static AVOID_SYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn initial_compare_marks_projection_migrations_terminal() {
+        let response = initial_compare_error_value(
+            "streamed snapshot compare ReplicatedStorage",
+            "legacy leaf script ReplicatedStorage/Misc/init (Notice).luau uses the reserved init-marker filename grammar; rename it to ReplicatedStorage/Misc/%69nit (Notice).luau before syncing",
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], PROJECTION_MIGRATION_REQUIRED_CODE);
+        assert_eq!(response["retryable"], false);
+        assert!(response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("%69nit (Notice).luau")));
+    }
+
+    #[test]
+    fn initial_compare_keeps_transient_errors_retryable_by_omission() {
+        let response =
+            initial_compare_error_value("streamed snapshot compare Workspace", "disk changed");
+        assert_eq!(response["ok"], false);
+        assert_eq!(
+            response["error"],
+            "streamed snapshot compare Workspace: disk changed"
+        );
+        assert!(response.get("code").is_none());
+        assert!(response.get("retryable").is_none());
+    }
 
     struct TempDir(tempfile::TempDir);
     impl TempDir {
@@ -14847,6 +15057,35 @@ mod tests {
     }
 
     #[test]
+    fn script_with_children_rename_ignores_mismatched_named_init_leaf() {
+        let d = TempDir::new("rename-script-dir-with-init-leaf");
+        let engine = ConflictEngine::new();
+        let quiet = push_quiet();
+        let ctx = harness(&engine, &quiet, d.path());
+        let parent = d.path().join("ReplicatedStorage");
+        let old_path = parent.join("Old");
+        let new_path = parent.join("New");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(old_path.join("init (Old).luau"), "return 'parent'\n").unwrap();
+        std::fs::write(
+            old_path.join("init (Notifications).luau"),
+            "return 'literal child'\n",
+        )
+        .unwrap();
+
+        rename_path_and_init(&old_path, &new_path, "New", true, &ctx).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(new_path.join("init (New).luau")).unwrap(),
+            "return 'parent'\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new_path.join("init (Notifications).luau")).unwrap(),
+            "return 'literal child'\n"
+        );
+    }
+
+    #[test]
     fn equivalent_legacy_parent_marker_is_migrated_by_atomic_parent_rename() {
         let d = TempDir::new("rename-equivalent-legacy-init");
         let engine = ConflictEngine::new();
@@ -15519,10 +15758,11 @@ mod tests {
     }
 
     #[test]
-    fn fs_mismatched_legacy_init_update_remains_a_literal_leaf_script() {
+    fn fs_mismatched_legacy_init_update_is_rejected_until_canonicalized() {
         let d = TempDir::new("fs-legacy-init-leaf-op");
         let misc = d.path().join("ReplicatedStorage").join("Misc");
         std::fs::create_dir_all(&misc).unwrap();
+        std::fs::write(misc.join("init (Misc).luau"), "return 'parent'\n").unwrap();
         let literal = misc.join("init (Notifications).luau");
         let source = "return 'literal child'\n";
         std::fs::write(&literal, source).unwrap();
@@ -15534,16 +15774,100 @@ mod tests {
             is_dir: Some(false),
         };
 
-        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("literal leaf set op");
+        assert!(
+            fs_op_to_plugin_op(d.path(), &op).is_none(),
+            "a raw reserved leaf must not cross the live transport"
+        );
+    }
+
+    #[test]
+    fn fs_delete_of_parent_init_reprojects_parent_as_folder() {
+        let d = TempDir::new("fs-parent-init-delete");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        let parent_source = misc.join("init (Misc).luau");
+        let literal = misc.join("init (Notifications).luau");
+        std::fs::write(&parent_source, "return 'parent'\n").unwrap();
+        std::fs::write(&literal, "return 'literal child'\n").unwrap();
+        std::fs::remove_file(&parent_source).unwrap();
+        let op = Op {
+            kind: OpKind::Delete,
+            path: parent_source,
+            from: None,
+            content: None,
+            is_dir: Some(false),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("parent projection op");
 
         assert_eq!(plugin_op["op"], "set");
+        assert_eq!(plugin_op["path"], serde_json::json!(["ReplicatedStorage"]));
         assert_eq!(
-            plugin_op["path"],
+            plugin_op["diskPath"],
             serde_json::json!(["ReplicatedStorage", "Misc"])
         );
-        assert_eq!(plugin_op["node"]["name"], "init (Notifications)");
-        assert_eq!(plugin_op["node"]["class"], "ModuleScript");
-        assert_eq!(plugin_op["node"]["properties"]["Source"], source);
+        assert_eq!(plugin_op["node"]["class"], "Folder");
+        assert_eq!(plugin_op["node"]["name"], "Misc");
+    }
+
+    #[test]
+    fn fs_rename_of_parent_init_to_canonical_reserved_leaf_expands_to_two_wire_ops() {
+        let d = TempDir::new("fs-parent-init-rename-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        let from = misc.join("init (Misc).luau");
+        let to = misc.join("%69nit (Notifications).luau");
+        let source = "return 'renamed source'\n";
+        std::fs::write(&from, source).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: Some(source.as_bytes().to_vec()),
+            is_dir: Some(false),
+        };
+
+        let plugin_op = fs_op_to_plugin_op(d.path(), &op).expect("carrier transition batch");
+
+        assert_eq!(plugin_op["op"], "batch");
+        let ops = plugin_op["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0]["op"], "set");
+        assert_eq!(ops[0]["node"]["class"], "Folder");
+        assert_eq!(ops[0]["node"]["name"], "Misc");
+        assert_eq!(ops[1]["op"], "set");
+        assert_eq!(ops[1]["node"]["name"], "init (Notifications)");
+        assert_eq!(ops[1]["node"]["class"], "ModuleScript");
+        assert_eq!(ops[1]["node"]["properties"]["Source"], source);
+
+        let event = serde_json::json!({ "type": "op", "op": op }).to_string();
+        let wire_ops = event_to_plugin_ops(d.path(), &event);
+        assert_eq!(wire_ops.len(), 2);
+        assert!(wire_ops.iter().all(|wire_op| wire_op["op"] != "batch"));
+    }
+
+    #[test]
+    fn fs_rename_of_parent_init_to_raw_reserved_leaf_is_rejected() {
+        let d = TempDir::new("fs-parent-init-rename-legacy-leaf");
+        let misc = d.path().join("ReplicatedStorage").join("Misc");
+        std::fs::create_dir_all(&misc).unwrap();
+        let from = misc.join("init (Misc).luau");
+        let to = misc.join("init (Notifications).luau");
+        let source = "return 'renamed source'\n";
+        std::fs::write(&from, source).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        let op = Op {
+            kind: OpKind::Rename,
+            path: to,
+            from: Some(from),
+            content: Some(source.as_bytes().to_vec()),
+            is_dir: Some(false),
+        };
+
+        assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
+        let event = serde_json::json!({ "type": "op", "op": op }).to_string();
+        assert!(event_to_plugin_ops(d.path(), &event).is_empty());
     }
 
     #[test]
