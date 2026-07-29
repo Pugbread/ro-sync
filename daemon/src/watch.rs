@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use notify::event::{ModifyKind, RemoveKind, RenameMode};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::RecommendedWatcher;
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{
@@ -466,15 +466,25 @@ fn collect_raw_pending(
                 }
                 continue;
             }
-            if event
-                .event
-                .paths
-                .iter()
-                .any(|path| is_projected_path(path, root))
-            {
-                return Err(format!(
-                    "filesystem watcher delivered an unpaired or malformed rename ({mode:?})"
-                ));
+            // Unpaired or single-path renames are routine on macOS: FSEvents
+            // reports RenameMode::Any under load — including for this daemon's
+            // OWN atomic temp-file swaps when it writes synced files. Treating
+            // that as a fatal ambiguity quarantined the watcher moments after
+            // every burst of writes, tearing down the plugin connection in a
+            // loop. The path's true state is knowable — ask the filesystem:
+            // present → ingest as a create/modify (content is re-read anyway),
+            // absent → ingest as a removal.
+            let _ = mode;
+            for path in &event.event.paths {
+                if !is_projected_path(path, root) {
+                    continue;
+                }
+                let resolved_kind = if path.symlink_metadata().is_ok() {
+                    EventKind::Create(CreateKind::Any)
+                } else {
+                    EventKind::Remove(RemoveKind::Any)
+                };
+                push_raw_path(&mut pending, &mut by_path, path, &resolved_kind);
             }
             continue;
         }

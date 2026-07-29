@@ -30,10 +30,18 @@ local WATCHED_SERVICES = {
 }
 
 local SETTING_MANUAL_URL = "manualUrl"
+-- Remembers the last answered overwrite decision. When set to "studio" and a
+-- reconnect finds only changed script sources (delta-eligible drift), the
+-- plugin re-answers the picker itself instead of parking on "waiting" until a
+-- human clicks the same button again.
+local SETTING_STICKY_CHOICE = "stickyInitialChoice"
 local DEFAULT_URL = "http://127.0.0.1:7878"
 local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
-local PROBE_TIMEOUT_SECONDS = 2
+-- 4s, not 2: a loaded machine has answered /hello in 2.03s — a 2s timeout
+-- silently misses every daemon and the pill reads no_daemon while everything
+-- is actually up.
+local PROBE_TIMEOUT_SECONDS = 4
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
 local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
@@ -1803,10 +1811,14 @@ local urlBox = setmetatable({}, {
 })
 
 local function log(msg)
+	-- Debug: mirror the plugin's internal log panel to Studio Output so
+	-- `rosync logs` and the Output window capture the connection story.
+	print("[Ro Sync dbg] " .. tostring(msg))
 	ui.addLog(msg)
 end
 
 local function setPill(state, detail)
+	print("[Ro Sync dbg] status → " .. tostring(state) .. (detail ~= nil and (" (" .. tostring(detail) .. ")") or ""))
 	ui.setStatus(state, detail)
 end
 
@@ -3934,10 +3946,28 @@ local function applyOps(ops, shouldContinue): boolean
 		return false
 	end
 	local label = "Ro Sync: " .. summarizeOps(ops)
-	local recordingOk, recordingId = pcall(function()
-		return ChangeHistoryService:TryBeginRecording(label, label)
-	end)
-	if not recordingOk or recordingId == nil then
+	-- Team Create holds the change-history lock during commit/sync windows. A
+	-- single TryBeginRecording refusal here used to cancel the whole apply and
+	-- tear down the transport (full re-compare + decision picker) — the main
+	-- reconnect driver on busy Team Create places. Ride the lock out instead.
+	local recordingId = nil
+	for attempt = 1, 20 do
+		local recordingOk, id = pcall(function()
+			return ChangeHistoryService:TryBeginRecording(label, label)
+		end)
+		if recordingOk and id ~= nil then
+			recordingId = id
+			break
+		end
+		if shouldContinue and not shouldContinue() then
+			return false
+		end
+		if attempt == 1 then
+			log("applyOps: Studio refused a rollback-safe recording (Team Create busy?); retrying for up to 30s")
+		end
+		task.wait(1.5)
+	end
+	if recordingId == nil then
 		log("applyOps error: Studio refused to begin a rollback-safe recording")
 		return false
 	end
@@ -5482,9 +5512,18 @@ disconnectHooks = function()
 	serviceConnections = {}
 	scaleState.itemChangedAvailable = false
 	pendingEditorSourceByScript = {}
+	local disconnected = 0
 	while next(connections) do
 		local inst = next(connections)
 		disconnectInstance(inst)
+		disconnected += 1
+		if disconnected % 20000 == 0 then
+			-- Hundreds of thousands of tracked instances exhaust the per-frame
+			-- execution budget if torn down in one gulp (observed Script
+			-- timeout in wsLoop on a 459k-instance place). Yield when the
+			-- calling context allows it.
+			pcall(task.wait)
+		end
 	end
 	connections = {}
 	table.clear(activeConnectionSet)
@@ -5604,6 +5643,7 @@ local function hookService(svc, progress, shouldContinue): boolean
 end
 
 local function installHooks(shouldContinue): boolean
+	local hooksStarted = os.clock()
 	scaleState.avoidSyncTrackingPaused = true
 	disconnectHooks()
 	table.clear(scaleState.avoidSyncRoots)
@@ -5701,9 +5741,10 @@ local function installHooks(shouldContinue): boolean
 	scaleState.markAvoidSyncPathsDirty()
 	log(
 		string.format(
-			"hooks indexed: %d instance(s), %d property connection(s)",
+			"hooks indexed: %d instance(s), %d property connection(s), %.1fs",
 			scaleState.trackedInstanceCount,
-			scaleState.trackedConnectionCount
+			scaleState.trackedConnectionCount,
+			os.clock() - hooksStarted
 		)
 	)
 	if shouldContinue and not shouldContinue() then
@@ -5723,6 +5764,15 @@ scaleState.beginStudioScanGuard = function(opts)
 		reason = nil,
 		connections = {},
 		expectedMutations = {},
+		-- Source-only mutation tracking: pure script edits during the bootstrap
+		-- stream are recorded here and replayed through the live op channel
+		-- after connect, instead of forcing a full restart (which starved
+		-- busy Team Create places forever).
+		mutatedSources = {},
+		mutatedSourceCount = 0,
+		sourceOverflow = false,
+		structuralDirty = false,
+		tolerateSourceEdits = false,
 	}
 	guard.pushExpectedMutation = function(expected)
 		guard.expectedMutations[#guard.expectedMutations + 1] = expected
@@ -5778,6 +5828,18 @@ scaleState.beginStudioScanGuard = function(opts)
 		end
 		guard.dirty = true
 		guard.reason = guard.reason or reason
+		if eventKind == "Source" and typeof(item) == "Instance" then
+			if guard.mutatedSources[item] == nil then
+				if guard.mutatedSourceCount >= 256 then
+					guard.sourceOverflow = true
+				else
+					guard.mutatedSources[item] = true
+					guard.mutatedSourceCount += 1
+				end
+			end
+		else
+			guard.structuralDirty = true
+		end
 	end
 	local function addConnection(connection)
 		if connection then
@@ -5842,6 +5904,16 @@ scaleState.beginStudioScanGuard = function(opts)
 		end
 	end
 	return guard
+end
+
+-- True when the guarded mutation genuinely invalidates a snapshot in flight:
+-- anything structural (add/remove/rename/reparent/attributes), or more Source
+-- edits than the bounded replay set can hold. Pure Source edits within the cap
+-- are recoverable — the recorded scripts replay through the live op channel.
+scaleState.guardBlocksSnapshot = function(guard)
+	return guard ~= nil
+		and guard.dirty == true
+		and (guard.structuralDirty == true or guard.sourceOverflow == true)
 end
 
 scaleState.disconnectStudioScanGuard = function(guard)
@@ -6070,7 +6142,12 @@ end
 scaleState.collectStudioStatsWithGuard = function(guard)
 	local stats = { scriptCount = 0, instanceCount = 0 }
 	local progress = { visited = 0 }
-	local projectionInfo = setmetatable({}, { __mode = "k" })
+	-- Strong keys on purpose: the initial push streams structure from this index
+	-- after the /initial-compare round trip, and on large places (100k+
+	-- instances) a GC cycle in that window swept a weak-keyed table, leaving
+	-- "Studio projection index is unavailable" retry loops. The guard's disposal
+	-- releases the whole index, so its lifetime is already bounded.
+	local projectionInfo = {}
 	if guard then
 		guard.projectionInfo = projectionInfo
 	end
@@ -6081,7 +6158,10 @@ scaleState.collectStudioStatsWithGuard = function(guard)
 		if ok and service then
 			scaleState.scanStudioServiceStats(service, stats, progress, projectionInfo)
 		end
-		if guard and guard.dirty then
+		-- Source-only edits don't change structure counts and the fresh read at
+		-- push time picks up the newer content, so only structural mutations
+		-- invalidate the scan.
+		if scaleState.guardBlocksSnapshot(guard) then
 			break
 		end
 	end
@@ -6095,6 +6175,17 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	local projectionInfo = guard and guard.projectionInfo
 	if type(projectionInfo) ~= "table" or not projectionInfo[service] then
 		return nil, "Studio projection index is unavailable"
+	end
+	-- The push path opts into surviving Source-only edits (they're recorded and
+	-- replayed after connect); the compare path stays strict.
+	local function blockedByMutation()
+		if guard == nil then
+			return false
+		end
+		if guard.tolerateSourceEdits == true then
+			return scaleState.guardBlocksSnapshot(guard)
+		end
+		return guard.dirty == true
 	end
 	local records = {}
 	local sourceInstances = {}
@@ -6120,7 +6211,7 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 		},
 	}
 	while #stack > 0 do
-		if guard and guard.dirty then
+		if blockedByMutation() then
 			return nil, "Studio changed during streamed structure scan"
 		end
 		local frame = stack[#stack]
@@ -6144,7 +6235,7 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 			nextId += 1
 			if nextId % scaleState.studioScanYieldEvery == 0 then
 				task.wait()
-				if guard and guard.dirty then
+				if blockedByMutation() then
 					return nil, "Studio changed during streamed structure scan"
 				end
 			end
@@ -11700,6 +11791,10 @@ local function wsLoop(gen)
 			local terminalReason = nil
 			local lastPongClock = os.clock()
 			local conns: { RBXScriptConnection } = {}
+			-- FIFO for incoming daemon ops; drained by a single worker so a
+			-- burst of disk-side changes applies in order under one recording.
+			local opQueue = {}
+			local opWorkerRunning = false
 			local function acceptTransport()
 				if accepted or not reconnectState.desired or not connected or gen ~= wsGeneration then
 					if not reconnectState.desired or not connected or gen ~= wsGeneration then
@@ -11748,6 +11843,13 @@ local function wsLoop(gen)
 					end
 					if kind == "op" then
 						-- Daemon wraps the op under msg.op (nested, per Agent 1).
+						-- MessageReceived fires one coroutine per frame; applying
+						-- inline meant a burst of N disk-side ops ran N concurrent
+						-- applyOps — one held the undo recording while the rest
+						-- starved against it (and children raced their parent
+						-- folders: "parent path not found"). Queue instead: one
+						-- worker drains in arrival order, batching a burst under a
+						-- single recording.
 						if type(msg.op) == "table" then
 							local function shouldContinueApply()
 								return reconnectState.desired
@@ -11756,18 +11858,35 @@ local function wsLoop(gen)
 									and gen == wsGeneration
 									and ws == client
 							end
-							if applyOps({ msg.op }, shouldContinueApply) and shouldContinueApply() then
-								-- Echo the source Studio actually accepted. The daemon uses
-								-- this as the acknowledgement that advances its conflict
-								-- baseline; failed/cancelled writes produce no ack.
-								local ack = sourceAckForAppliedOp(msg.op)
-								if ack then
-									wsSend(client, { type = "push", ops = { ack } })
-								end
-							elseif shouldContinueApply() then
-								recoveryContext = "live filesystem operation failed or was cancelled"
-								pcall(function()
-									client:Close()
+							opQueue[#opQueue + 1] = msg.op
+							if not opWorkerRunning then
+								opWorkerRunning = true
+								task.spawn(function()
+									while shouldContinueApply() do
+										local batch = opQueue
+										if #batch == 0 then
+											break
+										end
+										opQueue = {}
+										if applyOps(batch, shouldContinueApply) and shouldContinueApply() then
+											-- Echo the sources Studio actually accepted. The
+											-- daemon uses these acks to advance its conflict
+											-- baseline; failed/cancelled writes produce no ack.
+											for _, appliedOp in ipairs(batch) do
+												local ack = sourceAckForAppliedOp(appliedOp)
+												if ack then
+													wsSend(client, { type = "push", ops = { ack } })
+												end
+											end
+										elseif shouldContinueApply() then
+											recoveryContext = "live filesystem operation failed or was cancelled"
+											pcall(function()
+												client:Close()
+											end)
+											break
+										end
+									end
+									opWorkerRunning = false
 								end)
 							end
 						else
@@ -11976,6 +12095,7 @@ local function startHooksAndWs(): boolean
 	local function shouldContinueInstall()
 		return reconnectState.desired and busy and installGeneration == wsGeneration
 	end
+	log("installing live-sync hooks — silent for up to a minute on large places")
 	if not installHooks(shouldContinueInstall) or not shouldContinueInstall() then
 		-- installHooks can yield for very large places. A click-to-cancel or
 		-- generation change must tear down every partially installed signal
@@ -11986,9 +12106,11 @@ local function startHooksAndWs(): boolean
 		return false
 	end
 	local scanGuard = scaleState.activeScanGuard
-	if scanGuard and scanGuard.dirty then
-		-- A mutation on a not-yet-hooked branch may have happened while the
-		-- time-sliced install was running. Tear down and compare a fresh view.
+	if scaleState.guardBlocksSnapshot(scanGuard) then
+		-- A structural mutation on a not-yet-hooked branch may have happened
+		-- while the time-sliced install was running. Tear down and compare a
+		-- fresh view. Source-only edits are recorded on the guard and replayed
+		-- below instead of forcing this restart.
 		disconnectHooks()
 		pendingOps = {}
 		pushPending = false
@@ -12009,6 +12131,24 @@ local function startHooksAndWs(): boolean
 	setPill("connecting")
 	setBanner("Initial sync complete. Authenticating the live Studio connection...")
 	log("initial sync complete — watching " .. #WATCHED_SERVICES .. " services; authenticating WebSocket")
+	if scanGuard and next(scanGuard.mutatedSources or {}) ~= nil then
+		-- Replay collaborator Source edits that landed while the bootstrap
+		-- stream was in flight — the disk snapshot predates them. Deleted or
+		-- reparented scripts would have set structuralDirty and restarted, so
+		-- everything recorded here is still a live script.
+		local replayed = 0
+		for inst in pairs(scanGuard.mutatedSources) do
+			pcall(function()
+				if inst:IsDescendantOf(game) and inst:IsA("LuaSourceContainer") then
+					queueScriptUpdateOp(inst, readScriptSource(inst))
+					replayed += 1
+				end
+			end)
+		end
+		if replayed > 0 then
+			log(string.format("replaying %d Source edit(s) recorded during the bootstrap stream", replayed))
+		end
+	end
 	task.spawn(function()
 		wsLoop(gen)
 	end)
@@ -12021,6 +12161,12 @@ end
 
 local function doPushPath(strictStudio: boolean?, scanGuard)
 	log("initial-compare → push: streaming bounded Studio structure + Sources")
+	local pushStarted = os.clock()
+	if scanGuard then
+		-- Survive collaborator Source commits during the multi-minute bootstrap
+		-- stream (Team Create); recorded scripts replay once live sync is up.
+		scanGuard.tolerateSourceEdits = true
+	end
 	local strict = strictStudio == true
 	local streamId = HttpService:GenerateGUID(false)
 	local cursor = {
@@ -12032,7 +12178,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 	local totalSources = 0
 
 	local function shouldContinue()
-		return reconnectState.desired and busy and (not scanGuard or not scanGuard.dirty)
+		return reconnectState.desired and busy and not scaleState.guardBlocksSnapshot(scanGuard)
 	end
 
 	local function encodedSize(body): (number?, string?)
@@ -12214,7 +12360,13 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				)
 		end
 		local lastErr = nil
-		for attempt = 1, 2 do
+		-- Roblox's client-side HttpService throttle (500 requests/min) rejects
+		-- the call before it leaves Studio, so replaying the exact body is safe.
+		-- Wait out the budget window instead of aborting the whole stream —
+		-- aborting restarts the scan and burns even more budget.
+		local attempt = 0
+		while true do
+			attempt += 1
 			local ok, response = httpJson("/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES)
 			local attemptErr = nil
 			if
@@ -12246,10 +12398,13 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				attemptErr = tostring(response)
 			end
 			lastErr = attemptErr
-			if attempt < 2 then
-				log(string.format("  ↻ %s — exact retry (%s)", label, lastErr:sub(1, 150)))
-				task.wait(0.15)
+			local isRateLimit = tostring(lastErr):find("Number of requests exceeded limit", 1, true) ~= nil
+			local maxAttempts = if isRateLimit then 40 else 2
+			if attempt >= maxAttempts then
+				break
 			end
+			log(string.format("  ↻ %s — exact retry (%s)", label, lastErr:sub(1, 150)))
+			task.wait(if isRateLimit then 3 else 0.15)
 		end
 		return nil, lastErr or "stream request failed"
 	end
@@ -12370,6 +12525,8 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 	end
 
 	local function drainContinuation(phase, targetPhase): (boolean, string?)
+		local drainStarted = os.clock()
+		local drainTicks = 0
 		while cursor.phase == phase do
 			if not shouldContinue() then
 				return false, "Studio changed during daemon disk continuation"
@@ -12382,6 +12539,22 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 			if not sent then
 				return false, sendErr
 			end
+			drainTicks += 1
+			if cursor.phase == phase then
+				-- The daemon is still writing/validating disk state; poll gently
+				-- instead of burning the 500 req/min HttpService budget on
+				-- hundreds of empty ticks.
+				task.wait(0.25)
+			end
+		end
+		if drainTicks > 4 then
+			log(string.format(
+				"  … %s %s drained after %d tick(s), %.1fs",
+				tostring(cursor.service),
+				phase,
+				drainTicks,
+				os.clock() - drainStarted
+			))
 		end
 		if cursor.phase ~= targetPhase then
 			return false, string.format("daemon did not advance %s to %s", phase, targetPhase)
@@ -12446,6 +12619,13 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 			log(string.format("push %s structure failed: %s", serviceName, tostring(structureErr):sub(1, 200)))
 			return false
 		end
+		log(string.format(
+			"  ✓ %s structure streamed (%d/%d services); %d Source(s) next",
+			serviceName,
+			serviceIndex,
+			#WATCHED_SERVICES,
+			#sourceInstances
+		))
 		if cursor.phase == "diskFence" then
 			local drained, drainErr = drainContinuation("diskFence", "sources")
 			if not drained then
@@ -12467,9 +12647,59 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				return false
 			end
 		else
+			-- Batch many Sources into each request. The daemon accepts up to 64
+			-- parts / 512 KiB encoded per chunk, but one request per script
+			-- starves Studio's HttpService budget (500 requests/min) on large
+			-- places — 1700+ scripts turned the initial push into a
+			-- rate-limit retry loop that could never finish.
+			local BATCH_MAX_PARTS = 64 -- daemon STREAM_HASH_CHUNK_NODES
+			local BATCH_MAX_DATA_BYTES = 224 * 1024 -- raw budget; ~2x JSON-escape margin under both 512 KiB caps
+			local batch = {}
+			local batchBytes = 0
+
+			local function sendParts(parts, finalChunk)
+				if #parts == 0 then
+					return true
+				end
+				local body = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
+				body.sources = parts
+				local bytes = encodedSize(body)
+				if not bytes then
+					return false, "source batch failed to encode"
+				end
+				if bytes > scaleState.maxStreamRequestBytes and #parts > 1 then
+					-- Escaping outgrew the raw-byte estimate; split and resend.
+					local mid = math.floor(#parts / 2)
+					local first = table.move(parts, 1, mid, 1, {})
+					local second = table.move(parts, mid + 1, #parts, 1, {})
+					local sentFirst, firstErr = sendParts(first, false)
+					if not sentFirst then
+						return false, firstErr
+					end
+					return sendParts(second, finalChunk)
+				end
+				if bytes > scaleState.maxStreamRequestBytes then
+					return false, "push Source part cannot fit one bounded request"
+				end
+				return sendBody(
+					body,
+					string.format("%s Sources ×%d chunk %d", serviceName, #parts, body.chunkIndex)
+				)
+			end
+
+			local function flushBatch(finalChunk)
+				local parts = batch
+				batch = {}
+				batchBytes = 0
+				return sendParts(parts, finalChunk)
+			end
+
 			for sourceIndex, sourceEntry in ipairs(sourceInstances) do
 				if not shouldContinue() then
 					return false
+				end
+				if sourceIndex % 200 == 0 then
+					log(string.format("  … %s Sources %d/%d", serviceName, sourceIndex, #sourceInstances))
 				end
 				local source = readScriptSource(sourceEntry.inst)
 				if #source > scaleState.maxScriptSourceBytes then
@@ -12488,54 +12718,38 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				local partIndex = 0
 				repeat
 					local budget = math.min(scaleState.sourceChunkBytes, math.max(0, #source - offset))
-					local body = nil
-					while budget >= 0 do
-						local stop = utf8ChunkEnd(source, offset, budget)
-						if not stop then
-							return false
-						end
-						local finalPart = stop == #source
-						local finalChunk = finalPart and sourceIndex == #sourceInstances
-						local candidate = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
-						candidate.sources = {
-							{
-								id = sourceEntry.id,
-								partIndex = partIndex,
-								offset = offset,
-								totalBytes = #source,
-								data = string.sub(source, offset + 1, stop),
-								finalPart = finalPart,
-								sha256 = sourceHash,
-							},
-						}
-						local bytes = encodedSize(candidate)
-						if bytes and bytes <= scaleState.maxStreamRequestBytes then
-							body = candidate
-							break
-						end
-						if budget == 0 then
-							break
-						end
-						budget = math.floor(budget / 2)
-					end
-					if not body then
+					local stop = utf8ChunkEnd(source, offset, budget)
+					if not stop then
 						log("push Source contains invalid UTF-8 or cannot fit one bounded request")
 						return false
 					end
-					local part = body.sources[1]
-					local sent, sendErr =
-						sendBody(body, string.format("%s Source %d part %d", serviceName, sourceEntry.id, partIndex))
-					if not sent then
-						log("push source stream failed: " .. tostring(sendErr))
-						return false
-					end
-					offset += #part.data
+					local finalPart = stop == #source
+					local data = string.sub(source, offset + 1, stop)
+					batch[#batch + 1] = {
+						id = sourceEntry.id,
+						partIndex = partIndex,
+						offset = offset,
+						totalBytes = #source,
+						data = data,
+						finalPart = finalPart,
+						sha256 = sourceHash,
+					}
+					batchBytes += #data
+					offset = stop
 					partIndex += 1
-					if partIndex % 8 == 0 then
-						task.wait()
+					local finalChunk = finalPart and sourceIndex == #sourceInstances
+					if finalChunk or #batch >= BATCH_MAX_PARTS or batchBytes >= BATCH_MAX_DATA_BYTES then
+						local sent, sendErr = flushBatch(finalChunk)
+						if not sent then
+							log("push source stream failed: " .. tostring(sendErr))
+							return false
+						end
 					end
 				until offset == #source and partIndex > 0
 				totalSources += 1
+				if sourceIndex % 16 == 0 then
+					task.wait()
+				end
 			end
 		end
 
@@ -12566,10 +12780,11 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 
 	log(
 		string.format(
-			"bootstrap stream done: %d structure record(s), %d Source(s), %d service(s)",
+			"bootstrap stream done: %d structure record(s), %d Source(s), %d service(s), %.1fs",
 			totalRecords,
 			totalSources,
-			#WATCHED_SERVICES
+			#WATCHED_SERVICES,
+			os.clock() - pushStarted
 		)
 	)
 	return shouldContinue() and cursor.phase == "complete"
@@ -12631,7 +12846,12 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 			return nil, string.format("%s request exceeds %d bytes", label, scaleState.maxStreamRequestBytes)
 		end
 		local lastErr = nil
-		for attempt = 1, 2 do
+		-- See the push-path postExact: wait out Studio's HttpService throttle
+		-- (500 requests/min) rather than aborting; the throttled call never
+		-- left Studio so an exact replay is safe.
+		local attempt = 0
+		while true do
+			attempt += 1
 			local ok, raw = httpRequest("/snapshot/stream", "POST", body, true)
 			if not shouldContinue() then
 				return nil, mutationGuard.reason or "disk stream cancelled"
@@ -12654,10 +12874,13 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 			else
 				lastErr = tostring(raw)
 			end
-			if attempt < 2 then
-				log(string.format("  ↻ %s — exact retry (%s)", label, tostring(lastErr):sub(1, 150)))
-				task.wait(0.15)
+			local isRateLimit = tostring(lastErr):find("Number of requests exceeded limit", 1, true) ~= nil
+			local maxAttempts = if isRateLimit then 40 else 2
+			if attempt >= maxAttempts then
+				break
 			end
+			log(string.format("  ↻ %s — exact retry (%s)", label, tostring(lastErr):sub(1, 150)))
+			task.wait(if isRateLimit then 3 else 0.15)
 		end
 		return nil, lastErr or "snapshot stream request failed"
 	end
@@ -13658,6 +13881,10 @@ end
 -- large top-level chunk can reuse earlier compiler registers.
 local projectInitCandidate: any = nil
 local connectionAttempt = 0
+-- Consecutive discovery misses since the last successful connection. A silent
+-- probe timeout (loaded machine, daemon still booting) auto-retries instead of
+-- parking on no_daemon until a human clicks Connect again.
+local noDaemonRetries = 0
 
 local function disconnect(reason)
 	reconnectState.desired = false
@@ -13833,9 +14060,17 @@ runInitialCompare = function()
 	end
 
 	local function scanBecameDirty(context): boolean
-		if scanGuard and scanGuard.dirty then
+		if scaleState.guardBlocksSnapshot(scanGuard) then
 			restartForMutation(context)
 			return true
+		end
+		if scanGuard and scanGuard.dirty and not scanGuard.sourceToleranceLogged then
+			scanGuard.sourceToleranceLogged = true
+			log(string.format(
+				"%s — Source-only edit(s) recorded (%d script(s)); continuing, will replay after connect",
+				context,
+				scanGuard.mutatedSourceCount or 0
+			))
 		end
 		return false
 	end
@@ -14260,6 +14495,97 @@ runInitialCompare = function()
 	if scanBecameDirty("Studio changed during snapshot comparison") then
 		return
 	end
+	-- Delta fast path support: when the divergence is only changed script
+	-- sources (nothing created or removed), "Keep Studio" doesn't need a full
+	-- place push — the changed scripts replay through the live op channel
+	-- after connect. A 7-file drift used to cost a multi-minute re-push.
+	local function prefetchStudioDeltaItems(choiceId, comparison)
+		local summary = if type(comparison) == "table" then comparison.summary else nil
+		local newFiles, changedFiles, removedFiles
+		if type(summary) == "table" then
+			newFiles = tonumber(summary.newFiles) or 0
+			changedFiles = tonumber(summary.changedFiles) or 0
+			removedFiles = tonumber(summary.removedFiles) or 0
+		elseif type(comparison) == "table" then
+			newFiles = countArray(comparison.newFiles)
+			changedFiles = countArray(comparison.changedFiles)
+			removedFiles = countArray(comparison.removedFiles)
+		else
+			return nil
+		end
+		if newFiles ~= 0 or removedFiles ~= 0 or changedFiles < 1 or changedFiles > 200 then
+			return nil
+		end
+		local items = {}
+		local cursor = nil
+		for _ = 1, 8 do
+			local url = string.format(
+				"%s/initial-choice/details?choiceId=%s&limit=512",
+				baseUrl,
+				HttpService:UrlEncode(tostring(choiceId))
+			)
+			if cursor then
+				url ..= "&cursor=" .. HttpService:UrlEncode(tostring(cursor))
+			end
+			local ok, detailResp = httpRequestTo(url, "GET")
+			if not ok or not detailResp.Success then
+				return nil
+			end
+			local decoded
+			local decOk = pcall(function()
+				decoded = HttpService:JSONDecode(detailResp.Body or "")
+			end)
+			if not decOk or type(decoded) ~= "table" or decoded.ok ~= true or type(decoded.items) ~= "table" then
+				return nil
+			end
+			for _, item in ipairs(decoded.items) do
+				items[#items + 1] = item
+			end
+			if decoded.complete == true or decoded.nextCursor == nil then
+				break
+			end
+			cursor = decoded.nextCursor
+		end
+		if #items ~= changedFiles then
+			return nil
+		end
+		return items
+	end
+
+	local function applyStudioDeltaFastPath(items)
+		if type(items) ~= "table" or #items == 0 or not scanGuard then
+			return false
+		end
+		local resolved = {}
+		for _, item in ipairs(items) do
+			if
+				type(item) ~= "table"
+				or tostring(item.action) ~= "overwrite"
+				or item.classChanged == true
+				or item.sourceChanged ~= true
+				or type(item.path) ~= "string"
+			then
+				return false
+			end
+			local inst = resolvePath(string.split(item.path, "/"))
+			if not inst or not inst:IsA("LuaSourceContainer") then
+				return false
+			end
+			resolved[#resolved + 1] = inst
+		end
+		for _, inst in ipairs(resolved) do
+			if scanGuard.mutatedSources[inst] == nil then
+				scanGuard.mutatedSources[inst] = true
+				scanGuard.mutatedSourceCount += 1
+			end
+		end
+		log(string.format(
+			"decision studio → delta fast path: replaying %d changed script(s) instead of a full push",
+			#resolved
+		))
+		return true
+	end
+
 	local action = tostring(resp.action)
 	if action == "in-sync" then
 		-- Daemon says disk and Studio already match within tolerance — skip
@@ -14292,10 +14618,31 @@ runInitialCompare = function()
 	elseif action == "decide" then
 		local choiceId = resp.choiceId
 		log("decide: " .. describeInitialComparison(resp.comparison))
+		-- Prefetch changed-path details while the choice is still pending — the
+		-- daemon drops them once the decision is redeemed. Powers the studio
+		-- delta fast path.
+		local deltaItems = prefetchStudioDeltaItems(choiceId, resp.comparison)
+		if deltaItems then
+			log(string.format("delta fast path armed: %d changed script(s) prefetched", #deltaItems))
+		end
+		-- Deliberately NO auto-answer here: with disk-side authors (agents,
+		-- other tools) writing into the project, even a changed-scripts-only
+		-- drift is ambiguous about which side is newer. The delta fast path
+		-- below still makes whatever the human chooses apply in seconds, and
+		-- the decision session no longer expires while they think.
 		decisionGeneration += 1
 		local gen = decisionGeneration
 		task.spawn(function()
+			local decisionWaitStarted = os.clock()
 			local choice, selectiveDiskChoice, selectedDiskCount = waitForDecision(choiceId, gen)
+			if choice ~= nil then
+				log(string.format("decision '%s' after %.1fs", tostring(choice), os.clock() - decisionWaitStarted))
+			end
+			if choice == "studio" then
+				plugin:SetSetting(SETTING_STICKY_CHOICE, "studio")
+			elseif choice == "disk" then
+				plugin:SetSetting(SETTING_STICKY_CHOICE, nil)
+			end
 			if gen ~= decisionGeneration then
 				disposeScanGuard()
 				return
@@ -14321,6 +14668,10 @@ runInitialCompare = function()
 					reconnectState.retryInitialCompare("strict snapshot pull failed")
 				end
 			elseif choice == "studio" then
+				if deltaItems ~= nil and applyStudioDeltaFastPath(deltaItems) then
+					completeInitialCompare()
+					return
+				end
 				-- The guard keeps the tree coherent while the modal is open;
 				-- rescan and push one service at a time without retaining the
 				-- comparison Sources.
@@ -14370,6 +14721,11 @@ local function probePort(port, gameId)
 	local url = string.format("http://127.0.0.1:%d", port)
 	local ok, resp = httpRequestTo(url .. "/hello", "GET")
 	if not ok or not resp.Success then
+		print(string.format(
+			"[Ro Sync dbg] probe :%d failed — %s",
+			port,
+			if ok then string.format("HTTP %s %s", tostring(resp.StatusCode), tostring(resp.StatusMessage)) else tostring(resp)
+		))
 		return false, url, nil
 	end
 	local hello
@@ -14547,6 +14903,16 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 			elseif probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
+			if probe.hello ~= nil then
+				print(string.format(
+					"[Ro Sync dbg] probe :%d — daemon '%s' gameId=%s project=%s matched=%s",
+					port,
+					tostring(probe.hello.name),
+					tostring(probe.hello.gameId),
+					tostring(probe.hello.project),
+					tostring(probe.matched)
+				))
+			end
 			if daemonInitializer == nil and probe.hello ~= nil then
 				daemonInitializer = projectInitOffer(probe.url, port, probe.hello)
 			end
@@ -14579,6 +14945,15 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 	if result.initializer == nil then
 		result.initializer = daemonInitializer
 	end
+	print(string.format(
+		"[Ro Sync dbg] discover result: found=%s port=%s sawWrongGame=%s initializer=%s initializerError=%s (GameId %s)",
+		tostring(result.found),
+		tostring(result.port),
+		tostring(result.sawWrongGame),
+		tostring(result.initializer ~= nil),
+		tostring(result.initializerError),
+		tostring(gameId)
+	))
 	return result
 end
 
@@ -14929,10 +15304,28 @@ startConnect = function()
 					log("found a daemon on a probed port, but no gameId match or project initializer")
 				else
 					setPill("no_daemon", gameId)
+					noDaemonRetries += 1
+					if noDaemonRetries <= 20 then
+						local retryAttempt = connectionAttempt
+						local delaySeconds = math.min(15, 3 * noDaemonRetries)
+						log(string.format(
+							"no daemon answered; auto-retrying discovery in %ds (retry %d/20)",
+							delaySeconds,
+							noDaemonRetries
+						))
+						task.delay(delaySeconds, function()
+							if connectionAttempt == retryAttempt and not busy and not connected and startConnect then
+								startConnect()
+							end
+						end)
+					else
+						log("auto-retry limit reached; click Connect to try again")
+					end
 				end
 				busy = false
 				return
 			end
+			noDaemonRetries = 0
 			chosenUrl = result.url
 			chosenPort = tostring(result.port)
 			log(string.format("matched daemon at %s", chosenUrl))

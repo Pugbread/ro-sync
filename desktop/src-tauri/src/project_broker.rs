@@ -278,12 +278,17 @@ fn handle_connection(stream: &mut TcpStream, shared: &BrokerShared) -> Result<()
     }
 }
 
+// Must match PLUGIN_PROTOCOL_VERSION in daemon/src/ws.rs and plugin/Plugin.luau.
+// The plugin refuses a broker's projectInit offer on any mismatch, which
+// silently disables Connect → Create Project.
+const PLUGIN_PROTOCOL_VERSION: u64 = 5;
+
 fn broker_hello(shared: &BrokerShared) -> Value {
     let (projects_root, projects_root_error) = configured_projects_root(shared);
     json!({
         "ok": true,
         "name": "Ro Sync Desktop",
-        "pluginProtocol": 2,
+        "pluginProtocol": PLUGIN_PROTOCOL_VERSION,
         "pluginCapability": shared.capability,
         "projectInit": {
             "available": projects_root.is_some(),
@@ -835,7 +840,7 @@ mod tests {
         let shared = test_shared(data.path());
 
         let unavailable = broker_hello(&shared);
-        assert_eq!(unavailable["pluginProtocol"], 2);
+        assert_eq!(unavailable["pluginProtocol"], PLUGIN_PROTOCOL_VERSION);
         assert_eq!(unavailable["projectInit"]["available"], false);
         assert!(unavailable["projectInit"]["error"].is_string());
 
