@@ -68,7 +68,7 @@ const COMMON_DARK = Object.freeze({
   "--shadow-2": "0 2px 4px rgba(0, 0, 0, 0.3), 0 4px 12px rgba(0, 0, 0, 0.25)",
   "--shadow-modal": "0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 2px 6px rgba(0, 0, 0, 0.35), 0 20px 56px rgba(0, 0, 0, 0.6)",
   "--shadow-border": "0 0 0 1px rgba(255, 255, 255, 0.075)",
-  "--shadow-border-hover": "0 0 0 1px rgba(255, 255, 255, 0.13)",
+  "--shadow-border-hover": "0 0 0 1px rgba(255, 255, 255, 0.14)",
 });
 
 export const APPEARANCE_THEME_TOKENS = Object.freeze({

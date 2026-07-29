@@ -645,30 +645,16 @@
       "name": "repair",
       "title": "rosync repair",
       "category": "Maintenance",
-      "description": "Checks live tree access, rebuilds generated metadata, and repairs startup-blocking disk projection conflicts.",
-      "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]\nrosync repair projection [--project <path>] [--raw]\nrosync repair projection --project <path> --resolve <conflict-or-recovery-id> [--keep <exact-filename|quarantine>] [--raw]",
+      "description": "Checks live tree access and rebuilds generated Ro Sync metadata.",
+      "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]",
       "examples": [
         "rosync repair tree --project .",
         "rosync repair sourcemap --project .",
-        "rosync repair sourcemap --project . --output .luau-sourcemap.json",
-        "rosync repair projection --project . --raw",
-        "rosync repair projection --project . --resolve pc_abc123 --keep \"init.luau\" --raw",
-        "rosync repair projection --project . --resolve recovery_abc123 --raw",
-        "rosync repair projection --project . --resolve recovery_abc123 --keep quarantine --raw"
+        "rosync repair sourcemap --project . --output .luau-sourcemap.json"
       ],
       "notes": [
         "`repair tree` validates that the live Studio tree can be read; use `rosync tree` or `rosync query` to inspect it.",
-        "`repair sourcemap` rebuilds luau-lsp sourcemap JSON from synced service folders.",
-        "`repair projection` is fully offline: it does not start a daemon or contact Roblox Studio.",
-        "Raw reports include `countsKnown`; callers must require `countsKnown: true`, `truncated: false`, and zero conflicts before treating the projection as proven clean.",
-        "Inspection previews every conflicting init source with a bounded source preview, size, class, and SHA-256 hash. Ro Sync never guesses a winner.",
-        "Resolution rescans the project and rejects stale conflict IDs. Unselected marker files are moved into `.rosync-backups`; they are never deleted.",
-        "Before the UI inspects or resolves a blocker, it removes the project from persisted desired-serving state so desktop health checks and Terminal 64 startup cannot retry behind the repair panel.",
-        "macOS and Linux resolution uses held directory handles and atomic no-replace renames. Windows currently supports offline inspection but fails closed before mutation until the equivalent handle-relative resolver is available.",
-        "Every resolution writes durable prepared/committed receipts under `.rosync-backups`. An uncertain transaction returns `recoveryRequired`, reports whether the receipt path was proven through `receiptAvailable`, advertises supported `recoveryActions`, and blocks daemon startup across reloads.",
-        "Resolving a recovery ID without `--keep` securely replays the recorded decision after re-proving the receipt, kept source, and every source/destination hash. Ambiguous both-or-neither states remain blocked.",
-        "`--keep quarantine` is an explicit last-resort recovery action for an unreplayable transaction record. It moves only that transaction directory out of the active recovery prefix, never edits source files, and still requires a complete clean projection scan before serving.",
-        "Legacy literal filenames in the reserved init-marker grammar are renamed to their escaped disk spelling without changing script source or the Roblox instance name."
+        "`repair sourcemap` rebuilds luau-lsp sourcemap JSON from synced service folders."
       ],
       "slug": "repair"
     },

@@ -16,10 +16,10 @@ import {
   buildDaemonCmd,
   checkBinaryCmd,
   checkCargoCmd,
+  deleteFilesCmd,
   openFolderEnsuredCmd,
   pickFolderCmd,
   pluginInstallCmd,
-  projectionRepairCmd,
   readFileCmd,
   secureWidgetStateCmd,
   wallyInstallCmd,
@@ -142,32 +142,6 @@ function unwrapText(value) {
   return value.content ?? value.text ?? value.data ?? value.stdout ?? "";
 }
 
-function unwrapProjectionRepairResult(result, operation) {
-  if (
-    result
-    && typeof result === "object"
-    && !Object.hasOwn(result, "stdout")
-    && typeof result.ok === "boolean"
-  ) {
-    return result;
-  }
-  const stdout = unwrapText(result).trim();
-  let value = null;
-  try {
-    value = JSON.parse(stdout);
-  } catch {
-    const stderr = String(result?.stderr || "").trim();
-    throw new Error(stderr || stdout || `${operation} returned no structured result`);
-  }
-  if (value && typeof value === "object" && value.ok === false) {
-    return value;
-  }
-  if (result?.code != null && result.code !== 0) {
-    throw new Error(value?.error || String(result?.stderr || "").trim() || `${operation} failed`);
-  }
-  return value;
-}
-
 function encodeTextBase64(value) {
   return btoa(unescape(encodeURIComponent(String(value))));
 }
@@ -179,29 +153,23 @@ function nextId() {
 let setStateQueue = Promise.resolve();
 
 // `payload.timeoutMs` — optional override for the default 30s timeout, for
-// long-running ops like `cargo build`; a non-positive value disables local
-// expiry for non-cancellable mutations. The timeoutMs key is NOT forwarded to
-// the host.
+// long-running ops like `cargo build`. The timeoutMs key is NOT forwarded to
+// the host; it only controls our local pending-promise expiry.
 function postT64(type, payload = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId();
     const { timeoutMs = 30000, ...forwarded } = payload || {};
-    // A non-positive timeout deliberately keeps the RPC pending until the host
-    // replies. Filesystem mutations use this mode because expiring only the
-    // renderer promise cannot cancel an already-running host command.
-    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? setTimeout(() => {
-          if (pending.has(id)) {
-            pending.delete(id);
-            reject(new Error(`t64 ${type} timed out`));
-          }
-        }, timeoutMs)
-      : null;
+    const timer = setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        reject(new Error(`t64 ${type} timed out`));
+      }
+    }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
     try {
       window.parent.postMessage({ type, payload: { ...forwarded, id } }, "*");
     } catch (err) {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       pending.delete(id);
       reject(err);
     }
@@ -242,6 +210,7 @@ export const host = Object.freeze({
     hostTheme: !IS_DESKTOP_HOST,
     windowDrag: IS_DESKTOP_HOST,
     updates: IS_DESKTOP_HOST,
+    deleteProjectFiles: true,
   }),
 
   async startWindowDrag() {
@@ -338,6 +307,18 @@ export const host = Object.freeze({
     return widgetExec(writeFileFromB64Cmd(path, encodeTextBase64(text)));
   },
 
+  async deleteProjectFiles(paths) {
+    const files = Array.isArray(paths) ? paths.map(String) : [];
+    if (IS_DESKTOP_HOST) {
+      return invokeDesktop("delete_project_files", { paths: files });
+    }
+    const result = await widgetExec(deleteFilesCmd(files));
+    if (result && result.code != null && result.code !== 0) {
+      throw new Error(result.stderr?.trim() || `file deletion exited ${result.code}`);
+    }
+    return { ok: true, deleted: files.length };
+  },
+
   async readResourceText(path) {
     try {
       const text = await runFetchWithDeadline(
@@ -410,41 +391,6 @@ export const host = Object.freeze({
   async wallyInstall(cwd) {
     if (IS_DESKTOP_HOST) return invokeDesktop("wally_install", { cwd });
     return widgetExec(wallyInstallCmd(cwd), { timeoutMs: 2 * 60_000 });
-  },
-
-  async projectionInspect(project) {
-    if (IS_DESKTOP_HOST) {
-      return unwrapProjectionRepairResult(
-        await invokeDesktop("projection_inspect", { project: String(project || "") }),
-        "Projection inspection",
-      );
-    }
-    const result = await widgetExec(
-      projectionRepairCmd({ project }),
-      { timeoutMs: 60_000 },
-    );
-    return unwrapProjectionRepairResult(result, "Projection inspection");
-  },
-
-  async projectionResolve(project, conflictId, keep = null) {
-    if (IS_DESKTOP_HOST) {
-      return unwrapProjectionRepairResult(
-        await invokeDesktop("projection_resolve", {
-          project: String(project || ""),
-          conflictId: String(conflictId || ""),
-          keep: keep == null ? null : String(keep),
-        }),
-        "Projection resolution",
-      );
-    }
-    const result = await widgetExec(
-      projectionRepairCmd({ project, resolveId: conflictId, keep }),
-      // The host command is not cancellable. Never let the renderer abandon a
-      // filesystem mutation while it may still be committing or reporting a
-      // recovery receipt.
-      { timeoutMs: 0 },
-    );
-    return unwrapProjectionRepairResult(result, "Projection resolution");
   },
 
   async windowBounds() {
@@ -522,7 +468,7 @@ window.addEventListener("message", (ev) => {
   if (replyId && pending.has(replyId)) {
     const { resolve, reject, timer } = pending.get(replyId);
     pending.delete(replyId);
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
     if (msg.payload.error && !msg.payload.ok && msg.payload.stdout == null) {
       reject(new Error(msg.payload.error));
     } else {

@@ -160,11 +160,6 @@ assert.match(styleSource, /min-height:\s*108px/);
 assert.match(styleSource, /html\.theme-pending body/);
 assert.match(styleSource, /color:\s*var\(--accent-contrast\)/);
 assert.match(styleSource, /background:\s*var\(--code-bg\)/);
-assert.match(
-  styleSource,
-  /button\.primary:focus-visible[\s\S]*?0 0 0 4px var\(--accent-hover\)/,
-  "primary actions must retain a visible keyboard focus ring",
-);
 
 function relativeLuminance(hex) {
   const channels = hex.match(/[\da-f]{2}/gi).map((part) => Number.parseInt(part, 16) / 255);

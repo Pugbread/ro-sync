@@ -27,24 +27,6 @@ globalThis.__TAURI__ = {
       calls.push({ command, args });
       if (command === "state_get") return { value: { activeProjectId: "p1" } };
       if (command === "app_info") return { platform: "darwin", version: "test" };
-      if (command === "projection_inspect") {
-        return {
-          ok: true,
-          conflicts: [],
-          remaining: 0,
-          totalConflicts: 0,
-          countsKnown: true,
-          truncated: false,
-        };
-      }
-      if (command === "projection_resolve") {
-        return {
-          ok: false,
-          code: "STALE_PROJECTION_CONFLICT",
-          error: "files changed",
-          conflicts: [],
-        };
-      }
       return { ok: true, running: true, port: 7878 };
     },
   },
@@ -96,6 +78,20 @@ assert.deepEqual(calls.at(-1), {
 await desktop.host.daemonList();
 assert.deepEqual(calls.at(-1), { command: "daemon_list", args: {} });
 
+await desktop.host.deleteProjectFiles([
+  "/tmp/ro-sync-project/ReplicatedStorage/Pkg/init.luau",
+  "/tmp/ro-sync-project/ReplicatedStorage/Pkg/init (Pkg).luau",
+]);
+assert.deepEqual(calls.at(-1), {
+  command: "delete_project_files",
+  args: {
+    paths: [
+      "/tmp/ro-sync-project/ReplicatedStorage/Pkg/init.luau",
+      "/tmp/ro-sync-project/ReplicatedStorage/Pkg/init (Pkg).luau",
+    ],
+  },
+});
+
 await desktop.host.daemonStop({
   project: "/tmp/ro-sync-project",
   bootId: "boot-id",
@@ -118,51 +114,7 @@ assert.deepEqual(calls.at(-1), { command: "project_broker_status", args: {} });
 await desktop.host.projectInitDrain();
 assert.deepEqual(calls.at(-1), { command: "project_init_drain", args: {} });
 
-assert.deepEqual(
-  await desktop.host.projectionInspect("/tmp/ro-sync-project"),
-  {
-    ok: true,
-    conflicts: [],
-    remaining: 0,
-    totalConflicts: 0,
-    countsKnown: true,
-    truncated: false,
-  },
-);
-assert.deepEqual(calls.at(-1), {
-  command: "projection_inspect",
-  args: { project: "/tmp/ro-sync-project" },
-});
-assert.deepEqual(
-  await desktop.host.projectionResolve(
-    "/tmp/ro-sync-project",
-    "projection_abcdef",
-    "init.luau",
-  ),
-  {
-    ok: false,
-    code: "STALE_PROJECTION_CONFLICT",
-    error: "files changed",
-    conflicts: [],
-  },
-  "typed stale results must survive the native bridge",
-);
-assert.deepEqual(calls.at(-1), {
-  command: "projection_resolve",
-  args: {
-    project: "/tmp/ro-sync-project",
-    conflictId: "projection_abcdef",
-    keep: "init.luau",
-  },
-});
-
 const nativeCommands = await readFile(new URL("../desktop/src-tauri/src/commands.rs", import.meta.url), "utf8");
-const bridgeSource = await readFile(new URL("../bridge.js", import.meta.url), "utf8");
-assert.match(
-  bridgeSource,
-  /projectionRepairCmd\(\{ project, resolveId: conflictId, keep \}\)[\s\S]*?timeoutMs:\s*0/,
-  "the renderer must not abandon a non-cancellable host-side filesystem mutation",
-);
 assert.doesNotMatch(
   nativeCommands,
   /blocking_pick_folder/,

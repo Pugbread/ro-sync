@@ -24,7 +24,6 @@ mod path_resolver;
 mod playtest_run;
 mod project_config;
 mod project_init;
-mod projection_repair;
 #[cfg(test)]
 mod query;
 mod remote;
@@ -1031,8 +1030,6 @@ pub enum RepairCommand {
     Tree(RepairTreeArgs),
     /// Regenerate luau-lsp sourcemap JSON.
     Sourcemap(RepairSourcemapArgs),
-    /// Inspect or resolve startup-blocking filesystem projection conflicts offline.
-    Projection(RepairProjectionArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -1057,21 +1054,6 @@ pub struct RepairSourcemapArgs {
     /// Output path. Defaults to `<project>/sourcemap.json`.
     #[arg(long)]
     pub output: Option<PathBuf>,
-    #[arg(long)]
-    pub raw: bool,
-}
-
-#[derive(ClapArgs, Debug)]
-pub struct RepairProjectionArgs {
-    /// Project directory. Defaults to current working directory.
-    #[arg(long)]
-    pub project: Option<PathBuf>,
-    /// Resolve this opaque conflict id from a fresh scan.
-    #[arg(long)]
-    pub resolve: Option<String>,
-    /// Exact init filename to keep, or recovery action `resume`/`quarantine`.
-    #[arg(long, requires = "resolve")]
-    pub keep: Option<String>,
     #[arg(long)]
     pub raw: bool,
 }
@@ -4616,14 +4598,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let canonical_project = lifecycle::canonical_project(&args.project)
         .map_err(|error| format!("serve: canonicalize {}: {error}", args.project.display()))?;
-    // A daemon owns the filesystem projection for its full lifetime. Offline
-    // repair acquires this same per-project OS lock, so neither startup nor a
-    // live watcher can observe a half-committed recovery transaction.
-    let _project_operation_lock =
-        projection_repair::acquire_project_operation_lock(&canonical_project, "daemon projection")
-            .map_err(|error| format!("serve: {error}"))?;
-    projection_repair::ensure_no_pending_recovery(&canonical_project)
-        .map_err(|error| format!("serve: {error}"))?;
     let projects_root = args
         .projects_root
         .as_deref()
@@ -11045,7 +11019,6 @@ async fn run_repair(args: RepairArgs) -> Result<(), Box<dyn std::error::Error>> 
     match args.command {
         RepairCommand::Tree(args) => run_repair_tree(args).await,
         RepairCommand::Sourcemap(args) => run_repair_sourcemap(args),
-        RepairCommand::Projection(args) => run_repair_projection(args),
     }
 }
 
@@ -11106,175 +11079,6 @@ fn run_repair_sourcemap(args: RepairSourcemapArgs) -> Result<(), Box<dyn std::er
         println!("ok: wrote {}", output.display());
     }
     Ok(())
-}
-
-fn run_repair_projection(args: RepairProjectionArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let project = project_or_cwd(args.project.as_deref(), "repair projection")?;
-    if let Some(conflict_id) = args.resolve.as_deref() {
-        let result = match projection_repair::resolve(&project, conflict_id, args.keep.as_deref()) {
-            Ok(result) => result,
-            Err(error) => {
-                if args.raw {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&projection_repair_error_value(
-                            &project, &error
-                        ))?
-                    );
-                }
-                return Err(format!("repair projection: {error}").into());
-            }
-        };
-        if args.raw {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            if !result.ok {
-                return Err(format!(
-                    "repair projection: {}",
-                    result
-                        .error
-                        .as_deref()
-                        .unwrap_or("projection resolution requires recovery")
-                )
-                .into());
-            }
-        } else {
-            println!(
-                "resolved {}: kept {}",
-                result.resolution.kind, result.resolution.kept_file
-            );
-            for backup in &result.resolution.backup_paths {
-                println!("  backup: {backup}");
-            }
-            if result.resolution.receipt_available {
-                println!("  receipt: {}", result.resolution.receipt_path);
-            } else {
-                println!("  receipt: unavailable");
-            }
-            if let (Some(source), Some(canonical)) = (
-                result.resolution.source_path.as_deref(),
-                result.resolution.canonical_path.as_deref(),
-            ) {
-                println!("  renamed: {source} -> {canonical}");
-            }
-            if result.counts_known {
-                println!("{} projection conflict(s) remain", result.remaining);
-            } else {
-                println!("remaining projection conflict count is unknown");
-            }
-            if !result.ok {
-                return Err(format!(
-                    "repair projection: {}; receipt {}: {}",
-                    result
-                        .code
-                        .as_deref()
-                        .unwrap_or("projection resolution verification failed"),
-                    if result.resolution.receipt_available {
-                        result.resolution.receipt_path.as_str()
-                    } else {
-                        "unavailable"
-                    },
-                    result
-                        .error
-                        .as_deref()
-                        .unwrap_or("unknown transaction proof failure")
-                )
-                .into());
-            }
-        }
-        return Ok(());
-    }
-
-    let scan = match projection_repair::inspect(&project) {
-        Ok(scan) => scan,
-        Err(error) => {
-            if args.raw {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&projection_repair_error_value(&project, &error))?
-                );
-            }
-            return Err(format!("repair projection: {error}").into());
-        }
-    };
-    if args.raw {
-        println!("{}", serde_json::to_string_pretty(&scan)?);
-    }
-    if !scan.ok {
-        if !args.raw {
-            eprintln!(
-                "{}",
-                scan.error
-                    .as_deref()
-                    .unwrap_or("offline projection recovery is required")
-            );
-            if let Some(resolution) = scan.resolution.as_ref() {
-                if resolution.receipt_available {
-                    eprintln!("  receipt: {}", resolution.receipt_path);
-                }
-                eprintln!(
-                    "  reconcile: rosync repair projection --project {:?} --resolve {} --raw",
-                    project, resolution.id
-                );
-            }
-        }
-        return Err(format!(
-            "repair projection: {}",
-            scan.error
-                .as_deref()
-                .unwrap_or("offline projection recovery is required")
-        )
-        .into());
-    }
-    if !args.raw && scan.remaining == 0 {
-        println!(
-            "ok: no startup-blocking projection conflicts in {}",
-            scan.project
-        );
-    } else if !args.raw {
-        println!(
-            "{} startup-blocking projection conflict(s) in {}:",
-            scan.remaining, scan.project
-        );
-        for conflict in &scan.conflicts {
-            println!(
-                "  {}  {}  {}",
-                conflict.id, conflict.kind, conflict.directory
-            );
-            for file in &conflict.files {
-                println!(
-                    "    {}  {}  {} bytes  {}",
-                    file.name, file.class_name, file.size, file.sha256
-                );
-            }
-            if let Some(canonical) = conflict.canonical_path.as_deref() {
-                println!("    rename to {canonical}");
-            }
-        }
-        if scan.truncated {
-            println!(
-                "  showing first {}; rerun after resolving these conflicts",
-                scan.conflicts.len()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn projection_repair_error_value(
-    project: &std::path::Path,
-    error: &projection_repair::ProjectionRepairError,
-) -> serde_json::Value {
-    serde_json::json!({
-        "ok": false,
-        "code": error.code(),
-        "error": error.message(),
-        "project": project.display().to_string(),
-        "conflicts": [],
-        "remaining": 0,
-        "totalConflicts": 0,
-        "countsKnown": false,
-        "truncated": true,
-    })
 }
 
 async fn run_find(args: FindArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -19206,9 +19010,7 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             RepairCommand::Sourcemap(args) => {
                 assert_eq!(args.output.unwrap(), PathBuf::from("map.json"));
             }
-            RepairCommand::Tree(_) | RepairCommand::Projection(_) => {
-                panic!("expected repair sourcemap command")
-            }
+            RepairCommand::Tree(_) => panic!("expected repair sourcemap command"),
         }
 
         let cli = Cli::try_parse_from(["rosync", "repair", "tree", "--depth", "32"]).unwrap();
@@ -19219,59 +19021,8 @@ ReplicatedStorage/Packages/Dep.luau:1:1-8: (W0) TypeError: vendor
             RepairCommand::Tree(args) => {
                 assert_eq!(args.depth, 32);
             }
-            RepairCommand::Sourcemap(_) | RepairCommand::Projection(_) => {
-                panic!("expected repair tree command")
-            }
+            RepairCommand::Sourcemap(_) => panic!("expected repair tree command"),
         }
-
-        let cli = Cli::try_parse_from([
-            "rosync",
-            "repair",
-            "projection",
-            "--project",
-            ".",
-            "--resolve",
-            "pc_abc123",
-            "--keep",
-            "init (Pkg).luau",
-            "--raw",
-        ])
-        .unwrap();
-        let Some(Command::Repair(args)) = cli.command else {
-            panic!("expected repair command");
-        };
-        match args.command {
-            RepairCommand::Projection(args) => {
-                assert_eq!(args.project.unwrap(), PathBuf::from("."));
-                assert_eq!(args.resolve.as_deref(), Some("pc_abc123"));
-                assert_eq!(args.keep.as_deref(), Some("init (Pkg).luau"));
-                assert!(args.raw);
-            }
-            RepairCommand::Tree(_) | RepairCommand::Sourcemap(_) => {
-                panic!("expected repair projection command")
-            }
-        }
-    }
-
-    #[test]
-    fn projection_raw_errors_are_typed_and_bounded() {
-        let value = projection_repair_error_value(
-            std::path::Path::new("/tmp/project"),
-            &projection_repair::ProjectionRepairError::classify(format!(
-                "conflict is stale; inspect again {}",
-                "x".repeat(20_000)
-            )),
-        );
-        assert_eq!(value["ok"], false);
-        assert_eq!(value["code"], "STALE_PROJECTION_CONFLICT");
-        assert_eq!(value["conflicts"], serde_json::json!([]));
-        assert_eq!(value["countsKnown"], false);
-        assert_eq!(value["truncated"], true);
-        assert!(
-            value["error"].as_str().unwrap().chars().count() <= 8192,
-            "{}",
-            value["error"]
-        );
     }
 
     #[test]

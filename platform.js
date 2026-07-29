@@ -471,6 +471,24 @@ export function readFileCmd(absPath) {
   return `cat ${posixQuote(absPath)} 2>/dev/null || true`;
 }
 
+// Permanently remove a small, explicit list of regular-file paths after the
+// renderer has shown them to the user. This never recurses and quotes every
+// path as a literal, so directories and shell syntax cannot broaden the delete.
+export function deleteFilesCmd(paths) {
+  const files = Array.isArray(paths) ? paths.map(String) : [];
+  if (!files.length || files.length > 8) {
+    throw new Error("deleteFilesCmd requires between 1 and 8 file paths");
+  }
+  if (IS_WINDOWS) {
+    const removals = files.map((path) =>
+      `$p = [Environment]::ExpandEnvironmentVariables(${psQuote(path)}); ` +
+      `if (Test-Path -LiteralPath $p -PathType Leaf) { Remove-Item -LiteralPath $p -Force }`
+    ).join("; ");
+    return psEncodedCmd(`$ErrorActionPreference = 'Stop'; ${removals}`);
+  }
+  return `rm -f -- ${files.map(posixQuote).join(" ")}`;
+}
+
 // ---------- Binary presence + build helpers ----------
 
 // Probe whether the daemon binary exists. Stdout is "yes" or "no".
@@ -534,41 +552,6 @@ export function buildDaemonCmd() {
     `bash ./build.sh 2>&1; ` +
     `echo "___EXIT:$?"`
   );
-}
-
-// Inspect or resolve startup-blocking filesystem projection conflicts without
-// starting the daemon. The renderer can only select an opaque conflict ID and
-// an exact candidate name; it never receives a generic shell or rename
-// primitive.
-export function projectionRepairCmd({ project, resolveId = null, keep = null }) {
-  const binaryPath = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
-  const args = [
-    "repair",
-    "projection",
-    "--project",
-    String(project),
-    "--raw",
-  ];
-  if (resolveId != null) {
-    args.push("--resolve", String(resolveId));
-    if (keep != null && String(keep)) args.push("--keep", String(keep));
-  }
-
-  if (IS_WINDOWS) {
-    const psArgs = args.map(psQuote).join(", ");
-    return psEncodedCmd(
-      `$ErrorActionPreference = 'Stop'; ` +
-      `$bin = [Environment]::ExpandEnvironmentVariables(${psQuote(binaryPath)}); ` +
-      `if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) { ` +
-      `  throw ('Ro Sync CLI not found: ' + $bin) ` +
-      `}; ` +
-      `$argv = @(${psArgs}); ` +
-      `& $bin @argv; ` +
-      `exit $LASTEXITCODE`
-    );
-  }
-
-  return `${posixExpandQuote(binaryPath)} ${args.map(posixQuote).join(" ")}`;
 }
 
 // Parse the `___EXIT:<code>` tail emitted by buildDaemonCmd. Returns

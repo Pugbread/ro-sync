@@ -1865,6 +1865,24 @@ pub(crate) fn atomic_write_authorized(
     atomic_write_in_parent(&parent, &name, path, bytes, mode)
 }
 
+pub(crate) fn remove_authorized_regular_file(store: &Path, path: &Path) -> Result<bool, String> {
+    let (parent, _, name) = authorized_parent_for_path(store, path, false)?;
+    let file = match parent.open_regular_file(&name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "could not open {} for deletion: {error}",
+                display_path(path)
+            ))
+        }
+    };
+    parent
+        .remove_open_file(&file, &name)
+        .map_err(|error| format!("could not delete {}: {error}", display_path(path)))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1917,6 +1935,22 @@ mod tests {
         assert!(
             ensure_authorized_path(&store, &directory.path().join("other/wally.toml")).is_err()
         );
+    }
+
+    #[test]
+    fn authorized_regular_file_removal_is_non_recursive_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let store = directory.path().join("roots.json");
+        let project = authorize_project_root(&store, &project).unwrap();
+        let marker = project.join("init.luau");
+        fs::write(&marker, "return true").unwrap();
+
+        assert!(remove_authorized_regular_file(&store, &marker).unwrap());
+        assert!(!marker.exists());
+        assert!(!remove_authorized_regular_file(&store, &marker).unwrap());
+        assert!(remove_authorized_regular_file(&store, &project).is_err());
     }
 
     #[test]

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
   collapseDaemonDiagnostic,
+  conflictDeletePaths,
   formatProjectFailure,
 } from "../views/project-error.js";
 
@@ -22,14 +23,38 @@ assert.equal(conflict.code, "multiple-init-markers");
 assert.equal(conflict.statusLabel, "File conflict");
 assert.deepEqual(conflict.files, ["init (vide).luau", "init.luau"]);
 assert.equal(conflict.path.endsWith("/vide"), true);
-assert.match(conflict.guidance, /Compare & resolve/);
-assert.match(conflict.guidance, /Ro Sync projection may use the named marker/);
+assert.deepEqual(conflict.deletePaths, [
+  "/tmp/Race Stars/ReplicatedStorage/Packages/_Index/alicesaidhi_vide@0.4.0/vide/init (vide).luau",
+  "/tmp/Race Stars/ReplicatedStorage/Packages/_Index/alicesaidhi_vide@0.4.0/vide/init.luau",
+]);
+assert.match(conflict.guidance, /Delete permanently removes both files/);
 
 const namedClassConflict = formatProjectFailure(
   'multiple init source markers in /tmp/Controller: "init (Controller).server.luau" and "init (Controller).client.luau"',
 );
-assert.match(namedClassConflict.guidance, /review both local sources and script classes/);
-assert.doesNotMatch(namedClassConflict.guidance, /Package folders/);
+assert.equal(namedClassConflict.deletePaths.length, 0);
+assert.match(namedClassConflict.guidance, /Delete is unavailable/);
+
+assert.deepEqual(
+  conflictDeletePaths("/tmp/Game", "/tmp/Game/ReplicatedStorage/Pkg", [
+    "init (Pkg).luau",
+    "init.luau",
+  ]),
+  [
+    "/tmp/Game/ReplicatedStorage/Pkg/init (Pkg).luau",
+    "/tmp/Game/ReplicatedStorage/Pkg/init.luau",
+  ],
+);
+assert.deepEqual(
+  conflictDeletePaths("/tmp/Game", "/tmp/Other", ["init.luau"]),
+  [],
+  "diagnostics outside the selected project must never become delete targets",
+);
+assert.deepEqual(
+  conflictDeletePaths("/tmp/Game", "/tmp/Game", ["../../state.json"]),
+  [],
+  "non-marker filenames must never become delete targets",
+);
 
 const legacyLeaf = formatProjectFailure(
   "Error: legacy leaf script ReplicatedStorage/Client/UIController/Misc/init (Notifications).luau uses the reserved init-marker filename grammar; rename it to ReplicatedStorage/Client/UIController/Misc/%69nit (Notifications).luau before syncing",
@@ -46,14 +71,6 @@ assert.equal(
   "/tmp/Race Stars/ReplicatedStorage/Client/UIController/Misc",
 );
 assert.match(legacyLeaf.guidance, /script name in Studio will stay the same/);
-
-const pendingRecovery = formatProjectFailure(
-  "Error: serve: PROJECTION_RECOVERY_REQUIRED: pending offline projection recovery receipt .rosync-backups/projection-repair/tx/prepared.json",
-  "/tmp/Race Stars",
-);
-assert.equal(pendingRecovery.code, "projection-recovery-required");
-assert.equal(pendingRecovery.statusLabel, "Recovery required");
-assert.match(pendingRecovery.guidance, /Review recovery/);
 
 assert.equal(
   formatProjectFailure("Error: address already in use on port 7878").code,
@@ -132,10 +149,16 @@ assert.doesNotMatch(
   /stream\.close|appStreams\.delete/,
   "terminal plugin shutdowns must not blind the UI watcher to later recovery",
 );
+assert.match(projectsSource, /data-error-act="fix"[\s\S]*?data-error-act="delete"/);
 assert.match(
   projectsSource,
-  /serve\(p\.id, \{ restart: true \}\)/,
-  "Retry must restart an already-served daemon so startup validation runs again",
+  /const stopped = await cancelServing\(p\.id\)[\s\S]*?api\.host\.deleteProjectFiles[\s\S]*?await serve\(p\.id\)/,
+  "Delete must stop serving, remove only the verified conflict files, then retry",
+);
+assert.match(
+  projectsSource,
+  /const fixConflict = async[\s\S]*?cancelServing\(p\.id\)[\s\S]*?openFolder/,
+  "Fix must stop serving, leave files untouched, and open their folder",
 );
 
 console.log("project error UX checks passed");

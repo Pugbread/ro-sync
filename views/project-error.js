@@ -33,7 +33,7 @@ export function formatProjectFailure(raw, projectPath = "") {
       statusLabel: "Rename required",
       title: "This script filename needs an escaped spelling",
       summary: "Its literal name overlaps the syntax Ro Sync reserves for a parent script source.",
-      guidance: `Use Fix filename offline to rename ${basename(sourcePath)} to ${basename(canonicalPath)} safely. The source and script name in Studio will stay the same.`,
+      guidance: `Rename ${basename(sourcePath)} to ${basename(canonicalPath)}, then retry. The script name in Studio will stay the same.`,
       path: resolveDiagnosticDirectory(projectPath, sourcePath),
       files: [basename(sourcePath), basename(canonicalPath)],
       sourcePath,
@@ -50,35 +50,18 @@ export function formatProjectFailure(raw, projectPath = "") {
     const first = markerMatch[2];
     const second = markerMatch[3];
     const files = [first, second];
-    const hasPlainInit = files.some((file) =>
-      /^init(?:\.(?:server|client))?\.(?:luau|lua)$/.test(file)
-    );
+    const deletePaths = conflictDeletePaths(projectPath, path, files);
     return {
       code: "multiple-init-markers",
       statusLabel: "File conflict",
-      title: "Two init files map to the same script",
-      summary: "Ro Sync stopped before serving to avoid choosing the wrong source file.",
-      guidance: hasPlainInit
-        ? `Use Compare & resolve to review both local sources while the daemon is off. Package sources may use plain init, while a Ro Sync projection may use the named marker; the file you do not keep will be archived.`
-        : `Use Compare & resolve to review both local sources and script classes while the daemon is off. Ro Sync will archive every marker you do not keep.`,
+      title: "Fix these files or delete them?",
+      summary: "Both files claim the same parent script, so Ro Sync stopped serving.",
+      guidance: deletePaths.length === files.length
+        ? "Fix keeps both files and opens their folder. Delete permanently removes both files, then retries the daemon."
+        : "Fix keeps both files and opens their folder. Delete is unavailable because the reported paths could not be verified.",
       path,
       files,
-      diagnostic,
-    };
-  }
-
-  if (
-    /PROJECTION_RECOVERY_REQUIRED|pending (?:offline )?projection recovery|projection recovery receipt/i
-      .test(diagnostic)
-  ) {
-    return {
-      code: "projection-recovery-required",
-      statusLabel: "Recovery required",
-      title: "A prior offline repair needs review",
-      summary: "Ro Sync found a non-terminal recovery record and kept the daemon stopped.",
-      guidance: "Use Review recovery to inspect the durable receipt and affected files before serving this project.",
-      path: projectPath,
-      files: [],
+      deletePaths,
       diagnostic,
     };
   }
@@ -161,4 +144,43 @@ function resolveDiagnosticDirectory(projectPath, sourcePath) {
   if (!root) return directory;
   const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/";
   return `${root}${separator}${directory.replace(/[\\/]+/g, separator)}`;
+}
+
+export function conflictDeletePaths(projectPath, directoryPath, files) {
+  const root = normalizeAbsolutePath(projectPath);
+  const directory = normalizeAbsolutePath(directoryPath);
+  if (!root || !directory || !isPathInsideRoot(root, directory)) return [];
+  if (!Array.isArray(files) || files.length < 1 || files.length > 8) return [];
+  if (!files.every(isInitMarkerLeaf)) return [];
+  const separator = String(directoryPath).includes("\\") && !String(directoryPath).includes("/")
+    ? "\\"
+    : "/";
+  const base = String(directoryPath).replace(/[\\/]+$/, "");
+  return files.map((file) => `${base}${separator}${file}`);
+}
+
+function normalizeAbsolutePath(path) {
+  let value = String(path || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (/^\/\/\?\/UNC\//i.test(value)) value = `//${value.slice("//?/UNC/".length)}`;
+  else if (/^\/\/\?\//i.test(value)) value = value.slice("//?/".length);
+  if (!/^(?:\/|[A-Za-z]:\/|\/\/[^/]+\/[^/]+)/.test(value)) return "";
+  if (/(?:^|\/)\.\.?(?:\/|$)/.test(value) || /[\u0000-\u001f\u007f]/.test(value)) return "";
+  value = value.replace(/^([a-z]):\//, (_, drive) => `${drive.toUpperCase()}:/`);
+  return value;
+}
+
+function isPathInsideRoot(root, path) {
+  if (path === root) return true;
+  return path.startsWith(`${root}/`);
+}
+
+function isInitMarkerLeaf(file) {
+  const value = String(file || "");
+  if (!value || value.includes("/") || value.includes("\\") || /[\u0000-\u001f\u007f]/.test(value)) {
+    return false;
+  }
+  const match = value.match(/^(.+?)(?:\.(server|client))?\.(lua|luau)$/i);
+  if (!match) return false;
+  const stem = match[1];
+  return /^init$/i.test(stem) || /^init \(.+\)$/i.test(stem);
 }

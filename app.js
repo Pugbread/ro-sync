@@ -1491,13 +1491,7 @@ async function ensureDesktopDaemon(projectId, project) {
 }
 
 async function ensureDaemonInner() {
-  // Terminal 64 is single-daemon, but desired serving state is still the
-  // persisted servedProjectIds capability. Keeping a project selected must
-  // not restart it after the user stopped it or suspended it for recovery.
-  const activeId = app.state.activeProjectId;
-  const project = activeId && isProjectServed(activeId)
-    ? activeProjectPath()
-    : null;
+  const project = activeProjectPath();
   const preferred =
     projectPathsEqual(app.state.daemonProject, project) && app.state.daemonPort
       ? app.state.daemonPort
@@ -2361,24 +2355,6 @@ async function serveProject(projectId) {
   return app.daemonOk;
 }
 
-// Remove a project from the persisted desired-serving set before an offline
-// repair begins. The desktop health loop and startup bootstrap both derive
-// automatic daemon starts from this set, so a non-cancellable filesystem
-// transaction cannot be retried behind the recovery UI.
-async function suspendProjectForRepair(projectId) {
-  if (!projectById(projectId)) return false;
-  const current = servedProjectIds();
-  if (!current.includes(projectId)) return true;
-  await setState({
-    servedProjectIds: current.filter((id) => id !== projectId),
-    activeProjectId: app.state.activeProjectId,
-  });
-  if (IS_DESKTOP_HOST) refreshDesktopDaemonPresentation();
-  else refreshProjectsServingIndicator();
-  emit("projection:repair-suspended", { projectId });
-  return true;
-}
-
 async function stopProject(projectId) {
   if (!projectById(projectId)) return true;
   if (IS_DESKTOP_HOST) {
@@ -2435,7 +2411,6 @@ function navigate(route) {
     ensureDaemon,
     killDaemon,
     serveProject,
-    suspendProjectForRepair,
     stopProject,
     restartProject,
     reportConflictCount: conflictBadge.report,
@@ -2888,7 +2863,6 @@ window.__rosync = {
   getDaemonSession,
   reportDaemonFailure,
   serveProject,
-  suspendProjectForRepair,
   stopProject,
   restartProject,
   ensureDaemon,

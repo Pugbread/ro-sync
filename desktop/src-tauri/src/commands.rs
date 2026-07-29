@@ -21,14 +21,13 @@ use crate::{
     secrets::SecretStore,
     storage::{
         atomic_write, atomic_write_authorized, read_authorized_utf8_file, read_utf8_file,
-        validate_project_file_path, MAX_PROJECT_FILE_BYTES,
+        remove_authorized_regular_file, validate_project_file_path, MAX_PROJECT_FILE_BYTES,
     },
     AppState,
 };
 
 const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_PROJECTION_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const ROBLOX_CLOUD_SECRET_KEY: &str = "robloxCloudApiKey";
 const ROBLOX_CLOUD_SECRET_ENV: &str = "ROSYNC_OPEN_CLOUD_CREDENTIAL";
 
@@ -62,6 +61,12 @@ pub(crate) struct FixedCommandResult {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DeleteProjectFilesResult {
+    ok: bool,
+    deleted: usize,
 }
 
 #[tauri::command]
@@ -278,6 +283,41 @@ pub(crate) fn write_project_file(
 }
 
 #[tauri::command]
+pub(crate) fn delete_project_files(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<DeleteProjectFilesResult, String> {
+    if paths.is_empty() || paths.len() > 8 {
+        return Err("choose between 1 and 8 conflict files to delete".into());
+    }
+    let files = paths
+        .iter()
+        .map(|raw| {
+            let path = validate_absolute_path(raw)?;
+            if !is_init_source_marker(&path) {
+                return Err(format!(
+                    "{} is not an init source marker",
+                    display_path(&path)
+                ));
+            }
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let _guard = state
+        .io_lock
+        .lock()
+        .map_err(|_| "application state lock is poisoned".to_string())?;
+    let mut deleted = 0;
+    for path in files {
+        deleted += usize::from(remove_authorized_regular_file(
+            &state.paths.authorized_roots_file,
+            &path,
+        )?);
+    }
+    Ok(DeleteProjectFilesResult { ok: true, deleted })
+}
+
+#[tauri::command]
 pub(crate) fn read_resource_file(
     state: State<'_, AppState>,
     path: String,
@@ -430,124 +470,6 @@ pub(crate) async fn wally_install(
         .map_err(|error| format!("Wally task failed: {error}"))?
 }
 
-#[tauri::command]
-pub(crate) async fn projection_inspect(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    project: String,
-) -> Result<Value, String> {
-    let project = authorized_project_directory(&state, &project)?;
-    run_projection_cli(&app, &project, None, None).await
-}
-
-#[tauri::command]
-pub(crate) async fn projection_resolve(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    project: String,
-    conflict_id: String,
-    keep: Option<String>,
-) -> Result<Value, String> {
-    validate_projection_conflict_id(&conflict_id)?;
-    if let Some(candidate) = keep.as_deref() {
-        validate_projection_candidate(candidate)?;
-    }
-    let project = authorized_project_directory(&state, &project)?;
-    run_projection_cli(&app, &project, Some(&conflict_id), keep.as_deref()).await
-}
-
-fn authorized_project_directory(state: &State<'_, AppState>, raw: &str) -> Result<PathBuf, String> {
-    let project = validate_absolute_path(raw)?;
-    let project =
-        crate::storage::resolve_authorized_path(&state.paths.authorized_roots_file, &project)?;
-    if !project.is_dir() {
-        return Err("Ro Sync project path must be an authorized folder".into());
-    }
-    Ok(project)
-}
-
-fn validate_projection_conflict_id(value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err("projection conflict ID is invalid".into());
-    }
-    Ok(())
-}
-
-fn validate_projection_candidate(value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 512
-        || matches!(value, "." | "..")
-        || value
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
-    {
-        return Err("projection candidate must be one exact filename".into());
-    }
-    Ok(())
-}
-
-async fn run_projection_cli(
-    app: &AppHandle,
-    project: &Path,
-    conflict_id: Option<&str>,
-    keep: Option<&str>,
-) -> Result<Value, String> {
-    let mut args = vec![
-        "repair".to_string(),
-        "projection".to_string(),
-        "--project".to_string(),
-        display_path(project),
-        "--raw".to_string(),
-    ];
-    if let Some(conflict_id) = conflict_id {
-        args.push("--resolve".to_string());
-        args.push(conflict_id.to_string());
-        if let Some(keep) = keep {
-            args.push("--keep".to_string());
-            args.push(keep.to_string());
-        }
-    }
-
-    let output = app
-        .shell()
-        .sidecar("rosync")
-        .map_err(|error| format!("could not locate bundled Ro Sync CLI: {error}"))?
-        .args(args)
-        .current_dir(project)
-        .output()
-        .await
-        .map_err(|error| format!("could not run offline projection repair: {error}"))?;
-
-    if output.stdout.len() > MAX_PROJECTION_OUTPUT_BYTES
-        || output.stderr.len() > MAX_PROJECTION_OUTPUT_BYTES
-    {
-        return Err("offline projection repair returned too much data".into());
-    }
-    if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) {
-        return Ok(value);
-    }
-    if !output.status.success() {
-        let stderr = bounded_output(&output.stderr);
-        let stdout = bounded_output(&output.stdout);
-        let message = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(if message.is_empty() {
-            "offline projection repair failed without a diagnostic".into()
-        } else {
-            message.to_string()
-        });
-    }
-    Err("offline projection repair returned invalid JSON".into())
-}
-
 fn validate_text_resource(raw: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(raw);
     if path.is_absolute()
@@ -579,6 +501,28 @@ fn validate_absolute_path(raw: &str) -> Result<PathBuf, String> {
         return Err("path must not contain . or .. components".into());
     }
     Ok(path)
+}
+
+fn is_init_source_marker(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    let Some(stem) = lower
+        .strip_suffix(".luau")
+        .or_else(|| lower.strip_suffix(".lua"))
+    else {
+        return false;
+    };
+    let stem = stem
+        .strip_suffix(".server")
+        .or_else(|| stem.strip_suffix(".client"))
+        .unwrap_or(stem);
+    stem == "init"
+        || stem
+            .strip_prefix("init (")
+            .and_then(|inner| inner.strip_suffix(')'))
+            .is_some_and(|inner| !inner.is_empty())
 }
 
 fn plugin_directory(app: &AppHandle) -> Result<PathBuf, String> {
@@ -776,14 +720,22 @@ mod tests {
     }
 
     #[test]
-    fn projection_resolution_arguments_are_opaque_and_leaf_scoped() {
-        assert!(validate_projection_conflict_id("projection_0123456789abcdef").is_ok());
-        assert!(validate_projection_conflict_id("../escape").is_err());
-        assert!(validate_projection_conflict_id("").is_err());
-        assert!(validate_projection_candidate("init (vide).luau").is_ok());
-        assert!(validate_projection_candidate("init.luau").is_ok());
-        assert!(validate_projection_candidate("../init.luau").is_err());
-        assert!(validate_projection_candidate("nested/init.luau").is_err());
-        assert!(validate_projection_candidate("nested\\init.luau").is_err());
+    fn conflict_deletion_accepts_only_init_source_markers() {
+        for path in [
+            "/tmp/init.luau",
+            "/tmp/INIT.server.lua",
+            "/tmp/init (Package).luau",
+            "/tmp/init (UI).client.luau",
+        ] {
+            assert!(is_init_source_marker(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/tmp/Config.luau",
+            "/tmp/init (Package) [1].luau",
+            "/tmp/init ().luau",
+            "/tmp/init.luau.backup",
+        ] {
+            assert!(!is_init_source_marker(Path::new(path)), "{path}");
+        }
     }
 }

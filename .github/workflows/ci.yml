@@ -182,7 +182,6 @@ jobs:
           node scripts/check-plugin-reconnect-policy.mjs
           node scripts/check-activity-format.mjs
           node scripts/check-project-error-ux.mjs
-          node scripts/check-projection-repair-ux.mjs
           node scripts/check-theme-policy.mjs
 
       - name: Install plugin build tools

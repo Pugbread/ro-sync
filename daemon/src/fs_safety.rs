@@ -236,32 +236,18 @@ enum DirectoryPolicy {
 
 impl PortableDirectoryIndex {
     pub fn read(directory: &Path) -> io::Result<Self> {
-        Self::read_with_policy(directory, DirectoryPolicy::SyncedProjection, false)
-    }
-
-    /// Read one synced directory for the offline projection repair command.
-    ///
-    /// This preserves the normal no-link, regular-object, portability, case
-    /// collision, and directory-generation checks while allowing the exact
-    /// duplicate init-marker condition the repair command needs to inspect.
-    /// Callers must not use this relaxed index for normal projection reads.
-    pub fn read_for_projection_repair(directory: &Path) -> io::Result<Self> {
-        Self::read_with_policy(directory, DirectoryPolicy::SyncedProjection, true)
+        Self::read_with_policy(directory, DirectoryPolicy::SyncedProjection)
     }
 
     pub fn read_project_root(directory: &Path) -> io::Result<Self> {
-        Self::read_with_policy(directory, DirectoryPolicy::ProjectRoot, false)
+        Self::read_with_policy(directory, DirectoryPolicy::ProjectRoot)
     }
 
     pub fn read_raw(directory: &Path) -> io::Result<Self> {
-        Self::read_with_policy(directory, DirectoryPolicy::RawLookup, false)
+        Self::read_with_policy(directory, DirectoryPolicy::RawLookup)
     }
 
-    fn read_with_policy(
-        directory: &Path,
-        policy: DirectoryPolicy,
-        allow_multiple_init_sources: bool,
-    ) -> io::Result<Self> {
+    fn read_with_policy(directory: &Path, policy: DirectoryPolicy) -> io::Result<Self> {
         let metadata = require_metadata_no_follow(directory)?;
         if !metadata.is_dir() {
             return Err(invalid_data(format!(
@@ -332,8 +318,7 @@ impl PortableDirectoryIndex {
         let mut folded: HashMap<String, Vec<usize>> = HashMap::with_capacity(entries.len());
         let mut linked_exact = HashMap::with_capacity(linked.len());
         let mut linked_folded: HashMap<String, Vec<usize>> = HashMap::with_capacity(linked.len());
-        let mut init_source: Option<usize> = None;
-        let mut multiple_init_sources = false;
+        let mut init_source = None;
         for (index, entry) in entries.iter().enumerate() {
             exact.insert(entry.fragment.clone(), index);
             let folded_fragment = ascii_fold(&entry.fragment);
@@ -362,17 +347,7 @@ impl PortableDirectoryIndex {
                         entry.path.display()
                     )));
                 }
-                if multiple_init_sources {
-                    continue;
-                }
-                if let Some(previous) = init_source {
-                    if allow_multiple_init_sources {
-                        // `None` means the relaxed repair view must not expose
-                        // a false "unique" marker to accidental callers.
-                        init_source = None;
-                        multiple_init_sources = true;
-                        continue;
-                    }
+                if let Some(previous) = init_source.replace(index) {
                     return Err(invalid_data(format!(
                         "multiple init source markers in {}: {:?} and {:?}; keep exactly one source marker (use plain init.* for Wally/Rojo packages, or init (<Name>).* for a Ro Sync script-with-children directory)",
                         directory.display(),
@@ -380,7 +355,6 @@ impl PortableDirectoryIndex {
                         entry.fragment
                     )));
                 }
-                init_source = Some(index);
             }
         }
         for (index, entry) in linked.iter().enumerate() {
@@ -581,7 +555,7 @@ impl SyncedPathValidationCache {
             .is_some_and(|index| index.generation == current_generation);
         if !reusable {
             self.indices.remove(&key);
-            let index = PortableDirectoryIndex::read_with_policy(directory, policy, false)?;
+            let index = PortableDirectoryIndex::read_with_policy(directory, policy)?;
             self.indices.insert(key.clone(), index);
             #[cfg(test)]
             {
