@@ -536,6 +536,41 @@ export function buildDaemonCmd() {
   );
 }
 
+// Inspect or resolve startup-blocking filesystem projection conflicts without
+// starting the daemon. The renderer can only select an opaque conflict ID and
+// an exact candidate name; it never receives a generic shell or rename
+// primitive.
+export function projectionRepairCmd({ project, resolveId = null, keep = null }) {
+  const binaryPath = joinShell(WIDGET_DIR_SHELL, BINARY_REL);
+  const args = [
+    "repair",
+    "projection",
+    "--project",
+    String(project),
+    "--raw",
+  ];
+  if (resolveId != null) {
+    args.push("--resolve", String(resolveId));
+    if (keep != null && String(keep)) args.push("--keep", String(keep));
+  }
+
+  if (IS_WINDOWS) {
+    const psArgs = args.map(psQuote).join(", ");
+    return psEncodedCmd(
+      `$ErrorActionPreference = 'Stop'; ` +
+      `$bin = [Environment]::ExpandEnvironmentVariables(${psQuote(binaryPath)}); ` +
+      `if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) { ` +
+      `  throw ('Ro Sync CLI not found: ' + $bin) ` +
+      `}; ` +
+      `$argv = @(${psArgs}); ` +
+      `& $bin @argv; ` +
+      `exit $LASTEXITCODE`
+    );
+  }
+
+  return `${posixExpandQuote(binaryPath)} ${args.map(posixQuote).join(" ")}`;
+}
+
 // Parse the `___EXIT:<code>` tail emitted by buildDaemonCmd. Returns
 // `{ ok, code, log }` where `log` is the build output without the sentinel.
 export function parseBuildOutput(stdout) {

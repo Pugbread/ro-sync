@@ -4,11 +4,24 @@ import { daemonJson, daemonWS } from "../bridge.js";
 import { copyText, joinProjectFile, pathFromDrop } from "./runtime.js";
 import { pushActivity, renderActivityFeed } from "./activity-format.js";
 import { formatProjectFailure } from "./project-error.js";
+import {
+  buildProjectionLineDiff,
+  formatFileBytes,
+  markerStyleLabel,
+  normalizeProjectionReport,
+  shortHash,
+} from "./projection-repair.js";
 
 const MAX_PROJECT_LOG_LINES = 100;
 const MAX_PROJECT_PARSED_OPS_PER_SECOND = 20;
 const RAW_OP_RE = /"type"\s*:\s*"op"/;
 const DEFAULT_WALLY_FOLDER = "ReplicatedStorage/Assets/Packages";
+// Offline repair state outlives a disposable Projects view mount. A user can
+// navigate away while the non-cancellable host command is still committing;
+// its eventual recovery result must still lock serving when they return.
+const projectionRepairByProject = new Map();
+const projectionInspectSequence = new Map();
+const projectionRecoveryRequiredProjects = new Set();
 const DEFAULT_WALLY_FILE = `[package]
 name = "game/project"
 version = "0.1.0"
@@ -155,6 +168,31 @@ export function mountProjects(root, api) {
   const announcedFailureByProject = new Map();
   const openFailureDetailsByProject = new Set();
 
+  function projectionFailureKey(failure) {
+    return `${failure?.code || ""}\u0000${normalizeRepairPath(failure?.path)}`;
+  }
+
+  function clearProjectionRepair(projectId) {
+    projectionRepairByProject.delete(projectId);
+    projectionInspectSequence.set(
+      projectId,
+      (projectionInspectSequence.get(projectId) || 0) + 1,
+    );
+  }
+
+  function projectionRepairLocksDaemon(projectId) {
+    return projectionRepairByProject.has(projectId)
+      || projectionRecoveryRequiredProjects.has(projectId);
+  }
+
+  function publishProjectionRepairState(projectId) {
+    if (disposed) {
+      api.emitBus?.("projection:repair-state", { projectId });
+    } else {
+      renderDetail();
+    }
+  }
+
   if (api.host.isDesktop) {
     $path.readOnly = true;
     $path.placeholder = "Choose a project folder with Browse…";
@@ -249,6 +287,8 @@ export function mountProjects(root, api) {
       const initials = leafInitials(p.name || basename(p.path));
       const projectIsServing = isServing(p.id);
       const projectIsStarting = startingProjects.has(p.id);
+      const repairIsResolving = projectionRepairByProject.get(p.id)?.status === "resolving";
+      const repairBlocksStart = !projectIsServing && projectionRepairLocksDaemon(p.id);
       const st = statusFor(p);
       const dupeGroups = (snapshotByProject.get(p.id) || {}).dupeGroups || 0;
 
@@ -258,8 +298,8 @@ export function mountProjects(root, api) {
           <span class="name"></span>
           <span class="path"></span>
         </div>
-        <label class="switch toggle" title="${projectIsStarting ? "Daemon is starting" : (projectIsServing ? "Stop serving" : "Start serving")}" data-act="serve-wrap">
-          <input type="checkbox" data-act="serve" ${projectIsServing ? "checked" : ""} ${projectIsStarting ? 'disabled aria-busy="true"' : ""} aria-label="Serve this project" />
+        <label class="switch toggle" title="${repairIsResolving ? "Offline repair is in progress" : (repairBlocksStart ? "Review the saved recovery receipt before serving" : (projectIsStarting ? "Daemon is starting" : (projectIsServing ? "Stop serving" : "Start serving")))}" data-act="serve-wrap">
+          <input type="checkbox" data-act="serve" ${projectIsServing ? "checked" : ""} ${projectIsStarting || repairIsResolving || repairBlocksStart ? `disabled${projectIsStarting ? ' aria-busy="true"' : ""}` : ""} aria-label="Serve this project" />
           <span class="switch-track"><span class="switch-thumb"></span></span>
         </label>
         <div class="chips">
@@ -306,9 +346,16 @@ export function mountProjects(root, api) {
       if (priorDetails.open) openFailureDetailsByProject.add(priorProjectId);
       else openFailureDetailsByProject.delete(priorProjectId);
     }
-    const activeDetailControl = $detail.contains(document.activeElement)
-      ? document.activeElement?.dataset?.errorAct || null
+    const activeElement = $detail.contains(document.activeElement)
+      ? document.activeElement
       : null;
+    const activeDetailControl = [
+      "errorAct",
+      "repairAct",
+      "repairChoose",
+      "repairConflict",
+    ].map((key) => [key, activeElement?.dataset?.[key]])
+      .find(([, value]) => value != null) || null;
     const s = api.getState();
     const projects = s.projects || [];
     const p = projects.find((x) => x.id === selectedId)
@@ -343,7 +390,17 @@ export function mountProjects(root, api) {
     const failure = st.kind === "err"
       ? (st.failure || formatProjectFailure(st.detail || st.label, p.path))
       : null;
+    let projectionRepair = projectionRepairByProject.get(p.id) || null;
     const failureKey = failure ? `${failure.code}\u0000${failure.diagnostic}` : "";
+    const repairFailureKey = failure ? projectionFailureKey(failure) : "";
+    if (
+      projectionRepair
+      && !["resolving", "recovery"].includes(projectionRepair.status)
+      && (!failure || projectionRepair.failureKey !== repairFailureKey)
+    ) {
+      clearProjectionRepair(p.id);
+      projectionRepair = null;
+    }
     const announceFailure = !!failure && announcedFailureByProject.get(p.id) !== failureKey;
     if (failure) announcedFailureByProject.set(p.id, failureKey);
     else announcedFailureByProject.delete(p.id);
@@ -362,7 +419,13 @@ export function mountProjects(root, api) {
         ${api.host.supports.spawnSession ? `<button class="detail-icon-btn" data-act="spawn-session" type="button" title="Spawn Session" aria-label="Spawn Session">${sessionSVG()}<span>Spawn Session</span></button>` : ""}
         <button class="detail-icon-btn" data-act="edit" type="button" title="Edit project" aria-label="Edit project">${editSVG()}<span>Edit</span></button>
       </div>
-      ${failure ? projectFailureMarkup(failure, announceFailure) : ""}
+      ${failure ? projectFailureMarkup(
+        failure,
+        announceFailure,
+        projectionRepair,
+        projectionRepairLocksDaemon(p.id),
+      ) : ""}
+      ${failure && projectionRepair ? projectionRepairMarkup(projectionRepair, failure) : ""}
       <div class="project-log-shell">
         <div class="project-log-head">
           <span>Recent actions</span>
@@ -383,7 +446,10 @@ export function mountProjects(root, api) {
       });
     }
     if (priorProjectId === p.id && activeDetailControl) {
-      $detail.querySelector(`[data-error-act="${activeDetailControl}"]`)?.focus({ preventScroll: true });
+      const [datasetKey, value] = activeDetailControl;
+      const attribute = datasetKey.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+      const escapedValue = String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      $detail.querySelector(`[data-${attribute}="${escapedValue}"]`)?.focus({ preventScroll: true });
     }
 
     $detail.querySelector('[data-act="back"]').addEventListener("click", () => {
@@ -408,6 +474,9 @@ export function mountProjects(root, api) {
     $detail.querySelector('[data-error-act="open"]')?.addEventListener("click", () => {
       openFolder(failure.path || p.path);
     });
+    $detail.querySelector('[data-error-act="repair"]')?.addEventListener("click", () => {
+      inspectProjectionConflicts(p, failure);
+    });
     $detail.querySelector('[data-error-act="retry"]')?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -415,6 +484,7 @@ export function mountProjects(root, api) {
       button.textContent = "Retrying…";
       await serve(p.id, { restart: true });
     });
+    bindProjectionRepairActions(p, failure);
     renderActivityLog();
   }
 
@@ -782,6 +852,9 @@ export function mountProjects(root, api) {
     api.reportDaemonFailure?.(id, null);
     announcedFailureByProject.delete(id);
     openFailureDetailsByProject.delete(id);
+    projectionRepairByProject.delete(id);
+    projectionInspectSequence.delete(id);
+    projectionRecoveryRequiredProjects.delete(id);
     if (editingId === id) editingId = null;
     if (selectedId === id) selectedId = (next[0] && next[0].id) || null;
     $workspace.dataset.mode = "list";
@@ -790,6 +863,11 @@ export function mountProjects(root, api) {
 
   async function serve(id, { restart = false } = {}) {
     if (startingProjects.has(id)) return;
+    if (projectionRepairLocksDaemon(id)) {
+      api.toast("Finish or review the offline repair before starting the daemon.");
+      render();
+      return;
+    }
     startingProjects.add(id);
     api.setState({ activeProjectId: id });
     selectedId = id;
@@ -831,8 +909,328 @@ export function mountProjects(root, api) {
     }
   }
 
+  async function inspectProjectionConflicts(project, failure, notice = "") {
+    if (projectionRepairByProject.get(project.id)?.status === "resolving") return;
+    const failureKey = projectionFailureKey(failure);
+    const sequence = (projectionInspectSequence.get(project.id) || 0) + 1;
+    projectionInspectSequence.set(project.id, sequence);
+    projectionRepairByProject.set(project.id, {
+      status: "loading",
+      report: null,
+      currentId: "",
+      selectedKeep: "",
+      error: "",
+      notice,
+      failureKey,
+    });
+    renderDetail();
+    try {
+      if (typeof api.suspendProjectForRepair !== "function") {
+        throw new Error("This Ro Sync host cannot safely pause automatic daemon retries.");
+      }
+      const suspended = await api.suspendProjectForRepair(project.id);
+      if (!suspended) {
+        throw new Error("Ro Sync could not pause automatic daemon retries for this project.");
+      }
+      const raw = await api.host.projectionInspect(project.path);
+      if (projectionInspectSequence.get(project.id) !== sequence) return;
+      const report = normalizeProjectionReport(raw);
+      if (!report.ok) {
+        if (report.resolution?.recoveryRequired) {
+          projectionRecoveryRequiredProjects.add(project.id);
+          projectionRepairByProject.set(project.id, {
+            status: "recovery",
+            report,
+            currentId: "",
+            selectedKeep: "",
+            error: report.resolution.recoveryError
+              || report.error
+              || "Ro Sync found a prior repair that still requires recovery.",
+            notice: "",
+            failureKey,
+          });
+        } else {
+          projectionRepairByProject.set(project.id, {
+            status: "error",
+            report,
+            currentId: "",
+            selectedKeep: "",
+            error: report.error || "Ro Sync could not inspect this projection.",
+            notice: "",
+            failureKey,
+          });
+        }
+      } else {
+        const current = chooseProjectionConflict(report, failure);
+        if (
+          report.countsKnown
+          && !report.truncated
+          && report.conflicts.length === 0
+          && report.remaining === 0
+          && report.totalConflicts === 0
+        ) {
+          projectionRecoveryRequiredProjects.delete(project.id);
+        }
+        projectionRepairByProject.set(project.id, {
+          status: "ready",
+          report,
+          currentId: current?.id || "",
+          selectedKeep: "",
+          error: "",
+          notice,
+          failureKey,
+        });
+      }
+    } catch (error) {
+      if (projectionInspectSequence.get(project.id) !== sequence) return;
+      projectionRepairByProject.set(project.id, {
+        status: "error",
+        report: null,
+        currentId: "",
+        selectedKeep: "",
+        error: error?.message || String(error),
+        notice: "",
+        failureKey,
+      });
+    }
+    if (projectionInspectSequence.get(project.id) === sequence) {
+      publishProjectionRepairState(project.id);
+    }
+  }
+
+  async function resolveProjectionConflict(project, failure, conflict, keep) {
+    const currentState = projectionRepairByProject.get(project.id);
+    if (!currentState || currentState.status === "resolving") return;
+    const sequence = (projectionInspectSequence.get(project.id) || 0) + 1;
+    projectionInspectSequence.set(project.id, sequence);
+    projectionRepairByProject.set(project.id, {
+      ...currentState,
+      status: "resolving",
+      error: "",
+    });
+    renderDetail();
+    try {
+      const raw = await api.host.projectionResolve(project.path, conflict.id, keep || null);
+      if (projectionInspectSequence.get(project.id) !== sequence) return;
+      const report = normalizeProjectionReport(raw);
+      if (!report.ok) {
+        if (report.resolution?.recoveryRequired) {
+          projectionRecoveryRequiredProjects.add(project.id);
+          projectionRepairByProject.set(project.id, {
+            status: "recovery",
+            report,
+            currentId: "",
+            selectedKeep: "",
+            error: report.resolution.recoveryError
+              || report.error
+              || "Ro Sync preserved a recovery receipt because the repair could not be proven complete.",
+            notice: "",
+            failureKey: currentState.failureKey,
+          });
+          api.toast("Repair paused safely. Review the recovery receipt before retrying the daemon.");
+          publishProjectionRepairState(project.id);
+          return;
+        }
+        const stale = /stale|changed|no longer|not found/i.test(
+          `${report.code} ${report.error}`,
+        );
+        if (stale) {
+          if (disposed) {
+            projectionRepairByProject.set(project.id, {
+              ...currentState,
+              status: "error",
+              selectedKeep: "",
+              error: "The files changed while this review was open. Inspect them again before resolving.",
+            });
+            publishProjectionRepairState(project.id);
+            return;
+          }
+          projectionRepairByProject.set(project.id, {
+            ...currentState,
+            status: "ready",
+            selectedKeep: "",
+            error: "",
+          });
+          await inspectProjectionConflicts(
+            project,
+            failure,
+            "The files changed while this review was open, so Ro Sync refreshed them without moving anything.",
+          );
+          return;
+        }
+        const preserveRecovery = currentState.status === "recovery";
+        projectionRepairByProject.set(project.id, {
+          ...currentState,
+          status: preserveRecovery ? "recovery" : "ready",
+          report: currentState.report,
+          selectedKeep: "",
+          confirmQuarantine: false,
+          error: report.error || "Ro Sync could not complete the repair.",
+        });
+        publishProjectionRepairState(project.id);
+        return;
+      }
+
+      const archived = report.resolution?.backupPaths?.length || 0;
+      const resumedRecovery = currentState.status === "recovery";
+      const resolutionNotice = resumedRecovery
+        ? keep === "quarantine"
+          ? "The broken recovery record was quarantined. Source files were not changed by that action."
+          : "The durable recovery decision was replayed and verified."
+        : archived > 0
+          ? `${archived === 1 ? "The other file was" : `${archived} files were`} archived under .rosync-backups. Nothing was deleted.`
+          : "The filename was migrated without changing the script source.";
+      const projectionIsProvenClean = report.countsKnown
+        && !report.truncated
+        && report.conflicts.length === 0
+        && report.remaining === 0
+        && report.totalConflicts === 0;
+      if (projectionIsProvenClean) {
+        projectionRecoveryRequiredProjects.delete(project.id);
+        clearProjectionRepair(project.id);
+        api.toast(`${resolutionNotice} Retrying the daemon…`);
+        await serve(project.id, { restart: true });
+        return;
+      }
+
+      const next = chooseProjectionConflict(report, failure);
+      projectionRepairByProject.set(project.id, {
+        status: "ready",
+        report,
+        currentId: next?.id || "",
+        selectedKeep: "",
+        error: "",
+        notice: resolutionNotice,
+        failureKey: currentState.failureKey,
+      });
+      api.toast(`Resolved. ${report.remaining} startup ${report.remaining === 1 ? "blocker remains" : "blockers remain"}.`);
+      publishProjectionRepairState(project.id);
+    } catch (error) {
+      if (projectionInspectSequence.get(project.id) !== sequence) return;
+      const message = error?.message || String(error);
+      projectionRecoveryRequiredProjects.add(project.id);
+      projectionRepairByProject.set(project.id, {
+        status: "recovery",
+        report: {
+          ok: false,
+          code: "PROJECTION_RESULT_UNVERIFIED",
+          error: message,
+          conflicts: [],
+          remaining: 0,
+          totalConflicts: 0,
+          countsKnown: false,
+          truncated: true,
+          resolution: {
+            receiptPath: "",
+            receiptAvailable: false,
+            recoveryRequired: true,
+            recoveryError: message,
+          },
+        },
+        currentId: "",
+        selectedKeep: "",
+        error: `Ro Sync lost the final repair result: ${message}`,
+        notice: "",
+        failureKey: currentState.failureKey,
+      });
+      api.toast("Repair outcome is unverified. Automatic daemon retries remain paused.");
+      publishProjectionRepairState(project.id);
+    }
+  }
+
+  function bindProjectionRepairActions(project, failure) {
+    const state = projectionRepairByProject.get(project.id);
+    if (!state) return;
+    const conflict = currentProjectionConflict(state, failure);
+
+    $detail.querySelector('[data-repair-act="refresh"]')?.addEventListener("click", () => {
+      inspectProjectionConflicts(project, failure);
+    });
+    $detail.querySelector('[data-repair-act="close"]')?.addEventListener("click", () => {
+      if (state.status === "resolving") return;
+      clearProjectionRepair(project.id);
+      renderDetail();
+    });
+    $detail.querySelector('[data-repair-act="open-backup"]')?.addEventListener("click", () => {
+      openFolder(joinProjectFile(project.path, ".rosync-backups"));
+    });
+    $detail.querySelector('[data-repair-act="resume-recovery"]')?.addEventListener("click", () => {
+      const recoveryId = state.report?.resolution?.id;
+      if (!recoveryId || state.status === "resolving") return;
+      resolveProjectionConflict(project, failure, { id: recoveryId }, null);
+    });
+    $detail.querySelector('[data-repair-act="quarantine-recovery"]')?.addEventListener("click", () => {
+      if (state.status === "resolving") return;
+      projectionRepairByProject.set(project.id, {
+        ...state,
+        confirmQuarantine: true,
+      });
+      renderDetail();
+    });
+    $detail.querySelector('[data-repair-act="cancel-quarantine"]')?.addEventListener("click", () => {
+      projectionRepairByProject.set(project.id, {
+        ...state,
+        confirmQuarantine: false,
+      });
+      renderDetail();
+    });
+    $detail.querySelector('[data-repair-act="confirm-quarantine"]')?.addEventListener("click", () => {
+      const recoveryId = state.report?.resolution?.id;
+      if (!recoveryId || state.status === "resolving") return;
+      resolveProjectionConflict(project, failure, { id: recoveryId }, "quarantine");
+    });
+    $detail.querySelectorAll("[data-repair-conflict]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (state.status === "resolving") return;
+        const next = state.report?.conflicts?.[Number(button.dataset.repairConflict)];
+        if (!next) return;
+        projectionRepairByProject.set(project.id, {
+          ...state,
+          currentId: next.id,
+          selectedKeep: "",
+          error: "",
+        });
+        renderDetail();
+      });
+    });
+    $detail.querySelectorAll("[data-repair-choose]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (state.status === "resolving") return;
+        const file = conflict?.files?.[Number(button.dataset.repairChoose)];
+        if (!file) return;
+        projectionRepairByProject.set(project.id, {
+          ...state,
+          selectedKeep: file.name,
+          error: "",
+        });
+        renderDetail();
+      });
+    });
+    $detail.querySelector('[data-repair-act="cancel-choice"]')?.addEventListener("click", () => {
+      if (state.status === "resolving") return;
+      projectionRepairByProject.set(project.id, {
+        ...state,
+        selectedKeep: "",
+        error: "",
+      });
+      renderDetail();
+    });
+    $detail.querySelector('[data-repair-act="confirm"]')?.addEventListener("click", () => {
+      if (!conflict || !state.selectedKeep) return;
+      resolveProjectionConflict(project, failure, conflict, state.selectedKeep);
+    });
+    $detail.querySelector('[data-repair-act="migrate"]')?.addEventListener("click", () => {
+      if (!conflict) return;
+      resolveProjectionConflict(project, failure, conflict, conflict.files?.[0]?.name || null);
+    });
+  }
+
   async function stopServing(id) {
     if (!isServing(id)) { render(); return; }
+    if (projectionRepairByProject.get(id)?.status === "resolving") {
+      api.toast("Wait for the offline repair to finish before changing daemon state.");
+      return;
+    }
     try {
       if (typeof api.stopProject === "function") await api.stopProject(id);
       else if (typeof api.killDaemon === "function") await api.killDaemon(id);
@@ -843,6 +1241,7 @@ export function mountProjects(root, api) {
     startErrorByProject.delete(id);
     terminalFailureProjects.delete(id);
     api.reportDaemonFailure?.(id, null);
+    clearProjectionRepair(id);
     render();
     await refreshStatuses();
   }
@@ -1414,13 +1813,16 @@ export function mountProjects(root, api) {
   const offPluginState = api.onBus("plugin:state", (event = {}) => {
     handlePluginState(event);
   });
+  const offProjectionRepair = api.onBus("projection:repair-state", (event = {}) => {
+    if (!event.projectId || event.projectId === selectedId) render();
+  });
 
   render();
   refreshStatuses();
 
   return () => {
     disposed = true;
-    offState(); offUp(); offDown(); offPluginShutdown(); offPluginState();
+    offState(); offUp(); offDown(); offPluginShutdown(); offPluginState(); offProjectionRepair();
     if (activityRaf) cancelAnimationFrame(activityRaf);
     if (skippedActivityTimer) clearTimeout(skippedActivityTimer);
     closeActivityStream();
@@ -1477,8 +1879,17 @@ function escapeHTML(s) {
   }[c]));
 }
 
-function projectFailureMarkup(failure, announce = true) {
+function projectFailureMarkup(
+  failure,
+  announce = true,
+  repairState = null,
+  daemonLocked = false,
+) {
   const isMigration = failure.code === "legacy-init-leaf";
+  const isRecovery = failure.code === "projection-recovery-required";
+  const isRepairable = failure.code === "multiple-init-markers"
+    || isMigration
+    || isRecovery;
   const fileList = failure.files?.length
     ? `<div class="project-error-files" aria-label="${isMigration ? "Required filename migration" : "Conflicting files"}">
         ${failure.files.map((file) => `<code>${escapeHTML(file)}</code>`).join(`<span aria-hidden="true">${isMigration ? "→" : "or"}</span>`)}
@@ -1487,6 +1898,24 @@ function projectFailureMarkup(failure, announce = true) {
   const openLabel = failure.code === "multiple-init-markers" || isMigration
     ? "Open conflict folder"
     : "Open project folder";
+  const repairLabel = isMigration
+    ? "Fix filename offline"
+    : isRecovery
+      ? "Review recovery"
+      : "Compare & resolve";
+  const repairBusy = repairState?.status === "loading" || repairState?.status === "resolving";
+  const repairLocksDaemon = daemonLocked
+    || repairState?.status === "resolving"
+    || repairState?.status === "recovery";
+  const repairButton = isRepairable
+    ? `<button type="button" class="primary" data-error-act="repair" ${repairBusy ? 'disabled aria-busy="true"' : ""}>${
+        repairState?.status === "loading"
+          ? "Inspecting…"
+          : repairState?.status === "resolving"
+            ? "Resolving…"
+            : repairLabel
+      }</button>`
+    : "";
   return `
     <section class="project-error" role="${announce ? "alert" : "region"}" ${announce ? 'aria-live="assertive"' : 'aria-label="Project startup error"'} data-error-code="${escapeHTML(failure.code)}">
       <div class="project-error-main">
@@ -1499,7 +1928,8 @@ function projectFailureMarkup(failure, announce = true) {
       <p class="project-error-guidance">${escapeHTML(failure.guidance)}</p>
       ${fileList}
       <div class="project-error-actions">
-        <button type="button" class="primary" data-error-act="retry">Retry daemon</button>
+        ${repairButton}
+        <button type="button" class="${isRepairable ? "" : "primary"}" data-error-act="retry" ${repairLocksDaemon ? `disabled${repairState?.status === "resolving" ? ' aria-busy="true"' : ""}` : ""}>Retry daemon</button>
         <button type="button" data-error-act="open">${openLabel}</button>
         <button type="button" data-error-act="copy">Copy diagnostic</button>
       </div>
@@ -1510,6 +1940,325 @@ function projectFailureMarkup(failure, announce = true) {
         </summary>
         <pre><code>${escapeHTML(failure.diagnostic)}</code></pre>
       </details>
+    </section>
+  `;
+}
+
+function normalizeRepairPath(path) {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/\/+$/, "");
+}
+
+function chooseProjectionConflict(report, failure, preferredId = "") {
+  const conflicts = report?.conflicts || [];
+  if (preferredId) {
+    const preferred = conflicts.find((conflict) => conflict.id === preferredId);
+    if (preferred) return preferred;
+  }
+  const expectedKind = failure?.code === "legacy-init-leaf"
+    ? "legacy-reserved-init-leaf"
+    : failure?.code;
+  const failurePath = normalizeRepairPath(failure?.path);
+  return conflicts.find((conflict) => {
+    if (expectedKind && conflict.kind !== expectedKind) return false;
+    const directory = normalizeRepairPath(conflict.directory);
+    return !failurePath || !directory
+      || failurePath === directory
+      || failurePath.endsWith(`/${directory}`);
+  }) || conflicts.find((conflict) => conflict.kind === expectedKind) || conflicts[0] || null;
+}
+
+function currentProjectionConflict(state, failure) {
+  return chooseProjectionConflict(state?.report, failure, state?.currentId);
+}
+
+function projectionDiffPane(rows, side, file) {
+  if (!file?.utf8) {
+    return `<div class="projection-code-empty">Preview unavailable — this source is not valid UTF-8.</div>`;
+  }
+  return `
+    <div class="projection-code" role="region" aria-label="${escapeHTML(file.name)} source preview" tabindex="0">
+      ${rows.map((row) => {
+        const line = row[side];
+        if (!line) {
+          return `<div class="projection-code-line is-blank" aria-hidden="true"><span></span><code> </code></div>`;
+        }
+        return `<div class="projection-code-line is-${line.kind}">
+          <span aria-hidden="true">${line.number}</span>
+          <code>${escapeHTML(line.text || " ")}</code>
+        </div>`;
+      }).join("")}
+    </div>
+  `;
+}
+
+function projectionSinglePreview(file) {
+  const lines = String(file?.preview || "").split(/\r?\n/).slice(0, 240);
+  const rows = lines.map((line, index) => ({
+    left: { number: index + 1, text: line, kind: "same" },
+  }));
+  return projectionDiffPane(rows, "left", file);
+}
+
+function projectionFileCard(file, index, state, diffRows = null, side = "left", choose = true) {
+  const selected = state.selectedKeep === file.name;
+  const preview = diffRows
+    ? projectionDiffPane(diffRows, side, file)
+    : projectionSinglePreview(file);
+  return `
+    <article class="projection-file ${selected ? "is-selected" : ""}">
+      <header class="projection-file-head">
+        <div class="projection-file-title">
+          <code>${escapeHTML(file.name)}</code>
+          <span>${escapeHTML(markerStyleLabel(file.style))}</span>
+        </div>
+        <div class="projection-file-meta">
+          <span>${escapeHTML(file.className)}</span>
+          <span>${escapeHTML(formatFileBytes(file.size))}</span>
+          <span title="${escapeHTML(file.sha256)}">sha ${escapeHTML(shortHash(file.sha256))}</span>
+        </div>
+      </header>
+      ${preview}
+      ${file.previewTruncated ? `<div class="projection-preview-note">Preview truncated · full file protected by SHA-256</div>` : ""}
+      ${choose ? `<button type="button" class="${selected ? "primary" : ""}" data-repair-choose="${index}" aria-pressed="${selected}" ${state.status === "resolving" ? "disabled" : ""}>
+        ${selected ? checkSVG() : ""}<span>${selected ? "Selected" : `Keep ${escapeHTML(file.name)}`}</span>
+      </button>` : ""}
+    </article>
+  `;
+}
+
+function projectionRepairMarkup(state, failure) {
+  if (state.status === "loading") {
+    return `
+      <section class="projection-repair is-loading" aria-live="polite" aria-busy="true">
+        <div class="projection-repair-kicker"><span class="dot dot-idle"></span>Offline repair</div>
+        <h2>Inspecting the disk projection…</h2>
+        <p>The daemon and Roblox Studio can stay closed while Ro Sync reads these files.</p>
+        <div class="projection-loading-bar" aria-hidden="true"></div>
+      </section>
+    `;
+  }
+
+  if (state.status === "error") {
+    return `
+      <section class="projection-repair is-error" role="alert">
+        <div class="projection-repair-kicker"><span class="dot dot-err"></span>Offline repair</div>
+        <h2>Ro Sync could not inspect this conflict</h2>
+        <p>${escapeHTML(state.error || "The projection inspection failed.")}</p>
+        <div class="projection-repair-actions">
+          <button type="button" class="primary" data-repair-act="refresh">Try inspection again</button>
+          <button type="button" data-repair-act="close">Close</button>
+        </div>
+      </section>
+    `;
+  }
+
+  if (state.status === "recovery") {
+    const resolution = state.report?.resolution || {};
+    const receiptAvailable = resolution.receiptAvailable === true;
+    const receiptPath = resolution.receiptPath || "";
+    const recoveryId = resolution.id || "";
+    const recoveryActions = new Set(resolution.recoveryActions || []);
+    const canResume = !!recoveryId && recoveryActions.has("resume");
+    const canQuarantine = !!recoveryId && recoveryActions.has("quarantine");
+    const recoveryGuidance = canResume
+      ? "Resume replays the already-recorded decision, verifies every source and destination hash, and refuses ambiguous state."
+      : canQuarantine
+        ? "The transaction cannot be replayed. After reviewing the folder, you may quarantine only its broken recovery record; Ro Sync will still require a complete clean projection scan."
+        : "This recovery record has no safe automated action. Review the backup and conflicting files before trying a newer Ro Sync build or the CLI.";
+    return `
+      <section class="projection-repair is-error projection-repair-recovery" role="alert">
+        <div class="projection-repair-kicker"><span class="dot dot-err"></span>Recovery required</div>
+        <h2>The repair stopped before Ro Sync could prove the final state</h2>
+        <p>${escapeHTML(state.error || (
+          receiptAvailable
+            ? "Ro Sync preserved a recovery receipt for the uncertain transaction."
+            : "Ro Sync could not prove that its recovery receipt is still reachable from this project path."
+        ))}</p>
+        <div class="projection-recovery-receipt">
+          <span>Recovery receipt</span>
+          <code>${receiptAvailable && receiptPath
+            ? escapeHTML(receiptPath)
+            : "Unavailable — inspect the backup root and conflicting folder manually"}</code>
+        </div>
+        <p>Ro Sync will not retry the daemon from this state. ${escapeHTML(recoveryGuidance)}</p>
+        ${state.confirmQuarantine ? `
+          <div class="projection-confirm is-danger" role="group" aria-label="Confirm recovery record quarantine">
+            <div>
+              <strong>Quarantine only this recovery record?</strong>
+              <span>This does not restore or delete source files. Ro Sync will move the transaction record aside, rescan the whole projection, and keep the daemon stopped unless that scan is proven clean.</span>
+            </div>
+            <div class="projection-confirm-actions">
+              <button type="button" data-repair-act="cancel-quarantine">Cancel</button>
+              <button type="button" class="danger" data-repair-act="confirm-quarantine">Quarantine &amp; rescan</button>
+            </div>
+          </div>
+        ` : ""}
+        <div class="projection-repair-actions">
+          ${canResume ? `<button type="button" class="primary" data-repair-act="resume-recovery">Resume verified repair</button>` : ""}
+          <button type="button" class="${canResume ? "" : "primary"}" data-repair-act="open-backup">Open recovery folder</button>
+          ${canQuarantine && !state.confirmQuarantine ? `<button type="button" class="danger" data-repair-act="quarantine-recovery">Quarantine record…</button>` : ""}
+          <button type="button" data-repair-act="refresh">Refresh recovery</button>
+          <button type="button" data-repair-act="close">Close</button>
+        </div>
+      </section>
+    `;
+  }
+
+  const report = state.report;
+  const conflict = currentProjectionConflict(state, failure);
+  if (!conflict) {
+    if (report?.truncated || report?.remaining > 0) {
+      return `
+        <section class="projection-repair is-error" role="alert">
+          <div class="projection-repair-kicker"><span class="dot dot-warn"></span>Offline repair</div>
+          <h2>${escapeHTML(String(report.remaining || report.totalConflicts || "More"))} startup blockers could not be displayed</h2>
+          <p>Ro Sync kept the daemon stopped because this report is incomplete. Refresh after updating Ro Sync or review the project from the CLI.</p>
+          <div class="projection-repair-actions">
+            <button type="button" class="primary" data-repair-act="refresh">Refresh inspection</button>
+            <button type="button" data-repair-act="close">Close</button>
+          </div>
+        </section>
+      `;
+    }
+    return `
+      <section class="projection-repair" aria-live="polite">
+        <div class="projection-repair-kicker"><span class="dot dot-ok"></span>Offline repair</div>
+        <h2>No projection blockers were found</h2>
+        <p>The files may have changed since the startup error. Retry the daemon, or refresh this check.</p>
+        <div class="projection-repair-actions">
+          <button type="button" data-repair-act="refresh">Refresh inspection</button>
+          <button type="button" data-repair-act="close">Close</button>
+        </div>
+      </section>
+    `;
+  }
+
+  const isLegacy = conflict.kind === "legacy-reserved-init-leaf";
+  const files = conflict.files || [];
+  const currentIndex = Math.max(0, report.conflicts.findIndex((item) => item.id === conflict.id));
+  const classesDiffer = new Set(files.map((file) => file.className)).size > 1;
+  const filesTruncated = !!conflict.filesTruncated;
+  const blockerTotal = report.totalConflicts || report.conflicts.length;
+  const liveStatus = state.notice
+    || (state.selectedKeep
+      ? `${state.selectedKeep} selected. Confirmation is available.`
+      : `Viewing startup blocker ${currentIndex + 1} of ${blockerTotal}.`);
+  const relation = conflict.identical && !classesDiffer
+    ? `<div class="projection-relation is-identical">${checkSVG()}<span>The source bytes are identical. Choosing a layout will not change the code.</span></div>`
+    : conflict.identical
+      ? `<div class="projection-relation is-warning">${alertSVG()}<span>The source bytes match, but the script classes differ. Choose the intended class.</span></div>`
+      : !isLegacy
+        ? `<div class="projection-relation is-warning">${alertSVG()}<span>These sources differ. Ro Sync will not guess which one you intended.</span></div>`
+        : "";
+  const completenessWarning = filesTruncated
+    ? `<div class="projection-repair-error" role="alert">This conflict has more marker files than the renderer can safely display. Refresh after updating Ro Sync; resolution is disabled.</div>`
+    : "";
+  const reportPageWarning = report.truncated
+    ? `<div class="projection-relation is-warning">${alertSVG()}<span>Showing ${report.conflicts.length} of ${blockerTotal} blockers. Ro Sync will reveal the next page after a visible blocker is resolved.</span></div>`
+    : "";
+
+  let body = "";
+  if (isLegacy) {
+    const sourceName = basename(conflict.sourcePath || files[0]?.name || "");
+    const targetName = basename(conflict.canonicalPath || "");
+    body = `
+      <div class="projection-rename">
+        <code>${escapeHTML(sourceName)}</code>
+        <span aria-hidden="true">→</span>
+        <code>${escapeHTML(targetName)}</code>
+      </div>
+      ${files[0] ? projectionFileCard(files[0], 0, state, null, "left", false) : ""}
+      <div class="projection-confirm">
+        <div>
+          <strong>Preserve the script; fix only its disk spelling</strong>
+          <span>The escaped filename still maps to the same Roblox script name.</span>
+        </div>
+        <button type="button" class="primary" data-repair-act="migrate" ${state.status === "resolving" ? 'disabled aria-busy="true"' : ""}>
+          ${state.status === "resolving" ? "Renaming…" : "Rename safely"}
+        </button>
+      </div>
+    `;
+  } else {
+    const firstTwo = files.slice(0, 2);
+    const diff = firstTwo.length === 2
+      ? buildProjectionLineDiff(firstTwo[0].preview, firstTwo[1].preview)
+      : null;
+    const cards = files.map((file, index) => projectionFileCard(
+      file,
+      index,
+      state,
+      index < 2 ? diff?.rows : null,
+      index === 1 ? "right" : "left",
+      !filesTruncated,
+    )).join("");
+    const otherNames = files
+      .filter((file) => file.name !== state.selectedKeep)
+      .map((file) => file.name);
+    body = `
+      ${relation}
+      ${completenessWarning}
+      <div class="projection-files-grid">${cards}</div>
+      ${diff?.approximate ? `<div class="projection-preview-note">Large preview: showing a bounded positional comparison.</div>` : ""}
+      ${diff?.truncated ? `<div class="projection-preview-note">Only the first 240 preview lines are rendered.</div>` : ""}
+      ${state.selectedKeep && !filesTruncated ? `
+        <div class="projection-confirm" role="group" aria-label="Confirm conflict resolution">
+          <div>
+            <strong>Keep ${escapeHTML(state.selectedKeep)}</strong>
+            <span>${otherNames.length === 1
+              ? `${escapeHTML(otherNames[0])} will be moved to .rosync-backups.`
+              : `${otherNames.length} other markers will be moved to .rosync-backups.`} Nothing is deleted.</span>
+          </div>
+          <div class="projection-confirm-actions">
+            <button type="button" data-repair-act="cancel-choice" ${state.status === "resolving" ? "disabled" : ""}>Cancel</button>
+            <button type="button" class="primary" data-repair-act="confirm" ${state.status === "resolving" ? 'disabled aria-busy="true"' : ""}>
+              ${state.status === "resolving" ? "Archiving…" : "Archive other & continue"}
+            </button>
+          </div>
+        </div>
+      ` : ""}
+    `;
+  }
+
+  return `
+    <section class="projection-repair">
+      <span class="sr-only" role="status" aria-live="polite" aria-atomic="true">${escapeHTML(liveStatus)}</span>
+      <header class="projection-repair-head">
+        <div>
+          <div class="projection-repair-kicker"><span class="dot dot-warn"></span>Offline repair · blocker ${currentIndex + 1} of ${blockerTotal}</div>
+          <h2>${isLegacy
+            ? "Escape this literal script filename"
+            : `Choose the source for ${escapeHTML(basename(conflict.directory))}`}</h2>
+          <p>${isLegacy
+            ? "This is a deterministic filename migration; the source and Studio name stay unchanged."
+            : "Both choices are local disk files. Choose the one that should define the parent script."}</p>
+        </div>
+        <button type="button" class="projection-close" data-repair-act="close" aria-label="Close offline repair" ${state.status === "resolving" ? "disabled" : ""}>${xSVG()}</button>
+      </header>
+      <div class="projection-path" title="${escapeHTML(conflict.directory)}">${escapeHTML(conflict.directory)}</div>
+      ${state.notice ? `<div class="projection-repair-notice">${checkSVG()}<span>${escapeHTML(state.notice)}</span>${
+        state.report?.resolution?.backupPaths?.length
+          ? `<button type="button" data-repair-act="open-backup">Open backup</button>`
+          : ""
+      }</div>` : ""}
+      ${state.error ? `<div class="projection-repair-error" role="alert">${escapeHTML(state.error)}</div>` : ""}
+      ${reportPageWarning}
+      ${body}
+      ${report.conflicts.length > 1 ? `
+        <div class="projection-stepper" aria-label="Startup blockers">
+          ${report.conflicts.map((item, index) => `
+            <button type="button" data-repair-conflict="${index}" aria-current="${item.id === conflict.id ? "step" : "false"}" title="${escapeHTML(item.directory)}" ${state.status === "resolving" ? "disabled" : ""}>
+              ${index + 1}
+            </button>
+          `).join("")}
+        </div>
+      ` : ""}
+      <footer class="projection-repair-foot">
+        <span>Studio truth is still available after startup through initial sync.</span>
+        <button type="button" data-repair-act="refresh" ${state.status === "resolving" ? "disabled" : ""}>Refresh files</button>
+      </footer>
     </section>
   `;
 }
@@ -1637,6 +2386,11 @@ function sessionSVG() {
 function xSVG() {
   return '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">' +
     '<path d="m4.25 4.25 7.5 7.5M11.75 4.25l-7.5 7.5"/>' +
+    '</svg>';
+}
+function checkSVG() {
+  return '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="m3.25 8.25 3 3 6.5-6.5"/>' +
     '</svg>';
 }
 function folderSVG() {

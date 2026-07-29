@@ -85,6 +85,8 @@ pub fn run() {
             commands::clipboard_write,
             commands::plugin_install,
             commands::wally_install,
+            commands::projection_inspect,
+            commands::projection_resolve,
             daemon::daemon_ensure,
             daemon::daemon_list,
             daemon::daemon_status,

@@ -33,7 +33,7 @@ export function formatProjectFailure(raw, projectPath = "") {
       statusLabel: "Rename required",
       title: "This script filename needs an escaped spelling",
       summary: "Its literal name overlaps the syntax Ro Sync reserves for a parent script source.",
-      guidance: `Rename ${basename(sourcePath)} to ${basename(canonicalPath)}, then retry. The script name in Studio will stay the same.`,
+      guidance: `Use Fix filename offline to rename ${basename(sourcePath)} to ${basename(canonicalPath)} safely. The source and script name in Studio will stay the same.`,
       path: resolveDiagnosticDirectory(projectPath, sourcePath),
       files: [basename(sourcePath), basename(canonicalPath)],
       sourcePath,
@@ -59,10 +59,26 @@ export function formatProjectFailure(raw, projectPath = "") {
       title: "Two init files map to the same script",
       summary: "Ro Sync stopped before serving to avoid choosing the wrong source file.",
       guidance: hasPlainInit
-        ? `In ${basename(path)}, compare both sources and keep only the marker that matches the parent script's current layout. Package sources may use plain init, while a flattened Ro Sync projection may use the named marker.`
-        : `In ${basename(path)}, compare both sources and script classes, then keep only the marker intended to define the parent script.`,
+        ? `Use Compare & resolve to review both local sources while the daemon is off. Package sources may use plain init, while a Ro Sync projection may use the named marker; the file you do not keep will be archived.`
+        : `Use Compare & resolve to review both local sources and script classes while the daemon is off. Ro Sync will archive every marker you do not keep.`,
       path,
       files,
+      diagnostic,
+    };
+  }
+
+  if (
+    /PROJECTION_RECOVERY_REQUIRED|pending (?:offline )?projection recovery|projection recovery receipt/i
+      .test(diagnostic)
+  ) {
+    return {
+      code: "projection-recovery-required",
+      statusLabel: "Recovery required",
+      title: "A prior offline repair needs review",
+      summary: "Ro Sync found a non-terminal recovery record and kept the daemon stopped.",
+      guidance: "Use Review recovery to inspect the durable receipt and affected files before serving this project.",
+      path: projectPath,
+      files: [],
       diagnostic,
     };
   }

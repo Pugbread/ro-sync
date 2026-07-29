@@ -22,12 +22,13 @@ assert.equal(conflict.code, "multiple-init-markers");
 assert.equal(conflict.statusLabel, "File conflict");
 assert.deepEqual(conflict.files, ["init (vide).luau", "init.luau"]);
 assert.equal(conflict.path.endsWith("/vide"), true);
-assert.match(conflict.guidance, /flattened Ro Sync projection may use the named marker/);
+assert.match(conflict.guidance, /Compare & resolve/);
+assert.match(conflict.guidance, /Ro Sync projection may use the named marker/);
 
 const namedClassConflict = formatProjectFailure(
   'multiple init source markers in /tmp/Controller: "init (Controller).server.luau" and "init (Controller).client.luau"',
 );
-assert.match(namedClassConflict.guidance, /compare both sources and script classes/);
+assert.match(namedClassConflict.guidance, /review both local sources and script classes/);
 assert.doesNotMatch(namedClassConflict.guidance, /Package folders/);
 
 const legacyLeaf = formatProjectFailure(
@@ -45,6 +46,14 @@ assert.equal(
   "/tmp/Race Stars/ReplicatedStorage/Client/UIController/Misc",
 );
 assert.match(legacyLeaf.guidance, /script name in Studio will stay the same/);
+
+const pendingRecovery = formatProjectFailure(
+  "Error: serve: PROJECTION_RECOVERY_REQUIRED: pending offline projection recovery receipt .rosync-backups/projection-repair/tx/prepared.json",
+  "/tmp/Race Stars",
+);
+assert.equal(pendingRecovery.code, "projection-recovery-required");
+assert.equal(pendingRecovery.statusLabel, "Recovery required");
+assert.match(pendingRecovery.guidance, /Review recovery/);
 
 assert.equal(
   formatProjectFailure("Error: address already in use on port 7878").code,

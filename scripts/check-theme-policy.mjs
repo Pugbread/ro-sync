@@ -57,8 +57,8 @@ const explicitDark = resolveAppearanceTheme("dark", {
   systemDark: false,
 });
 assert.equal(explicitDark.preference, "dark");
-assert.equal(explicitDark.tokens["--bg"], "#181818");
-assert.equal(explicitDark.tokens["--accent"], "#7aa2d6");
+assert.equal(explicitDark.tokens["--bg"], "#0e1116");
+assert.equal(explicitDark.tokens["--accent"], "#4f8ef7");
 
 const systemLight = resolveAppearanceTheme("system", { systemDark: false });
 assert.equal(systemLight.effective, "light");
@@ -160,6 +160,11 @@ assert.match(styleSource, /min-height:\s*108px/);
 assert.match(styleSource, /html\.theme-pending body/);
 assert.match(styleSource, /color:\s*var\(--accent-contrast\)/);
 assert.match(styleSource, /background:\s*var\(--code-bg\)/);
+assert.match(
+  styleSource,
+  /button\.primary:focus-visible[\s\S]*?0 0 0 4px var\(--accent-hover\)/,
+  "primary actions must retain a visible keyboard focus ring",
+);
 
 function relativeLuminance(hex) {
   const channels = hex.match(/[\da-f]{2}/gi).map((part) => Number.parseInt(part, 16) / 255);

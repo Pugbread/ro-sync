@@ -200,6 +200,21 @@ assert(
   !winWritePs.includes("Remove-Item -LiteralPath $p"),
   "Windows write must never delete the destination before replacement succeeds",
 );
+const hostileWindowsProject = "C:\\Projects\\it's $(touch pwned) & %TEMP%";
+const winProjectionPs = decodePowerShell(win.projectionRepairCmd({
+  project: hostileWindowsProject,
+  resolveId: "projection_abcdef",
+  keep: "init (vide).luau",
+}));
+assert(winProjectionPs.includes("$argv = @("), "Windows projection repair must use an argv array");
+assert(
+  winProjectionPs.includes("'C:\\Projects\\it''s $(touch pwned) & %TEMP%'"),
+  "Windows projection repair must keep hostile project text inside one literal PowerShell argument",
+);
+assert(
+  winProjectionPs.includes("'--resolve', 'projection_abcdef', '--keep', 'init (vide).luau'"),
+  "Windows projection resolution must pass only fixed flags and opaque values",
+);
 
 const mac = await loadPlatform("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)", "mac");
 assert(mac.PLATFORM === "darwin", "Mac UA must select darwin platform");
@@ -250,5 +265,20 @@ assert(!macLaunch.includes(forbiddenOwnerToken), "POSIX launch must never embed 
 const secureState = mac.secureWidgetStateCmd();
 assert(secureState.includes("chmod 600"), "POSIX state writes must restore mode 0600");
 assert(secureState.includes('"$HOME/.terminal64/widgets/ro-sync/state.json"'), "state hardening must expand HOME");
+const hostilePosixProject = "/tmp/it's $(touch pwned) & boom";
+const macProjection = mac.projectionRepairCmd({
+  project: hostilePosixProject,
+  resolveId: "projection_abcdef",
+  keep: "init.luau",
+});
+assert(
+  macProjection.includes(mac.shQuote(hostilePosixProject)),
+  "POSIX projection repair must shell-quote the project as one literal argument",
+);
+assert(
+  macProjection.includes(mac.shQuote("projection_abcdef"))
+    && macProjection.includes(mac.shQuote("init.luau")),
+  "POSIX projection repair must quote the opaque ID and exact candidate",
+);
 
 console.log("platform command checks passed");

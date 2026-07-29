@@ -631,7 +631,11 @@ pub fn legacy_reserved_init_leaf_migration(path: &Path) -> io::Result<Option<std
     let Some(parent) = path.parent() else {
         return Ok(None);
     };
-    let index = PortableDirectoryIndex::read(parent)?;
+    // Projection repair must be able to compute the canonical escaped leaf
+    // spelling even when this directory is simultaneously blocked by multiple
+    // parent init markers. The relaxed view preserves every other filesystem
+    // safety check and is used here only to collect occupied leaf fragments.
+    let index = PortableDirectoryIndex::read_for_projection_repair(parent)?;
     let taken = index
         .entries()
         .iter()

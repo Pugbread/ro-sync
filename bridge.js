@@ -19,6 +19,7 @@ import {
   openFolderEnsuredCmd,
   pickFolderCmd,
   pluginInstallCmd,
+  projectionRepairCmd,
   readFileCmd,
   secureWidgetStateCmd,
   wallyInstallCmd,
@@ -141,6 +142,32 @@ function unwrapText(value) {
   return value.content ?? value.text ?? value.data ?? value.stdout ?? "";
 }
 
+function unwrapProjectionRepairResult(result, operation) {
+  if (
+    result
+    && typeof result === "object"
+    && !Object.hasOwn(result, "stdout")
+    && typeof result.ok === "boolean"
+  ) {
+    return result;
+  }
+  const stdout = unwrapText(result).trim();
+  let value = null;
+  try {
+    value = JSON.parse(stdout);
+  } catch {
+    const stderr = String(result?.stderr || "").trim();
+    throw new Error(stderr || stdout || `${operation} returned no structured result`);
+  }
+  if (value && typeof value === "object" && value.ok === false) {
+    return value;
+  }
+  if (result?.code != null && result.code !== 0) {
+    throw new Error(value?.error || String(result?.stderr || "").trim() || `${operation} failed`);
+  }
+  return value;
+}
+
 function encodeTextBase64(value) {
   return btoa(unescape(encodeURIComponent(String(value))));
 }
@@ -152,23 +179,29 @@ function nextId() {
 let setStateQueue = Promise.resolve();
 
 // `payload.timeoutMs` — optional override for the default 30s timeout, for
-// long-running ops like `cargo build`. The timeoutMs key is NOT forwarded to
-// the host; it only controls our local pending-promise expiry.
+// long-running ops like `cargo build`; a non-positive value disables local
+// expiry for non-cancellable mutations. The timeoutMs key is NOT forwarded to
+// the host.
 function postT64(type, payload = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId();
     const { timeoutMs = 30000, ...forwarded } = payload || {};
-    const timer = setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error(`t64 ${type} timed out`));
-      }
-    }, timeoutMs);
+    // A non-positive timeout deliberately keeps the RPC pending until the host
+    // replies. Filesystem mutations use this mode because expiring only the
+    // renderer promise cannot cancel an already-running host command.
+    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => {
+          if (pending.has(id)) {
+            pending.delete(id);
+            reject(new Error(`t64 ${type} timed out`));
+          }
+        }, timeoutMs)
+      : null;
     pending.set(id, { resolve, reject, timer });
     try {
       window.parent.postMessage({ type, payload: { ...forwarded, id } }, "*");
     } catch (err) {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       pending.delete(id);
       reject(err);
     }
@@ -379,6 +412,41 @@ export const host = Object.freeze({
     return widgetExec(wallyInstallCmd(cwd), { timeoutMs: 2 * 60_000 });
   },
 
+  async projectionInspect(project) {
+    if (IS_DESKTOP_HOST) {
+      return unwrapProjectionRepairResult(
+        await invokeDesktop("projection_inspect", { project: String(project || "") }),
+        "Projection inspection",
+      );
+    }
+    const result = await widgetExec(
+      projectionRepairCmd({ project }),
+      { timeoutMs: 60_000 },
+    );
+    return unwrapProjectionRepairResult(result, "Projection inspection");
+  },
+
+  async projectionResolve(project, conflictId, keep = null) {
+    if (IS_DESKTOP_HOST) {
+      return unwrapProjectionRepairResult(
+        await invokeDesktop("projection_resolve", {
+          project: String(project || ""),
+          conflictId: String(conflictId || ""),
+          keep: keep == null ? null : String(keep),
+        }),
+        "Projection resolution",
+      );
+    }
+    const result = await widgetExec(
+      projectionRepairCmd({ project, resolveId: conflictId, keep }),
+      // The host command is not cancellable. Never let the renderer abandon a
+      // filesystem mutation while it may still be committing or reporting a
+      // recovery receipt.
+      { timeoutMs: 0 },
+    );
+    return unwrapProjectionRepairResult(result, "Projection resolution");
+  },
+
   async windowBounds() {
     if (IS_DESKTOP_HOST) return null;
     return t64("t64:get-bounds", { timeoutMs: 1000 });
@@ -454,7 +522,7 @@ window.addEventListener("message", (ev) => {
   if (replyId && pending.has(replyId)) {
     const { resolve, reject, timer } = pending.get(replyId);
     pending.delete(replyId);
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     if (msg.payload.error && !msg.payload.ok && msg.payload.stdout == null) {
       reject(new Error(msg.payload.error));
     } else {
