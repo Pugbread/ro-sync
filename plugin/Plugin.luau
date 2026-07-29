@@ -1666,14 +1666,16 @@ local function mountFallbackUi(reason)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
 		elseif state == "connecting" then
-			status.Text = "Connecting..."
+			-- `detail` carries the current initial-sync phase so the multi-
+			-- minute connect on large places reads as progress, not a hang.
+			status.Text = if detail ~= nil then tostring(detail) else "Connecting..."
 			status.TextColor3 = Color3.fromRGB(65, 135, 245)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
 		elseif state == "waiting" then
-			status.Text = "Waiting for initial sync..."
-			status.TextColor3 = Color3.fromRGB(65, 135, 245)
-			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			status.Text = if detail ~= nil then tostring(detail) else "Action needed · choose Studio or Disk"
+			status.TextColor3 = Color3.fromRGB(240, 173, 78)
+			stateDot.BackgroundColor3 = Color3.fromRGB(240, 173, 78)
 			connectBtn.Text = "Cancel"
 		elseif state == "project_init" then
 			status.Text = "New Studio project · ready to create"
@@ -12138,6 +12140,7 @@ local function startHooksAndWs(): boolean
 		return reconnectState.desired and busy and installGeneration == wsGeneration
 	end
 	log("installing live-sync hooks — silent for up to a minute on large places")
+	setPill("connecting", "Installing live-sync hooks…")
 	if not installHooks(shouldContinueInstall) or not shouldContinueInstall() then
 		-- installHooks can yield for very large places. A click-to-cancel or
 		-- generation change must tear down every partially installed signal
@@ -12170,7 +12173,7 @@ local function startHooksAndWs(): boolean
 	busy = false
 	wsGeneration += 1
 	local gen = wsGeneration
-	setPill("connecting")
+	setPill("connecting", "Authenticating live connection…")
 	setBanner("Initial sync complete. Authenticating the live Studio connection...")
 	log("initial sync complete — watching " .. #WATCHED_SERVICES .. " services; authenticating WebSocket")
 	if scanGuard and next(scanGuard.mutatedSources or {}) ~= nil then
@@ -12203,6 +12206,7 @@ end
 
 local function doPushPath(strictStudio: boolean?, scanGuard)
 	log("initial-compare → push: streaming bounded Studio structure + Sources")
+	setPill("connecting", "Pushing Studio → files…")
 	local pushStarted = os.clock()
 	if scanGuard then
 		-- Survive collaborator Source commits during the multi-minute bootstrap
@@ -12834,6 +12838,7 @@ end
 
 local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?, selectionChoiceId: string?)
 	log("initial-compare → pull: streaming bounded disk structure + Sources")
+	setPill("connecting", "Pulling files → Studio…")
 	local pullGeneration = wsGeneration
 	local selective = selectiveSelectedCount ~= nil
 	local strict = strictDisk == true and not selective
@@ -14143,6 +14148,7 @@ runInitialCompare = function()
 	end
 
 	scanGuard = scaleState.beginStudioScanGuard()
+	setPill("connecting", "Scanning place…")
 	local statsStarted = os.clock()
 	local studioStats, statsProgress = scaleState.collectStudioStatsWithGuard(scanGuard)
 	if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
@@ -14164,6 +14170,7 @@ runInitialCompare = function()
 	-- Stats-first lets a brand-new empty project choose `push` without ever
 	-- serializing every Source into one place-sized comparison body.
 	log("initial-compare: checking project stats")
+	setPill("connecting", string.format("Checking project · %d scripts", studioStats.scriptCount))
 	local ok, resp = httpJson("/initial-compare", "POST", {
 		studioStats = studioStats,
 		studioSnapshot = {},
@@ -14293,6 +14300,7 @@ runInitialCompare = function()
 		end
 
 		for index, serviceName in ipairs(advertisedServices) do
+			setPill("connecting", string.format("Comparing %s · %d/%d", serviceName, index, #advertisedServices))
 			if
 				type(resp) ~= "table"
 				or tostring(resp.action) ~= "compare"
@@ -14632,6 +14640,7 @@ runInitialCompare = function()
 			"decision studio → delta fast path: replaying %d changed script(s) instead of a full push",
 			#resolved
 		))
+		setPill("connecting", string.format("Syncing %d changed script(s)…", #resolved))
 		return true
 	end
 
