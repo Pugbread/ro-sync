@@ -1201,6 +1201,7 @@ export function mountProjects(root, api) {
         open: () => {
           activityErrorCount = 0;
           lastActivityErrorAt = 0;
+          clearActivityStreamErrors();
           void refreshStatuses();
         },
         error: () => {
@@ -1241,6 +1242,17 @@ export function mountProjects(root, api) {
       type: "stream-error",
       attempts: count,
     });
+  }
+
+  function clearActivityStreamErrors() {
+    let write = 0;
+    for (const entry of activityFrames) {
+      if (entry?.frame?.type === "stream-error") continue;
+      activityFrames[write++] = entry;
+    }
+    if (write === activityFrames.length) return;
+    activityFrames.length = write;
+    scheduleActivityRender();
   }
 
   function shouldSkipRawActivityFrame(raw) {

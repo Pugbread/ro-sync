@@ -300,8 +300,8 @@ export function formatActivity(entry) {
         tone: "danger",
         state: "failed",
         stateLabel: "Interrupted",
-        title: "Activity connection interrupted",
-        intent: "Ro Sync will keep trying to reconnect to this project.",
+        title: "Desktop activity feed interrupted",
+        intent: "Project sync keeps running while the desktop view reconnects.",
         facts: frame.attempts > 1 ? [fact("Attempts", frame.attempts)] : [],
       };
     default:

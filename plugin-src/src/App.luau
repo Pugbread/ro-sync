@@ -58,6 +58,8 @@ local function statusView(state, detail)
 		return "Scanning localhost...", Colors.Accent, "Cancel"
 	elseif state == "connecting" then
 		return "Connecting...", Colors.Accent, "Cancel"
+	elseif state == "reconnecting" then
+		return string.format("Retrying in %ss...", tostring(detail or "?")), Colors.Accent, "Cancel"
 	elseif state == "waiting" then
 		return "Waiting for initial sync...", Colors.Accent, "Cancel"
 	elseif state == "project_init" then

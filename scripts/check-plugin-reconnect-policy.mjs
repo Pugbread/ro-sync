@@ -23,6 +23,16 @@ assert.match(
   /pluginCapability = reconnectState\.pluginCapability/,
   "the authenticated hello must use the freshly fetched process capability",
 );
+assert.ok(
+  wsLoop.indexOf("client.Opened:Connect")
+    < wsLoop.indexOf('type = "hello"'),
+  "the plugin must observe Roblox's asynchronous WebSocket open before sending hello",
+);
+assert.match(
+  wsLoop,
+  /client\.ConnectionState == Enum\.WebStreamClientState\.Open[\s\S]*?os\.clock\(\) < openDeadline[\s\S]*?if opened and not closed[\s\S]*?type = "hello"/,
+  "the plugin must wait boundedly for an open, writable WebSocket before authenticating",
+);
 assert.match(
   wsLoop,
   /if\s+retryable == false[\s\S]*?terminalReason = reason/,
@@ -221,6 +231,11 @@ assert.match(
   source,
   /message:lower\(\):find\("protocol"[\s\S]*?setPill\("error", "update Ro Sync"\)[\s\S]*?else[\s\S]*?setPill\("error", "action required"\)/,
   "non-protocol terminal failures must not misleadingly ask the user to update Ro Sync",
+);
+assert.match(
+  source,
+  /reconnectState\.retryInitialCompare = function\(context\)[\s\S]*?setPill\("reconnecting", waitSec\)[\s\S]*?Waiting for the matching project daemon[\s\S]*?Last check:/,
+  "offline recovery must show a truthful retry state and the latest daemon error",
 );
 
 const disconnect = source.slice(

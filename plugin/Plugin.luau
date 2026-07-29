@@ -1674,6 +1674,11 @@ local function mountFallbackUi(reason)
 			status.TextColor3 = Color3.fromRGB(65, 135, 245)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
+		elseif state == "reconnecting" then
+			status.Text = string.format("Retrying in %ss...", tostring(detail or "?"))
+			status.TextColor3 = Color3.fromRGB(65, 135, 245)
+			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			connectBtn.Text = "Cancel"
 		elseif state == "waiting" then
 			status.Text = "Waiting for initial sync..."
 			status.TextColor3 = Color3.fromRGB(65, 135, 245)
@@ -6671,6 +6676,7 @@ end
 
 local WS_BACKOFF_START = 1
 local WS_BACKOFF_MAX = 30
+local WS_OPEN_TIMEOUT = 10
 local WS_HEARTBEAT_INTERVAL = 20
 local WS_HEARTBEAT_TIMEOUT = 45
 local WS_POST_WAKE_GRACE = 30
@@ -12089,6 +12095,8 @@ local function wsLoop(gen)
 			setPill("connecting")
 		else
 			local closed = false
+			local opened = false
+			local openError = nil
 			local accepted = false
 			local terminalReason = nil
 			local lastPongClock = os.clock()
@@ -12112,6 +12120,20 @@ local function wsLoop(gen)
 				schedulePushRetry(0)
 			end
 
+			table.insert(
+				conns,
+				client.Opened:Connect(function()
+					opened = true
+				end)
+			)
+			table.insert(
+				conns,
+				client.Error:Connect(function(code, message)
+					openError = string.format("%s: %s", tostring(code), tostring(message))
+					recoveryContext = "WebSocket error " .. openError
+					closed = true
+				end)
+			)
 			table.insert(
 				conns,
 				client.MessageReceived:Connect(function(payload)
@@ -12258,15 +12280,46 @@ local function wsLoop(gen)
 				end)
 			)
 
-			-- Announce ourselves. If the initial Send fails outright, the common
-			-- recovery path below re-runs the full comparison with backoff.
-			local helloOk = wsSend(client, {
-				type = "hello",
-				clientId = clientId,
-				role = "plugin",
-				protocol = PLUGIN_PROTOCOL_VERSION,
-				pluginCapability = reconnectState.pluginCapability,
-			})
+			-- CreateWebStreamClient is asynchronous. Sending while its state is
+			-- still Connecting can return without throwing while dropping the
+			-- frame, leaving an established but forever-unidentified socket.
+			-- Wait for Roblox's Opened signal before sending the authenticated
+			-- hello, while keeping cancellation and failure bounded.
+			opened = client.ConnectionState == Enum.WebStreamClientState.Open
+			local openDeadline = os.clock() + WS_OPEN_TIMEOUT
+			while
+				not opened
+				and not closed
+				and openError == nil
+				and reconnectState.desired
+				and connected
+				and gen == wsGeneration
+				and os.clock() < openDeadline
+			do
+				task.wait(0.05)
+			end
+
+			local helloOk = false
+			if opened and not closed and openError == nil then
+				-- Announce ourselves only after the transport is writable. If
+				-- the initial Send fails outright, the common recovery path
+				-- below re-runs the full comparison with backoff.
+				helloOk = wsSend(client, {
+					type = "hello",
+					clientId = clientId,
+					role = "plugin",
+					protocol = PLUGIN_PROTOCOL_VERSION,
+					pluginCapability = reconnectState.pluginCapability,
+				})
+			elseif openError ~= nil then
+				log("ws: open error: " .. openError)
+			elseif not closed and reconnectState.desired and connected and gen == wsGeneration then
+				recoveryContext = "WebSocket open timed out"
+				log("ws: open timed out")
+				pcall(function()
+					client:Close()
+				end)
+			end
 			if helloOk then
 				lastPongClock = os.clock()
 				-- A pong is the daemon's acknowledgement that it accepted our
@@ -12381,11 +12434,18 @@ reconnectState.retryInitialCompare = function(context)
 	end
 	reconnectState.compareRetryPending = true
 	busy = true
-	setPill("connecting")
-	setBanner("Connection interrupted. Ro Sync is waiting for the matching daemon and will resync automatically.")
 	local generation = wsGeneration
 	local waitSec = wsBackoff
 	wsBackoff = math.min(wsBackoff * 2, WS_BACKOFF_MAX)
+	local lastError = tostring(context or "transport error")
+	setPill("reconnecting", waitSec)
+	setBanner(
+		string.format(
+			"Connection interrupted. Waiting for the matching project daemon. Retrying in %ds. Last check: %s",
+			waitSec,
+			lastError
+		)
+	)
 	log(string.format("recovery: %s; retrying initial sync in %ds", tostring(context or "transport error"), waitSec))
 	task.delay(waitSec, function()
 		reconnectState.compareRetryPending = false

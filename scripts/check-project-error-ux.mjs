@@ -136,6 +136,11 @@ assert.match(
   "retryable runtime shutdowns must retain the reconnecting stream and refresh authoritative status",
 );
 assert.match(
+  projectsSource,
+  /open: \(\) => \{[\s\S]*?clearActivityStreamErrors\(\)[\s\S]*?function clearActivityStreamErrors\(\)[\s\S]*?entry\?\.frame\?\.type === "stream-error"/,
+  "a recovered observer stream must remove its stale interruption cards",
+);
+assert.match(
   appSource,
   /t === "shutdown"[\s\S]*?data\.retryable === false[\s\S]*?reportDaemonFailure[\s\S]*?emit\("plugin:shutdown"/,
   "app-level streams must retain terminal plugin failures while Projects is unmounted",

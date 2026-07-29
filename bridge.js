@@ -573,6 +573,14 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
   let stopped = false;
   let backoff = 1000;
   let reconnectTimer = null;
+  let handshakeTimer = null;
+  let generation = 0;
+
+  function clearHandshakeTimer() {
+    if (!handshakeTimer) return;
+    clearTimeout(handshakeTimer);
+    handshakeTimer = null;
+  }
 
   function scheduleReconnect() {
     if (stopped) return;
@@ -587,6 +595,8 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
 
   function connect() {
     if (stopped) return;
+    const socketGeneration = ++generation;
+    let ready = false;
     try {
       ws = new WebSocket(wsUrl);
     } catch (e) {
@@ -595,7 +605,6 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
       return;
     }
     ws.onopen = (e) => {
-      backoff = 1000;
       // Identify this socket before subscribing to privileged daemon traffic.
       // The daemon rejects request/push/response frames from unidentified or
       // role-mismatched peers; widget streams are read-only clients.
@@ -606,8 +615,21 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
           role: "watch",
           protocol: 6,
         }));
+        // The WebSocket upgrade only proves that a TCP transport exists.
+        // A pong proves that the daemon parsed and accepted our watch hello.
+        ws.send(JSON.stringify({ type: "ping" }));
       } catch {}
-      if (handlers.open) { try { handlers.open(e); } catch (err) { console.error(err); } }
+      if (handlers.transportOpen) {
+        try { handlers.transportOpen(e); } catch (err) { console.error(err); }
+      }
+      clearHandshakeTimer();
+      handshakeTimer = setTimeout(() => {
+        if (stopped || socketGeneration !== generation || ready) return;
+        if (handlers.error) {
+          try { handlers.error(new Error("daemon WebSocket hello timed out")); } catch {}
+        }
+        try { ws?.close(); } catch {}
+      }, 5000);
     };
     ws.onmessage = (e) => {
       if (handlers.skipRaw) {
@@ -617,16 +639,27 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
           console.error(err);
         }
       }
-      if (!handlers.message) return;
       const data = parseMaybe(e.data);
-      try { handlers.message(data, e); } catch (err) { console.error(err); }
+      if (!ready && data && typeof data === "object"
+          && data.type !== "shutdown" && data.type !== "error") {
+        ready = true;
+        backoff = 1000;
+        clearHandshakeTimer();
+        if (handlers.open) {
+          try { handlers.open(e); } catch (err) { console.error(err); }
+        }
+      }
+      if (handlers.message) {
+        try { handlers.message(data, e); } catch (err) { console.error(err); }
+      }
     };
     ws.onerror = (e) => {
       if (handlers.error) { try { handlers.error(e); } catch (err) { console.error(err); } }
     };
     ws.onclose = (e) => {
+      clearHandshakeTimer();
       if (handlers.close) { try { handlers.close(e); } catch (err) { console.error(err); } }
-      ws = null;
+      if (socketGeneration === generation) ws = null;
       scheduleReconnect();
     };
   }
@@ -636,6 +669,8 @@ export function daemonWS(base, path = "/ws", handlers = {}) {
   return {
     close: () => {
       stopped = true;
+      generation++;
+      clearHandshakeTimer();
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       if (ws) { try { ws.close(); } catch {} ws = null; }
     },
