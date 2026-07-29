@@ -236,7 +236,7 @@ jobs:
           )
           rm -rf "$bundle"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.out }}
           path: |
@@ -286,7 +286,7 @@ jobs:
           cargo install --locked --version 7.5.1 rojo
       - name: Build Studio plugin
         run: node plugin/build-plugin.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: RoSyncPlugin.rbxm
           path: |
@@ -702,7 +702,7 @@ jobs:
             }
           }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ro-sync-desktop-${{ matrix.asset_platform }}
           path: desktop/release-assets/*
