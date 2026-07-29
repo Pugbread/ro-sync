@@ -8,7 +8,9 @@ name = "rosync"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+# Exactly the tokio subsystems the daemon uses (audited 2026-07-28) — "full"
+# compiled every feature group and slowed cold builds.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "process", "fs", "io-util"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
@@ -35,3 +37,24 @@ tempfile = "3"
 opt-level = 3
 lto = true
 strip = true
+
+# Iteration profile: compiles ~3x faster than release (no LTO, light
+# optimization, parallel codegen) and is plenty fast to run for local daemon
+# testing. Build with: cargo build --profile fastdev
+# Binary lands in target/fastdev/rosync.
+[profile.fastdev]
+inherits = "release"
+opt-level = 1
+lto = false
+strip = false
+codegen-units = 16
+# Release-derived profiles disable incremental by default; for the edit-one-
+# function-and-rebuild loop it cuts warm rebuilds from minutes to seconds.
+incremental = true
+
+# Dependencies get full optimization: they compile once (cached forever) and
+# hold the hot paths — sha2 hashing, serde_json, tokio. Only rosync's own
+# code stays at opt-level 1 for fast iteration, so deployed fastdev daemons
+# run hashing/serialization at release speed.
+[profile.fastdev.package."*"]
+opt-level = 3

@@ -10780,13 +10780,18 @@ async fn run_decision(args: DecisionArgs) -> Result<(), Box<dyn std::error::Erro
                 .map(str::to_string)
         })
         .ok_or("decision: pending choice has no choiceId")?;
-    let value = http_post_json(
-        args.port,
-        "/initial-choice",
-        &serde_json::json!({ "choiceId": choice_id, "choice": choice }),
-    )
-    .await
-    .map_err(|e| format!("decision: {e}"))?;
+    // The daemon gates a full-disk overwrite behind mode="all" (the widget's
+    // selective picker sends explicit path selections instead). Without this,
+    // `--disk` always 409'd — making "studio" the only answer the CLI could
+    // ever give, which silently biased every scripted/automated decision.
+    let body = if choice == "disk" {
+        serde_json::json!({ "choiceId": choice_id, "choice": choice, "mode": "all" })
+    } else {
+        serde_json::json!({ "choiceId": choice_id, "choice": choice })
+    };
+    let value = http_post_json(args.port, "/initial-choice", &body)
+        .await
+        .map_err(|e| format!("decision: {e}"))?;
     if args.raw {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if value

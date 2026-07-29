@@ -46,6 +46,12 @@ import {
   resolveAppearanceTheme,
 } from "./views/theme.js";
 
+// Debug tracing for daemon lifecycle diagnosis. Shows in the webview console
+// (right-click → Inspect Element → Console in dev builds).
+function dbg(...args) {
+  console.log("[rosync-dbg]", ...args);
+}
+
 const APPEARANCE_CONTEXT = Object.freeze({
   supportsHost: host.supports.hostTheme,
   isDesktop: IS_DESKTOP_HOST,
@@ -1185,6 +1191,7 @@ async function inspectOwnedDesktopDaemon(spec) {
 }
 
 async function stopOwnedDesktopDaemon(spec, reason) {
+  dbg("stopOwnedDesktopDaemon:", { project: spec?.project, port: spec?.port, reason });
   const owned = await inspectOwnedDesktopDaemon(spec);
   if (!owned.running) {
     if (spec?.bootId && spec?.ownerToken) {
@@ -1233,7 +1240,17 @@ function clearDesktopDaemonTracking(projectId, { preserveTarget = false } = {}) 
 
 async function ensureDesktopDaemon(projectId, project) {
   const projectInfo = projectById(projectId);
-  if (!projectInfo || projectInfo.path !== project || !isProjectServed(projectId)) return;
+  if (!projectInfo || projectInfo.path !== project || !isProjectServed(projectId)) {
+    dbg("ensureDesktopDaemon: skipped", {
+      projectId,
+      project,
+      known: !!projectInfo,
+      pathMatch: projectInfo?.path === project,
+      served: isProjectServed(projectId),
+    });
+    return;
+  }
+  dbg("ensureDesktopDaemon: starting", { projectId, project });
   let ownedCandidate = null;
   let requestedToken = null;
   const existingSession = app.state.daemonSessions?.[projectId] || null;
@@ -1281,6 +1298,14 @@ async function ensureDesktopDaemon(projectId, project) {
       ownerToken: requestedToken,
     });
     result = lifecycleValue(result);
+    dbg("ensureDesktopDaemon: daemonEnsure result", {
+      ok: result.ok,
+      running: result.running,
+      port: result.port,
+      pid: result.pid,
+      managedBy: result.managedBy,
+      error: result.error || null,
+    });
     if (result.ok === false || result.running === false) {
       throw new Error(result.error || "managed daemon did not start");
     }
@@ -1573,6 +1598,7 @@ async function killDaemon(projectIdOrOptions = null, maybeOptions = {}) {
     }
     const session = app.state.daemonSessions?.[projectId] || null;
     const plan = desktopStopPlan(sessionPolicyState(session));
+    dbg("killDaemon: stop plan", { projectId, kind: plan.kind, port: plan.spec?.port });
     if (plan.kind === "clear-local") {
       clearDesktopDaemonTracking(projectId, { preserveTarget });
       stopDaemonHeartbeat(projectId);

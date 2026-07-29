@@ -2785,6 +2785,25 @@ async fn initial_decision(
     Query(params): Query<InitialDecisionParams>,
 ) -> impl IntoResponse {
     let started = Instant::now();
+    // Each poll is proof the plugin's decision picker is still alive. Refresh
+    // the compare session's expiry clocks so a human who takes longer than the
+    // TTLs (15 min pending / 2 min completed) to answer doesn't have the
+    // session pruned out from under the picker — that silently orphaned the
+    // eventual choice and wedged the initial sync.
+    {
+        let sessions = INITIAL_COMPARE_ACCUMULATORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        if let Some(session) = sessions.get(state.canonical_project.as_ref()) {
+            if let Ok(mut session) = session.try_lock() {
+                session.started_at = Instant::now();
+                if session.completed_at.is_some() {
+                    session.completed_at = Some(Instant::now());
+                }
+            }
+        }
+    }
     loop {
         let decision = {
             let slot = state.pending_initial.lock().unwrap();

@@ -117,7 +117,12 @@ impl ManagedDaemonClaims {
                     Err(_) => return,
                 };
                 for claim in claims {
-                    let _ = heartbeat_exact_managed_daemon(&claim);
+                    if let Err(error) = heartbeat_exact_managed_daemon(&claim) {
+                        eprintln!(
+                            "[rosync-dbg] heartbeat failed for {} (port {}): {error}",
+                            claim.project, claim.port
+                        );
+                    }
                 }
             })
             .is_err()
@@ -257,6 +262,10 @@ fn request_exact_managed_daemon_close(
     claim: &ExactManagedDaemonClaim,
     deadline: Instant,
 ) -> Result<(), String> {
+    eprintln!(
+        "[rosync-dbg] requesting daemon close: project {} port {} pid {}",
+        claim.project, claim.port, claim.pid
+    );
     let hello = local_json_request_until(claim.port, "GET", "/hello", &[], deadline)?;
     let exact_daemon = hello.get("managed").and_then(Value::as_bool) == Some(true)
         && hello.get("managedBy").and_then(Value::as_str) == Some("desktop")
@@ -595,6 +604,11 @@ pub(crate) async fn daemon_ensure(
     // starts for different projects serial inside one Desktop process so two
     // concurrent UI requests cannot both select the same free port.
     let _start_guard = state.daemon_start_lock.lock().await;
+    eprintln!(
+        "[rosync-dbg] daemon_ensure: project {} preferred_port {:?}",
+        display_path(&project),
+        spec.preferred_port
+    );
 
     let mut base_args = vec![
         "daemon".to_string(),
@@ -835,6 +849,7 @@ async fn run_lifecycle(
     let sidecar = app.shell().sidecar("rosync").map_err(|error| {
         LifecycleFailure::Message(format!("could not locate bundled Ro Sync daemon: {error}"))
     })?;
+    eprintln!("[rosync-dbg] run_lifecycle: rosync {}", args.join(" "));
     let mut command = sidecar.args(args).current_dir(resource_dir);
     if let Some((lsp, compiler)) = bundled_luau_tools(resource_dir) {
         command = command
@@ -885,6 +900,11 @@ async fn run_lifecycle(
                 // short-lived sidecar handle.
                 if let Some(value) = parse_lifecycle_stdout(&stdout) {
                     let _ = lifecycle_children.terminate(pid);
+                    let mut shown = value.to_string();
+                    if let Some(secret) = secret {
+                        shown = shown.replace(secret, "[redacted]");
+                    }
+                    eprintln!("[rosync-dbg] run_lifecycle: ok — {shown}");
                     return Ok(normalize_lifecycle(value));
                 }
             }
@@ -899,6 +919,7 @@ async fn run_lifecycle(
             Some(CommandEvent::Terminated(payload)) => {
                 lifecycle_children.forget(pid);
                 status_code = payload.code;
+                eprintln!("[rosync-dbg] run_lifecycle: child pid {pid} terminated, code {status_code:?}");
                 break;
             }
             None => {
@@ -933,6 +954,7 @@ async fn run_lifecycle(
             )
         };
     }
+    eprintln!("[rosync-dbg] run_lifecycle: failed — {message}");
     Err(LifecycleFailure::Message(message))
 }
 
