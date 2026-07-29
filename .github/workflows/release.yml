@@ -12,7 +12,7 @@ jobs:
   updater-smoke:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -54,7 +54,7 @@ jobs:
       ROSYNC_BUILD_COMMIT: ${{ github.sha }}
       ROSYNC_BUILD_DIRTY: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check widget platform commands
         run: node scripts/check-platform-commands.mjs
@@ -260,7 +260,7 @@ jobs:
       ROSYNC_BUILD_COMMIT: ${{ github.sha }}
       ROSYNC_BUILD_DIRTY: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check cross-runtime protocol constants
         run: node scripts/check-plugin-reconnect-policy.mjs
       - uses: dtolnay/rust-toolchain@stable
@@ -327,7 +327,7 @@ jobs:
       ROSYNC_BUILD_COMMIT: ${{ github.sha }}
       ROSYNC_BUILD_DIRTY: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -724,7 +724,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
