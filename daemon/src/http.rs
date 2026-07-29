@@ -8115,8 +8115,9 @@ pub(crate) fn event_to_plugin_op(root: &Path, event: &str) -> Option<Value> {
 }
 
 fn broadcast_filtered_op(events: &broadcast::Sender<String>, op: &Op) -> Result<(), String> {
-    let payload = serde_json::to_string(&json!({ "type": "op", "op": op }))
-        .map_err(|error| format!("serialize op: {error}"))?;
+    let value = serde_json::to_value(op).map_err(|error| format!("serialize op: {error}"))?;
+    let payload =
+        crate::ws::journal_op_event(&value).ok_or_else(|| "journal op event".to_string())?;
     events
         .send(payload)
         .map(|_| ())

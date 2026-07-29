@@ -77,6 +77,78 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
 static PLUGIN_CAPABILITY: OnceLock<String> = OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// Op journal: a bounded ring of every disk-side op event published this daemon
+// boot, keyed by a monotonic sequence number. A plugin that loses its
+// transport can resume by presenting the last sequence it applied — the
+// daemon replays the gap instead of forcing a multi-minute full re-compare.
+// The per-boot plugin capability doubles as the journal's identity: a
+// capability match guarantees the seq space is the same daemon boot.
+// ---------------------------------------------------------------------------
+const OP_JOURNAL_CAP: usize = 4096;
+
+struct OpJournal {
+    next_seq: u64,
+    entries: std::collections::VecDeque<(u64, String)>,
+}
+
+static OP_JOURNAL: OnceLock<Mutex<OpJournal>> = OnceLock::new();
+
+fn op_journal() -> &'static Mutex<OpJournal> {
+    OP_JOURNAL.get_or_init(|| {
+        Mutex::new(OpJournal {
+            next_seq: 1,
+            entries: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// Serialize an op event with the next journal sequence, retain it for
+/// resume replay, and return the payload to broadcast.
+pub(crate) fn journal_op_event(op: &serde_json::Value) -> Option<String> {
+    let mut journal = op_journal().lock().unwrap();
+    let seq = journal.next_seq;
+    let payload =
+        serde_json::to_string(&serde_json::json!({ "type": "op", "seq": seq, "op": op })).ok()?;
+    journal.next_seq += 1;
+    if journal.entries.len() >= OP_JOURNAL_CAP {
+        journal.entries.pop_front();
+    }
+    journal.entries.push_back((seq, payload.clone()));
+    Some(payload)
+}
+
+/// Sequence of the most recently journaled op (0 when none this boot).
+pub(crate) fn journal_head() -> u64 {
+    op_journal().lock().unwrap().next_seq - 1
+}
+
+/// Raw event payloads the resuming plugin missed, oldest first — or None when
+/// continuity can't be proven (gap fell off the ring, or the claim is ahead
+/// of the journal) and the caller must fall back to a full compare.
+fn journal_replay_after(last_seq: u64) -> Option<Vec<String>> {
+    let journal = op_journal().lock().unwrap();
+    let head = journal.next_seq - 1;
+    if last_seq > head {
+        return None;
+    }
+    if last_seq == head {
+        return Some(Vec::new());
+    }
+    let first_retained = journal.entries.front().map(|(seq, _)| *seq)?;
+    if last_seq + 1 < first_retained {
+        return None;
+    }
+    Some(
+        journal
+            .entries
+            .iter()
+            .filter(|(seq, _)| *seq > last_seq)
+            .map(|(_, payload)| payload.clone())
+            .collect(),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum PeerKind {
@@ -146,6 +218,11 @@ pub enum ClientMsg {
         protocol: Option<u64>,
         #[serde(rename = "pluginCapability", alias = "capability", default)]
         plugin_capability: Option<String>,
+        /// Last op-journal sequence the plugin applied before losing its
+        /// transport. When continuity holds, the daemon replays the gap and
+        /// the plugin skips the full initial compare.
+        #[serde(rename = "resumeFrom", default)]
+        resume_from: Option<u64>,
     },
     Push {
         #[serde(default)]
@@ -175,9 +252,19 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     Op {
         op: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     Ping,
     Pong,
+    /// Resume accepted: `missed` journaled op frames follow immediately.
+    ResumeOk {
+        missed: usize,
+        #[serde(rename = "seqHead")]
+        seq_head: u64,
+    },
+    /// Resume impossible (journal gap / unknown seq); run a full compare.
+    ResumeReject,
     Shutdown {
         reason: String,
         code: &'static str,
@@ -337,6 +424,7 @@ async fn recv_loop(
                     role,
                     protocol,
                     plugin_capability: presented_capability,
+                    resume_from,
                 }) => {
                     if peer_kind != PeerKind::Unidentified {
                         let _ = send_server_msg(
@@ -442,6 +530,52 @@ async fn recv_loop(
                             publish_plugin_state(&state, true);
                         }
                         peer_kind = PeerKind::Plugin;
+                        // Resume handshake. With a provable journal gap the
+                        // missed op frames replay immediately; without a
+                        // resume claim the plugin still learns the current
+                        // seq head so its NEXT drop can resume. A broken
+                        // claim gets an explicit reject → full compare.
+                        match resume_from {
+                            Some(last_seq) => match journal_replay_after(last_seq) {
+                                Some(missed) => {
+                                    let _ = send_server_msg(
+                                        &out_tx,
+                                        &ServerMsg::ResumeOk {
+                                            missed: missed.len(),
+                                            seq_head: journal_head(),
+                                        },
+                                    );
+                                    for payload in missed {
+                                        if let Some(op) = event_to_plugin_op(
+                                            state.canonical_project.as_path(),
+                                            &payload,
+                                        ) {
+                                            let seq = serde_json::from_str::<Value>(&payload)
+                                                .ok()
+                                                .and_then(|v| {
+                                                    v.get("seq").and_then(Value::as_u64)
+                                                });
+                                            let _ = send_server_msg(
+                                                &out_tx,
+                                                &ServerMsg::Op { op, seq },
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let _ = send_server_msg(&out_tx, &ServerMsg::ResumeReject);
+                                }
+                            },
+                            None => {
+                                let _ = send_server_msg(
+                                    &out_tx,
+                                    &ServerMsg::ResumeOk {
+                                        missed: 0,
+                                        seq_head: journal_head(),
+                                    },
+                                );
+                            }
+                        }
                     } else {
                         peer_kind = classified_peer;
                         classified_peer.store(&peer.kind);
@@ -608,8 +742,11 @@ async fn send_loop(
                         if let Some(op) = event_to_plugin_op(state.canonical_project.as_path(), &s) {
                             let current_peer = PeerKind::load(&peer.kind);
                             if current_peer == PeerKind::Plugin {
+                                let seq = serde_json::from_str::<Value>(&s)
+                                    .ok()
+                                    .and_then(|v| v.get("seq").and_then(Value::as_u64));
                                 if *state.active_plugin.lock().unwrap() == Some(conn_id)
-                                    && !send_ws_msg(&mut sender, &ServerMsg::Op { op }).await
+                                    && !send_ws_msg(&mut sender, &ServerMsg::Op { op, seq }).await
                                 {
                                     break;
                                 }

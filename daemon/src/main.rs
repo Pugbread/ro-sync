@@ -16246,9 +16246,13 @@ fn handle_op(
 }
 
 fn emit_op(events: &broadcast::Sender<String>, op: &Op) {
-    let payload = serde_json::json!({ "type": "op", "op": op });
-    if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = events.send(s);
+    // Journal every op with a sequence number so a resuming plugin can replay
+    // the frames it missed instead of paying a full re-compare.
+    let Ok(value) = serde_json::to_value(op) else {
+        return;
+    };
+    if let Some(payload) = crate::ws::journal_op_event(&value) {
+        let _ = events.send(payload);
     }
 }
 
