@@ -1587,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn one_sided_cross_boundary_renames_require_exact_resync() {
+    fn cross_boundary_renames_still_require_exact_resync() {
         let root = Path::new("/project");
         let inside = root.join("Workspace/Main.luau");
         let outside = PathBuf::from("/outside/Main.luau");
@@ -1600,13 +1600,37 @@ mod tests {
             let error = collect_raw_pending(vec![event], root).unwrap_err();
             assert!(error.contains("crossed"), "{error}");
         }
+    }
 
-        let unpaired = debounced_event(
-            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
-            &[&inside],
-        );
-        let error = collect_raw_pending(vec![unpaired], root).unwrap_err();
-        assert!(error.contains("unpaired"), "{error}");
+    #[test]
+    fn unpaired_renames_resolve_by_probing_disk() {
+        // FSEvents delivers RenameMode::Any/From without a partner under load
+        // (including for the daemon's own atomic temp-file swaps). Instead of
+        // quarantining the watcher, the batch asks the filesystem: a path that
+        // still exists ingests as a create, a missing one as a removal.
+        let project = TempDir::new().unwrap();
+        let workspace = project.path().join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let present = workspace.join("Present.luau");
+        std::fs::write(&present, b"return true\n").unwrap();
+        let missing = workspace.join("Missing.luau");
+
+        for (path, expect_create) in [(&present, true), (&missing, false)] {
+            let unpaired = debounced_event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &[path.as_path()],
+            );
+            let resolved = collect_raw_pending(vec![unpaired], project.path()).unwrap();
+            assert_eq!(resolved.len(), 1, "{resolved:?}");
+            match &resolved[0] {
+                RawPending::Path { path: seen, kind } => {
+                    assert_eq!(seen, path.as_path());
+                    let is_create = matches!(kind, EventKind::Create(_));
+                    assert_eq!(is_create, expect_create, "{kind:?}");
+                }
+                other => panic!("expected a resolved path, got {other:?}"),
+            }
+        }
     }
 
     #[test]
