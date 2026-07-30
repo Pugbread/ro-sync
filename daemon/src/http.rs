@@ -916,6 +916,8 @@ struct Hello {
     plugin_protocol: u64,
     #[serde(rename = "pluginCapability")]
     plugin_capability: &'static str,
+    #[serde(rename = "hashChunkNodes")]
+    hash_chunk_nodes: usize,
     #[serde(rename = "projectInit")]
     project_init: ProjectInitHello,
 }
@@ -954,6 +956,7 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         plugin_connected,
         plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
         plugin_capability: crate::ws::plugin_capability(),
+        hash_chunk_nodes: STREAM_COMPARE_HASH_CHUNK_NODES,
         project_init: ProjectInitHello {
             available: projects_root.is_some(),
             projects_root,
@@ -2012,9 +2015,9 @@ fn process_streamed_initial_compare_chunk(
             if !body.records.is_empty() || !body.studio_snapshot.is_empty() {
                 return Err("hash chunks may contain only script hashes".into());
             }
-            if body.hashes.len() > STREAM_HASH_CHUNK_NODES {
+            if body.hashes.len() > STREAM_COMPARE_HASH_CHUNK_NODES {
                 return Err(format!(
-                    "hash chunks are limited to {STREAM_HASH_CHUNK_NODES} scripts"
+                    "hash chunks are limited to {STREAM_COMPARE_HASH_CHUNK_NODES} scripts"
                 ));
             }
             let studio_nodes = stream
@@ -4921,6 +4924,13 @@ const MAX_BOOTSTRAP_NODES: usize = 1_000_000;
 const STREAM_REQUEST_BODY_BYTES: usize = 512 * 1024;
 const STREAM_STRUCTURE_CHUNK_NODES: usize = 512;
 const STREAM_HASH_CHUNK_NODES: usize = 64;
+// Compare hashes are {id, sha256} — about 90 bytes each — so sharing the
+// 64-node cap with source parts (which carry real script text) filled roughly
+// 1% of each 512 KiB request. A 2.9k-script place spent ~46 round trips on
+// hashes alone against Studio's 500 requests/minute budget. Sizing this to the
+// structure cap keeps a full chunk near 46 KiB, still an order of magnitude
+// under the body limit. Advertised via /hello so older plugins keep sending 64.
+const STREAM_COMPARE_HASH_CHUNK_NODES: usize = 512;
 const STREAM_SOURCE_CHUNK_BYTES: usize = 512 * 1024;
 const STREAM_SOURCE_PART_BYTES: usize = 64 * 1024;
 const MAX_STREAM_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
