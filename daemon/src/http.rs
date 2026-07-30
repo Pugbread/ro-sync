@@ -1275,10 +1275,22 @@ fn initial_choice_action_rank(action: InitialChoiceAction) -> u8 {
     }
 }
 
+// A disk snapshot taken ahead of need. The initial compare walks and hashes
+// each service's disk tree only after the plugin finishes streaming that
+// service's Studio structure, which serializes disk IO behind Studio-side
+// streaming. The walk depends only on the service name, so the session spawns
+// one walker per service at creation and the prep step reuses the result when
+// the tree generation still matches (falling back to a fresh walk otherwise).
+struct PrewarmedDiskService {
+    generation: crate::fs_safety::TreeGeneration,
+    disk: snapshot::FlatDiskService,
+}
+
 struct InitialCompareAccumulator {
     compare_id: String,
     disk_stats: Stats,
     studio_stats: Stats,
+    disk_prewarm: HashMap<String, std::sync::mpsc::Receiver<Result<PrewarmedDiskService, String>>>,
     next_service: usize,
     comparison: InitialComparison,
     staged_baselines: Vec<StagedScriptBaseline>,
@@ -1533,10 +1545,36 @@ async fn initial_compare(
             .lock()
             .unwrap();
         prune_initial_compare_sessions(&mut sessions);
+        // Start every service's disk walk now, in parallel, so it overlaps
+        // the plugin's Studio-side structure streaming instead of running
+        // serially after it. Consumed (and generation-checked) in
+        // prepare_streamed_initial_service_comparison.
+        let mut disk_prewarm = HashMap::new();
+        for service in snapshot::SYNCED_SERVICES {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let root = project.clone();
+            let service_name = (*service).to_string();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let generation = crate::fs_safety::capture_tree_metadata(&root, &service_name)?;
+                    let disk = snapshot::emit_flat_service(&root, &service_name)
+                        .map_err(|error| format!("scan {}: {error}", root.join(&service_name).display()))?;
+                    if crate::fs_safety::capture_tree_metadata(&root, &service_name)? != generation {
+                        return Err(format!(
+                            "disk service {service_name} changed during prewarm; rescan required"
+                        ));
+                    }
+                    Ok(PrewarmedDiskService { generation, disk })
+                })();
+                let _ = send.send(result);
+            });
+            disk_prewarm.insert((*service).to_string(), receive);
+        }
         let session = Arc::new(Mutex::new(InitialCompareAccumulator {
             compare_id: compare_id.clone(),
             disk_stats,
             studio_stats: body.studio_stats,
+            disk_prewarm,
             next_service: 0,
             comparison: InitialComparison::default(),
             staged_baselines: Vec::new(),
@@ -1814,6 +1852,13 @@ fn process_streamed_initial_compare_chunk(
     let chunk_index = body
         .chunk_index
         .ok_or("streamed comparison chunk is missing chunkIndex")?;
+    // Detach this service's prewarmed disk walk before the stream borrow
+    // below; it is consumed exactly once, by the final structure chunk.
+    let disk_prewarm = if phase == "structure" && body.final_chunk {
+        session.disk_prewarm.remove(service)
+    } else {
+        None
+    };
     if session.service_stream.is_none() {
         if phase != "structure" || chunk_index != 0 {
             return Err("a service stream must begin with structure chunk 0".into());
@@ -1914,7 +1959,7 @@ fn process_streamed_initial_compare_chunk(
             std::thread::spawn(move || {
                 let prepared = (|| {
                     let validated = validate_flat_snapshot(&records, &service_name, false)?;
-                    prepare_streamed_initial_service_comparison(&root, validated)
+                    prepare_streamed_initial_service_comparison(&root, validated, disk_prewarm)
                 })();
                 let _ = send.send((records, prepared));
             });
@@ -2204,6 +2249,7 @@ struct PreparedStreamedComparison {
 fn prepare_streamed_initial_service_comparison(
     root: &Path,
     studio: ValidatedFlatSnapshot,
+    disk_prewarm: Option<std::sync::mpsc::Receiver<Result<PrewarmedDiskService, String>>>,
 ) -> Result<PreparedStreamedComparison, String> {
     let service = studio
         .service
@@ -2211,14 +2257,31 @@ fn prepare_streamed_initial_service_comparison(
         .and_then(Value::as_str)
         .ok_or("flat Studio service is missing its name")?
         .to_string();
-    let service_generation = crate::fs_safety::capture_tree_metadata(root, &service)?;
-    let disk = snapshot::emit_flat_service(root, &service)
-        .map_err(|error| format!("scan {}: {error}", root.join(&service).display()))?;
-    if crate::fs_safety::capture_tree_metadata(root, &service)? != service_generation {
-        return Err(format!(
-            "disk service {service} changed during initial comparison; restart the scan"
-        ));
+    // Prefer the walk prewarmed at session creation. It is only trusted when
+    // the tree generation still matches right now; any drift (or a missing /
+    // failed prewarm) falls back to the original capture → walk → verify.
+    let mut prewarmed = None;
+    if let Some(receiver) = disk_prewarm {
+        if let Ok(Ok(candidate)) = receiver.recv() {
+            if crate::fs_safety::capture_tree_metadata(root, &service)? == candidate.generation {
+                prewarmed = Some(candidate);
+            }
+        }
     }
+    let (service_generation, disk) = match prewarmed {
+        Some(candidate) => (candidate.generation, candidate.disk),
+        None => {
+            let generation = crate::fs_safety::capture_tree_metadata(root, &service)?;
+            let disk = snapshot::emit_flat_service(root, &service)
+                .map_err(|error| format!("scan {}: {error}", root.join(&service).display()))?;
+            if crate::fs_safety::capture_tree_metadata(root, &service)? != generation {
+                return Err(format!(
+                    "disk service {service} changed during initial comparison; restart the scan"
+                ));
+            }
+            (generation, disk)
+        }
+    };
     let disk_source_paths = disk.source_paths;
     let disk = validate_flat_snapshot(&disk.records, &service, true)?;
     let mut local_services = vec![disk.service];
@@ -17354,6 +17417,7 @@ mod tests {
                 compare_id: new_choice_id(),
                 disk_stats: Stats::default(),
                 studio_stats: Stats::default(),
+                disk_prewarm: HashMap::new(),
                 next_service: 0,
                 comparison: InitialComparison::default(),
                 staged_baselines: Vec::new(),
@@ -18213,7 +18277,7 @@ mod tests {
             .unwrap();
         }
         let studio = validate_flat_snapshot(&studio_records, "ReplicatedStorage", false).unwrap();
-        let prepared = prepare_streamed_initial_service_comparison(project.path(), studio).unwrap();
+        let prepared = prepare_streamed_initial_service_comparison(project.path(), studio, None).unwrap();
         assert_eq!(prepared.local_source_paths_by_path.len(), 2_048);
         assert_eq!(prepared.expected_hash_ids.len(), 2_048);
         assert!(prepared
@@ -18417,6 +18481,7 @@ mod tests {
             compare_id: "wide-name-session-budget".into(),
             disk_stats: Stats::default(),
             studio_stats: Stats::default(),
+            disk_prewarm: HashMap::new(),
             next_service: 0,
             comparison: InitialComparison::default(),
             staged_baselines: Vec::new(),
@@ -19570,6 +19635,7 @@ mod tests {
             compare_id: new_choice_id(),
             disk_stats: Stats::default(),
             studio_stats: Stats::default(),
+            disk_prewarm: HashMap::new(),
             next_service: snapshot::SYNCED_SERVICES.len(),
             comparison: InitialComparison::default(),
             staged_baselines: Vec::new(),
