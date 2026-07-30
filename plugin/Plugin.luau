@@ -4420,8 +4420,34 @@ local scaleState = {
 	trackedInstanceCount = 0,
 	trackedConnectionCount = 0,
 	lastKnownParent = {},
+	-- Wall-clock slice budget for the big tree walks. See yieldIfSliceExpired.
+	sliceBudgetSeconds = 0.030,
 }
 local flushPush
+
+-- Yield on elapsed time, not on a fixed instance count.
+--
+-- The walks below used to `task.wait()` every N instances (500 for scans, 750
+-- for hooks). Each wait costs a whole frame, so on a 460k-instance place the
+-- stats scan spent ~918 frames — roughly 15s of a 19s scan — parked rather
+-- than working; hook install paid ~612 more. Total time under a fixed cadence
+-- is work * (1 + frameTime/sliceTime), so a small slice is pathological.
+--
+-- Slicing on wall-clock instead bounds the per-frame hitch directly (the thing
+-- responsiveness actually depends on) and makes the yield count fall out of
+-- how fast the machine is, not how many instances it happens to be holding.
+local sliceStartedAt = os.clock()
+scaleState.resetYieldSlice = function()
+	sliceStartedAt = os.clock()
+end
+scaleState.yieldIfSliceExpired = function(): boolean
+	if (os.clock() - sliceStartedAt) < scaleState.sliceBudgetSeconds then
+		return false
+	end
+	task.wait()
+	sliceStartedAt = os.clock()
+	return true
+end
 
 scaleState.preflightLiveOp = function(op, shouldContinue): (string?, string?)
 	-- Reject an oversized/cyclic value tree before sanitizeJson duplicates it.
@@ -4464,8 +4490,7 @@ scaleState.preflightLiveOp = function(op, shouldContinue): (string?, string?)
 			return nil, "live operation exceeds the 512 KiB frame limit"
 		end
 		visited += 1
-		if visited % scaleState.studioScanYieldEvery == 0 then
-			task.wait()
+		if scaleState.yieldIfSliceExpired() then
 			if shouldContinue and not shouldContinue() then
 				return nil, "cancelled"
 			end
@@ -5450,8 +5475,7 @@ connectTree = function(inst, progress, shouldContinue): boolean
 				or hasAvoidSyncAttribute(frame.inst)
 			connectInstance(frame.inst, frame.blocked, frame.blocked or frame.inst:IsA("LuaSourceContainer"))
 			meter.visited += 1
-			if meter.visited % scaleState.hookYieldEvery == 0 then
-				task.wait()
+			if scaleState.yieldIfSliceExpired() then
 				if shouldContinue and not shouldContinue() then
 					return false
 				end
@@ -5642,6 +5666,7 @@ end
 
 local function installHooks(shouldContinue): boolean
 	local hooksStarted = os.clock()
+	scaleState.resetYieldSlice()
 	scaleState.avoidSyncTrackingPaused = true
 	disconnectHooks()
 	table.clear(scaleState.avoidSyncRoots)
@@ -5987,9 +6012,7 @@ scaleState.scanStudioService = function(service: Instance, stats, progress)
 			frame.outputChildren = {}
 			frame.hasSyncableChild = false
 			progress.visited += 1
-			if progress.visited % scaleState.studioScanYieldEvery == 0 then
-				task.wait()
-			end
+			scaleState.yieldIfSliceExpired()
 			if SUPPRESS_CLASSES[frame.inst.ClassName] then
 				frame.suppressed = true
 				frame.children = {}
@@ -6048,9 +6071,7 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 			frame.hasAvoidSyncChild = false
 			frame.projectedChildCount = 0
 			progress.visited += 1
-			if progress.visited % scaleState.studioScanYieldEvery == 0 then
-				task.wait()
-			end
+			scaleState.yieldIfSliceExpired()
 			if SUPPRESS_CLASSES[frame.inst.ClassName] then
 				frame.children = {}
 				frame.suppressed = true
@@ -6140,6 +6161,7 @@ end
 scaleState.collectStudioStatsWithGuard = function(guard)
 	local stats = { scriptCount = 0, instanceCount = 0 }
 	local progress = { visited = 0 }
+	scaleState.resetYieldSlice()
 	-- Strong keys on purpose: the initial push streams structure from this index
 	-- after the /initial-compare round trip, and on large places (100k+
 	-- instances) a GC cycle in that window swept a weak-keyed table, leaving
@@ -6231,8 +6253,7 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 			frame.entered = true
 			frame.id = nextId
 			nextId += 1
-			if nextId % scaleState.studioScanYieldEvery == 0 then
-				task.wait()
+			if scaleState.yieldIfSliceExpired() then
 				if blockedByMutation() then
 					return nil, "Studio changed during streamed structure scan"
 				end
@@ -11735,6 +11756,16 @@ reconnectState.refreshHello = function()
 	baseUrl = candidateUrl
 	connectedPort = candidatePort or candidateUrl:match(":(%d+)$") or "?"
 	reconnectState.pluginCapability = capability
+	-- Negotiate the compare-hash batch size. A daemon that predates the
+	-- advertisement omits the field, so we stay at the conservative 64 it
+	-- still enforces; a newer one lets a 2.9k-script place send ~6 chunks
+	-- instead of ~46 against Studio's 500 requests/minute budget.
+	local advertisedHashChunk = tonumber(hello.hashChunkNodes)
+	if advertisedHashChunk and advertisedHashChunk >= 1 then
+		scaleState.compareHashChunkRecords = math.clamp(math.floor(advertisedHashChunk), 1, 512)
+	else
+		scaleState.compareHashChunkRecords = 64
+	end
 	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
 	if ui and ui.setProjectName and type(hello.name) == "string" and hello.name ~= "" then
 		ui.setProjectName(hello.name)
@@ -13116,8 +13147,7 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 				staged.Name = record.name
 				staged.Parent = parent
 				state.stagedInstances[id + 1] = staged
-				if id % scaleState.studioScanYieldEvery == 0 then
-					task.wait()
+				if scaleState.yieldIfSliceExpired() then
 					if not shouldContinue() then
 						error("detached snapshot staging cancelled", 0)
 					end
@@ -14490,8 +14520,9 @@ runInitialCompare = function()
 						sha256 = scaleState.normalizedSourceHash(sourceEntry.inst),
 					}
 					sourceIndex += 1
-					if sourceIndex % scaleState.compareHashChunkRecords == 0 then
-						task.wait()
+					-- Hashing cost scales with source bytes, not script count,
+					-- so pace this on elapsed time rather than the batch size.
+					if scaleState.yieldIfSliceExpired() then
 						if scanGuard.dirty then
 							disposeScanGuard()
 							reconnectState.retryInitialCompare("Studio changed while hashing scripts")
