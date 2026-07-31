@@ -10,6 +10,14 @@ const pluginSrcDir = path.join(repoRoot, "plugin-src");
 const pluginSourcePath = path.join(repoRoot, "plugin", "Plugin.luau");
 const pluginOutputPath = path.join(repoRoot, "plugin", "Plugin.rbxm");
 const pluginManifestPath = path.join(repoRoot, "plugin", "Plugin.build.json");
+const pluginChildModules = [
+  "Clipboard",
+  "PathHelpers",
+  "Photo",
+  "Playscript",
+  "Reflection",
+  "RemoteCodec",
+];
 
 function run(command, args) {
   const result = spawnSync(command, args, {
@@ -49,22 +57,18 @@ const buildDirty =
     String(gitText(["status", "--porcelain", "--untracked-files=no"]) || "").length > 0);
 
 await mkdir(path.join(pluginSrcDir, "src"), { recursive: true });
-await copyFile(
-  pluginSourcePath,
-  path.join(pluginSrcDir, "src", "RoSync.server.luau"),
-);
-await copyFile(
-  path.join(repoRoot, "plugin", "Photo.luau"),
-  path.join(pluginSrcDir, "src", "Photo.luau"),
-);
-await copyFile(
-  path.join(repoRoot, "plugin", "Playscript.luau"),
-  path.join(pluginSrcDir, "src", "Playscript.luau"),
-);
-await copyFile(
-  path.join(repoRoot, "plugin", "Clipboard.luau"),
-  path.join(pluginSrcDir, "src", "Clipboard.luau"),
-);
+await Promise.all([
+  copyFile(
+    pluginSourcePath,
+    path.join(pluginSrcDir, "src", "RoSync.server.luau"),
+  ),
+  ...pluginChildModules.map((moduleName) =>
+    copyFile(
+      path.join(repoRoot, "plugin", `${moduleName}.luau`),
+      path.join(pluginSrcDir, "src", `${moduleName}.luau`),
+    ),
+  ),
+]);
 await writeFile(
   path.join(pluginSrcDir, "src", "BuildInfo.luau"),
   [
@@ -77,6 +81,19 @@ await writeFile(
   ].join("\n"),
   "utf8",
 );
+
+const rojoProject = JSON.parse(
+  await readFile(path.join(pluginSrcDir, "plugin.project.json"), "utf8"),
+);
+for (const moduleName of pluginChildModules) {
+  const expectedPath = `src/${moduleName}.luau`;
+  const configuredPath = rojoProject?.tree?.RoSync?.[moduleName]?.$path;
+  if (configuredPath !== expectedPath) {
+    throw new Error(
+      `plugin.project.json must package RoSync.${moduleName} from ${expectedPath}`,
+    );
+  }
+}
 
 if (process.env.ROSYNC_SKIP_WALLY !== "1") {
   run("wally", ["install"]);

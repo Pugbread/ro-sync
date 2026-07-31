@@ -3,6 +3,14 @@
   "title": "rosync capture",
   "category": "Agent Runtime",
   "description": "Captures the Studio surface, the 3D viewport, or its in-game UI layer and writes a verified PNG without placing image bytes on stdout. The self-contained Photo engine can capture the current viewport, extract transparent ScreenGui layers, or clone and frame a Studio subject without place-provided capture dependencies or screenshot authorization.",
+  "subcommands": ["status", "authorize", "screen", "photo", "scene"],
+  "subcommandMetadata": {
+    "status": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "authorize": { "safety": "system-permission-prompt", "requires": ["project", "daemon", "studio-plugin"] },
+    "screen": { "safety": "writes-local-artifact", "requires": ["project", "daemon", "studio-plugin"] },
+    "photo": { "safety": "writes-local-artifact", "requires": ["project", "daemon", "studio-plugin"] },
+    "scene": { "safety": "writes-local-artifact", "requires": ["project", "daemon", "studio-plugin"] }
+  },
   "usage": "rosync capture status|authorize|screen|photo|scene [options]",
   "examples": [
     "rosync capture status --project . --raw",

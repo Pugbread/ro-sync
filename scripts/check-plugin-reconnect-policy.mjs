@@ -3,6 +3,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 const source = fs.readFileSync(new URL("../plugin/Plugin.luau", import.meta.url), "utf8");
+const pathHelpersSource = fs.readFileSync(
+  new URL("../plugin/PathHelpers.luau", import.meta.url),
+  "utf8",
+);
 const wsLoop = source.slice(
   source.indexOf("local function wsLoop(gen)"),
   source.indexOf("reconnectState.retryInitialCompare = function"),
@@ -386,26 +390,26 @@ assert.match(
   "large live Sources/subtrees must fail into streamed resync before building an unbounded nested operation",
 );
 assert.match(
-  source,
+  pathHelpersSource,
   /local leadingSpace = index == 1 and byte == 32[\s\S]*?if leadingDot or leadingSpace or trailingDotOrSpace or unsafe then/,
   "Windows-safe physical names must encode a leading ASCII space",
 );
 assert.match(
-  source,
+  pathHelpersSource,
   /function PathHelpers\.isReservedInitStem[\s\S]*?lower == "init"[\s\S]*?function PathHelpers\.leafScriptStem[\s\S]*?string\.format\("%%%02X"/,
   "literal leaf scripts matching init-marker grammar must escape their first byte",
 );
 assert.ok(
-  source.includes('return lower:match("^init %((.+)%)$") ~= nil'),
+  pathHelpersSource.includes('return lower:match("^init %((.+)%)$") ~= nil'),
   "named init reservation must require a non-empty parenthesized name",
 );
 assert.match(
-  source,
-  /allocatePhysicalFragment[\s\S]*?not isDirectory and SCRIPT_CLASSES\[className\][\s\S]*?PathHelpers\.leafScriptStem/,
+  pathHelpersSource,
+  /allocatePhysicalFragment[\s\S]*?not isDirectory and deps\.scriptClasses\[className\][\s\S]*?PathHelpers\.leafScriptStem/,
   "reserved init escaping must apply only to leaf scripts",
 );
 assert.match(
-  source,
+  pathHelpersSource,
   /function PathHelpers\.portableInitFileName[\s\S]*?#named <= 255[\s\S]*?return "init" \.\. suffix/,
   "directory-backed scripts must mirror Rust's portable named/plain init marker selection",
 );
@@ -524,13 +528,22 @@ assert.match(
 );
 assert.match(
   authoritativeSourceWrites,
-  /local function queueScriptSourceWrite[\s\S]*?local currentSource = tryReadScriptSource\(inst\)[\s\S]*?currentSource ~= nil and sourcesMatchForApply\(currentSource, newSource\)[\s\S]*?table\.insert\(queue,[\s\S]*?return true/,
-  "queued Source equality must use the authoritative editor buffer and enqueue an apply when it is unreadable",
+  /local function queueScriptSourceWrite[\s\S]*?Always retain the desired value[\s\S]*?table\.insert\(queue,[\s\S]*?return true/,
+  "queued Source writes must retain every desired value until last-write-wins coalescing",
 );
 assert.doesNotMatch(
   authoritativeSourceWrites,
   /sourcesMatchForApply\(readScriptSource\(inst\), newSource\)/,
   "authoritative Source write paths must never accept a stale raw Source fallback as equality",
+);
+const sourceWriteFlush = source.slice(
+  source.indexOf("local function flushScriptSourceWrites"),
+  source.indexOf("-- Source is the only property we round-trip"),
+);
+assert.match(
+  sourceWriteFlush,
+  /local coalesced = \{\}[\s\S]*?indexByInstance\[job\.inst\][\s\S]*?coalesced\[existingIndex\] = job[\s\S]*?queue = coalesced[\s\S]*?tryReadScriptSource\(job\.inst\)[\s\S]*?sourcesMatchForApply\(currentSource, job\.source\)[\s\S]*?queue = pending/,
+  "Source drains must coalesce repeated writes per Instance before checking the final desired value",
 );
 assert.match(
   source,
@@ -747,23 +760,46 @@ function modelCachedDuplicateInsertion(entries) {
     "every duplicate Instance must retain a one-to-one physical fragment",
   );
 }
-const generatedLookup = source.slice(
-  source.indexOf("function PathHelpers.findGeneratedPathChild"),
-  source.indexOf("function PathHelpers.findRawDisambiguatedChild"),
+const generatedLookup = pathHelpersSource.slice(
+  pathHelpersSource.indexOf("function PathHelpers.findGeneratedPathChild"),
+  pathHelpersSource.indexOf("function PathHelpers.findRawDisambiguatedChild"),
 );
 assert.match(
   generatedLookup,
-  /buildPhysicalSiblingIndex\(parent, ctx\)[\s\S]*?byLookupSegment\[seg\]/,
+  /local state = deps\.getSnapshotApplyState\(\)[\s\S]*?state\.buildPhysicalSiblingIndex\(parent, ctx\)[\s\S]*?byLookupSegment\[seg\]/,
   "generated lookup must reuse the iterative projection index",
 );
+const pathHelpersInstall = source.slice(
+  source.indexOf('script:FindFirstChild("PathHelpers")'),
+  source.indexOf("local function pathStartsWith"),
+);
+assert.match(
+  pathHelpersInstall,
+  /getSnapshotApplyState = function\(\)[\s\S]*?return snapshotApplyState/,
+  "PathHelpers must lazily share the one snapshot identity state instead of duplicating it",
+);
 assert.equal(
-  source.includes("syncRelevantSignature"),
+  pathHelpersSource.includes("syncRelevantSignature"),
   false,
   "generated lookup must not recursively recompute descendant signatures",
 );
 const snapshotPrepare = source.slice(
   source.indexOf("function snapshotApplyState.prepareInstance"),
   source.indexOf("function snapshotApplyState.pruneUnkept"),
+);
+const appliedProjectionRegistration = source.slice(
+  source.indexOf("function snapshotApplyState.registerAppliedProjection"),
+  source.indexOf("function snapshotApplyState.prepareInstance"),
+);
+assert.match(
+  appliedProjectionRegistration,
+  /ctx\.syncableInstances\[inst\] = true[\s\S]*?ctx\.directoryInstances\[inst\] = if node\.class == "Folder"[\s\S]*?local ancestor = inst\.Parent[\s\S]*?ctx\.syncableInstances\[ancestor\] = true[\s\S]*?ctx\.directoryInstances\[ancestor\] = true/,
+  "a set must immediately add its materialized node and ancestors to the shared projection index",
+);
+assert.match(
+  snapshotPrepare,
+  /ctx\.claimedInstances\[inst\] = true[\s\S]*?registerAppliedProjection\(inst, node, ctx\)[\s\S]*?diskPathCache\[inst\] = diskPath/,
+  "projection registration must happen in the same apply step that caches the exact disk identity",
 );
 assert.match(
   snapshotPrepare,
@@ -776,9 +812,43 @@ assert.match(
   "an AvoidSync carrier's own source must remain Studio-authoritative",
 );
 
-const physicalAllocator = source.slice(
-  source.indexOf("function PathHelpers.allocatePhysicalFragment"),
-  source.indexOf("function PathHelpers.mappedSyncClass"),
+function modelBackToBackFolderAndScriptSet(registerProjection) {
+  const projection = new Set();
+  const children = new Map([["ReplicatedStorage", []]]);
+  const set = (parent, name, kind) => {
+    const path = `${parent}/${name}`;
+    const siblings = children.get(parent) ?? [];
+    children.set(parent, [...siblings, path]);
+    children.set(path, []);
+    if (registerProjection) projection.add(path);
+    if (kind === "ModuleScript") projection.add(path);
+    return path;
+  };
+  const resolveParent = (parent) =>
+    (children.get("ReplicatedStorage") ?? []).find(
+      (candidate) => candidate === parent && projection.has(candidate),
+    );
+
+  const folder = set("ReplicatedStorage", "Fresh", "Folder");
+  const parent = resolveParent(folder);
+  if (!parent) return false;
+  set(parent, "Config.luau", "ModuleScript");
+  return true;
+}
+assert.equal(
+  modelBackToBackFolderAndScriptSet(false),
+  false,
+  "the pre-fix stale projection index must reproduce the dropped child set",
+);
+assert.equal(
+  modelBackToBackFolderAndScriptSet(true),
+  true,
+  "registering the Folder during its set must make the immediately following child resolvable",
+);
+
+const physicalAllocator = pathHelpersSource.slice(
+  pathHelpersSource.indexOf("function PathHelpers.allocatePhysicalFragment"),
+  pathHelpersSource.indexOf("function PathHelpers.mappedSyncClass"),
 );
 assert.match(
   physicalAllocator,
@@ -1365,7 +1435,12 @@ const liveApply = source.slice(
 );
 assert.match(
   liveApply,
-  /TryBeginRecording[\s\S]*?shouldContinue[\s\S]*?snapshotApplyState\.checkpoint[\s\S]*?flushScriptSourceWrites\(sourceWrites, shouldContinue\)/,
+  // The trailing argument list is deliberately open-ended: flushScriptSourceWrites
+  // also takes an optional failed-job collector so a single rejected Source can be
+  // reported against its own op instead of failing the whole coalesced batch. The
+  // invariant being asserted is that the same `shouldContinue` generation
+  // predicate reaches both the structure pass and the Source pass.
+  /TryBeginRecording[\s\S]*?shouldContinue[\s\S]*?snapshotApplyState\.checkpoint[\s\S]*?flushScriptSourceWrites\(sourceWrites, shouldContinue[,)]/,
   "yielding live filesystem applies must share one generation predicate across structure and Source writes",
 );
 assert.match(
@@ -1373,10 +1448,40 @@ assert.match(
   /FinishRecording\(recordingId, Enum\.FinishRecordingOperation\.Commit\)[\s\S]*?FinishRecording\(recordingId, Enum\.FinishRecordingOperation\.Cancel\)[\s\S]*?ChangeHistoryService:Undo\(\)/,
   "a disconnected or failed live apply must roll back its recording before returning failure",
 );
+// Inbound ops are queued and drained by a single worker rather than applied
+// inline. applyOps yields (UpdateSourceAsync) while holding the plugin's one
+// ChangeHistoryService recording, so a second op frame arriving mid-apply used
+// to fail its TryBeginRecording, drop the socket, and force a Studio-authoritative
+// resync that discarded local edits. The predicate still has to reach the apply.
 assert.match(
   wsLoop,
-  /local function shouldContinueApply\(\)[\s\S]*?not closed[\s\S]*?gen == wsGeneration[\s\S]*?ws == client[\s\S]*?applyOps\(\{ msg\.op \}, shouldContinueApply\)[\s\S]*?elseif shouldContinueApply\(\) then/,
+  /local function shouldContinueApply\(\)[\s\S]*?not closed[\s\S]*?gen == wsGeneration[\s\S]*?ws == client[\s\S]*?applyOps\(batch, shouldContinueApply\)[\s\S]*?elseif shouldContinueApply\(\) then/,
   "WebSocket operation apply must cancel on generation/transport loss and acknowledge only a committed result",
+);
+assert.match(
+  wsLoop,
+  /kind == "op" or kind == "ops"[\s\S]*?type\(msg\.ops\) == "table"[\s\S]*?#opQueue \+ #incoming > OP_QUEUE_MAX[\s\S]*?opQueueBytes \+ payloadBytes > OP_QUEUE_MAX_BYTES[\s\S]*?table\.insert\(opQueue, op\)[\s\S]*?opQueueBytes \+= payloadBytes[\s\S]*?runOpWorker\(\)/,
+  "single and bounded batched inbound ops must share one count- and byte-bounded apply lane",
+);
+assert.doesNotMatch(
+  wsLoop,
+  /applyOps\(\{ msg\.op \}/,
+  "applying a single op frame inline reintroduces the recording-contention disconnect",
+);
+assert.match(
+  wsLoop,
+  /elseif shouldContinueApply\(\) then[\s\S]*?requestControlledLiveResync\("live filesystem apply failed"\)/,
+  "an unacknowledged filesystem apply failure must force an exact comparison instead of leaving Studio stale",
+);
+assert.match(
+  wsLoop,
+  /failedOps ~= nil and next\(failedOps\) ~= nil[\s\S]*?requestControlledLiveResync\("one or more live Source writes were rejected"\)/,
+  "individually rejected Source writes must force an exact comparison after successful siblings are acknowledged",
+);
+assert.match(
+  wsLoop,
+  /operation frame was malformed or exceeded its bounded count[\s\S]*?requestControlledLiveResync\("malformed or oversized inbound operation frame"\)/,
+  "malformed or oversized inbound op frames must fail closed into exact comparison",
 );
 
 const liveHooks = source.slice(

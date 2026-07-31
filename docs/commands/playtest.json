@@ -18,6 +18,20 @@
     "stop",
     "request"
   ],
+  "subcommandMetadata": {
+    "run": { "safety": "controls-playtest-and-runtime-execution", "requires": ["project", "daemon", "studio-plugin"] },
+    "start": { "safety": "controls-playtest", "requires": ["project", "daemon", "studio-plugin"] },
+    "status": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "contexts": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "wait": { "safety": "streaming-read", "requires": ["project", "daemon", "studio-plugin"] },
+    "exec": { "safety": "risky-live-execution", "requires": ["project", "daemon", "studio-plugin"] },
+    "logs": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "ui": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "input": { "safety": "mutates-playtest-input", "requires": ["project", "daemon", "studio-plugin"] },
+    "capture": { "safety": "writes-local-artifact", "requires": ["project", "daemon", "studio-plugin"] },
+    "stop": { "safety": "controls-playtest", "requires": ["project", "daemon", "studio-plugin"] },
+    "request": { "safety": "risky-live-execution", "requires": ["project", "daemon", "studio-plugin"] }
+  },
   "examples": [
     "rosync playtest run --project . --script ./check.server.luau --raw",
     "rosync playtest run --project . --script ./bench.server.luau --client-script ./join.client.luau --mode multiplayer --players 2 --args '{\"map\":\"Lighthouse\",\"laps\":3}' --timeout 600 --raw",

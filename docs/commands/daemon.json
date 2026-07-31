@@ -3,6 +3,14 @@
   "title": "rosync daemon",
   "category": "Daemon",
   "description": "Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.",
+  "subcommands": ["start", "status", "stop", "restart", "logs"],
+  "subcommandMetadata": {
+    "start": { "safety": "controls-local-service", "requires": ["project"] },
+    "status": { "safety": "read-only", "requires": ["project"] },
+    "stop": { "safety": "controls-local-service", "requires": ["project"] },
+    "restart": { "safety": "controls-local-service", "requires": ["project"] },
+    "logs": { "safety": "read-only", "requires": ["project"] }
+  },
   "usage": "rosync daemon <start|status|stop|restart|logs> --project <path> [options]",
   "examples": [
     "rosync daemon start --project . --raw",

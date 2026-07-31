@@ -3,6 +3,12 @@
   "title": "rosync attr",
   "category": "Live writes",
   "description": "Lists, sets, or removes attributes on a live Studio instance.",
+  "subcommands": ["set", "rm", "ls"],
+  "subcommandMetadata": {
+    "set": { "safety": "mutates-studio", "requires": ["project", "daemon", "studio-plugin"] },
+    "rm": { "safety": "mutates-studio", "requires": ["project", "daemon", "studio-plugin"] },
+    "ls": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] }
+  },
   "usage": "rosync attr set|rm|ls [--project <path>] [--port <port>] --path <studio-path> [--name <attribute>] [--value <json>] [--raw]",
   "examples": [
     "rosync attr set --project . --path Workspace/Box --name Speed --value 12.5",

@@ -607,6 +607,16 @@ pub fn set_node_source(nodes: &mut BTreeMap<String, DiffNode>, path: &str, sourc
     }
 }
 
+/// Drop a node the live tree advertised but which no longer exists.
+///
+/// The comparison enumerates Studio first and reads each Source afterwards, so a
+/// runtime-spawned instance can vanish in between. Such a node must leave the
+/// Studio side entirely rather than linger without a hash, which would otherwise
+/// read as a spurious content difference against the file on disk.
+pub fn remove_studio_node(nodes: &mut BTreeMap<String, DiffNode>, path: &str) {
+    nodes.remove(path);
+}
+
 pub(crate) fn snapshot_sibling_order(children: &[Value]) -> Vec<usize> {
     let mut cache = ComparisonCache::new(TreeFlavor::Snapshot);
     cache.prepare_slice(children);

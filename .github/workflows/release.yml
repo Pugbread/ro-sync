@@ -75,7 +75,7 @@ jobs:
 
       - name: Build
         working-directory: daemon
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }}
 
       - name: Import Windows Authenticode certificate
         if: runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
@@ -140,7 +140,7 @@ jobs:
         if: runner.os == 'Windows' && env.ROSYNC_TAGGED_RELEASE == '1'
         shell: pwsh
         run: |
-          $binary = "daemon/target/${{ matrix.target }}/release/${{ matrix.src_bin }}"
+          $binary = "daemon/target/${{ matrix.target }}/dist/${{ matrix.src_bin }}"
           & $env:WINDOWS_SIGNTOOL sign `
             /s My `
             /sha1 $env:WINDOWS_CODESIGN_THUMBPRINT `
@@ -172,7 +172,7 @@ jobs:
             }
           fi
           node scripts/verify-build-identity.mjs \
-            --daemon "daemon/target/${{ matrix.target }}/release/${{ matrix.src_bin }}" \
+            --daemon "daemon/target/${{ matrix.target }}/dist/${{ matrix.src_bin }}" \
             --commit "$GITHUB_SHA" \
             --version "$daemon_version"
 
@@ -191,7 +191,7 @@ jobs:
             "$bundle/daemon" \
             "$bundle/tools/luau/${{ matrix.tool_target }}"
           cp \
-            "daemon/target/${{ matrix.target }}/release/${{ matrix.src_bin }}" \
+            "daemon/target/${{ matrix.target }}/dist/${{ matrix.src_bin }}" \
             "$dist/${{ matrix.out }}"
           cp "$dist/${{ matrix.out }}" "$bundle/daemon/${{ matrix.out }}"
           cp \
@@ -277,6 +277,10 @@ jobs:
         run: |
           node scripts/check-luau-bytecode.mjs plugin/Plugin.luau
           node scripts/check-luau-bytecode.mjs plugin/Clipboard.luau
+          node scripts/check-luau-bytecode.mjs plugin/PathHelpers.luau
+          node scripts/check-luau-bytecode.mjs plugin/Reflection.luau
+          node scripts/check-luau-bytecode.mjs plugin/RemoteCodec.luau
+          node scripts/check-luau-bytecode.mjs plugin/Playscript.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/BuildInfo.luau

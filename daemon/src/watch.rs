@@ -456,7 +456,25 @@ fn collect_raw_pending(
                 match (is_projected_path(from, root), is_projected_path(to, root)) {
                     (true, true) => push_raw_rename(&mut pending, &mut by_path, from, to),
                     (false, false) => {}
-                    _ => {
+                    // Moving *out* of the projection is unambiguous: whatever the
+                    // source was, file or directory, it is simply gone, and a
+                    // subtree removal is fully expressible. Treating it as
+                    // unrecoverable was self-defeating, because Ro Sync's own
+                    // keep-Studio sync moves each service root into
+                    // `.rosync-backups/` (blacklisted, so unprojected) before
+                    // rewriting it — tripping this arm once per service and
+                    // forcing a full reconnect and resync each time.
+                    (true, false) => push_raw_path(
+                        &mut pending,
+                        &mut by_path,
+                        from,
+                        &EventKind::Remove(RemoveKind::Any),
+                    ),
+                    // Moving *in* still requires a resync. The watcher receives a
+                    // single rename event for the directory and no creates for
+                    // its descendants, so there is no way to enumerate what
+                    // actually arrived from this batch alone.
+                    (false, true) => {
                         return Err(format!(
                             "filesystem rename crossed the synced projection boundary: {} -> {}",
                             from.display(),
@@ -1582,13 +1600,33 @@ mod tests {
         let inside = root.join("Workspace/Main.luau");
         let outside = PathBuf::from("/outside/Main.luau");
 
-        for (from, to) in [(&inside, &outside), (&outside, &inside)] {
-            let event = debounced_event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-                &[from, to],
-            );
-            let error = collect_raw_pending(vec![event], root).unwrap_err();
-            assert!(error.contains("crossed"), "{error}");
+        // Moving *in* is still unrecoverable: one rename event arrives for the
+        // destination and none for its descendants, so the batch cannot say what
+        // was actually added.
+        let inbound = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[&outside, &inside],
+        );
+        let error = collect_raw_pending(vec![inbound], root).unwrap_err();
+        assert!(error.contains("crossed"), "{error}");
+
+        // Moving *out* is a plain removal and must NOT force a resync. Ro Sync's
+        // own keep-Studio sync relocates each service root into
+        // `.rosync-backups/`, and erroring here made it reconnect once per
+        // service.
+        let outbound = debounced_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[&inside, &outside],
+        );
+        let pending = collect_raw_pending(vec![outbound], root)
+            .expect("a move out of the projection is expressible as a removal");
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            RawPending::Path { path, kind } => {
+                assert_eq!(path, &inside);
+                assert!(matches!(kind, EventKind::Remove(_)), "{kind:?}");
+            }
+            other => panic!("expected a removal, got {other:?}"),
         }
 
         let unpaired = debounced_event(

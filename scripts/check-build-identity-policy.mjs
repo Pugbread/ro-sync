@@ -24,8 +24,21 @@ try {
       /refs\/heads\/main/,
       `${relative} must watch the resolved branch rather than hard-coding main`,
     );
-    assert.match(buildScript, /symbolic-ref[\s\S]*?--git-path=\{reference\}/);
-    assert.match(buildScript, /core\.quotePath=false", "ls-files", "-z"/);
+    assert.doesNotMatch(
+      buildScript,
+      /ls-files/,
+      `${relative} must not invalidate a Rust build for every unrelated tracked file`,
+    );
+    assert.match(
+      buildScript,
+      /unwrap_or_else\(\|\| "source"\.to_string\(\)\)/,
+      `${relative} must use stable local build identity when CI did not provide one`,
+    );
+    assert.match(
+      buildScript,
+      /_ if short_commit == "source" => false/,
+      `${relative} must keep local source builds stable instead of recompiling for a dirty bit`,
+    );
   }
   const releaseWorkflow = readFileSync(
     path.join(root, ".github", "workflows", "release.yml"),
@@ -38,7 +51,7 @@ try {
   );
   assert.match(
     releaseWorkflow,
-    /Verify standalone daemon build identity[\s\S]*?--daemon "daemon\/target\/\$\{\{ matrix\.target \}\}\/release\/\$\{\{ matrix\.src_bin \}\}"[\s\S]*?--version "\$daemon_version"/,
+    /Build[\s\S]*?cargo build --profile dist --locked --target \$\{\{ matrix\.target \}\}[\s\S]*?Verify standalone daemon build identity[\s\S]*?--daemon "daemon\/target\/\$\{\{ matrix\.target \}\}\/dist\/\$\{\{ matrix\.src_bin \}\}"[\s\S]*?--version "\$daemon_version"/,
     "every standalone daemon matrix artifact must be identity-checked before staging",
   );
   assert.match(

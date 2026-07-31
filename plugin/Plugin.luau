@@ -2157,269 +2157,20 @@ local function splitStudioPath(path: string): { string }
 	return out
 end
 
-local function parseDisambiguatedSegment(seg: string): (string?, number?)
-	local base, ordinal = string.match(seg, "^(.-) %[([0-9]+)%]$")
-	if type(base) ~= "string" or base == "" then
-		return nil, nil
-	end
-	local n = tonumber(ordinal)
-	if not n then
-		return nil, nil
-	end
-	return base, n
-end
-
 local snapshotApplyState
-local PathHelpers = {}
-
-function PathHelpers.pathSegmentTaken(taken: { [string]: true }, candidate: string): boolean
-	return taken[string.lower(candidate)] == true
-end
-
-function PathHelpers.generatedPathSegmentForChild(
-	child: Instance,
-	taken: { [string]: true },
-	nextOrdinals: { [string]: number }?
-): string
-	local base = child.Name
-	if not PathHelpers.pathSegmentTaken(taken, base) then
-		taken[string.lower(base)] = true
-		if nextOrdinals then
-			nextOrdinals[string.lower(base)] = 1
-		end
-		return base
+local PathHelpers
+do
+	local moduleScript = script:FindFirstChild("PathHelpers")
+	if not moduleScript or not moduleScript:IsA("ModuleScript") then
+		error("[Ro Sync] packaged PathHelpers module is missing")
 	end
-	local baseKey = string.lower(base)
-	local n = if nextOrdinals then nextOrdinals[baseKey] or 1 else 1
-	while true do
-		local candidate = string.format("%s [%d]", base, n)
-		if not PathHelpers.pathSegmentTaken(taken, candidate) then
-			taken[string.lower(candidate)] = true
-			if nextOrdinals then
-				nextOrdinals[baseKey] = n + 1
-			end
-			return candidate
-		end
-		n += 1
-	end
-end
-
-PathHelpers.windowsReserved = {
-	CON = true,
-	PRN = true,
-	AUX = true,
-	NUL = true,
-	COM1 = true,
-	COM2 = true,
-	COM3 = true,
-	COM4 = true,
-	COM5 = true,
-	COM6 = true,
-	COM7 = true,
-	COM8 = true,
-	COM9 = true,
-	LPT1 = true,
-	LPT2 = true,
-	LPT3 = true,
-	LPT4 = true,
-	LPT5 = true,
-	LPT6 = true,
-	LPT7 = true,
-	LPT8 = true,
-	LPT9 = true,
-	["CONIN$"] = true,
-	["CONOUT$"] = true,
-}
-
-function PathHelpers.encodeName(name: string): string
-	if name == "" then
-		return "%_"
-	end
-	local out = {}
-	for index = 1, #name do
-		local byte = string.byte(name, index)
-		local leadingDot = index == 1 and byte == 46
-		local leadingSpace = index == 1 and byte == 32
-		local trailingDotOrSpace = index == #name and (byte == 46 or byte == 32)
-		local unsafe = byte >= 128
-			or byte < 32
-			or byte == 37
-			or byte == 34
-			or byte == 42
-			or byte == 47
-			or byte == 58
-			or byte == 60
-			or byte == 62
-			or byte == 63
-			or byte == 92
-			or byte == 124
-		if leadingDot or leadingSpace or trailingDotOrSpace or unsafe then
-			out[#out + 1] = string.format("%%%02X", byte)
-		else
-			out[#out + 1] = string.char(byte)
-		end
-	end
-	local encoded = table.concat(out)
-	local reservedHead = string.upper(encoded:match("^([^.]+)") or encoded)
-	if PathHelpers.windowsReserved[reservedHead] and #encoded > 0 then
-		encoded = string.format("%%%02X", string.byte(encoded, 1)) .. encoded:sub(2)
-	end
-	-- A literal Roblox suffix in the generated ordinal grammar must not alias
-	-- the allocator's own `<Name> [N]` lookup segment.
-	local prefix, ordinal = encoded:match("^(.-) %[(%d+)%]$")
-	if prefix and ordinal then
-		encoded = prefix .. " %5B" .. ordinal .. "%5D"
-	end
-	return encoded
-end
-
-function PathHelpers.scriptSuffix(className: string): string
-	if className == "Script" then
-		return ".server.luau"
-	elseif className == "LocalScript" then
-		return ".client.luau"
-	elseif className == "ModuleScript" then
-		return ".luau"
-	end
-	return ""
-end
-
-function PathHelpers.isReservedInitStem(encoded: string): boolean
-	local lower = string.lower(encoded)
-	if lower == "init" then
-		return true
-	end
-	return lower:match("^init %((.+)%)$") ~= nil
-end
-
-function PathHelpers.leafScriptStem(name: string, className: string): string
-	local encoded = PathHelpers.encodeName(name)
-	if SCRIPT_CLASSES[className] and PathHelpers.isReservedInitStem(encoded) and #encoded > 0 then
-		-- A literal leaf named `init` / `init (<Name>)` must not be parsed as
-		-- the Source marker for its containing directory. Escape the first
-		-- original byte while preserving the exact Roblox name on decode.
-		return string.format("%%%02X", string.byte(encoded, 1)) .. encoded:sub(2)
-	end
-	return encoded
-end
-
-function PathHelpers.portableInitFileName(name: string, className: string): string
-	local suffix = PathHelpers.scriptSuffix(className)
-	local named = "init (" .. PathHelpers.encodeName(name) .. ")" .. suffix
-	if #named <= 255 then
-		return named
-	end
-	return "init" .. suffix
-end
-
-function PathHelpers.stripScriptSuffix(fragment: string): string
-	local suffixes = {
-		".server.luau",
-		".client.luau",
-		".server.lua",
-		".client.lua",
-		".luau",
-		".lua",
-	}
-	for _, suffix in ipairs(suffixes) do
-		if fragment:sub(-#suffix) == suffix then
-			return fragment:sub(1, #fragment - #suffix)
-		end
-	end
-	return fragment
-end
-
-function PathHelpers.lookupSegmentForPhysicalFragment(fragment: string, isDirectory: boolean): string
-	return if isDirectory then fragment else PathHelpers.stripScriptSuffix(fragment)
-end
-
-function PathHelpers.isPortableDiskFragment(fragment): boolean
-	return type(fragment) == "string"
-		and fragment ~= ""
-		and #fragment <= 32 * 1024
-		and fragment ~= "."
-		and fragment ~= ".."
-		and not string.find(fragment, "\0", 1, true)
-		and not string.find(fragment, "/", 1, true)
-		and not string.find(fragment, "\\", 1, true)
-end
-
-function PathHelpers.sortKeyWithName(key: string?, name: string, mappedClass: string): string
-	local signature = mappedClass
-	if type(key) == "string" then
-		local first = string.find(key, "\0", 1, true)
-		local second = first and string.find(key, "\0", first + 1, true) or nil
-		local third = second and string.find(key, "\0", second + 1, true) or nil
-		if third then
-			signature = string.sub(key, third + 1)
-		end
-	end
-	return table.concat({
-		string.lower(name),
-		name,
-		mappedClass,
-		signature,
-	}, "\0")
-end
-
-function PathHelpers.allocatePhysicalFragment(state, name: string, className: string, isDirectory: boolean): string
-	local encoded = if not isDirectory and SCRIPT_CLASSES[className]
-		then PathHelpers.leafScriptStem(name, className)
-		else PathHelpers.encodeName(name)
-	local extension = if isDirectory then "" else PathHelpers.scriptSuffix(className)
-	local base = encoded .. extension
-	local baseKey = string.lower(base)
-	if not state.taken[baseKey] then
-		state.taken[baseKey] = true
-		state.nextOrdinal[baseKey] = state.nextOrdinal[baseKey] or 1
-		return base
-	end
-	local ordinal = state.nextOrdinal[baseKey] or 1
-	while true do
-		local candidate = string.format("%s [%d]%s", encoded, ordinal, extension)
-		ordinal += 1
-		if not state.taken[string.lower(candidate)] then
-			state.taken[string.lower(candidate)] = true
-			state.nextOrdinal[baseKey] = ordinal
-			return candidate
-		end
-	end
-end
-
-function PathHelpers.mappedSyncClass(inst: Instance): string
-	if inst:IsA("LuaSourceContainer") or inst.ClassName == "Folder" then
-		return inst.ClassName
-	end
-	return "Folder"
-end
-
-function PathHelpers.findGeneratedPathChild(parent: Instance, seg: string, ctx): Instance?
-	ctx = ctx or snapshotApplyState.newContext({
-		indexAvoidSyncCarriers = true,
+	local module = require(moduleScript)
+	PathHelpers = module.install({
+		scriptClasses = SCRIPT_CLASSES,
+		getSnapshotApplyState = function()
+			return snapshotApplyState
+		end,
 	})
-	local siblings = snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx)
-	return siblings.byLookupSegment[seg]
-end
-
-function PathHelpers.findRawDisambiguatedChild(parent: Instance, seg: string): Instance?
-	local base, ordinal = parseDisambiguatedSegment(seg)
-	if not base or not ordinal then
-		return nil
-	end
-	local seen = 0
-	for _, child in ipairs(parent:GetChildren()) do
-		if child.Name == base then
-			if seen == ordinal then
-				return child
-			end
-			seen += 1
-		end
-	end
-	return nil
-end
-
-function PathHelpers.findDisambiguatedChild(parent: Instance, seg: string): Instance?
-	return PathHelpers.findGeneratedPathChild(parent, seg) or PathHelpers.findRawDisambiguatedChild(parent, seg)
 end
 
 local function pathStartsWith(path: { string }, prefix: { string }?): boolean
@@ -2657,23 +2408,48 @@ local function writeScriptSource(inst, newSource: string, suppressStudioEcho: bo
 	return applyScriptSource(inst, newSource, suppressStudioEcho)
 end
 
-local function queueScriptSourceWrite(queue, inst, newSource: string): boolean
-	-- An unreadable editor document is never a successful no-op. Queue the
-	-- write so flushScriptSourceWrites attempts UpdateSourceAsync and reports
-	-- the failure through its failed-source count if Studio rejects it.
-	local currentSource = tryReadScriptSource(inst)
-	if currentSource ~= nil and sourcesMatchForApply(currentSource, newSource) then
-		sourceSyncState.expectRemoteSource(inst, newSource)
-		return false
-	end
+local function queueScriptSourceWrite(queue, inst, newSource: string, op): boolean
+	-- Always retain the desired value until every operation in this drain has
+	-- been seen. Comparing to Studio here is unsafe because an earlier queued
+	-- write for the same Script has not run yet (A -> B -> A would otherwise
+	-- skip the final A and leave B).
 	table.insert(queue, {
 		inst = inst,
 		source = newSource,
+		-- Which inbound op produced this write, so a single rejected Source can be
+		-- reported against that op alone instead of failing its whole batch.
+		op = op,
 	})
 	return true
 end
 
-local function flushScriptSourceWrites(queue, shouldContinue): (number, number)
+local function flushScriptSourceWrites(queue, shouldContinue, failedJobs): (number, number)
+	-- Preserve concurrency across different scripts while making repeated
+	-- writes to one Script strictly last-write-wins. Without this coalescing,
+	-- two workers could complete in reverse order and leave Studio with the
+	-- older Source even though the newer filesystem op was acknowledged.
+	local coalesced = {}
+	local indexByInstance = {}
+	for _, job in ipairs(queue) do
+		local existingIndex = indexByInstance[job.inst]
+		if existingIndex then
+			coalesced[existingIndex] = job
+		else
+			table.insert(coalesced, job)
+			indexByInstance[job.inst] = #coalesced
+		end
+	end
+	queue = coalesced
+	local pending = {}
+	for _, job in ipairs(queue) do
+		local currentSource = tryReadScriptSource(job.inst)
+		if currentSource ~= nil and sourcesMatchForApply(currentSource, job.source) then
+			sourceSyncState.expectRemoteSource(job.inst, job.source)
+		else
+			table.insert(pending, job)
+		end
+	end
+	queue = pending
 	local total = #queue
 	if total == 0 then
 		return 0, 0
@@ -2697,6 +2473,8 @@ local function flushScriptSourceWrites(queue, shouldContinue): (number, number)
 				end
 				if applyScriptSource(job.inst, job.source) then
 					applied += 1
+				elseif failedJobs then
+					table.insert(failedJobs, job)
 				end
 			end
 			finishedWorkers += 1
@@ -2721,7 +2499,7 @@ local function applyProperties(inst, props, opts)
 	if props.Source ~= nil and inst:IsA("LuaSourceContainer") then
 		local source = tostring(props.Source or "")
 		if opts and opts.sourceWrites then
-			queueScriptSourceWrite(opts.sourceWrites, inst, source)
+			queueScriptSourceWrite(opts.sourceWrites, inst, source, opts.currentOp)
 		else
 			if not writeScriptSource(inst, source) then
 				error("source write was not applied for " .. inst:GetFullName())
@@ -3466,9 +3244,16 @@ function snapshotApplyState.seedDiskPathsForService(service: Instance, exactIden
 			childPath[#childPath + 1] = placement.fragment
 			snapshotApplyState.diskPathCache[child] = childPath
 			local exact = exactIdentities and exactIdentities[child]
-			if exact and (placement.fragment ~= exact.fragment or placement.isDirectory ~= exact.isDirectory) then
+			if exact and placement.fragment ~= exact.fragment then
 				error("daemon-authored disk identity does not match Studio projection", 0)
 			end
+			-- Shape is deliberately NOT compared. `exact.isDirectory` is the
+			-- daemon's physical disk shape while `placement.isDirectory` is the
+			-- logical projection, and the two legitimately differ for a script
+			-- left in directory form after losing its last child. This runs on
+			-- the in-sync path, where a clean comparison means no decision
+			-- modal is ever offered — throwing here left the user with no way
+			-- forward but Cancel, on every future handshake.
 			if placement.isDirectory then
 				stack[#stack + 1] = {
 					parent = child,
@@ -3601,6 +3386,35 @@ function snapshotApplyState.createInstance(parent, node, ctx)
 	return created
 end
 
+function snapshotApplyState.registerAppliedProjection(inst: Instance, node, ctx)
+	-- The AvoidSync index is a snapshot of the service before this apply batch.
+	-- Keep it current for Instances that this batch just materialized or matched,
+	-- otherwise the next op cannot resolve an exact disk path through a newly
+	-- created Folder (the stale index still considers that Folder unprojected).
+	if ctx.avoidSyncBoundaries[inst] or ctx.avoidSyncCarriers[inst] then
+		return
+	end
+	ctx.syncableInstances[inst] = true
+	ctx.directoryInstances[inst] = if node.class == "Folder"
+			or node.diskFragmentIsDir == true
+			or (type(node.children) == "table" and #node.children > 0)
+		then true
+		else nil
+
+	-- A newly applied descendant also makes every ordinary container above it
+	-- part of the synchronized projection. This covers pass-through Models and
+	-- other Studio-owned ancestors without rescanning the whole service per op.
+	local ancestor = inst.Parent
+	while ancestor and ancestor.Parent ~= game do
+		if ctx.avoidSyncBoundaries[ancestor] then
+			break
+		end
+		ctx.syncableInstances[ancestor] = true
+		ctx.directoryInstances[ancestor] = true
+		ancestor = ancestor.Parent
+	end
+end
+
 function snapshotApplyState.prepareInstance(parent, assignment, opts, ctx)
 	local node = assignment.node
 	if type(node) ~= "table" or type(node.name) ~= "string" or not ALLOWED_CLASSES[node.class] then
@@ -3693,6 +3507,7 @@ function snapshotApplyState.prepareInstance(parent, assignment, opts, ctx)
 	end
 
 	ctx.claimedInstances[inst] = true
+	snapshotApplyState.registerAppliedProjection(inst, node, ctx)
 	if type(node.diskFragment) == "string" then
 		local parentDiskPath = snapshotApplyState.diskPathCache[parent]
 		if parentDiskPath then
@@ -4123,7 +3938,7 @@ local function applyOp(op, sharedApplyOpts)
 		if type(props) == "table" and props.Source ~= nil and target:IsA("LuaSourceContainer") then
 			local source = tostring(props.Source or "")
 			if sharedApplyOpts and sharedApplyOpts.sourceWrites then
-				queueScriptSourceWrite(sharedApplyOpts.sourceWrites, target, source)
+				queueScriptSourceWrite(sharedApplyOpts.sourceWrites, target, source, sharedApplyOpts.currentOp)
 			elseif not writeScriptSource(target, source) then
 				error("source update was not applied for " .. pathOf(target))
 			end
@@ -4229,7 +4044,42 @@ local function summarizeOps(ops): string
 	return table.concat(parts, ",")
 end
 
-local function applyOps(ops, shouldContinue): boolean
+-- Change-history bookkeeping for applyOps. Deliberately hung off
+-- snapshotApplyState rather than declared as top-level locals: the main chunk
+-- sits within a couple of registers of Luau's 200-local ceiling, and three more
+-- top-level locals here made the whole plugin fail to compile at -O0.
+snapshotApplyState.APPLY_RECORDING_ATTRIBUTE = "RoSyncActiveApplyRecording"
+snapshotApplyState.applyRecordingRecovered = false
+
+-- Studio recordings survive a plugin reload, so an apply interrupted mid-flight
+-- used to leave ChangeHistoryService occupied for the rest of the session — and
+-- because there is exactly one recording slot per plugin, every later apply then
+-- failed forever. Cancel any identifier a previous run left behind. Runs once per
+-- session: doing it again while a recording is legitimately open would cancel our
+-- own in-flight apply.
+function snapshotApplyState.recoverOrphanedApplyRecording()
+	if snapshotApplyState.applyRecordingRecovered then
+		return
+	end
+	snapshotApplyState.applyRecordingRecovered = true
+
+	local stale = nil
+	pcall(function()
+		stale = plugin:GetAttribute(snapshotApplyState.APPLY_RECORDING_ATTRIBUTE)
+	end)
+	if type(stale) ~= "string" or stale == "" then
+		return
+	end
+	log("applyOps: cancelling an orphaned change-history recording from a previous session")
+	pcall(function()
+		ChangeHistoryService:FinishRecording(stale, Enum.FinishRecordingOperation.Cancel)
+	end)
+	pcall(function()
+		plugin:SetAttribute(snapshotApplyState.APPLY_RECORDING_ATTRIBUTE, nil)
+	end)
+end
+
+local function applyOps(ops, shouldContinue): (boolean, { [any]: boolean }?)
 	if not ops or #ops == 0 then
 		return true
 	end
@@ -4237,14 +4087,28 @@ local function applyOps(ops, shouldContinue): boolean
 		return false
 	end
 	local label = "Ro Sync: " .. summarizeOps(ops)
-	local recordingOk, recordingId = pcall(function()
+	snapshotApplyState.recoverOrphanedApplyRecording()
+	local beginOk, beginResult = pcall(function()
 		return ChangeHistoryService:TryBeginRecording(label, label)
 	end)
-	if not recordingOk or recordingId == nil then
-		log("applyOps error: Studio refused to begin a rollback-safe recording")
-		return false
+	local recordingId = if beginOk then beginResult else nil
+	if recordingId == nil then
+		-- Change history is unavailable: another plugin holds the single
+		-- per-plugin recording slot, a solo playtest is running, or Studio
+		-- refused for its own reasons. None of that is a reason to drop a
+		-- filesystem edit on the floor. Fall back to a plain waypoint — which
+		-- cannot fail — and apply anyway. Undo granularity degrades; the user's
+		-- code still reaches Studio.
+		local reason = if beginOk then "Studio refused the recording" else tostring(beginResult)
+		log("applyOps: applying without a rollback-safe recording (" .. reason .. ")")
+		setWaypoint(label)
+	else
+		pcall(function()
+			plugin:SetAttribute(snapshotApplyState.APPLY_RECORDING_ATTRIBUTE, recordingId)
+		end)
 	end
 	lastRemoteApplyClock = os.clock()
+	local failedOps = {}
 	local ok, err = pcall(function()
 		local sourceWrites = {}
 		local applyOpts = {
@@ -4259,12 +4123,25 @@ local function applyOps(ops, shouldContinue): boolean
 				error("live operation apply cancelled", 0)
 			end
 			snapshotApplyState.checkpoint(applyOpts._applyContext)
+			applyOpts.currentOp = op
 			applyOp(op, applyOpts)
 		end
+		applyOpts.currentOp = nil
 		if #sourceWrites > 0 then
-			local _, failedSources = flushScriptSourceWrites(sourceWrites, shouldContinue)
+			local failedJobs = {}
+			local _, failedSources = flushScriptSourceWrites(sourceWrites, shouldContinue, failedJobs)
 			if failedSources > 0 then
-				error(string.format("%d live Source write(s) failed or were cancelled", failedSources), 0)
+				-- A rejected Source is that op's problem, not the batch's. Failing the
+				-- whole drain would roll back every sibling op and withhold every ack —
+				-- and now that ops are coalesced, one bad script could strand an
+				-- arbitrary number of good ones. Record the offenders so the caller
+				-- withholds only their acks, and let the rest commit.
+				for _, job in ipairs(failedJobs) do
+					if job.op ~= nil then
+						failedOps[job.op] = true
+					end
+				end
+				log(string.format("applyOps: %d live Source write(s) rejected; committing the rest", failedSources))
 			end
 		end
 		if shouldContinue and not shouldContinue() then
@@ -4272,7 +4149,7 @@ local function applyOps(ops, shouldContinue): boolean
 		end
 	end)
 	lastRemoteApplyClock = os.clock()
-	if ok then
+	if ok and recordingId ~= nil then
 		local finishOk, finishErr = pcall(function()
 			snapshotApplyState.runInternalWrite(function()
 				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Commit)
@@ -4280,24 +4157,34 @@ local function applyOps(ops, shouldContinue): boolean
 				recording = true,
 			})
 		end)
+		pcall(function()
+			plugin:SetAttribute(snapshotApplyState.APPLY_RECORDING_ATTRIBUTE, nil)
+		end)
 		if not finishOk then
 			ok = false
 			err = "change-history commit failed: " .. tostring(finishErr)
 		end
+	elseif ok then
+		setWaypoint(label)
 	end
 	if not ok then
 		log("applyOps error: " .. tostring(err))
-		local cancelOk = pcall(function()
-			snapshotApplyState.runInternalWrite(function()
-				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Cancel)
-			end, {
-				recording = true,
-			})
-		end)
-		if not cancelOk then
-			pcall(function()
-				ChangeHistoryService:Undo()
+		if recordingId ~= nil then
+			local cancelOk = pcall(function()
+				snapshotApplyState.runInternalWrite(function()
+					ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Cancel)
+				end, {
+					recording = true,
+				})
 			end)
+			pcall(function()
+				plugin:SetAttribute(snapshotApplyState.APPLY_RECORDING_ATTRIBUTE, nil)
+			end)
+			if not cancelOk then
+				pcall(function()
+					ChangeHistoryService:Undo()
+				end)
+			end
 		end
 		for _, serviceName in ipairs(WATCHED_SERVICES) do
 			local serviceOk, service = pcall(function()
@@ -4309,7 +4196,7 @@ local function applyOps(ops, shouldContinue): boolean
 		end
 		return false
 	end
-	return true
+	return true, failedOps
 end
 
 local function sourceAckForAppliedOp(op)
@@ -4485,6 +4372,9 @@ local reconnectState = {
 	-- Recovery may follow that project to a new port/process, but must never
 	-- attach to another local clone that happens to share GameId/PlaceId.
 	pinnedProject = nil,
+	-- Consecutive comparison restarts caused by Studio mutating mid-scan.
+	-- Drives restart backoff; reset once a comparison reaches live sync.
+	mutationRestarts = 0,
 }
 -- Forward-declared so wsLoop (below) can re-enter the initial-sync handshake
 -- after any established transport gap. The real function assignment happens
@@ -4599,7 +4489,26 @@ local function sanitizeJson(v, depth)
 	return nil
 end
 
-local function httpRequestTo(url, method, body, internalJsonSafe)
+-- Roblox grants each place ~500 HttpService requests per sliding minute and
+-- rejects the excess with "Number of requests exceeded limit". A large
+-- initial-sync stream can burn that budget mid-handshake; every recovery
+-- restart then re-burns it from scratch, so the plugin starves itself forever
+-- while the daemon is perfectly healthy. All plugin HTTP flows through
+-- httpRequestTo, so pace it below the platform cap here: short bursts stay
+-- instant, sustained streams are smoothed, and residual budget rejections
+-- (e.g. another plugin sharing the budget) retry the same request in place —
+-- a budget-rejected request never left Studio, so replaying it is safe.
+local httpBudget = {
+	windowSeconds = 60,
+	burstRequests = 150, -- requests allowed at full speed per window
+	maxRequests = 420, -- hard self-cap under Roblox's ~500/minute
+	smoothingWait = 0.15, -- ≈6.6 req/s ≈ 400/min once the burst is spent
+	stamps = {}, -- send-time circular queue: stamps[head..tail] are live
+	head = 1,
+	tail = 0,
+}
+
+local function httpRequestTo(url, method, body, internalJsonSafe, singleAttempt)
 	local req = {
 		Url = url,
 		Method = method or "GET",
@@ -4620,13 +4529,63 @@ local function httpRequestTo(url, method, body, internalJsonSafe)
 		end
 		req.Body = enc
 	end
-	local ok, resp = pcall(function()
-		return HttpService:RequestAsync(req)
-	end)
-	if not ok then
-		return false, tostring(resp)
+
+	local function liveStampCount(now)
+		local stamps = httpBudget.stamps
+		while httpBudget.head <= httpBudget.tail and now - stamps[httpBudget.head] >= httpBudget.windowSeconds do
+			stamps[httpBudget.head] = nil
+			httpBudget.head += 1
+		end
+		if httpBudget.head > httpBudget.tail then
+			httpBudget.head, httpBudget.tail = 1, 0
+		end
+		return httpBudget.tail - httpBudget.head + 1
 	end
-	return true, resp
+
+	local function awaitSelfBudget()
+		local smoothed = false
+		while true do
+			local now = os.clock()
+			local live = liveStampCount(now)
+			if live >= httpBudget.maxRequests then
+				-- Sleep until the oldest live stamp ages out of the window,
+				-- then re-check: another caller may have taken the freed slot.
+				local wakeIn = httpBudget.windowSeconds - (now - httpBudget.stamps[httpBudget.head])
+				task.wait(math.max(wakeIn, 0.1))
+			elseif live >= httpBudget.burstRequests and not smoothed then
+				smoothed = true
+				task.wait(httpBudget.smoothingWait)
+			else
+				-- No yield between this check and the stamp in the caller, so
+				-- concurrent callers cannot double-spend the same slot.
+				return
+			end
+		end
+	end
+
+	local attempt = 0
+	while true do
+		attempt += 1
+		awaitSelfBudget()
+		httpBudget.tail += 1
+		httpBudget.stamps[httpBudget.tail] = os.clock()
+		local ok, resp = pcall(function()
+			return HttpService:RequestAsync(req)
+		end)
+		if ok then
+			return true, resp
+		end
+		local message = tostring(resp)
+		local budgetRejected = message:lower():find("number of requests exceeded", 1, true) ~= nil
+		if not budgetRejected or singleAttempt == true or attempt >= 12 then
+			return false, message
+		end
+		-- The shared budget is exhausted (Studio internals or another plugin
+		-- can spend it too). Refill is a sliding minute; waiting here keeps a
+		-- multi-request handshake alive instead of failing and restarting it,
+		-- which would re-spend every chunk already streamed.
+		task.wait(5)
+	end
 end
 
 local function httpRequest(path, method, body, internalJsonSafe)
@@ -4880,16 +4839,9 @@ local function queueOp(op, bypassClockEchoGuard: boolean?)
 	if not bypassClockEchoGuard and isEchoing() then
 		return
 	end
-	local generation = wsGeneration
-	local _, preflightErr = scaleState.preflightLiveOp(op, function()
-		return reconnectState.desired and connected and generation == wsGeneration and not scaleState.liveResyncPending
-	end)
-	if preflightErr then
-		if preflightErr ~= "cancelled" and connected and generation == wsGeneration then
-			scaleState.requestControlledLiveResync("live update requires streamed resync: " .. tostring(preflightErr))
-		end
-		return
-	end
+	-- Validation and JSON encoding happen during the bounded two-pass flush.
+	-- Repeating the full tree walk here made every live Studio edit pay for
+	-- three sanitize/encode passes before it reached the daemon.
 	table.insert(pendingOps, op)
 	if not pushPending then
 		pushPending = true
@@ -5621,12 +5573,18 @@ disconnectInstance = function(inst)
 	sourceSyncState.generation[inst] = nil
 	local bucket = connections[inst]
 	if not bucket then
+		-- Clear the key even when the bucket is missing or falsy. disconnectHooks
+		-- used to drain with `while next(connections)`, so any key that survived
+		-- this early return spun that loop forever and killed the plugin with
+		-- "script exhaustion time exceeded" during teardown.
+		connections[inst] = nil
 		return
 	end
 	for _, c in ipairs(bucket) do
-		pcall(function()
-			c:Disconnect()
-		end)
+		-- pcall the method directly rather than wrapping it in a closure: this
+		-- runs once per connection across thousands of instances, and the closure
+		-- allocation was pure overhead on the teardown path.
+		pcall(c.Disconnect, c)
 	end
 	scaleState.trackedConnectionCount = math.max(0, scaleState.trackedConnectionCount - #bucket)
 	scaleState.trackedInstanceCount = math.max(0, scaleState.trackedInstanceCount - 1)
@@ -5829,17 +5787,23 @@ disconnectHooks = function()
 	scaleState.avoidSyncTrackingPaused = true
 	scaleState.hookGeneration += 1
 	for _, c in ipairs(serviceConnections) do
-		pcall(function()
-			c:Disconnect()
-		end)
+		pcall(c.Disconnect, c)
 	end
 	serviceConnections = {}
 	scaleState.itemChangedAvailable = false
 	sourceSyncState.pending = {}
 	sourceSyncState.expected = {}
 	sourceSyncState.generation = {}
-	while next(connections) do
-		local inst = next(connections)
+	-- Drain over a snapshot of the keys rather than re-probing `next(connections)`
+	-- each iteration. The old form depended on disconnectInstance always removing
+	-- the key it was handed; any key that survived made this loop spin forever and
+	-- Studio killed the plugin with "script exhaustion time exceeded" while merely
+	-- disconnecting. A snapshot terminates in O(n) regardless.
+	local hooked = {}
+	for inst in pairs(connections) do
+		hooked[#hooked + 1] = inst
+	end
+	for _, inst in ipairs(hooked) do
 		disconnectInstance(inst)
 	end
 	connections = {}
@@ -6423,7 +6387,15 @@ end
 scaleState.collectStudioStatsWithGuard = function(guard)
 	local stats = { scriptCount = 0, instanceCount = 0 }
 	local progress = { visited = 0 }
-	local projectionInfo = setmetatable({}, { __mode = "k" })
+	-- Strong keys, deliberately. Roblox collects an Instance's userdata once no
+	-- other Lua reference exists — even while the instance is still in the
+	-- DataModel — so a weak-keyed entry can vanish between the stats scan and
+	-- the streamed handshake that reads it back. The structure stream then
+	-- silently drops the evicted children while their parent still declares
+	-- scan-time childCount, and the daemon rejects the whole push ("streamed
+	-- parent N declared X children but received Y"). Lifetime stays bounded:
+	-- the owning scan guard is disposed on every handshake exit.
+	local projectionInfo = {}
 	if guard then
 		guard.projectionInfo = projectionInfo
 	end
@@ -6722,7 +6694,7 @@ local function wsSend(client, msg): boolean
 	return true
 end
 
-local function parseWsPayload(payload): any
+local function parseWsPayload(payload): (any, number)
 	local text
 	local t = typeof(payload)
 	if t == "string" then
@@ -6735,10 +6707,10 @@ local function parseWsPayload(payload): any
 			text = s
 		end
 	else
-		return nil
+		return nil, 0
 	end
 	if not text or text == "" then
-		return nil
+		return nil, 0
 	end
 	local decoded
 	local decOk, err = pcall(function()
@@ -6746,12 +6718,12 @@ local function parseWsPayload(payload): any
 	end)
 	if not decOk then
 		log("ws decode err: " .. tostring(err))
-		return nil
+		return nil, 0
 	end
 	if type(decoded) ~= "table" then
-		return nil
+		return nil, 0
 	end
-	return decoded
+	return decoded, #text
 end
 
 --------------------------------------------------------------------------------
@@ -6801,196 +6773,22 @@ local TREE_DEPTH_DEFAULT = 3
 local FIND_LIMIT_DEFAULT = 500
 local EVAL_CHUNK_NAME = "rosync-eval"
 
-local function splitRemotePath(p: string): { string }
-	local segs = {}
-	if p == nil or p == "" or p == "/" then
-		return segs
+local remoteCodec
+do
+	local moduleScript = script:FindFirstChild("RemoteCodec")
+	if not moduleScript or not moduleScript:IsA("ModuleScript") then
+		error("[Ro Sync] packaged RemoteCodec module is missing")
 	end
-	for seg in string.gmatch(tostring(p), "[^/]+") do
-		table.insert(segs, seg)
-	end
-	return segs
+	local module = require(moduleScript)
+	remoteCodec = module.install({
+		resolvePath = resolvePath,
+	})
 end
-
-local function resolveRemotePath(p: string): Instance?
-	local segs = splitRemotePath(p)
-	if #segs == 0 then
-		return game
-	end
-	return resolvePath(segs)
-end
-
-local function instancePathString(inst: Instance): string
-	if inst == nil or inst == game then
-		return ""
-	end
-	local parts = {}
-	local cur = inst
-	while cur and cur ~= game do
-		table.insert(parts, 1, cur.Name)
-		cur = cur.Parent
-	end
-	return table.concat(parts, "/")
-end
-
-local encodeRemoteValue
-local REMOTE_ENCODE_MAX_DEPTH = 64
-local REMOTE_ENCODE_MAX_NODES = 20000
-local REMOTE_ENCODE_MAX_TABLE_ENTRIES = 10000
-local REMOTE_ENCODE_MAX_STRING_BYTES = 4 * 1024 * 1024
-
-function encodeRemoteValue(v, depth, state)
-	depth = depth or 0
-	state = state or { nodes = 0, stringBytes = 0, seen = {} }
-	if depth > REMOTE_ENCODE_MAX_DEPTH then
-		error("remote value exceeds maximum nesting depth")
-	end
-	state.nodes += 1
-	if state.nodes > REMOTE_ENCODE_MAX_NODES then
-		error("remote value exceeds maximum node count")
-	end
-	local t = typeof(v)
-	if t == "string" then
-		state.stringBytes += #v
-		if state.stringBytes > REMOTE_ENCODE_MAX_STRING_BYTES then
-			error("remote value exceeds maximum string byte count")
-		end
-		return v
-	elseif t == "nil" or t == "boolean" then
-		return v
-	elseif t == "number" then
-		if v ~= v or v == math.huge or v == -math.huge then
-			return nil
-		end
-		return v
-	elseif t == "Vector2" then
-		return { __type = "Vector2", x = v.X, y = v.Y }
-	elseif t == "Vector3" then
-		return { __type = "Vector3", x = v.X, y = v.Y, z = v.Z }
-	elseif t == "CFrame" then
-		return { __type = "CFrame", components = { v:GetComponents() } }
-	elseif t == "Color3" then
-		return { __type = "Color3", r = v.R, g = v.G, b = v.B }
-	elseif t == "UDim" then
-		return { __type = "UDim", scale = v.Scale, offset = v.Offset }
-	elseif t == "UDim2" then
-		return {
-			__type = "UDim2",
-			x = { scale = v.X.Scale, offset = v.X.Offset },
-			y = { scale = v.Y.Scale, offset = v.Y.Offset },
-		}
-	elseif t == "EnumItem" then
-		return { __type = "EnumItem", enum = tostring(v.EnumType), name = v.Name, value = v.Value }
-	elseif t == "BrickColor" then
-		return { __type = "BrickColor", name = v.Name }
-	elseif t == "NumberRange" then
-		return { __type = "NumberRange", min = v.Min, max = v.Max }
-	elseif t == "Instance" then
-		return { __type = "Instance", path = instancePathString(v), class = v.ClassName }
-	elseif t == "table" then
-		if state.seen[v] then
-			error("remote value contains a table cycle")
-		end
-		state.seen[v] = true
-		local isArray = true
-		local entryCount = 0
-		for k in pairs(v) do
-			entryCount += 1
-			if entryCount > REMOTE_ENCODE_MAX_TABLE_ENTRIES then
-				state.seen[v] = nil
-				error("remote table exceeds maximum entry count")
-			end
-			if type(k) ~= "number" then
-				isArray = false
-				break
-			end
-		end
-		if isArray then
-			local out = {}
-			for i, item in ipairs(v) do
-				out[i] = encodeRemoteValue(item, depth + 1, state)
-			end
-			state.seen[v] = nil
-			return out
-		else
-			local out = {}
-			for k, item in pairs(v) do
-				if type(k) == "string" then
-					out[k] = encodeRemoteValue(item, depth + 1, state)
-				end
-			end
-			state.seen[v] = nil
-			return out
-		end
-	end
-	return tostring(v)
-end
-
-local function decodeRemoteValue(v)
-	local t = type(v)
-	if t == "nil" or t == "boolean" or t == "string" or t == "number" then
-		return v
-	end
-	if t ~= "table" then
-		return v
-	end
-	local tag = v.__type
-	if tag == nil then
-		return v
-	end -- untagged plain table passes through
-	if tag == "Vector2" then
-		return Vector2.new(tonumber(v.x) or 0, tonumber(v.y) or 0)
-	elseif tag == "Vector3" then
-		return Vector3.new(tonumber(v.x) or 0, tonumber(v.y) or 0, tonumber(v.z) or 0)
-	elseif tag == "CFrame" then
-		local c = v.components or {}
-		-- Accept either the 3-arg (pos only) or 12-arg full matrix form.
-		if #c == 3 then
-			return CFrame.new(c[1], c[2], c[3])
-		end
-		if #c == 12 then
-			return CFrame.new(c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12])
-		end
-		error("CFrame components must have length 3 or 12 (got " .. #c .. ")")
-	elseif tag == "Color3" then
-		return Color3.new(tonumber(v.r) or 0, tonumber(v.g) or 0, tonumber(v.b) or 0)
-	elseif tag == "UDim" then
-		return UDim.new(tonumber(v.scale) or 0, tonumber(v.offset) or 0)
-	elseif tag == "UDim2" then
-		local x = v.x or {}
-		local y = v.y or {}
-		return UDim2.new(
-			tonumber(x.scale) or 0,
-			tonumber(x.offset) or 0,
-			tonumber(y.scale) or 0,
-			tonumber(y.offset) or 0
-		)
-	elseif tag == "EnumItem" then
-		local enumName = tostring(v.enum or "")
-		local enumType = Enum[enumName]
-		if not enumType then
-			error("unknown Enum: " .. enumName)
-		end
-		local ok, item = pcall(function()
-			return enumType[tostring(v.name or "")]
-		end)
-		if not ok or item == nil then
-			error("unknown EnumItem: " .. enumName .. "." .. tostring(v.name))
-		end
-		return item
-	elseif tag == "BrickColor" then
-		return BrickColor.new(tostring(v.name or "Medium stone grey") :: any)
-	elseif tag == "NumberRange" then
-		return NumberRange.new(tonumber(v.min) or 0, tonumber(v.max) or 0)
-	elseif tag == "Instance" then
-		local inst = resolveRemotePath(tostring(v.path or ""))
-		if not inst then
-			error("instance not found: " .. tostring(v.path))
-		end
-		return inst
-	end
-	return v
-end
+local splitRemotePath = remoteCodec.splitPath
+local resolveRemotePath = remoteCodec.resolvePath
+local instancePathString = remoteCodec.pathOf
+local encodeRemoteValue = remoteCodec.encode
+local decodeRemoteValue = remoteCodec.decode
 
 local remoteHandlers = {}
 -- Remote feature helpers are deliberately split into short lexical scopes.
@@ -10984,473 +10782,23 @@ do
 		return { pong = os.clock() }
 	end
 
-	-- ----------------------------------------------------------------------------
-	-- Class / enum / attribute introspection
-	--
-	-- `class_info` tries a StudioService reflection path first (APIs vary by
-	-- Studio build and may not be available). It falls back to a baked table
-	-- covering the 20 most-inspected classes — not exhaustive, but enough for
-	-- agents to discover the shape of a class before they `get --prop` specific
-	-- values.
-	-- ----------------------------------------------------------------------------
-	local BUILTIN_CLASS_INFO = {
-		BasePart = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "ClassName", category = "Data", type = "string" },
-				{ name = "Anchored", category = "Behavior", type = "bool" },
-				{ name = "CanCollide", category = "Behavior", type = "bool" },
-				{ name = "CanTouch", category = "Behavior", type = "bool" },
-				{ name = "CanQuery", category = "Behavior", type = "bool" },
-				{ name = "CastShadow", category = "Appearance", type = "bool" },
-				{ name = "Massless", category = "Behavior", type = "bool" },
-				{ name = "Position", category = "Data", type = "Vector3" },
-				{ name = "Size", category = "Data", type = "Vector3" },
-				{ name = "Orientation", category = "Data", type = "Vector3" },
-				{ name = "CFrame", category = "Data", type = "CFrame" },
-				{ name = "Transparency", category = "Appearance", type = "float" },
-				{ name = "Reflectance", category = "Appearance", type = "float" },
-				{ name = "Material", category = "Appearance", type = "Material" },
-				{ name = "Color", category = "Appearance", type = "Color3" },
-				{ name = "BrickColor", category = "Appearance", type = "BrickColor" },
-				{ name = "CollisionGroup", category = "Behavior", type = "string" },
-				{ name = "Shape", category = "Shape", type = "Shape" },
-			},
-			methods = {
-				"GetMass",
-				"GetNetworkOwner",
-				"GetNetworkOwnershipAuto",
-				"GetRootPart",
-				"GetTouchingParts",
-				"GetConnectedParts",
-				"GetJoints",
-				"GetPivot",
-				"IsA",
-				"IsDescendantOf",
-				"IsAncestorOf",
-				"FindFirstChild",
-				"FindFirstAncestor",
-				"FindFirstAncestorOfClass",
-				"FindFirstAncestorWhichIsA",
-				"GetChildren",
-				"GetDescendants",
-				"GetFullName",
-				"Destroy",
-				"Clone",
-			},
-		},
-		Part = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Anchored", category = "Behavior", type = "bool" },
-				{ name = "CanCollide", category = "Behavior", type = "bool" },
-				{ name = "Shape", category = "Shape", type = "Shape" },
-				{ name = "Position", category = "Data", type = "Vector3" },
-				{ name = "Size", category = "Data", type = "Vector3" },
-				{ name = "CFrame", category = "Data", type = "CFrame" },
-				{ name = "Transparency", category = "Appearance", type = "float" },
-				{ name = "Material", category = "Appearance", type = "Material" },
-				{ name = "Color", category = "Appearance", type = "Color3" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "FindFirstChild", "GetChildren", "GetFullName" },
-		},
-		MeshPart = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "MeshId", category = "Data", type = "Content" },
-				{ name = "TextureContent", category = "Appearance", type = "Content" },
-				{ name = "TextureID", category = "Appearance", type = "Content" },
-				{ name = "Size", category = "Data", type = "Vector3" },
-				{ name = "CFrame", category = "Data", type = "CFrame" },
-				{ name = "Material", category = "Appearance", type = "Material" },
-				{ name = "Anchored", category = "Behavior", type = "bool" },
-				{ name = "CanCollide", category = "Behavior", type = "bool" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "FindFirstChild", "GetChildren", "GetFullName" },
-		},
-		Model = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "PrimaryPart", category = "Behavior", type = "Instance" },
-				{ name = "WorldPivot", category = "Data", type = "CFrame" },
-				{ name = "ModelStreamingMode", category = "Behavior", type = "ModelStreamingMode" },
-				{ name = "LevelOfDetail", category = "Appearance", type = "ModelLevelOfDetail" },
-			},
-			methods = {
-				"GetBoundingBox",
-				"GetExtentsSize",
-				"GetPivot",
-				"PivotTo",
-				"MoveTo",
-				"TranslateBy",
-				"ScaleTo",
-				"GetScale",
-				"Destroy",
-				"Clone",
-				"IsA",
-				"GetChildren",
-				"GetDescendants",
-				"GetFullName",
-			},
-		},
-		Folder = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "FindFirstChild", "GetChildren", "GetDescendants", "GetFullName" },
-		},
-		Script = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Source", category = "Data", type = "string" },
-				{ name = "Disabled", category = "Behavior", type = "bool" },
-				{ name = "RunContext", category = "Behavior", type = "RunContext" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-		LocalScript = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Source", category = "Data", type = "string" },
-				{ name = "Disabled", category = "Behavior", type = "bool" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-		ModuleScript = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Source", category = "Data", type = "string" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-		RemoteEvent = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-			},
-			methods = { "FireAllClients", "FireClient", "FireServer", "Destroy", "Clone" },
-		},
-		RemoteFunction = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-			},
-			methods = { "InvokeClient", "InvokeServer", "Destroy", "Clone" },
-		},
-		Camera = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "CFrame", category = "Data", type = "CFrame" },
-				{ name = "Focus", category = "Data", type = "CFrame" },
-				{ name = "FieldOfView", category = "Appearance", type = "float" },
-				{ name = "CameraType", category = "Behavior", type = "CameraType" },
-				{ name = "CameraSubject", category = "Behavior", type = "Instance" },
-				{ name = "HeadScale", category = "Appearance", type = "float" },
-			},
-			methods = { "GetRenderCFrame", "ScreenPointToRay", "WorldToScreenPoint", "WorldToViewportPoint" },
-		},
-		Lighting = {
-			properties = {
-				{ name = "Ambient", category = "Appearance", type = "Color3" },
-				{ name = "OutdoorAmbient", category = "Appearance", type = "Color3" },
-				{ name = "Brightness", category = "Appearance", type = "float" },
-				{ name = "ClockTime", category = "Data", type = "float" },
-				{ name = "TimeOfDay", category = "Data", type = "string" },
-				{ name = "GeographicLatitude", category = "Data", type = "float" },
-				{ name = "GlobalShadows", category = "Appearance", type = "bool" },
-				{ name = "FogStart", category = "Appearance", type = "float" },
-				{ name = "FogEnd", category = "Appearance", type = "float" },
-				{ name = "FogColor", category = "Appearance", type = "Color3" },
-				{ name = "Technology", category = "Appearance", type = "Technology" },
-			},
-			methods = { "GetSunDirection", "GetMoonDirection", "SetMinutesAfterMidnight" },
-		},
-		Workspace = {
-			properties = {
-				{ name = "Gravity", category = "Behavior", type = "float" },
-				{ name = "FallenPartsDestroyHeight", category = "Behavior", type = "float" },
-				{ name = "StreamingEnabled", category = "Behavior", type = "bool" },
-				{ name = "StreamingTargetRadius", category = "Behavior", type = "int" },
-				{ name = "CurrentCamera", category = "Data", type = "Instance" },
-			},
-			methods = {
-				"Raycast",
-				"FindPartOnRay",
-				"FindPartOnRayWithIgnoreList",
-				"GetPartBoundsInBox",
-				"GetPartsInPart",
-				"GetDescendants",
-				"GetChildren",
-			},
-		},
-		Players = {
-			properties = {
-				{ name = "CharacterAutoLoads", category = "Behavior", type = "bool" },
-				{ name = "RespawnTime", category = "Behavior", type = "float" },
-				{ name = "MaxPlayers", category = "Data", type = "int" },
-				{ name = "PreferredPlayers", category = "Data", type = "int" },
-			},
-			methods = { "GetPlayers", "GetPlayerFromCharacter", "GetPlayerByUserId", "Chat" },
-		},
-		ReplicatedStorage = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-			},
-			methods = { "GetChildren", "GetDescendants", "FindFirstChild", "WaitForChild" },
-		},
-		Frame = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Position", category = "Data", type = "UDim2" },
-				{ name = "Size", category = "Data", type = "UDim2" },
-				{ name = "AnchorPoint", category = "Data", type = "Vector2" },
-				{ name = "BackgroundColor3", category = "Appearance", type = "Color3" },
-				{ name = "BackgroundTransparency", category = "Appearance", type = "float" },
-				{ name = "BorderSizePixel", category = "Appearance", type = "int" },
-				{ name = "BorderColor3", category = "Appearance", type = "Color3" },
-				{ name = "ZIndex", category = "Behavior", type = "int" },
-				{ name = "Visible", category = "Behavior", type = "bool" },
-				{ name = "ClipsDescendants", category = "Behavior", type = "bool" },
-				{ name = "LayoutOrder", category = "Behavior", type = "int" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "FindFirstChild", "GetChildren", "GetFullName" },
-		},
-		TextLabel = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Text", category = "Text", type = "string" },
-				{ name = "TextColor3", category = "Text", type = "Color3" },
-				{ name = "TextSize", category = "Text", type = "float" },
-				{ name = "TextScaled", category = "Text", type = "bool" },
-				{ name = "Font", category = "Text", type = "Font" },
-				{ name = "FontFace", category = "Text", type = "FontFace" },
-				{ name = "TextXAlignment", category = "Text", type = "TextXAlignment" },
-				{ name = "TextYAlignment", category = "Text", type = "TextYAlignment" },
-				{ name = "RichText", category = "Text", type = "bool" },
-				{ name = "TextWrapped", category = "Text", type = "bool" },
-				{ name = "Position", category = "Data", type = "UDim2" },
-				{ name = "Size", category = "Data", type = "UDim2" },
-				{ name = "BackgroundColor3", category = "Appearance", type = "Color3" },
-				{ name = "BackgroundTransparency", category = "Appearance", type = "float" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-		TextButton = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Text", category = "Text", type = "string" },
-				{ name = "TextColor3", category = "Text", type = "Color3" },
-				{ name = "TextSize", category = "Text", type = "float" },
-				{ name = "Font", category = "Text", type = "Font" },
-				{ name = "AutoButtonColor", category = "Behavior", type = "bool" },
-				{ name = "Active", category = "Behavior", type = "bool" },
-				{ name = "Position", category = "Data", type = "UDim2" },
-				{ name = "Size", category = "Data", type = "UDim2" },
-				{ name = "BackgroundColor3", category = "Appearance", type = "Color3" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-		ImageLabel = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "Image", category = "Image", type = "Content" },
-				{ name = "ImageColor3", category = "Image", type = "Color3" },
-				{ name = "ImageTransparency", category = "Image", type = "float" },
-				{ name = "ScaleType", category = "Image", type = "ScaleType" },
-				{ name = "SliceCenter", category = "Image", type = "Rect" },
-				{ name = "SliceScale", category = "Image", type = "float" },
-				{ name = "Position", category = "Data", type = "UDim2" },
-				{ name = "Size", category = "Data", type = "UDim2" },
-				{ name = "BackgroundTransparency", category = "Appearance", type = "float" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-		ScrollingFrame = {
-			properties = {
-				{ name = "Name", category = "Data", type = "string" },
-				{ name = "Parent", category = "Data", type = "Instance" },
-				{ name = "CanvasSize", category = "Data", type = "UDim2" },
-				{ name = "CanvasPosition", category = "Data", type = "Vector2" },
-				{ name = "AutomaticCanvasSize", category = "Data", type = "AutomaticSize" },
-				{ name = "ScrollingDirection", category = "Data", type = "ScrollingDirection" },
-				{ name = "ScrollBarThickness", category = "Appearance", type = "int" },
-				{ name = "ScrollingEnabled", category = "Behavior", type = "bool" },
-				{ name = "Position", category = "Data", type = "UDim2" },
-				{ name = "Size", category = "Data", type = "UDim2" },
-				{ name = "BackgroundColor3", category = "Appearance", type = "Color3" },
-			},
-			methods = { "Destroy", "Clone", "IsA", "GetFullName" },
-		},
-	}
-
-	remoteHandlers.class_info = function(args)
-		local className = tostring(args.class_name or args.className or "")
-		if className == "" then
-			error("missing class_name")
+	-- Class, enum, and attribute introspection lives in a packaged child
+	-- module so its large fallback metadata table is compiled independently.
+	do
+		local moduleScript = script:FindFirstChild("Reflection")
+		if not moduleScript or not moduleScript:IsA("ModuleScript") then
+			error("[Ro Sync] packaged Reflection module is missing")
 		end
-		-- Try StudioService reflection first; fall back to the baked table.
-		-- StudioService:GetClassProperties isn't exposed on every Studio build,
-		-- so any failure is treated as "not available".
-		local ok, ss = pcall(function()
-			return game:GetService("StudioService")
-		end)
-		if ok and ss then
-			local getOk, props = pcall(function()
-				if typeof(ss.GetClassProperties) == "function" then
-					return ss:GetClassProperties(className)
-				end
-				return nil
-			end)
-			if getOk and type(props) == "table" and #props > 0 then
-				local out = {}
-				for _, p in ipairs(props) do
-					if type(p) == "table" then
-						local vt = p.ValueType
-						local typeStr
-						if type(vt) == "table" then
-							typeStr = tostring(vt.Name or vt)
-						elseif vt ~= nil then
-							typeStr = tostring(vt)
-						else
-							typeStr = tostring(p.Type or p.type or "")
-						end
-						table.insert(out, {
-							name = tostring(p.Name or p.name or ""),
-							category = tostring(p.Category or p.category or ""),
-							type = typeStr,
-						})
-					end
-				end
-				if #out > 0 then
-					return { properties = out, methods = {} }
-				end
-			end
+		local module = require(moduleScript)
+		local controller = module.install({
+			resolvePath = resolveRemotePath,
+			pathOf = instancePathString,
+			decode = decodeRemoteValue,
+			findLimitDefault = FIND_LIMIT_DEFAULT,
+		})
+		for name, handler in pairs(controller.handlers) do
+			remoteHandlers[name] = handler
 		end
-		local info = BUILTIN_CLASS_INFO[className]
-		if not info then
-			error("no class info available for: " .. className)
-		end
-		return { properties = info.properties, methods = info.methods }
-	end
-
-	remoteHandlers.enum_list = function(args)
-		local enumName = tostring(args.enum_name or args.name or "")
-		if enumName == "" then
-			error("missing enum_name")
-		end
-		local ok, enum = pcall(function()
-			return Enum[enumName]
-		end)
-		if not ok or enum == nil then
-			error("unknown enum: " .. enumName)
-		end
-		local itemsOk, rawItems = pcall(function()
-			return enum:GetEnumItems()
-		end)
-		if not itemsOk or type(rawItems) ~= "table" then
-			error("failed to read items for Enum." .. enumName)
-		end
-		local items = {}
-		for _, item in ipairs(rawItems) do
-			table.insert(items, { name = tostring(item.Name), value = item.Value })
-		end
-		return items
-	end
-
-	remoteHandlers.enums = function(_args)
-		local ok, enums = pcall(function()
-			return Enum:GetEnums()
-		end)
-		if not ok or type(enums) ~= "table" then
-			error("Enum:GetEnums() not available")
-		end
-		local out = {}
-		for _, e in ipairs(enums) do
-			local s = tostring(e)
-			if s:sub(1, 5) == "Enum." then
-				s = s:sub(6)
-			end
-			table.insert(out, s)
-		end
-		table.sort(out)
-		return out
-	end
-
-	remoteHandlers.find_by_attr = function(args)
-		local attrName = tostring(args.name or "")
-		if attrName == "" then
-			error("missing name")
-		end
-		local rootPath = args.under or args.root or ""
-		local root = resolveRemotePath(tostring(rootPath))
-		if not root then
-			error("root not found: " .. tostring(rootPath))
-		end
-		local limit = tonumber(args.limit) or FIND_LIMIT_DEFAULT
-		local hasValue = args.value ~= nil
-		local target = nil
-		if hasValue then
-			local dok, decoded = pcall(decodeRemoteValue, args.value)
-			if not dok then
-				error("decode value: " .. tostring(decoded))
-			end
-			target = decoded
-		end
-		local function equal(a, b)
-			if a == b then
-				return true
-			end
-			local ta, tb = typeof(a), typeof(b)
-			if ta ~= tb then
-				return false
-			end
-			-- Userdata types whose == isn't structural — fall back to tostring.
-			if
-				ta == "Vector3"
-				or ta == "Vector2"
-				or ta == "Color3"
-				or ta == "UDim"
-				or ta == "UDim2"
-				or ta == "CFrame"
-				or ta == "BrickColor"
-				or ta == "EnumItem"
-				or ta == "NumberRange"
-			then
-				return tostring(a) == tostring(b)
-			end
-			return false
-		end
-		local out = {}
-		local function walk(inst)
-			for _, c in ipairs(inst:GetChildren()) do
-				if #out >= limit then
-					return
-				end
-				local ok, val = pcall(function()
-					return c:GetAttribute(attrName)
-				end)
-				if ok and val ~= nil then
-					if not hasValue or equal(val, target) then
-						table.insert(out, instancePathString(c))
-					end
-				end
-				walk(c)
-			end
-		end
-		walk(root)
-		return out
 	end
 end
 
@@ -12126,6 +11474,85 @@ local function wsLoop(gen)
 				schedulePushRetry(0)
 			end
 
+			local function shouldContinueApply()
+				return reconnectState.desired and connected and not closed and gen == wsGeneration and ws == client
+			end
+
+			-- Inbound filesystem ops enter one cooperative lane, exactly like the
+			-- remote-write path already does. Roblox event callbacks overlap
+			-- whenever a handler yields, and applyOps yields (UpdateSourceAsync)
+			-- while holding a ChangeHistoryService recording — of which Studio
+			-- allows exactly one per plugin. A second op frame arriving mid-apply
+			-- used to fail its TryBeginRecording, which dropped the socket, which
+			-- forced a Studio-authoritative resync that discarded local edits.
+			-- Draining every queued op into a single apply removes both the
+			-- contention and the per-frame recording overhead.
+			-- Connection-scope, deliberately not a top-level local: the main chunk
+			-- sits one register under Luau's 200-local ceiling.
+			local OP_QUEUE_MAX = 4096
+			local OP_FRAME_MAX = 256
+			local OP_QUEUE_MAX_BYTES = 16 * 1024 * 1024
+			local opQueue = {}
+			local opQueueBytes = 0
+			local opWorkerRunning = false
+
+			local function runOpWorker()
+				if opWorkerRunning then
+					return
+				end
+				opWorkerRunning = true
+				task.spawn(function()
+					while #opQueue > 0 do
+						if not shouldContinueApply() then
+							table.clear(opQueue)
+							break
+						end
+						local batch = opQueue
+						opQueue = {}
+						opQueueBytes = 0
+						local batchOk, failedOps = applyOps(batch, shouldContinueApply)
+						if batchOk and shouldContinueApply() then
+							-- Echo the source Studio actually accepted. The daemon uses
+							-- this as the acknowledgement that advances its conflict
+							-- baseline; failed/cancelled writes produce no ack. Ops whose
+							-- Source Studio rejected are skipped individually so their
+							-- siblings still advance.
+							local acks = {}
+							for _, op in ipairs(batch) do
+								if failedOps == nil or not failedOps[op] then
+									local ack = sourceAckForAppliedOp(op)
+									if ack then
+										table.insert(acks, ack)
+									end
+								end
+							end
+							if #acks > 0 then
+								wsSend(client, { type = "push", ops = acks })
+							end
+							if failedOps ~= nil and next(failedOps) ~= nil and shouldContinueApply() then
+								-- Successful siblings are committed and acknowledged, but
+								-- every rejected Source has already been consumed from the
+								-- daemon stream. Re-run the bounded comparison so those
+								-- scripts are offered again instead of remaining stale.
+								scaleState.requestControlledLiveResync("one or more live Source writes were rejected")
+							end
+						elseif shouldContinueApply() then
+							-- The daemon's broadcast is already consumed. Without an
+							-- operation ledger, merely withholding the Source ack leaves
+							-- Studio stale forever. Fail closed into the bounded compare,
+							-- which re-offers the exact disk state without discarding it.
+							scaleState.requestControlledLiveResync("live filesystem apply failed")
+						end
+						-- applyOps only yields when the batch carried Source writes, so
+						-- a long run of structural ops (folder creates, deletes, renames)
+						-- would otherwise hold this thread for its whole drain and risk
+						-- script exhaustion. One yield per batch bounds that.
+						task.wait()
+					end
+					opWorkerRunning = false
+				end)
+			end
+
 			table.insert(
 				conns,
 				client.Opened:Connect(function()
@@ -12149,7 +11576,7 @@ local function wsLoop(gen)
 						end)
 						return
 					end
-					local msg = parseWsPayload(payload)
+					local msg, payloadBytes = parseWsPayload(payload)
 					if not msg then
 						return
 					end
@@ -12161,6 +11588,7 @@ local function wsLoop(gen)
 					local kind = tostring(msg.type or "")
 					if
 						kind == "op"
+						or kind == "ops"
 						or kind == "lagged"
 						or kind == "pong"
 						or kind == "ping"
@@ -12169,32 +11597,57 @@ local function wsLoop(gen)
 					then
 						acceptTransport()
 					end
-					if kind == "op" then
-						-- Daemon wraps the op under msg.op (nested, per Agent 1).
-						if type(msg.op) == "table" then
-							local function shouldContinueApply()
-								return reconnectState.desired
-									and connected
-									and not closed
-									and gen == wsGeneration
-									and ws == client
-							end
-							if applyOps({ msg.op }, shouldContinueApply) and shouldContinueApply() then
-								-- Echo the source Studio actually accepted. The daemon uses
-								-- this as the acknowledgement that advances its conflict
-								-- baseline; failed/cancelled writes produce no ack.
-								local ack = sourceAckForAppliedOp(msg.op)
-								if ack then
-									wsSend(client, { type = "push", ops = { ack } })
+					if kind == "op" or kind == "ops" then
+						local incoming = {}
+						local malformedFrame = false
+						if kind == "op" and type(msg.op) == "table" then
+							incoming[1] = msg.op
+						elseif
+							kind == "ops"
+							and type(msg.ops) == "table"
+							and #msg.ops > 0
+							and #msg.ops <= OP_FRAME_MAX
+						then
+							for _, op in ipairs(msg.ops) do
+								if type(op) ~= "table" then
+									malformedFrame = true
+									table.clear(incoming)
+									break
 								end
-							elseif shouldContinueApply() then
-								recoveryContext = "live filesystem operation failed or was cancelled"
-								pcall(function()
-									client:Close()
-								end)
+								incoming[#incoming + 1] = op
 							end
 						else
-							log("ws: op frame missing nested op payload")
+							malformedFrame = true
+						end
+						if malformedFrame then
+							log("ws: operation frame was malformed or exceeded its bounded count")
+							scaleState.requestControlledLiveResync("malformed or oversized inbound operation frame")
+						end
+						-- Never apply inline: this callback can be re-entered while a
+						-- previous apply is still yielding. Queue and let the single
+						-- worker drain it.
+						if not malformedFrame and #incoming > 0 then
+							if
+								#opQueue + #incoming > OP_QUEUE_MAX
+								or opQueueBytes + payloadBytes > OP_QUEUE_MAX_BYTES
+							then
+								log(
+									string.format(
+										"ws: inbound op queue exceeded %d ops or %d bytes — requesting a controlled resync",
+										OP_QUEUE_MAX,
+										OP_QUEUE_MAX_BYTES
+									)
+								)
+								table.clear(opQueue)
+								opQueueBytes = 0
+								scaleState.requestControlledLiveResync("inbound op queue overflow")
+							else
+								for _, op in ipairs(incoming) do
+									table.insert(opQueue, op)
+								end
+								opQueueBytes += payloadBytes
+								runOpWorker()
+							end
 						end
 					elseif kind == "lagged" then
 						log("ws: daemon broadcast lagged — will resync via /initial-compare")
@@ -12973,6 +12426,37 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				return false
 			end
 		else
+			-- Pack as many bounded Source parts as fit into every request. The
+			-- daemon accepts up to sourcePartChunkRecords parts and a 512 KiB
+			-- body per Sources chunk; one request per part made a 1,200-script
+			-- push cost 1,200+ HTTP requests, which the HttpService budget
+			-- pacing then stretched into minutes.
+			local envelopeBody = makeBody(serviceName, "sources", cursor.chunk, false)
+			envelopeBody.sources = {}
+			local envelopeBytes = encodedSize(envelopeBody)
+			if not envelopeBytes then
+				log("push source stream failed: could not measure the request envelope")
+				return false
+			end
+			-- Slack covers chunkIndex/finalChunk digit drift between the
+			-- envelope measured above and the eventual flush bodies. postExact
+			-- still hard-verifies every encoded body against the wire limit.
+			local packedBudget = scaleState.maxStreamRequestBytes - envelopeBytes - 64
+			local batch = {}
+			local batchBytes = 0
+			local function flushBatch(finalChunk): (boolean, string?)
+				local body = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
+				body.sources = batch
+				local lastPart = batch[#batch]
+				local sent, sendErr =
+					sendBody(body, string.format("%s Sources x%d (through id %d)", serviceName, #batch, lastPart.id))
+				if not sent then
+					return false, sendErr
+				end
+				batch = {}
+				batchBytes = 0
+				return true
+			end
 			for sourceIndex, sourceEntry in ipairs(sourceInstances) do
 				if not shouldContinue() then
 					return false
@@ -13004,29 +12488,26 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				local partIndex = 0
 				repeat
 					local budget = math.min(scaleState.sourceChunkBytes, math.max(0, #source - offset))
-					local body = nil
+					local part = nil
+					local partBytes = nil
 					while budget >= 0 do
 						local stop = utf8ChunkEnd(source, offset, budget)
 						if not stop then
 							return false
 						end
-						local finalPart = stop == #source
-						local finalChunk = finalPart and sourceIndex == #sourceInstances
-						local candidate = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
-						candidate.sources = {
-							{
-								id = sourceEntry.id,
-								partIndex = partIndex,
-								offset = offset,
-								totalBytes = #source,
-								data = string.sub(source, offset + 1, stop),
-								finalPart = finalPart,
-								sha256 = sourceHash,
-							},
+						local candidate = {
+							id = sourceEntry.id,
+							partIndex = partIndex,
+							offset = offset,
+							totalBytes = #source,
+							data = string.sub(source, offset + 1, stop),
+							finalPart = stop == #source,
+							sha256 = sourceHash,
 						}
 						local bytes = encodedSize(candidate)
-						if bytes and bytes <= scaleState.maxStreamRequestBytes then
-							body = candidate
+						if bytes and bytes <= packedBudget then
+							part = candidate
+							partBytes = bytes
 							break
 						end
 						if budget == 0 then
@@ -13034,24 +12515,55 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 						end
 						budget = math.floor(budget / 2)
 					end
-					if not body then
+					if not part then
 						log("push Source contains invalid UTF-8 or cannot fit one bounded request")
 						return false
 					end
-					local part = body.sources[1]
-					local sent, sendErr =
-						sendBody(body, string.format("%s Source %d part %d", serviceName, sourceEntry.id, partIndex))
-					if not sent then
-						log("push source stream failed: " .. tostring(sendErr))
-						return false
+					-- Flush before appending, never after: the final part of the
+					-- final script must ride the finalChunk flush below. A JSON
+					-- array's size is the sum of its independently encoded
+					-- elements plus one comma per element, so this bound is exact.
+					if
+						#batch > 0
+						and (
+							#batch >= scaleState.sourcePartChunkRecords
+							or batchBytes + #batch + partBytes > packedBudget
+						)
+					then
+						local flushed, flushErr = flushBatch(false)
+						if not flushed then
+							log("push source stream failed: " .. tostring(flushErr))
+							return false
+						end
+						if not shouldContinue() then
+							return false
+						end
 					end
+					batch[#batch + 1] = part
+					batchBytes += partBytes
 					offset += #part.data
 					partIndex += 1
 					if partIndex % 8 == 0 then
 						task.wait()
+						if not shouldContinue() then
+							return false
+						end
 					end
 				until offset == #source and partIndex > 0
 				totalSources += 1
+				-- Requests are rare now, so yield periodically between scripts to
+				-- keep Studio responsive through the hash/encode CPU work.
+				if sourceIndex % 16 == 0 then
+					task.wait()
+					if not shouldContinue() then
+						return false
+					end
+				end
+			end
+			local flushed, flushErr = flushBatch(true)
+			if not flushed then
+				log("push source stream failed: " .. tostring(flushErr))
+				return false
 			end
 		end
 
@@ -13287,8 +12799,12 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 				if type(record.diskFragment) ~= "string" or type(record.diskFragmentIsDir) ~= "boolean" then
 					return false, "disk structure record is missing exact fragment identity"
 				end
-				local expectedDirectory = record.class == "Folder" or record.hasChildren == true
-				if record.diskFragmentIsDir ~= expectedDirectory then
+				-- Leaf form and script-with-children directory form are both
+				-- valid on-disk representations of a script; a script that lost
+				-- its last child stays in directory form until something
+				-- rewrites it. Only require a directory when the node cannot be
+				-- a single file. See the matching identity-phase check.
+				if (record.class == "Folder" or record.hasChildren == true) and record.diskFragmentIsDir ~= true then
 					return false, "disk fragment shape does not match its projected node"
 				end
 				state.preorderStack[#state.preorderStack + 1] = id
@@ -13302,8 +12818,14 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 			if record.avoidSyncCarrier == true and record.class ~= "Folder" then
 				return false, "disk AvoidSync carrier must project as Folder"
 			end
-			local expectedHasChildren = id == 0 or childCount > 0 or record.class == "Folder"
-			if record.hasChildren ~= expectedHasChildren then
+			-- The daemon emits hasChildren from the PHYSICAL disk shape while
+			-- childCount counts PROJECTED children, so a script left in
+			-- directory form after losing its last child reports
+			-- hasChildren=true with childCount=0. That is a legal on-disk
+			-- state, not a malformed record; demanding equality here rejected
+			-- every disk-wins transfer for such a tree. Only require directory
+			-- shape when the node cannot be a single file.
+			if (id == 0 or childCount > 0 or record.class == "Folder") and record.hasChildren ~= true then
 				return false, "disk hasChildren does not match projected shape"
 			end
 			state.records[#state.records + 1] = record
@@ -14348,7 +13870,28 @@ runInitialCompare = function()
 			return
 		end
 		log(string.format("%s (%s); restarting initial compare", context, tostring(reason)))
-		task.defer(runInitialCompare)
+		-- Back off between restarts. Another plugin (or an edit-time script)
+		-- mutating a watched service faster than a full scan completes would
+		-- otherwise spin this restart tightly and silently forever, starving
+		-- Studio of the idle window the scan needs to finish.
+		reconnectState.mutationRestarts = math.min((reconnectState.mutationRestarts or 0) + 1, 8)
+		local waitSec = math.min(0.25 * 2 ^ (reconnectState.mutationRestarts - 1), 10)
+		if reconnectState.mutationRestarts > 2 then
+			setBanner(
+				string.format(
+					"Studio kept changing while Ro Sync compared the place. Retrying in %.1fs (%s).",
+					waitSec,
+					tostring(reason)
+				)
+			)
+		end
+		local restartGeneration = wsGeneration
+		task.delay(waitSec, function()
+			if not reconnectState.desired or not busy or restartGeneration ~= wsGeneration then
+				return
+			end
+			runInitialCompare()
+		end)
 	end
 
 	local function scanBecameDirty(context): boolean
@@ -14370,6 +13913,7 @@ runInitialCompare = function()
 		reconnectState.comparedCapability = compareCapability
 		scaleState.activeScanGuard = scanGuard
 		if startHooksAndWs() then
+			reconnectState.mutationRestarts = 0
 			disposeScanGuard()
 		else
 			restartForMutation("Studio changed while hooks were being installed")
@@ -14416,14 +13960,32 @@ runInitialCompare = function()
 	end
 	if type(resp) ~= "table" or not resp.action then
 		disposeScanGuard()
-		log("initial-compare: malformed response")
-		reconnectState.stopTerminal("daemon returned a malformed initial-compare response")
+		-- A daemon scan failure (symlink, unreadable file, case collision, bad
+		-- default.project.json) arrives as a well-formed {ok=false, error=...}
+		-- body, not a protocol violation. Report its text — it names the exact
+		-- path to fix, which "malformed response" threw away.
+		local scanError = if type(resp) == "table"
+				and type(resp.error) == "string"
+				and resp.error ~= ""
+			then tostring(resp.error)
+			else nil
+		if scanError then
+			log("initial-compare rejected the project: " .. scanError:sub(1, 300))
+			reconnectState.stopTerminal("Ro Sync could not read this project: " .. scanError)
+		else
+			log("initial-compare: malformed response")
+			reconnectState.stopTerminal("daemon returned a malformed initial-compare response")
+		end
 		return
 	end
 	local comparedDiskIdentities = nil
 	local comparedDiskIdentityServices = nil
 	if tostring(resp.action) == "compare" then
-		comparedDiskIdentities = setmetatable({}, { __mode = "k" })
+		-- Strong keys: populated chunk-by-chunk during the streamed comparison
+		-- and only consumed after the final service completes. Weak Instance
+		-- keys can be collected mid-stream (see projectionInfo), which would
+		-- fail identity seeding for a clean comparison. Scoped to this compare.
+		comparedDiskIdentities = {}
 		comparedDiskIdentityServices = {}
 		if scanBecameDirty("Studio changed before streamed comparison") then
 			return
@@ -14738,7 +14300,9 @@ runInitialCompare = function()
 				return
 			end
 			local identitySeen = {}
-			local fragmentOwners = setmetatable({}, { __mode = "k" })
+			-- Strong keys: sibling-collision baseline for the whole identity
+			-- stream; a weak entry collected mid-stream would skip detection.
+			local fragmentOwners = {}
 			local receivedIdentities = 0
 			while true do
 				local identityChunk = tonumber(resp.nextChunk)
@@ -14781,23 +14345,64 @@ runInitialCompare = function()
 				for _, identity in ipairs(identities) do
 					local id = type(identity) == "table" and tonumber(identity.id) or nil
 					local fragment = type(identity) == "table" and identity.diskFragment or nil
-					local isDirectory = type(identity) == "table" and identity.diskFragmentIsDir or nil
+					-- NOT `and ... or nil`: diskFragmentIsDir is false for every
+					-- leaf script, and `and false or nil` collapses to nil —
+					-- which rejected the entire identity stream on any place
+					-- containing one plain script file.
+					local isDirectory = if type(identity) == "table" then identity.diskFragmentIsDir else nil
 					local inst = id and id % 1 == 0 and id > 0 and instanceById[id + 1] or nil
 					local info = inst and scanGuard.projectionInfo[inst] or nil
-					local expectedDirectory = info and (info.class == "Folder" or info.hasChildren == true) or nil
-					if
-						not id
-						or identitySeen[id]
-						or not inst
-						or not info
-						or info.avoidSync == true
-						or info.avoidSyncCarrier == true
-						or not PathHelpers.isPortableDiskFragment(fragment)
-						or type(isDirectory) ~= "boolean"
-						or isDirectory ~= expectedDirectory
-					then
+					-- Name the failing identity and condition: a bare "invalid
+					-- disk identity" banner is undebuggable against a
+					-- thousand-node stream.
+					local invalidReason = nil
+					if not id or id % 1 ~= 0 then
+						invalidReason = "identity id is not an integer"
+					elseif identitySeen[id] then
+						invalidReason = "duplicate identity id"
+					elseif not inst then
+						invalidReason = "id is outside the streamed Studio structure"
+					elseif not info then
+						invalidReason = "target instance left the projection"
+					elseif info.avoidSync == true or info.avoidSyncCarrier == true then
+						invalidReason = "identity targets an AvoidSync subtree"
+					elseif not PathHelpers.isPortableDiskFragment(fragment) then
+						invalidReason = "disk fragment is not portable"
+					elseif type(isDirectory) ~= "boolean" then
+						invalidReason = "fragment shape flag is missing"
+					else
+						-- A script legitimately exists on disk in either leaf form
+						-- (Foo.luau) or script-with-children directory form
+						-- (Foo/init (Foo).luau). Deleting a script's last child
+						-- leaves the directory form behind, so requiring the
+						-- physical shape to equal the current logical projection
+						-- rejected a divergence this very handshake exists to
+						-- reconcile — and rejected it permanently, since the retry
+						-- rescans identical state. Only a node that CANNOT be
+						-- represented as a single file must be a directory.
+						-- Only a Folder is physically impossible as a file. Both
+						-- script forms are interchangeable on disk, in BOTH
+						-- directions: disk keeps directory form after a script
+						-- loses its last child, and disk holds leaf form when
+						-- Studio gained a child while disconnected (or a git
+						-- checkout rewrote the tree). Each is a divergence the
+						-- following push/pull reconciles — not a protocol fault.
+						if info.class == "Folder" and not isDirectory then
+							invalidReason = string.format(
+								"shape mismatch at %s: Studio projects a Folder but disk holds a file",
+								pathOf(inst)
+							)
+						end
+					end
+					if invalidReason then
 						disposeScanGuard()
-						reconnectState.retryInitialCompare("daemon returned an invalid disk identity")
+						reconnectState.retryInitialCompare(
+							string.format(
+								"daemon returned an invalid disk identity (id %s): %s",
+								tostring(id),
+								invalidReason
+							)
+						)
 						return
 					end
 					local parent = inst.Parent
@@ -15083,8 +14688,10 @@ end
 
 local function probePort(port, gameId)
 	-- Returns (matched: bool, url: string?, hello: table?)
+	-- Single-attempt: a whole-range scan must fail fast while the shared
+	-- HttpService budget is exhausted, not wait a minute per probed port.
 	local url = string.format("http://127.0.0.1:%d", port)
-	local ok, resp = httpRequestTo(url .. "/hello", "GET")
+	local ok, resp = httpRequestTo(url .. "/hello", "GET", nil, nil, true)
 	if not ok or not resp.Success then
 		return false, url, nil
 	end

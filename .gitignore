@@ -4,8 +4,11 @@ daemon/target/
 # Generated plugin build inputs
 plugin-src/Packages/
 plugin-src/src/RoSync.server.luau
+plugin-src/src/PathHelpers.luau
 plugin-src/src/Photo.luau
 plugin-src/src/Playscript.luau
+plugin-src/src/Reflection.luau
+plugin-src/src/RemoteCodec.luau
 
 # Runtime state & logs (contain absolute paths / project-specific data)
 state.json

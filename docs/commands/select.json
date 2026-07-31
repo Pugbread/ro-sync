@@ -3,6 +3,11 @@
   "title": "rosync select",
   "category": "Live writes",
   "description": "Reads or replaces the current Studio Selection.",
+  "subcommands": ["get", "set"],
+  "subcommandMetadata": {
+    "get": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "set": { "safety": "mutates-studio-selection", "requires": ["project", "daemon", "studio-plugin"] }
+  },
   "usage": "rosync select get|set [--project <path>] [--port <port>] [--paths <json-array>] [--raw]",
   "examples": [
     "rosync select get --project .",

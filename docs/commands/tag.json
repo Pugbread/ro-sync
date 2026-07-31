@@ -3,6 +3,11 @@
   "title": "rosync tag",
   "category": "Live writes",
   "description": "Adds or removes CollectionService tags on a live Studio instance.",
+  "subcommands": ["add", "rm"],
+  "subcommandMetadata": {
+    "add": { "safety": "mutates-studio", "requires": ["project", "daemon", "studio-plugin"] },
+    "rm": { "safety": "mutates-studio", "requires": ["project", "daemon", "studio-plugin"] }
+  },
   "usage": "rosync tag add|rm [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]",
   "examples": [
     "rosync tag add --project . --path Workspace/Box --tag Enemy",

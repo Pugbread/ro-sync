@@ -3,6 +3,11 @@
   "title": "rosync repair",
   "category": "Maintenance",
   "description": "Checks live tree access and rebuilds generated Ro Sync metadata.",
+  "subcommands": ["tree", "sourcemap"],
+  "subcommandMetadata": {
+    "tree": { "safety": "read-only", "requires": ["project", "daemon", "studio-plugin"] },
+    "sourcemap": { "safety": "writes-local-files", "requires": ["project"] }
+  },
   "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]",
   "examples": [
     "rosync repair tree --project .",

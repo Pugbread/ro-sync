@@ -15,6 +15,15 @@
       },
       "Clipboard": {
         "$path": "src/Clipboard.luau"
+      },
+      "PathHelpers": {
+        "$path": "src/PathHelpers.luau"
+      },
+      "Reflection": {
+        "$path": "src/Reflection.luau"
+      },
+      "RemoteCodec": {
+        "$path": "src/RemoteCodec.luau"
       }
     },
     "App": {

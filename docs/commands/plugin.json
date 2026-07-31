@@ -3,6 +3,11 @@
   "title": "rosync plugin",
   "category": "Project setup",
   "description": "Atomically installs the bundled Roblox Studio Plugin.rbxm or compares the installed copy with the bundle by SHA-256.",
+  "subcommands": ["install", "status"],
+  "subcommandMetadata": {
+    "install": { "safety": "writes-local-files", "requires": ["bundled-plugin", "roblox-plugin-directory"] },
+    "status": { "safety": "read-only", "requires": ["bundled-plugin", "roblox-plugin-directory"] }
+  },
   "usage": "rosync plugin <install|status> [--source <Plugin.rbxm>] [--plugin-dir <path>] [--raw]",
   "examples": [
     "rosync plugin install",

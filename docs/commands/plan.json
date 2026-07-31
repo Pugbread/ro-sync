@@ -3,6 +3,14 @@
   "title": "rosync plan",
   "category": "Command registry",
   "description": "Builds a read-only JSON plan for a mutating command without executing it.",
+  "subcommands": ["set", "new", "rm", "mv", "resolve"],
+  "subcommandMetadata": {
+    "set": { "safety": "read-only", "requires": [] },
+    "new": { "safety": "read-only", "requires": [] },
+    "rm": { "safety": "read-only", "requires": [] },
+    "mv": { "safety": "read-only", "requires": [] },
+    "resolve": { "safety": "read-only", "requires": [] }
+  },
   "usage": "rosync plan set --path <studio-path> --prop <property> --value <json>\nrosync plan new --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>]\nrosync plan rm --path <studio-path>\nrosync plan mv --from <studio-path> --to <parent-path> [--force]\nrosync plan resolve --path <filesystem-path> (--disk | --studio)",
   "examples": [
     "rosync plan set --path ReplicatedStorage/Config --prop Source --value '\"return {}\"'",

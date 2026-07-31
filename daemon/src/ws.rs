@@ -16,6 +16,7 @@
 //
 //   ServerMsg (tag "type", kebab-case):
 //     {"type":"op","op":<plugin-shape op>}
+//     {"type":"ops","ops":[<plugin-shape op>, ...]}
 //     {"type":"ping"}            // 10-second heartbeat
 //     {"type":"pong"}            // reply to client ping
 //     {"type":"shutdown","reason":"...","code":"...","retryable":true}
@@ -48,6 +49,9 @@ const PLUGIN_INBOUND_TIMEOUT: Duration = Duration::from_secs(45);
 const PLUGIN_POST_WAKE_GRACE: Duration = Duration::from_secs(30);
 const UNIDENTIFIED_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const PLUGIN_OP_BATCH_MAX_COUNT: usize = 256;
+const PLUGIN_OP_BATCH_MAX_BYTES: usize = 512 * 1024;
+const PLUGIN_OP_BATCH_WINDOW: Duration = Duration::from_millis(2);
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_ROUTES: usize = 1024;
 const MAX_PENDING_ROUTES_PER_CONNECTION: usize = 64;
@@ -294,6 +298,12 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     Op {
         op: Value,
+    },
+    Ops {
+        ops: Vec<Value>,
+    },
+    Lagged {
+        reason: String,
     },
     Ping,
     Pong,
@@ -882,11 +892,77 @@ async fn send_loop(
                                 let is_active = *state.active_plugin.lock().unwrap() == Some(conn_id);
                                 let mut failed = false;
                                 if is_active {
-                                    for op in plugin_ops {
-                                        if !send_ws_msg(&mut sender, &ServerMsg::Op { op }, conn_id).await {
-                                            failed = true;
-                                            break;
+                                    let mut coalesced = plugin_ops;
+                                    // Match Azul's useful transport pattern: preserve a
+                                    // short idle-window burst as one bounded batch instead
+                                    // of forcing Studio through one callback and queue
+                                    // insertion per filesystem notification.
+                                    tokio::time::sleep(PLUGIN_OP_BATCH_WINDOW).await;
+                                    while coalesced.len() < PLUGIN_OP_BATCH_MAX_COUNT {
+                                        match events_rx.try_recv() {
+                                            Ok(next) => {
+                                                let next_ops = event_to_plugin_ops(
+                                                    state.canonical_project.as_path(),
+                                                    &next,
+                                                );
+                                                if next_ops.is_empty() {
+                                                    // Non-op events are activity/UI data and
+                                                    // are intentionally invisible to the
+                                                    // plugin. A shutdown is the only control
+                                                    // frame that must not be consumed here.
+                                                    if has_type(&next, "shutdown") {
+                                                        let _ = send_plugin_ops(
+                                                            &mut sender,
+                                                            std::mem::take(&mut coalesced),
+                                                            conn_id,
+                                                        )
+                                                        .await;
+                                                        let _ = send_ws_frame(
+                                                                &mut sender,
+                                                                Message::Text(next),
+                                                                conn_id,
+                                                            )
+                                                            .await;
+                                                        let _ = send_ws_frame(
+                                                            &mut sender,
+                                                            Message::Close(None),
+                                                            conn_id,
+                                                        )
+                                                        .await;
+                                                        failed = true;
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                                coalesced.extend(next_ops);
+                                            }
+                                            Err(broadcast::error::TryRecvError::Empty) => break,
+                                            Err(broadcast::error::TryRecvError::Closed) => {
+                                                failed = true;
+                                                break;
+                                            }
+                                            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                                                close_connection(
+                                                    &mut sender,
+                                                    conn_id,
+                                                    &ConnectionClose::new(
+                                                        format!(
+                                                            "WebSocket peer missed {skipped} daemon event frame(s)"
+                                                        ),
+                                                        "event-broadcast-lagged",
+                                                        true,
+                                                    ),
+                                                )
+                                                .await;
+                                                failed = true;
+                                                break;
+                                            }
                                         }
+                                    }
+                                    if !failed
+                                        && !send_plugin_ops(&mut sender, coalesced, conn_id).await
+                                    {
+                                        failed = true;
                                     }
                                 }
                                 if failed {
@@ -1586,6 +1662,67 @@ async fn send_ws_msg(
     send_ws_frame(sender, Message::Text(s), conn_id).await
 }
 
+async fn send_plugin_ops(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    ops: Vec<Value>,
+    conn_id: u64,
+) -> bool {
+    let mut batch = Vec::new();
+    let mut batch_bytes = 32usize;
+    for op in ops {
+        let op_bytes = serde_json::to_vec(&op)
+            .map(|encoded| encoded.len().saturating_add(1))
+            .unwrap_or(PLUGIN_OP_BATCH_MAX_BYTES);
+        if op_bytes > PLUGIN_OP_BATCH_MAX_BYTES {
+            // Large Sources use the existing chunked initial-comparison path.
+            // Sending one unbounded live frame would defeat both queue limits.
+            let _ = send_ws_msg(
+                sender,
+                &ServerMsg::Lagged {
+                    reason: format!(
+                        "live operation exceeded {} byte transport limit",
+                        PLUGIN_OP_BATCH_MAX_BYTES
+                    ),
+                },
+                conn_id,
+            )
+            .await;
+            return false;
+        }
+        if !batch.is_empty()
+            && (batch.len() >= PLUGIN_OP_BATCH_MAX_COUNT
+                || batch_bytes.saturating_add(op_bytes) > PLUGIN_OP_BATCH_MAX_BYTES)
+        {
+            let message = if batch.len() == 1 {
+                ServerMsg::Op {
+                    op: batch.pop().expect("single operation"),
+                }
+            } else {
+                ServerMsg::Ops {
+                    ops: std::mem::take(&mut batch),
+                }
+            };
+            if !send_ws_msg(sender, &message, conn_id).await {
+                return false;
+            }
+            batch_bytes = 32;
+        }
+        batch_bytes = batch_bytes.saturating_add(op_bytes);
+        batch.push(op);
+    }
+    if batch.is_empty() {
+        return true;
+    }
+    let message = if batch.len() == 1 {
+        ServerMsg::Op {
+            op: batch.pop().expect("single operation"),
+        }
+    } else {
+        ServerMsg::Ops { ops: batch }
+    };
+    send_ws_msg(sender, &message, conn_id).await
+}
+
 async fn send_ws_frame(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     message: Message,
@@ -1666,6 +1803,19 @@ mod tests {
 
     async fn start_server() -> TestHarness {
         start_server_with_widget(false).await
+    }
+
+    #[test]
+    fn batched_plugin_operations_serialize_as_one_ops_frame() {
+        let message = ServerMsg::Ops {
+            ops: vec![
+                serde_json::json!({ "op": "delete", "path": ["Workspace", "Old"] }),
+                serde_json::json!({ "op": "set", "path": ["Workspace", "New"] }),
+            ],
+        };
+        let value = serde_json::to_value(message).unwrap();
+        assert_eq!(value["type"], "ops");
+        assert_eq!(value["ops"].as_array().map(Vec::len), Some(2));
     }
 
     #[test]
@@ -2828,6 +2978,91 @@ mod tests {
             !bin_dir.join(".meta.json").exists(),
             ".meta.json must not be emitted for a Folder (property sync is ripped out)"
         );
+    }
+
+    #[tokio::test]
+    async fn ws_coalesces_separate_burst_events_into_one_ops_frame() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+        let (mut plugin, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        plugin.send(plugin_hello("batch-test")).await.unwrap();
+        wait_for_active_plugin(&h).await;
+        for _ in 0..50 {
+            if h.state.events.receiver_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        h.state
+            .events
+            .send(
+                serde_json::json!({
+                    "type": "plugin-op",
+                    "op": { "op": "delete", "path": ["Workspace", "Old"] }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let delayed_events = h.state.events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let _ = delayed_events.send(
+                serde_json::json!({
+                    "type": "plugin-op",
+                    "op": { "op": "set", "path": ["Workspace", "New"], "class": "Folder" }
+                })
+                .to_string(),
+            );
+        });
+
+        let message = recv_until_type(&mut plugin, "ops", Duration::from_secs(5))
+            .await
+            .expect("one scheduling-window burst should share one bounded frame");
+        assert_eq!(message["ops"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn oversized_live_operation_requests_streamed_resync() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+        let (mut plugin, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        plugin
+            .send(plugin_hello("oversized-op-test"))
+            .await
+            .unwrap();
+        wait_for_active_plugin(&h).await;
+        for _ in 0..50 {
+            if h.state.events.receiver_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        h.state
+            .events
+            .send(
+                serde_json::json!({
+                    "type": "plugin-op",
+                    "op": {
+                        "op": "set",
+                        "path": ["Workspace", "Huge"],
+                        "class": "ModuleScript",
+                        "properties": {
+                            "Source": "x".repeat(PLUGIN_OP_BATCH_MAX_BYTES)
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let message = recv_until_type(&mut plugin, "lagged", Duration::from_secs(5))
+            .await
+            .expect("oversized live operations must use streamed resync");
+        assert!(message["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("transport limit")));
     }
 
     #[tokio::test]

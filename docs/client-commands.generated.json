@@ -39,6 +39,26 @@
       "title": "rosync plugin",
       "category": "Project setup",
       "description": "Atomically installs the bundled Roblox Studio Plugin.rbxm or compares the installed copy with the bundle by SHA-256.",
+      "subcommands": [
+        "install",
+        "status"
+      ],
+      "subcommandMetadata": {
+        "install": {
+          "safety": "writes-local-files",
+          "requires": [
+            "bundled-plugin",
+            "roblox-plugin-directory"
+          ]
+        },
+        "status": {
+          "safety": "read-only",
+          "requires": [
+            "bundled-plugin",
+            "roblox-plugin-directory"
+          ]
+        }
+      },
       "usage": "rosync plugin <install|status> [--source <Plugin.rbxm>] [--plugin-dir <path>] [--raw]",
       "examples": [
         "rosync plugin install",
@@ -56,6 +76,27 @@
       "title": "rosync auth",
       "category": "Project setup",
       "description": "Stores, inspects, or clears the CLI Roblox Open Cloud credential without accepting or printing the secret as a command-line value.",
+      "subcommands": [
+        "set",
+        "status",
+        "clear"
+      ],
+      "subcommandMetadata": {
+        "set": {
+          "safety": "writes-local-credentials",
+          "requires": [
+            "credential-input"
+          ]
+        },
+        "status": {
+          "safety": "read-only",
+          "requires": []
+        },
+        "clear": {
+          "safety": "writes-local-credentials",
+          "requires": []
+        }
+      },
       "usage": "rosync auth <set|status|clear> [--data-dir <path>] [--raw]",
       "examples": [
         "printf '%s' \"$ROBLOX_API_KEY\" | rosync auth set --from-stdin --raw",
@@ -75,6 +116,45 @@
       "title": "rosync daemon",
       "category": "Daemon",
       "description": "Starts, inspects, gracefully stops, restarts, or reads logs from one project-scoped managed background daemon.",
+      "subcommands": [
+        "start",
+        "status",
+        "stop",
+        "restart",
+        "logs"
+      ],
+      "subcommandMetadata": {
+        "start": {
+          "safety": "controls-local-service",
+          "requires": [
+            "project"
+          ]
+        },
+        "status": {
+          "safety": "read-only",
+          "requires": [
+            "project"
+          ]
+        },
+        "stop": {
+          "safety": "controls-local-service",
+          "requires": [
+            "project"
+          ]
+        },
+        "restart": {
+          "safety": "controls-local-service",
+          "requires": [
+            "project"
+          ]
+        },
+        "logs": {
+          "safety": "read-only",
+          "requires": [
+            "project"
+          ]
+        }
+      },
       "usage": "rosync daemon <start|status|stop|restart|logs> --project <path> [options]",
       "examples": [
         "rosync daemon start --project . --raw",
@@ -153,6 +233,55 @@
       "title": "rosync capture",
       "category": "Agent Runtime",
       "description": "Captures the Studio surface, the 3D viewport, or its in-game UI layer and writes a verified PNG without placing image bytes on stdout. The self-contained Photo engine can capture the current viewport, extract transparent ScreenGui layers, or clone and frame a Studio subject without place-provided capture dependencies or screenshot authorization.",
+      "subcommands": [
+        "status",
+        "authorize",
+        "screen",
+        "photo",
+        "scene"
+      ],
+      "subcommandMetadata": {
+        "status": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "authorize": {
+          "safety": "system-permission-prompt",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "screen": {
+          "safety": "writes-local-artifact",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "photo": {
+          "safety": "writes-local-artifact",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "scene": {
+          "safety": "writes-local-artifact",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        }
+      },
       "usage": "rosync capture status|authorize|screen|photo|scene [options]",
       "examples": [
         "rosync capture status --project . --raw",
@@ -202,6 +331,104 @@
         "stop",
         "request"
       ],
+      "subcommandMetadata": {
+        "run": {
+          "safety": "controls-playtest-and-runtime-execution",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "start": {
+          "safety": "controls-playtest",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "status": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "contexts": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "wait": {
+          "safety": "streaming-read",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "exec": {
+          "safety": "risky-live-execution",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "logs": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "ui": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "input": {
+          "safety": "mutates-playtest-input",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "capture": {
+          "safety": "writes-local-artifact",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "stop": {
+          "safety": "controls-playtest",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "request": {
+          "safety": "risky-live-execution",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        }
+      },
       "examples": [
         "rosync playtest run --project . --script ./check.server.luau --raw",
         "rosync playtest run --project . --script ./bench.server.luau --client-script ./join.client.luau --mode multiplayer --players 2 --args '{\"map\":\"Lighthouse\",\"laps\":3}' --timeout 600 --raw",
@@ -258,6 +485,35 @@
       "title": "rosync plan",
       "category": "Command registry",
       "description": "Builds a read-only JSON plan for a mutating command without executing it.",
+      "subcommands": [
+        "set",
+        "new",
+        "rm",
+        "mv",
+        "resolve"
+      ],
+      "subcommandMetadata": {
+        "set": {
+          "safety": "read-only",
+          "requires": []
+        },
+        "new": {
+          "safety": "read-only",
+          "requires": []
+        },
+        "rm": {
+          "safety": "read-only",
+          "requires": []
+        },
+        "mv": {
+          "safety": "read-only",
+          "requires": []
+        },
+        "resolve": {
+          "safety": "read-only",
+          "requires": []
+        }
+      },
       "usage": "rosync plan set --path <studio-path> --prop <property> --value <json>\nrosync plan new --path <parent-path> --class <ClassName> [--name <Name>] [--props <json-object>]\nrosync plan rm --path <studio-path>\nrosync plan mv --from <studio-path> --to <parent-path> [--force]\nrosync plan resolve --path <filesystem-path> (--disk | --studio)",
       "examples": [
         "rosync plan set --path ReplicatedStorage/Config --prop Source --value '\"return {}\"'",
@@ -360,6 +616,108 @@
       "title": "rosync monetization",
       "category": "Open Cloud",
       "description": "Discovers, lists, creates, edits, and uploads images for Roblox game passes and developer products through Open Cloud.",
+      "subcommands": [
+        "gamepass",
+        "product"
+      ],
+      "subcommandPaths": [
+        "gamepass discover",
+        "gamepass list",
+        "gamepass create",
+        "gamepass edit",
+        "gamepass image",
+        "gamepass images",
+        "product discover",
+        "product list",
+        "product create",
+        "product edit",
+        "product image",
+        "product images"
+      ],
+      "subcommandMetadata": {
+        "gamepass discover": {
+          "safety": "read-only",
+          "requires": [
+            "project"
+          ]
+        },
+        "gamepass list": {
+          "safety": "open-cloud-read",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "gamepass create": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "gamepass edit": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "gamepass image": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "gamepass images": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "product discover": {
+          "safety": "read-only",
+          "requires": [
+            "project"
+          ]
+        },
+        "product list": {
+          "safety": "open-cloud-read",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "product create": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "product edit": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "product image": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        },
+        "product images": {
+          "safety": "open-cloud-mutating",
+          "requires": [
+            "project",
+            "roblox-open-cloud-credential"
+          ]
+        }
+      },
       "usage": "rosync monetization gamepass discover [--project <path>]\nrosync monetization gamepass list [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--raw]\nrosync monetization gamepass create [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--description <text>] [--image <file>] [--not-for-sale] (<entry>... | --name <name> --price <robux>)\nrosync monetization gamepass edit [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) [--new-name <name>] [--price <robux>] [--description <text>] [--for-sale true|false]\nrosync monetization gamepass image [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) <file>\nrosync monetization gamepass images [--project <path>] [--universe-id <id>] [--api-key-env <name>] <dir>\n# Replace gamepass with product, dp, devproduct, gp, pass, or gamepasses as needed.",
       "examples": [
         "rosync monetization gamepass create \"VIP 499 robux\" --project .",
@@ -646,6 +1004,26 @@
       "title": "rosync repair",
       "category": "Maintenance",
       "description": "Checks live tree access and rebuilds generated Ro Sync metadata.",
+      "subcommands": [
+        "tree",
+        "sourcemap"
+      ],
+      "subcommandMetadata": {
+        "tree": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "sourcemap": {
+          "safety": "writes-local-files",
+          "requires": [
+            "project"
+          ]
+        }
+      },
       "usage": "rosync repair tree [--project <path>] [--port <port>] [--depth <n>] [--raw]\nrosync repair sourcemap [--project <path>] [--output <path>] [--raw]",
       "examples": [
         "rosync repair tree --project .",
@@ -889,6 +1267,37 @@
       "title": "rosync attr",
       "category": "Live writes",
       "description": "Lists, sets, or removes attributes on a live Studio instance.",
+      "subcommands": [
+        "set",
+        "rm",
+        "ls"
+      ],
+      "subcommandMetadata": {
+        "set": {
+          "safety": "mutates-studio",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "rm": {
+          "safety": "mutates-studio",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "ls": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        }
+      },
       "usage": "rosync attr set|rm|ls [--project <path>] [--port <port>] --path <studio-path> [--name <attribute>] [--value <json>] [--raw]",
       "examples": [
         "rosync attr set --project . --path Workspace/Box --name Speed --value 12.5",
@@ -906,6 +1315,28 @@
       "title": "rosync tag",
       "category": "Live writes",
       "description": "Adds or removes CollectionService tags on a live Studio instance.",
+      "subcommands": [
+        "add",
+        "rm"
+      ],
+      "subcommandMetadata": {
+        "add": {
+          "safety": "mutates-studio",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "rm": {
+          "safety": "mutates-studio",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        }
+      },
       "usage": "rosync tag add|rm [--project <path>] [--port <port>] --path <studio-path> --tag <tag> [--raw]",
       "examples": [
         "rosync tag add --project . --path Workspace/Box --tag Enemy",
@@ -936,6 +1367,28 @@
       "title": "rosync select",
       "category": "Live writes",
       "description": "Reads or replaces the current Studio Selection.",
+      "subcommands": [
+        "get",
+        "set"
+      ],
+      "subcommandMetadata": {
+        "get": {
+          "safety": "read-only",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        },
+        "set": {
+          "safety": "mutates-studio-selection",
+          "requires": [
+            "project",
+            "daemon",
+            "studio-plugin"
+          ]
+        }
+      },
       "usage": "rosync select get|set [--project <path>] [--port <port>] [--paths <json-array>] [--raw]",
       "examples": [
         "rosync select get --project .",

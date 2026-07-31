@@ -30,6 +30,20 @@ playtests. The builder packages it as `RoSync.Playscript`; `Plugin.luau`
 requires that child module for authenticated boot, event streaming,
 cross-context signals, completion, and bounded result transport.
 
+`RemoteCodec.luau` owns DataModel path conversion and the bounded JSON-safe
+remote value codec. The builder packages it as `RoSync.RemoteCodec`; the main
+script injects its Studio path resolver so protocol behavior remains unchanged
+without keeping the recursive codec in the already-large top-level chunk.
+
+`Reflection.luau` owns the class, enum, and attribute-introspection handlers,
+including their offline fallback metadata. The builder packages it as
+`RoSync.Reflection`, and the main script injects the shared path/value helpers.
+
+`PathHelpers.luau` owns portable filename encoding, duplicate-fragment
+allocation, and generated Studio-path lookup. The builder packages it as
+`RoSync.PathHelpers`; snapshot application state is injected through a lazy
+getter so the existing initialization order and identity caches are preserved.
+
 ## Build
 
 ```sh
