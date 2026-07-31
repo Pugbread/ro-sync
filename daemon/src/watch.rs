@@ -175,11 +175,141 @@ impl RawIngressBarrier {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionEntry {
+    generation: crate::fs_safety::FileGeneration,
+    is_dir: bool,
+}
+
+type ProjectionEntries = HashMap<PathBuf, ProjectionEntry>;
+type ReconciledServices = HashMap<String, ProjectionEntries>;
+
+#[derive(Debug, Clone, Default)]
+struct ProjectionManifest {
+    entries: ProjectionEntries,
+}
+
+impl ProjectionManifest {
+    fn scan_all(root: &Path) -> Result<Self, String> {
+        let mut manifest = Self::default();
+        for service in crate::fs_safety::SYNCED_SERVICES {
+            manifest.replace_service(root, service, scan_projection_service(root, service)?);
+        }
+        Ok(manifest)
+    }
+
+    fn service_entries(&self, root: &Path, service: &str) -> ProjectionEntries {
+        let service_root = root.join(service);
+        self.entries
+            .iter()
+            .filter(|(path, _)| path.starts_with(&service_root))
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect()
+    }
+
+    fn replace_service(
+        &mut self,
+        root: &Path,
+        service: &str,
+        entries: HashMap<PathBuf, ProjectionEntry>,
+    ) {
+        let service_root = root.join(service);
+        self.entries
+            .retain(|path, _| !path.starts_with(&service_root));
+        self.entries.extend(entries);
+    }
+
+    fn apply_published_op(&mut self, root: &Path, op: &Op) {
+        match op.kind {
+            OpKind::Delete => {
+                self.entries.retain(|path, _| !path.starts_with(&op.path));
+            }
+            OpKind::Rename => {
+                let Some(from) = op.from.as_deref() else {
+                    return;
+                };
+                let moved = self
+                    .entries
+                    .iter()
+                    .filter_map(|(path, entry)| {
+                        path.strip_prefix(from)
+                            .ok()
+                            .map(|suffix| (path.clone(), op.path.join(suffix), entry.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (old, new, entry) in moved {
+                    self.entries.remove(&old);
+                    self.entries.insert(new, entry);
+                }
+            }
+            OpKind::Add | OpKind::Update => {
+                if !is_projected_path(&op.path, root) {
+                    return;
+                }
+                match projection_entry_at(&op.path) {
+                    Ok(Some(entry)) => {
+                        self.entries.insert(op.path.clone(), entry);
+                    }
+                    Ok(None) => {
+                        self.entries.remove(&op.path);
+                    }
+                    Err(error) => eprintln!(
+                        "rosync: watcher manifest could not record published {}: {error}",
+                        op.path.display()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn projection_entry_at(path: &Path) -> Result<Option<ProjectionEntry>, String> {
+    let Some(metadata) = crate::fs_safety::metadata_no_follow(path)
+        .map_err(|error| format!("inspect projection entry {}: {error}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(ProjectionEntry {
+        generation: crate::fs_safety::file_generation_no_follow(path)
+            .map_err(|error| format!("capture projection entry {}: {error}", path.display()))?,
+        is_dir: metadata.is_dir(),
+    }))
+}
+
+fn scan_projection_service(root: &Path, service: &str) -> Result<ProjectionEntries, String> {
+    let first = crate::fs_safety::capture_tree_metadata(root, service)?;
+    let second = crate::fs_safety::capture_tree_metadata(root, service)?;
+    if first != second {
+        return Err(format!(
+            "synced service {service} changed during targeted watcher reconciliation"
+        ));
+    }
+
+    let mut entries = HashMap::with_capacity(second.entries().len());
+    for entry in second.entries() {
+        if !is_projected_path(&entry.path, root) {
+            continue;
+        }
+        entries.insert(
+            entry.path.clone(),
+            ProjectionEntry {
+                generation: entry.generation.clone(),
+                is_dir: entry.kind == crate::fs_safety::SafeEntryKind::Directory,
+            },
+        );
+    }
+    Ok(entries)
+}
+
 pub struct Watch {
     _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
     tx: broadcast::Sender<WatchEvent>,
     raw_tx: std::sync::mpsc::SyncSender<RawIngress>,
     raw_barrier: Arc<RawIngressBarrier>,
+    projection_manifest: Arc<Mutex<ProjectionManifest>>,
     root: PathBuf,
     #[allow(dead_code)]
     pause_until: Arc<Mutex<Instant>>,
@@ -216,13 +346,33 @@ impl Watch {
         )?;
         debouncer.watch(&root, RecursiveMode::Recursive)?;
 
+        // FSEvents cannot always pair the two sides of a rename. Keep a
+        // metadata-only image of the sync projection so one-sided rename
+        // notifications can be reconciled exactly without disconnecting the
+        // Studio WebSocket. The native watch is already armed, so subsequent
+        // changes are also present in raw ingress while this bounded scan runs.
+        let projection_manifest = Arc::new(Mutex::new(
+            ProjectionManifest::scan_all(&root).map_err(|error| {
+                notify::Error::generic(&format!(
+                    "initialize filesystem watcher projection manifest: {error}"
+                ))
+            })?,
+        ));
         let pause_until = Arc::new(Mutex::new(Instant::now()));
         let tx_thread = tx.clone();
         let root_thread = root.clone();
         let pause_thread = pause_until.clone();
         let thread_barrier = raw_barrier.clone();
+        let thread_manifest = projection_manifest.clone();
         std::thread::spawn(move || {
-            drain_loop(raw_rx, thread_barrier, tx_thread, root_thread, pause_thread)
+            drain_loop(
+                raw_rx,
+                thread_barrier,
+                tx_thread,
+                root_thread,
+                pause_thread,
+                thread_manifest,
+            )
         });
 
         Ok(Self {
@@ -230,6 +380,7 @@ impl Watch {
             tx,
             raw_tx,
             raw_barrier,
+            projection_manifest,
             root,
             pause_until,
         })
@@ -248,6 +399,12 @@ impl Watch {
             &self.raw_barrier,
             "downstream watcher rebuild discarded retained raw ingress",
         );
+        match ProjectionManifest::scan_all(&self.root) {
+            Ok(refreshed) => *self.projection_manifest.lock().unwrap() = refreshed,
+            Err(error) => eprintln!(
+                "rosync: watcher projection manifest refresh failed after rebuild barrier: {error}"
+            ),
+        }
         replace_with_fresh_subscription(&self.tx, receiver);
     }
 
@@ -442,12 +599,94 @@ fn is_projected_path(path: &Path, root: &Path) -> bool {
     is_synced_path(path, root) && !is_blacklisted(path, root) && !is_root_reserved(path, root)
 }
 
+#[derive(Debug, Default)]
+struct CollectedRawPending {
+    pending: Vec<RawPending>,
+    reconciliations: Vec<RenameReconciliation>,
+}
+
+#[derive(Debug)]
+struct RenameReconciliation {
+    services: HashSet<String>,
+    diagnostic: String,
+}
+
+fn synced_service_for_path(path: &Path, root: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let service = relative.components().next()?.as_os_str().to_str()?;
+    crate::fs_safety::SYNCED_SERVICES
+        .contains(&service)
+        .then(|| service.to_string())
+}
+
+fn observed_path_diagnostic(path: &Path, root: &Path) -> String {
+    let projected = is_projected_path(path, root);
+    let observed = match crate::fs_safety::metadata_no_follow(path) {
+        Ok(Some(metadata)) if metadata.is_dir() => "directory".to_string(),
+        Ok(Some(metadata)) if metadata.is_file() => "file".to_string(),
+        Ok(Some(_)) => "unsupported-object".to_string(),
+        Ok(None) => "missing".to_string(),
+        Err(error) => format!("inspection-error:{error}"),
+    };
+    format!(
+        "{} [projected={projected}, observed={observed}]",
+        path.display()
+    )
+}
+
+fn unpaired_rename_reconciliation(
+    mode: RenameMode,
+    paths: &[PathBuf],
+    root: &Path,
+) -> RenameReconciliation {
+    // A one-sided FSEvents rename can have its unseen counterpart anywhere in
+    // the projection, including another service. The smallest scope that
+    // cannot leave an old counterpart behind is therefore all synced service
+    // directories—not the whole project and not the Studio DataModel.
+    let services = crate::fs_safety::SYNCED_SERVICES
+        .iter()
+        .map(|service| (*service).to_string())
+        .collect();
+    let observed = paths
+        .iter()
+        .map(|path| observed_path_diagnostic(path, root))
+        .collect::<Vec<_>>()
+        .join(", ");
+    RenameReconciliation {
+        services,
+        diagnostic: format!(
+            "filesystem watcher delivered one-sided rename mode={mode:?}; paths=[{observed}]"
+        ),
+    }
+}
+
+fn scoped_rename_reconciliation(
+    description: &str,
+    paths: &[PathBuf],
+    root: &Path,
+) -> RenameReconciliation {
+    let services = paths
+        .iter()
+        .filter_map(|path| synced_service_for_path(path, root))
+        .collect();
+    let observed = paths
+        .iter()
+        .map(|path| observed_path_diagnostic(path, root))
+        .collect::<Vec<_>>()
+        .join(", ");
+    RenameReconciliation {
+        services,
+        diagnostic: format!("{description}; paths=[{observed}]"),
+    }
+}
+
 fn collect_raw_pending(
     events: Vec<DebouncedEvent>,
     root: &Path,
-) -> Result<Vec<RawPending>, String> {
+) -> Result<CollectedRawPending, String> {
     let mut pending = Vec::<RawPending>::new();
     let mut by_path = HashMap::<PathBuf, usize>::new();
+    let mut reconciliations = Vec::new();
     for event in events {
         if let EventKind::Modify(ModifyKind::Name(mode)) = event.event.kind {
             if mode == RenameMode::Both && event.event.paths.len() == 2 {
@@ -470,15 +709,18 @@ fn collect_raw_pending(
                         from,
                         &EventKind::Remove(RemoveKind::Any),
                     ),
-                    // Moving *in* still requires a resync. The watcher receives a
-                    // single rename event for the directory and no creates for
-                    // its descendants, so there is no way to enumerate what
-                    // actually arrived from this batch alone.
+                    // Moving *in* requires an exact projection scan. The watcher
+                    // receives a single rename event for the directory and no
+                    // creates for its descendants, so there is no way to
+                    // enumerate what actually arrived from this batch alone.
+                    // Reconcile the affected service against the retained
+                    // projection instead of tearing down the live Studio
+                    // transport.
                     (false, true) => {
-                        return Err(format!(
-                            "filesystem rename crossed the synced projection boundary: {} -> {}",
-                            from.display(),
-                            to.display()
+                        reconciliations.push(scoped_rename_reconciliation(
+                            "filesystem rename entered the synced projection",
+                            &event.event.paths,
+                            root,
                         ));
                     }
                 }
@@ -488,11 +730,21 @@ fn collect_raw_pending(
                 .event
                 .paths
                 .iter()
-                .any(|path| is_projected_path(path, root))
+                .any(|path| is_synced_path(path, root))
             {
-                return Err(format!(
-                    "filesystem watcher delivered an unpaired or malformed rename ({mode:?})"
-                ));
+                let reconciliation =
+                    if matches!(mode, RenameMode::Any | RenameMode::From | RenameMode::To) {
+                        unpaired_rename_reconciliation(mode, &event.event.paths, root)
+                    } else {
+                        scoped_rename_reconciliation(
+                            &format!(
+                            "filesystem watcher delivered malformed paired rename mode={mode:?}"
+                        ),
+                            &event.event.paths,
+                            root,
+                        )
+                    };
+                reconciliations.push(reconciliation);
             }
             continue;
         }
@@ -503,7 +755,149 @@ fn collect_raw_pending(
             }
         }
     }
-    Ok(pending)
+    Ok(CollectedRawPending {
+        pending,
+        reconciliations,
+    })
+}
+
+fn collapse_changed_subtrees(mut candidates: Vec<(PathBuf, bool)>) -> Vec<(PathBuf, bool)> {
+    candidates.sort_by(|(left, _), (right, _)| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut roots = Vec::<(PathBuf, bool)>::new();
+    for candidate in candidates {
+        if roots
+            .iter()
+            .any(|(root, is_dir)| *is_dir && candidate.0.starts_with(root))
+        {
+            continue;
+        }
+        roots.push(candidate);
+    }
+    roots
+}
+
+fn reconcile_service_entries(previous: &ProjectionEntries, current: &ProjectionEntries) -> Vec<Op> {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+
+    for (path, before) in previous {
+        match current.get(path) {
+            None => removed.push((path.clone(), before.is_dir)),
+            Some(after) if before.is_dir != after.is_dir => {
+                removed.push((path.clone(), before.is_dir));
+                added.push((path.clone(), after.is_dir));
+            }
+            Some(after) if !before.is_dir && before.generation != after.generation => {
+                updated.push(path.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    for (path, after) in current {
+        if !previous.contains_key(path) {
+            added.push((path.clone(), after.is_dir));
+        }
+    }
+
+    let mut ops = Vec::new();
+    // Remove old subtree roots before creating the final projection. A paired
+    // rename would preserve Instance identity, but a one-sided native event
+    // cannot prove that identity. Delete+add is conservative and exact: it
+    // cannot leave a missed source sibling behind or guess the wrong target.
+    for (path, is_dir) in collapse_changed_subtrees(removed) {
+        ops.push(Op {
+            kind: OpKind::Delete,
+            path,
+            from: None,
+            content: None,
+            is_dir: Some(is_dir),
+        });
+    }
+    // The watch bridge expands an added directory from disk exactly once, so
+    // descendants below a newly added directory must not be duplicated here.
+    for (path, is_dir) in collapse_changed_subtrees(added) {
+        ops.push(Op {
+            kind: OpKind::Add,
+            path,
+            from: None,
+            content: None,
+            is_dir: Some(is_dir),
+        });
+    }
+    updated.sort();
+    for path in updated {
+        ops.push(Op {
+            kind: OpKind::Update,
+            path,
+            from: None,
+            content: None,
+            is_dir: Some(false),
+        });
+    }
+    ops
+}
+
+fn scan_projection_service_stable(root: &Path, service: &str) -> Result<ProjectionEntries, String> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match scan_projection_service(root, service) {
+            Ok(entries) => return Ok(entries),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::yield_now();
+    }
+    Err(last_error
+        .unwrap_or_else(|| format!("targeted watcher reconciliation failed for service {service}")))
+}
+
+fn reconcile_projection_services(
+    root: &Path,
+    manifest: &ProjectionManifest,
+    services: &HashSet<String>,
+) -> Result<(Vec<Op>, ReconciledServices), String> {
+    let mut ordered_services = services.iter().cloned().collect::<Vec<_>>();
+    ordered_services.sort();
+    let mut ops = Vec::new();
+    let mut replacements = HashMap::new();
+    for service in ordered_services {
+        if !crate::fs_safety::SYNCED_SERVICES.contains(&service.as_str()) {
+            continue;
+        }
+        let previous = manifest.service_entries(root, &service);
+        let current = scan_projection_service_stable(root, &service)?;
+        ops.extend(reconcile_service_entries(&previous, &current));
+        replacements.insert(service, current);
+    }
+    Ok((ops, replacements))
+}
+
+fn raw_pending_touches_services(
+    pending: &RawPending,
+    services: &HashSet<String>,
+    root: &Path,
+) -> bool {
+    match pending {
+        RawPending::Path { path, .. } => {
+            synced_service_for_path(path, root).is_some_and(|service| services.contains(&service))
+        }
+        RawPending::Rename { from, to } => [from, to].into_iter().any(|path| {
+            synced_service_for_path(path, root).is_some_and(|service| services.contains(&service))
+        }),
+    }
+}
+
+fn directory_add_services(pending: &[Op], root: &Path) -> HashSet<String> {
+    pending
+        .iter()
+        .filter(|op| op.kind == OpKind::Add && op.is_dir == Some(true))
+        .filter_map(|op| synced_service_for_path(&op.path, root))
+        .collect()
 }
 
 fn drain_loop(
@@ -512,6 +906,7 @@ fn drain_loop(
     tx: broadcast::Sender<WatchEvent>,
     root: PathBuf,
     pause_until: Arc<Mutex<Instant>>,
+    projection_manifest: Arc<Mutex<ProjectionManifest>>,
 ) {
     let mut discarded_through = None;
     while let Ok(item) = raw_rx.recv() {
@@ -538,7 +933,7 @@ fn drain_loop(
         // updates, and repeated deletes on the exact same path. Rename source
         // and destination paths are barriers, so identity-bearing ordering is
         // never collapsed across a move.
-        let raw_pending = match collect_raw_pending(events, &root) {
+        let collected = match collect_raw_pending(events, &root) {
             Ok(pending) => pending,
             Err(reason) => {
                 raw_barrier.activate(reason, true);
@@ -546,15 +941,48 @@ fn drain_loop(
                 continue;
             }
         };
-        if raw_pending.is_empty() {
+        if collected.pending.is_empty() && collected.reconciliations.is_empty() {
             continue;
         }
-        let raw_pending = match compose_raw_rename_chains(raw_pending) {
+        let mut raw_pending = match compose_raw_rename_chains(collected.pending) {
             Ok(pending) => pending,
             Err(reason) => {
                 raw_barrier.activate(reason, true);
                 flush_raw_quarantine(&raw_rx, &raw_barrier, &tx, &mut discarded_through);
                 continue;
+            }
+        };
+
+        let mut reconcile_services = HashSet::new();
+        for reconciliation in &collected.reconciliations {
+            reconcile_services.extend(reconciliation.services.iter().cloned());
+            eprintln!(
+                "rosync: watcher targeted reconciliation: {}",
+                reconciliation.diagnostic
+            );
+        }
+        // The service rescan covers every event in the affected projection
+        // generation. Do not also classify raw siblings from that service or
+        // the same write could be published twice.
+        raw_pending
+            .retain(|pending| !raw_pending_touches_services(pending, &reconcile_services, &root));
+
+        let (reconciled_ops, mut manifest_service_replacements) = if reconcile_services.is_empty() {
+            (Vec::new(), HashMap::new())
+        } else {
+            let manifest_snapshot = projection_manifest.lock().unwrap().clone();
+            match reconcile_projection_services(&root, &manifest_snapshot, &reconcile_services) {
+                Ok(result) => result,
+                Err(reason) => {
+                    raw_barrier.activate(
+                        format!(
+                            "targeted watcher reconciliation could not establish an exact projection: {reason}"
+                        ),
+                        true,
+                    );
+                    flush_raw_quarantine(&raw_rx, &raw_barrier, &tx, &mut discarded_through);
+                    continue;
+                }
             }
         };
 
@@ -573,7 +1001,7 @@ fn drain_loop(
             }
         };
 
-        let mut pending = Vec::<Op>::new();
+        let mut pending = reconciled_ops;
         let mut resync_reason = None;
         for raw in raw_pending {
             let op = match raw {
@@ -603,13 +1031,59 @@ fn drain_loop(
             flush_raw_quarantine(&raw_rx, &raw_barrier, &tx, &mut discarded_through);
             continue;
         }
+
+        // An added directory is expanded recursively by the async watch
+        // bridge. Native backends are not required to emit a child event for
+        // every descendant, so inserting only the directory would leave this
+        // retained projection incomplete. Capture the whole affected service
+        // before publication; a later one-sided rename can then delete every
+        // old descendant exactly.
+        let mut manifest_refresh_error = None;
+        for service in directory_add_services(&pending, &root) {
+            if manifest_service_replacements.contains_key(&service) {
+                continue;
+            }
+            match scan_projection_service_stable(&root, &service) {
+                Ok(entries) => {
+                    manifest_service_replacements.insert(service, entries);
+                }
+                Err(error) => {
+                    manifest_refresh_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(reason) = manifest_refresh_error {
+            raw_barrier.activate(
+                format!(
+                    "filesystem watcher could not retain an exact directory-add projection: {reason}"
+                ),
+                true,
+            );
+            flush_raw_quarantine(&raw_rx, &raw_barrier, &tx, &mut discarded_through);
+            continue;
+        }
+
+        let mut published_all = true;
         for op in pending {
             if flush_raw_quarantine(&raw_rx, &raw_barrier, &tx, &mut discarded_through) {
+                published_all = false;
                 break;
             }
-            if !send_op_unless_quarantined(&raw_barrier, &tx, op) {
+            if !send_op_unless_quarantined(&raw_barrier, &tx, op.clone()) {
                 flush_raw_quarantine(&raw_rx, &raw_barrier, &tx, &mut discarded_through);
+                published_all = false;
                 break;
+            }
+            projection_manifest
+                .lock()
+                .unwrap()
+                .apply_published_op(&root, &op);
+        }
+        if published_all && !manifest_service_replacements.is_empty() {
+            let mut manifest = projection_manifest.lock().unwrap();
+            for (service, entries) in manifest_service_replacements {
+                manifest.replace_service(&root, &service, entries);
             }
         }
     }
@@ -1595,20 +2069,27 @@ mod tests {
     }
 
     #[test]
-    fn one_sided_cross_boundary_renames_require_exact_resync() {
+    fn one_sided_and_cross_boundary_renames_request_targeted_reconciliation() {
         let root = Path::new("/project");
         let inside = root.join("Workspace/Main.luau");
         let outside = PathBuf::from("/outside/Main.luau");
 
-        // Moving *in* is still unrecoverable: one rename event arrives for the
-        // destination and none for its descendants, so the batch cannot say what
-        // was actually added.
+        // Moving in has no descendant events, so reconcile the affected service
+        // against the retained projection rather than guessing one add.
         let inbound = debounced_event(
             EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
             &[&outside, &inside],
         );
-        let error = collect_raw_pending(vec![inbound], root).unwrap_err();
-        assert!(error.contains("crossed"), "{error}");
+        let inbound = collect_raw_pending(vec![inbound], root).unwrap();
+        assert!(inbound.pending.is_empty());
+        assert_eq!(inbound.reconciliations.len(), 1);
+        assert_eq!(
+            inbound.reconciliations[0].services,
+            HashSet::from(["Workspace".to_string()])
+        );
+        assert!(inbound.reconciliations[0]
+            .diagnostic
+            .contains("entered the synced projection"));
 
         // Moving *out* is a plain removal and must NOT force a resync. Ro Sync's
         // own keep-Studio sync relocates each service root into
@@ -1620,8 +2101,9 @@ mod tests {
         );
         let pending = collect_raw_pending(vec![outbound], root)
             .expect("a move out of the projection is expressible as a removal");
-        assert_eq!(pending.len(), 1);
-        match &pending[0] {
+        assert!(pending.reconciliations.is_empty());
+        assert_eq!(pending.pending.len(), 1);
+        match &pending.pending[0] {
             RawPending::Path { path, kind } => {
                 assert_eq!(path, &inside);
                 assert!(matches!(kind, EventKind::Remove(_)), "{kind:?}");
@@ -1633,8 +2115,302 @@ mod tests {
             EventKind::Modify(ModifyKind::Name(RenameMode::From)),
             &[&inside],
         );
-        let error = collect_raw_pending(vec![unpaired], root).unwrap_err();
-        assert!(error.contains("unpaired"), "{error}");
+        let unpaired = collect_raw_pending(vec![unpaired], root).unwrap();
+        assert!(unpaired.pending.is_empty());
+        assert_eq!(unpaired.reconciliations.len(), 1);
+        assert_eq!(
+            unpaired.reconciliations[0].services.len(),
+            crate::fs_safety::SYNCED_SERVICES.len()
+        );
+        assert!(unpaired.reconciliations[0].diagnostic.contains("mode=From"));
+        assert!(unpaired.reconciliations[0]
+            .diagnostic
+            .contains("projected=true"));
+        assert!(unpaired.reconciliations[0]
+            .diagnostic
+            .contains("observed=missing"));
+    }
+
+    #[test]
+    fn every_one_sided_rename_mode_uses_projection_reconciliation() {
+        let root = Path::new("/project");
+        let path = root.join("ReplicatedStorage/AtomicSave.luau");
+        for mode in [RenameMode::Any, RenameMode::From, RenameMode::To] {
+            let collected = collect_raw_pending(
+                vec![debounced_event(
+                    EventKind::Modify(ModifyKind::Name(mode)),
+                    &[path.as_path()],
+                )],
+                root,
+            )
+            .unwrap();
+            assert!(collected.pending.is_empty(), "{mode:?}");
+            assert_eq!(collected.reconciliations.len(), 1, "{mode:?}");
+            let reconciliation = &collected.reconciliations[0];
+            assert_eq!(
+                reconciliation.services.len(),
+                crate::fs_safety::SYNCED_SERVICES.len(),
+                "{mode:?}"
+            );
+            assert!(
+                reconciliation
+                    .diagnostic
+                    .contains(&format!("mode={mode:?}")),
+                "{}",
+                reconciliation.diagnostic
+            );
+            assert!(
+                reconciliation
+                    .diagnostic
+                    .contains(&path.display().to_string()),
+                "{}",
+                reconciliation.diagnostic
+            );
+        }
+    }
+
+    #[test]
+    fn one_sided_blacklisted_rename_side_still_reconciles_projection() {
+        let root = Path::new("/project");
+        let temporary_side = root.join("Workspace/.Main.luau.swp");
+        assert!(is_blacklisted(&temporary_side, root));
+
+        let collected = collect_raw_pending(
+            vec![debounced_event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                &[temporary_side.as_path()],
+            )],
+            root,
+        )
+        .unwrap();
+
+        assert!(collected.pending.is_empty());
+        assert_eq!(collected.reconciliations.len(), 1);
+        assert_eq!(
+            collected.reconciliations[0].services.len(),
+            crate::fs_safety::SYNCED_SERVICES.len()
+        );
+        assert!(collected.reconciliations[0]
+            .diagnostic
+            .contains("projected=false"));
+    }
+
+    #[test]
+    fn targeted_reconciliation_turns_atomic_replace_into_one_update() {
+        let project = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let workspace = root.join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("Main.luau");
+        std::fs::write(&source, b"return 'before'\n").unwrap();
+        let before = scan_projection_service(&root, "Workspace").unwrap();
+
+        let temporary = workspace.join("Main.luau.tmp");
+        std::fs::write(&temporary, b"return 'after replacement'\n").unwrap();
+        // Windows rename cannot replace an existing destination. The
+        // reconciliation invariant is the final on-disk generation, so use a
+        // portable remove+rename sequence here.
+        std::fs::remove_file(&source).unwrap();
+        std::fs::rename(&temporary, &source).unwrap();
+        let after = scan_projection_service(&root, "Workspace").unwrap();
+
+        let ops = reconcile_service_entries(&before, &after);
+        assert_eq!(ops.len(), 1, "{ops:#?}");
+        assert_eq!(ops[0].kind, OpKind::Update);
+        assert_eq!(ops[0].path, source);
+        assert_eq!(ops[0].is_dir, Some(false));
+    }
+
+    #[test]
+    fn targeted_reconciliation_removes_old_file_and_adds_new_file() {
+        let project = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let workspace = root.join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let old = workspace.join("Old.luau");
+        let new = workspace.join("New.luau");
+        std::fs::write(&old, b"return true\n").unwrap();
+        let before = scan_projection_service(&root, "Workspace").unwrap();
+
+        std::fs::rename(&old, &new).unwrap();
+        let after = scan_projection_service(&root, "Workspace").unwrap();
+        let ops = reconcile_service_entries(&before, &after);
+
+        assert_eq!(ops.len(), 2, "{ops:#?}");
+        assert_eq!(ops[0].kind, OpKind::Delete);
+        assert_eq!(ops[0].path, old);
+        assert_eq!(ops[1].kind, OpKind::Add);
+        assert_eq!(ops[1].path, new);
+    }
+
+    #[test]
+    fn targeted_directory_reconciliation_collapses_descendants() {
+        let project = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let workspace = root.join("Workspace");
+        let old = workspace.join("Old");
+        let new = workspace.join("New");
+        std::fs::create_dir_all(old.join("Nested")).unwrap();
+        std::fs::write(old.join("Nested/Child.luau"), b"return true\n").unwrap();
+        let before = scan_projection_service(&root, "Workspace").unwrap();
+
+        std::fs::rename(&old, &new).unwrap();
+        let after = scan_projection_service(&root, "Workspace").unwrap();
+        let ops = reconcile_service_entries(&before, &after);
+
+        assert_eq!(ops.len(), 2, "{ops:#?}");
+        assert_eq!(ops[0].kind, OpKind::Delete);
+        assert_eq!(ops[0].path, old);
+        assert_eq!(ops[0].is_dir, Some(true));
+        assert_eq!(ops[1].kind, OpKind::Add);
+        assert_eq!(ops[1].path, new);
+        assert_eq!(ops[1].is_dir, Some(true));
+    }
+
+    #[test]
+    fn one_sided_rename_drain_publishes_exact_ops_without_resync() {
+        let project = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let workspace = root.join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let old = workspace.join("Old.luau");
+        let new = workspace.join("New.luau");
+        std::fs::write(&old, b"return true\n").unwrap();
+
+        let manifest = Arc::new(Mutex::new(ProjectionManifest::scan_all(&root).unwrap()));
+        std::fs::rename(&old, &new).unwrap();
+
+        let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel(2);
+        let barrier = Arc::new(RawIngressBarrier::default());
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let drain_barrier = barrier.clone();
+        let drain = std::thread::spawn(move || {
+            drain_loop(
+                raw_rx,
+                drain_barrier,
+                event_tx,
+                root,
+                Arc::new(Mutex::new(Instant::now())),
+                manifest,
+            );
+        });
+
+        enqueue_raw_result(
+            &raw_tx,
+            &barrier,
+            Ok(vec![debounced_event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                &[old.as_path()],
+            )]),
+        );
+        let first = recv_timeout(&mut event_rx, 1_000).expect("reconciled delete");
+        let second = recv_timeout(&mut event_rx, 1_000).expect("reconciled add");
+        assert_eq!((first.kind, first.path), (OpKind::Delete, old));
+        assert_eq!((second.kind, second.path), (OpKind::Add, new));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        drop(raw_tx);
+        drain.join().unwrap();
+    }
+
+    #[test]
+    fn directory_add_manifest_keeps_descendants_for_later_one_sided_rename() {
+        let project = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let workspace = root.join("Workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let manifest = Arc::new(Mutex::new(ProjectionManifest::scan_all(&root).unwrap()));
+        let manifest_for_assert = manifest.clone();
+        let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel(4);
+        let barrier = Arc::new(RawIngressBarrier::default());
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let drain_barrier = barrier.clone();
+        let drain_root = root.clone();
+        let drain = std::thread::spawn(move || {
+            drain_loop(
+                raw_rx,
+                drain_barrier,
+                event_tx,
+                drain_root,
+                Arc::new(Mutex::new(Instant::now())),
+                manifest,
+            );
+        });
+
+        let old = workspace.join("Old");
+        let old_child = old.join("Nested/Child.luau");
+        std::fs::create_dir_all(old_child.parent().unwrap()).unwrap();
+        std::fs::write(&old_child, b"return true\n").unwrap();
+        enqueue_raw_result(
+            &raw_tx,
+            &barrier,
+            Ok(vec![debounced_event(
+                EventKind::Create(notify::event::CreateKind::Folder),
+                &[old.as_path()],
+            )]),
+        );
+        let added = recv_timeout(&mut event_rx, 1_000).expect("directory add");
+        assert_eq!((added.kind, added.path), (OpKind::Add, old.clone()));
+
+        let manifest_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if manifest_for_assert
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&old_child)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < manifest_deadline,
+                "directory add never retained its nested child"
+            );
+            std::thread::yield_now();
+        }
+
+        let new = workspace.join("New");
+        let new_child = new.join("Nested/Child.luau");
+        std::fs::rename(&old, &new).unwrap();
+        enqueue_raw_result(
+            &raw_tx,
+            &barrier,
+            Ok(vec![debounced_event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                &[old.as_path()],
+            )]),
+        );
+        let removed = recv_timeout(&mut event_rx, 1_000).expect("reconciled directory delete");
+        let added = recv_timeout(&mut event_rx, 1_000).expect("reconciled directory add");
+        assert_eq!((removed.kind, removed.path), (OpKind::Delete, old));
+        assert_eq!((added.kind, added.path), (OpKind::Add, new));
+
+        let manifest_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let final_manifest = manifest_for_assert.lock().unwrap();
+            let exact = !final_manifest.entries.contains_key(&old_child)
+                && final_manifest.entries.contains_key(&new_child);
+            drop(final_manifest);
+            if exact {
+                break;
+            }
+            assert!(
+                Instant::now() < manifest_deadline,
+                "one-sided directory rename never retained its exact descendants"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        drop(raw_tx);
+        drain.join().unwrap();
     }
 
     #[test]
@@ -1649,6 +2425,7 @@ mod tests {
         let barrier = Arc::new(RawIngressBarrier::default());
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let root = project.path().to_path_buf();
+        let manifest = Arc::new(Mutex::new(ProjectionManifest::scan_all(&root).unwrap()));
         let drain_barrier = barrier.clone();
         let drain = std::thread::spawn(move || {
             drain_loop(
@@ -1657,6 +2434,7 @@ mod tests {
                 event_tx,
                 root,
                 Arc::new(Mutex::new(Instant::now())),
+                manifest,
             );
         });
 
@@ -1800,6 +2578,7 @@ mod tests {
         let event_keepalive = event_tx.clone();
         let drain_barrier = barrier.clone();
         let root = project.path().to_path_buf();
+        let manifest = Arc::new(Mutex::new(ProjectionManifest::scan_all(&root).unwrap()));
         let drain = std::thread::spawn(move || {
             drain_loop(
                 raw_rx,
@@ -1807,6 +2586,7 @@ mod tests {
                 event_tx,
                 root,
                 Arc::new(Mutex::new(Instant::now())),
+                manifest,
             );
         });
         drop(raw_tx);

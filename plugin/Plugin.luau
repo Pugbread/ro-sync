@@ -4636,7 +4636,7 @@ local scaleState = {
 	hookYieldEvery = 750,
 	studioScanYieldEvery = 500,
 	structureChunkRecords = 512,
-	compareHashChunkRecords = 64,
+	compareHashChunkRecords = 512,
 	sourcePartChunkRecords = 64,
 	deleteChunkRecords = 512,
 	sourceChunkBytes = 64 * 1024,
@@ -11456,12 +11456,28 @@ local function wsLoop(gen)
 			local lastPongClock = os.clock()
 			local heartbeatSuspectClock = nil
 			local conns: { RBXScriptConnection } = {}
+			local closeStarted = false
+			local function closeClient()
+				-- Roblox can take an unbounded amount of time to return from
+				-- WebStreamClient:Close() (observed at roughly 1,000 seconds
+				-- after a watcher shutdown). Publish the local terminal state
+				-- first so the watchdog exits and recovery starts immediately,
+				-- then isolate the engine close from this callback/task.
+				closed = true
+				if closeStarted then
+					return
+				end
+				closeStarted = true
+				task.spawn(function()
+					pcall(function()
+						client:Close()
+					end)
+				end)
+			end
 			local function acceptTransport()
 				if accepted or not reconnectState.desired or not connected or gen ~= wsGeneration then
 					if not reconnectState.desired or not connected or gen ~= wsGeneration then
-						pcall(function()
-							client:Close()
-						end)
+						closeClient()
 					end
 					return
 				end
@@ -11571,9 +11587,7 @@ local function wsLoop(gen)
 				conns,
 				client.MessageReceived:Connect(function(payload)
 					if not reconnectState.desired or not connected or gen ~= wsGeneration then
-						pcall(function()
-							client:Close()
-						end)
+						closeClient()
 						return
 					end
 					local msg, payloadBytes = parseWsPayload(payload)
@@ -11652,9 +11666,7 @@ local function wsLoop(gen)
 					elseif kind == "lagged" then
 						log("ws: daemon broadcast lagged — will resync via /initial-compare")
 						recoveryContext = "daemon broadcast lagged"
-						pcall(function()
-							client:Close()
-						end)
+						closeClient()
 					elseif kind == "shutdown" then
 						local reason = tostring(msg.reason or "daemon requested reconnect")
 						local retryable = msg.retryable
@@ -11673,9 +11685,7 @@ local function wsLoop(gen)
 								reason
 							)
 						)
-						pcall(function()
-							client:Close()
-						end)
+						closeClient()
 					elseif kind == "pong" then
 					-- liveness already refreshed above
 					elseif kind == "ping" then
@@ -11708,9 +11718,7 @@ local function wsLoop(gen)
 							setBanner(
 								"A Studio update was not fully written to disk. Ro Sync is reconciling before continuing."
 							)
-							pcall(function()
-								client:Close()
-							end)
+							closeClient()
 						end
 					elseif kind == "request" then
 						remoteState.handleRemoteRequest(client, msg)
@@ -11775,9 +11783,7 @@ local function wsLoop(gen)
 			elseif not closed and reconnectState.desired and connected and gen == wsGeneration then
 				recoveryContext = "WebSocket open timed out"
 				log("ws: open timed out")
-				pcall(function()
-					client:Close()
-				end)
+				closeClient()
 			end
 			if helloOk then
 				lastPongClock = os.clock()
@@ -11785,10 +11791,7 @@ local function wsLoop(gen)
 				-- authenticated hello. Keep `ws` unpublished until then so queued
 				-- filesystem pushes cannot race ahead of authentication.
 				if not wsSend(client, { type = "ping" }) then
-					closed = true
-					pcall(function()
-						client:Close()
-					end)
+					closeClient()
 				end
 				local lastPing = os.clock()
 				local lastWatchdogClock = lastPing
@@ -11806,10 +11809,7 @@ local function wsLoop(gen)
 						lastPing = now
 						log(string.format("ws: scheduler stalled for %.1fs — probing before timeout", schedulerGap))
 						if not wsSend(client, { type = "ping" }) then
-							closed = true
-							pcall(function()
-								client:Close()
-							end)
+							closeClient()
 						end
 					elseif now - lastPing >= WS_HEARTBEAT_INTERVAL then
 						lastPing = now
@@ -11822,9 +11822,7 @@ local function wsLoop(gen)
 							wsSend(client, { type = "ping" })
 						elseif now - heartbeatSuspectClock > WS_POST_WAKE_GRACE then
 							log("ws: heartbeat remained silent after post-wake grace — closing")
-							pcall(function()
-								client:Close()
-							end)
+							closeClient()
 							break
 						end
 					else
@@ -11840,9 +11838,7 @@ local function wsLoop(gen)
 					c:Disconnect()
 				end)
 			end
-			pcall(function()
-				client:Close()
-			end)
+			closeClient()
 			-- A workflow transaction is owned by the remote session. Losing that
 			-- session makes commit intent unknowable, so fail closed and roll back.
 			remoteState.requestRemoteWriteCleanup("disconnect")
@@ -11978,9 +11974,13 @@ local function startHooksAndWs(): boolean
 	return true
 end
 
-local function doPushPath(strictStudio: boolean?, scanGuard)
+local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: string?)
 	log("initial-compare → push: streaming bounded Studio structure + Sources")
 	local strict = strictStudio == true
+	if strict and (type(initialChoiceId) ~= "string" or initialChoiceId == "") then
+		log("initial-compare → strict push rejected a missing choiceId")
+		return false
+	end
 	local streamId = HttpService:GenerateGUID(false)
 	local cursor = {
 		service = WATCHED_SERVICES[1],
@@ -12193,6 +12193,9 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				end
 				attemptErr = "malformed matching partial receipt: " .. tostring(partialErr)
 			end
+			if ok and type(response) == "table" and response.ok == false and response.stale == true then
+				return nil, tostring(response.error or "initial Studio choice became stale")
+			end
 			if not shouldContinue() then
 				return nil, "Studio push cancelled or changed"
 			end
@@ -12307,6 +12310,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 		return {
 			pluginProtocol = PLUGIN_PROTOCOL_VERSION,
 			streamId = streamId,
+			choiceId = if strict then initialChoiceId else nil,
 			service = serviceName,
 			phase = phase,
 			chunkIndex = chunkIndex,
@@ -14645,7 +14649,7 @@ runInitialCompare = function()
 				-- The guard keeps the tree coherent while the modal is open;
 				-- rescan and push one service at a time without retaining the
 				-- comparison Sources.
-				if doPushPath(true, scanGuard) then
+				if doPushPath(true, scanGuard, choiceId) then
 					completeInitialCompare()
 				elseif scanBecameDirty("Studio changed during strict snapshot push") then
 					return

@@ -1400,9 +1400,9 @@ fn append_source_parts_atomically(
             "encoded Source chunks are limited to {STREAM_SOURCE_CHUNK_BYTES} bytes"
         ));
     }
-    if parts.len() > STREAM_HASH_CHUNK_NODES {
+    if parts.len() > STREAM_SOURCE_PART_CHUNK_NODES {
         return Err(format!(
-            "Source chunks are limited to {STREAM_HASH_CHUNK_NODES} parts"
+            "Source chunks are limited to {STREAM_SOURCE_PART_CHUNK_NODES} parts"
         ));
     }
 
@@ -1702,6 +1702,17 @@ fn process_streamed_push_chunk(
                 }
                 Ok(Err(error)) => Err(error),
                 Ok(Ok(fingerprint)) => {
+                    if session.strict {
+                        let expected = session
+                            .expected_service_generations
+                            .get(session.next_service)
+                            .ok_or("strict streamed push disk fence is incomplete")?;
+                        if fingerprint.metadata != *expected {
+                            return Err(format!(
+                                "disk service {service} changed after the initial Studio choice; no files were replaced"
+                            ));
+                        }
+                    }
                     session.service_stream.initial_fingerprint = Some(fingerprint);
                     session.service_stream.fence_result = None;
                     session.service_stream.phase = PushStreamPhase::Sources;
@@ -2118,6 +2129,25 @@ fn audit_stream_push_complete(
     }
 }
 
+fn consume_studio_transfer_grant(
+    project: &Path,
+    choice_id: &str,
+) -> Result<Vec<crate::fs_safety::TreeGeneration>, String> {
+    if !valid_initial_choice_token(choice_id) {
+        return Err("strict streamed push has an invalid choiceId".into());
+    }
+    let key = (project.to_path_buf(), choice_id.to_string());
+    let grant = {
+        let grants = STUDIO_TRANSFER_GRANTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut grants = grants.lock().unwrap();
+        grants.retain(|_, grant| grant.created_at.elapsed() < STUDIO_TRANSFER_GRANT_TTL);
+        grants.remove(&key)
+    }
+    .ok_or("strict streamed push choiceId is stale, consumed, or unauthorized")?;
+    revalidate_initial_service_generations(project, &grant.service_generations)?;
+    Ok(grant.service_generations)
+}
+
 fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
     if body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
         return Json(json!({
@@ -2133,6 +2163,18 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
     };
     if stream_id.is_empty() || stream_id.len() > 128 {
         return Json(json!({ "ok": false, "error": "invalid streamed push streamId" }));
+    }
+    if body.strict && body.choice_id.is_none() {
+        return Json(json!({
+            "ok": false,
+            "error": "strict streamed push requires the initial Studio choiceId",
+        }));
+    }
+    if !body.strict && body.choice_id.is_some() {
+        return Json(json!({
+            "ok": false,
+            "error": "non-strict streamed push cannot include an initial choiceId",
+        }));
     }
     let is_start = body.service.as_deref() == snapshot::SYNCED_SERVICES.first().copied()
         && body.phase.as_deref() == Some("structure")
@@ -2169,9 +2211,30 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                         "error": "too many active streamed transfer sessions",
                     }));
                 }
+                let expected_service_generations = if body.strict {
+                    match consume_studio_transfer_grant(
+                        &project,
+                        body.choice_id
+                            .as_deref()
+                            .expect("strict push choiceId was validated above"),
+                    ) {
+                        Ok(generations) => generations,
+                        Err(error) => {
+                            return Json(json!({
+                                "ok": false,
+                                "stale": true,
+                                "error": error,
+                            }));
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
                 let session = Arc::new(Mutex::new(PushStreamAccumulator {
                     rollback_state: state.clone(),
                     stream_id: stream_id.to_string(),
+                    choice_id: body.choice_id.clone(),
+                    expected_service_generations,
                     strict: body.strict,
                     force_prune: body.force_prune || body.strict,
                     next_service: 0,
@@ -2196,6 +2259,12 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
     };
 
     let mut session = session_handle.lock().unwrap();
+    if session.strict != body.strict || session.choice_id != body.choice_id {
+        return Json(json!({
+            "ok": false,
+            "error": "streamed push authorization changed after stream start",
+        }));
+    }
     if push_stream_expired(&session) {
         return Json(json!({
             "ok": false,

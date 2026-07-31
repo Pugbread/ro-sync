@@ -93,6 +93,10 @@ pub struct PendingInitial {
     pub disk_stats: Stats,
     pub studio_stats: Stats,
     pub choice: Option<Choice>,
+    /// Exact per-service disk generations captured while the comparison was
+    /// built. A destructive Studio choice is authorized only while every
+    /// generation still matches, including at streamed-push fencing time.
+    pub service_generations: Vec<crate::fs_safety::TreeGeneration>,
     /// Immutable, path-sorted divergence metadata. IDs are dense indexes into
     /// this vector and are the only selective-write authority accepted from
     /// the widget.

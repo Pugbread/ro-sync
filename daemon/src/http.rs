@@ -1298,6 +1298,18 @@ struct InitialCompareAccumulator {
     completed_at: Option<Instant>,
 }
 
+#[derive(Clone)]
+struct StudioTransferGrant {
+    service_generations: Vec<crate::fs_safety::TreeGeneration>,
+    created_at: Instant,
+}
+
+type StudioTransferGrantKey = (PathBuf, String);
+static STUDIO_TRANSFER_GRANTS: OnceLock<
+    Mutex<HashMap<StudioTransferGrantKey, StudioTransferGrant>>,
+> = OnceLock::new();
+const STUDIO_TRANSFER_GRANT_TTL: Duration = Duration::from_secs(5 * 60);
+
 enum InitialCompareStreamPhase {
     Structure,
     DiskPrepare,
@@ -2075,9 +2087,9 @@ fn process_streamed_initial_compare_chunk(
             if !body.records.is_empty() || !body.studio_snapshot.is_empty() {
                 return Err("hash chunks may contain only script hashes".into());
             }
-            if body.hashes.len() > STREAM_HASH_CHUNK_NODES {
+            if body.hashes.len() > STREAM_COMPARE_HASH_CHUNK_NODES {
                 return Err(format!(
-                    "hash chunks are limited to {STREAM_HASH_CHUNK_NODES} scripts"
+                    "hash chunks are limited to {STREAM_COMPARE_HASH_CHUNK_NODES} scripts"
                 ));
             }
             let studio_nodes = stream
@@ -2536,6 +2548,40 @@ fn normalized_file_hash(project_root: &Path, path: &Path) -> Result<crate::confl
     Ok(hasher.finalize().into())
 }
 
+fn capture_initial_service_generations(
+    project: &Path,
+) -> Result<Vec<crate::fs_safety::TreeGeneration>, String> {
+    snapshot::SYNCED_SERVICES
+        .iter()
+        .map(|service| crate::fs_safety::capture_tree_metadata(project, service))
+        .collect()
+}
+
+fn revalidate_initial_service_generations(
+    project: &Path,
+    expected: &[crate::fs_safety::TreeGeneration],
+) -> Result<(), String> {
+    if expected.len() != snapshot::SYNCED_SERVICES.len() {
+        return Err("initial comparison disk fence is incomplete; restart the scan".into());
+    }
+    for (index, generation) in expected.iter().enumerate() {
+        let expected_service = snapshot::SYNCED_SERVICES[index];
+        if generation.service != expected_service {
+            return Err(format!(
+                "initial comparison disk fence expected {expected_service}, found {}",
+                generation.service
+            ));
+        }
+        let current = crate::fs_safety::capture_tree_metadata(project, expected_service)?;
+        if current != *generation {
+            return Err(format!(
+                "disk service {expected_service} changed after the initial comparison; restart the scan"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn finish_initial_comparison(
     state: &AppState,
     disk_stats: Stats,
@@ -2545,7 +2591,7 @@ fn finish_initial_comparison(
 ) -> Json<Value> {
     let compact_response = staged_comparison.is_some();
     if comparison.is_clean() {
-        if let Some(staged_comparison) = staged_comparison {
+        if let Some(staged_comparison) = staged_comparison.as_ref() {
             for generation in &staged_comparison.service_generations {
                 let current = match crate::fs_safety::capture_tree_metadata(
                     state.canonical_project.as_path(),
@@ -2589,7 +2635,7 @@ fn finish_initial_comparison(
                     }
                 }
             }
-            for baseline in staged_comparison.baselines {
+            for baseline in &staged_comparison.baselines {
                 state
                     .conflict
                     .record_sync(&baseline.path, baseline.source_hash, baseline.fs_mtime);
@@ -2626,11 +2672,24 @@ fn finish_initial_comparison(
         removed_files: comparison.summary.removed_files,
     };
     let detail_count = details.len();
+    let service_generations = match staged_comparison {
+        Some(staged) => staged.service_generations,
+        None => match capture_initial_service_generations(state.canonical_project.as_path()) {
+            Ok(generations) => generations,
+            Err(error) => {
+                return Json(json!({
+                    "ok": false,
+                    "error": format!("capture initial-choice disk fence: {error}"),
+                }));
+            }
+        },
+    };
     let pending = PendingInitial {
         choice_id: choice_id.clone(),
         disk_stats,
         studio_stats,
         choice: None,
+        service_generations,
         details,
         summary,
         selected_disk_paths: None,
@@ -3036,9 +3095,13 @@ async fn initial_decision(
         let decision = {
             let slot = state.pending_initial.lock().unwrap();
             match slot.as_ref() {
-                Some(p) if p.choice_id == params.choice_id => p
-                    .choice
-                    .map(|choice| (choice, p.selected_disk_paths.clone())),
+                Some(p) if p.choice_id == params.choice_id => p.choice.map(|choice| {
+                    (
+                        choice,
+                        p.selected_disk_paths.clone(),
+                        p.service_generations.clone(),
+                    )
+                }),
                 _ => {
                     return Json(json!({
                         "choice": "stale",
@@ -3049,7 +3112,7 @@ async fn initial_decision(
             }
         };
 
-        if let Some((choice, selected_disk_paths)) = decision {
+        if let Some((choice, selected_disk_paths, service_generations)) = decision {
             if choice == Choice::Disk {
                 if let Some(paths) = selected_disk_paths.as_ref() {
                     let grants =
@@ -3069,6 +3132,20 @@ async fn initial_decision(
                         },
                     );
                 }
+            } else if choice == Choice::Studio {
+                let grants = STUDIO_TRANSFER_GRANTS.get_or_init(|| Mutex::new(HashMap::new()));
+                let mut grants = grants.lock().unwrap();
+                grants.retain(|_, grant| grant.created_at.elapsed() < STUDIO_TRANSFER_GRANT_TTL);
+                grants.insert(
+                    (
+                        state.canonical_project.as_ref().clone(),
+                        params.choice_id.clone(),
+                    ),
+                    StudioTransferGrant {
+                        service_generations,
+                        created_at: Instant::now(),
+                    },
+                );
             }
             {
                 let mut slot = state.pending_initial.lock().unwrap();
@@ -3302,6 +3379,55 @@ async fn initial_choice(
         }
         other => return initial_choice_error(format!("unknown choice: {other}")),
     };
+
+    if choice == Choice::Studio {
+        let service_generations = {
+            let slot = state.pending_initial.lock().unwrap();
+            let Some(pending) = slot
+                .as_ref()
+                .filter(|pending| pending.choice_id == body.choice_id)
+            else {
+                return initial_choice_error("no pending decision");
+            };
+            if pending.choice.is_some() {
+                return initial_choice_error("initial decision is already resolved");
+            }
+            pending.service_generations.clone()
+        };
+        if let Err(error) = revalidate_initial_service_generations(
+            state.canonical_project.as_path(),
+            &service_generations,
+        ) {
+            {
+                let mut slot = state.pending_initial.lock().unwrap();
+                if slot.as_ref().is_some_and(|pending| {
+                    pending.choice_id == body.choice_id && pending.choice.is_none()
+                }) {
+                    *slot = None;
+                }
+            }
+            clear_completed_initial_compare_for_choice(
+                state.canonical_project.as_path(),
+                &body.choice_id,
+            );
+            let event = json!({
+                "type": "initial-choice-stale",
+                "choiceId": body.choice_id,
+                "error": error,
+            });
+            if let Ok(serialized) = serde_json::to_string(&event) {
+                let _ = state.events.send(serialized);
+            }
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "stale": true,
+                    "error": error,
+                })),
+            );
+        }
+    }
 
     let newly_chosen = {
         let mut slot = state.pending_initial.lock().unwrap();
@@ -4457,7 +4583,9 @@ fn produce_source_response(
     }
 
     let mut parts = Vec::new();
-    while parts.len() < STREAM_HASH_CHUNK_NODES && stream.source_index < stream.source_ids.len() {
+    while parts.len() < STREAM_SOURCE_PART_CHUNK_NODES
+        && stream.source_index < stream.source_ids.len()
+    {
         load_pull_source(stream)?;
         let part = pull_source_part(
             stream
@@ -5111,6 +5239,8 @@ struct PushBody {
     plugin_protocol: Option<u64>,
     #[serde(rename = "streamId", default)]
     stream_id: Option<String>,
+    #[serde(rename = "choiceId", default)]
+    choice_id: Option<String>,
     #[serde(default)]
     service: Option<String>,
     #[serde(default)]
@@ -5148,7 +5278,8 @@ const MAX_BOOTSTRAP_INSTANCE_DEPTH: usize = 48;
 const MAX_BOOTSTRAP_NODES: usize = 1_000_000;
 const STREAM_REQUEST_BODY_BYTES: usize = 512 * 1024;
 const STREAM_STRUCTURE_CHUNK_NODES: usize = 512;
-const STREAM_HASH_CHUNK_NODES: usize = 64;
+const STREAM_COMPARE_HASH_CHUNK_NODES: usize = 512;
+const STREAM_SOURCE_PART_CHUNK_NODES: usize = 64;
 const STREAM_SOURCE_CHUNK_BYTES: usize = 512 * 1024;
 const STREAM_SOURCE_PART_BYTES: usize = 64 * 1024;
 const MAX_STREAM_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
@@ -5300,6 +5431,8 @@ impl Drop for PushServiceStream {
 struct PushStreamAccumulator {
     rollback_state: AppState,
     stream_id: String,
+    choice_id: Option<String>,
+    expected_service_generations: Vec<crate::fs_safety::TreeGeneration>,
     strict: bool,
     force_prune: bool,
     next_service: usize,

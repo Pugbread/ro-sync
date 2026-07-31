@@ -78,6 +78,30 @@ assert.match(
   "any inbound daemon traffic must clear the heartbeat suspect window",
 );
 
+const closeClient = wsLoop.slice(
+  wsLoop.indexOf("local function closeClient()"),
+  wsLoop.indexOf("local function acceptTransport()"),
+);
+assert.match(
+  closeClient,
+  /closed = true[\s\S]*?task\.spawn\(function\(\)[\s\S]*?client:Close\(\)/,
+  "WebSocket close must publish local completion before isolating the engine call in another task",
+);
+assert.ok(
+  closeClient.indexOf("closed = true") < closeClient.indexOf("client:Close()"),
+  "a blocking WebSocket Close call must never delay local retry state",
+);
+
+const laggedBranch = wsLoop.slice(
+  wsLoop.indexOf('elseif kind == "lagged"'),
+  wsLoop.indexOf('elseif kind == "shutdown"'),
+);
+assert.match(
+  laggedBranch,
+  /recoveryContext = "daemon broadcast lagged"[\s\S]*?closeClient\(\)/,
+  "broadcast lag recovery must enter the nonblocking close path",
+);
+
 const shutdownBranch = wsLoop.slice(
   wsLoop.indexOf('elseif kind == "shutdown"'),
   wsLoop.indexOf('elseif kind == "pong"'),
@@ -94,12 +118,12 @@ assert.match(
 );
 assert.match(
   shutdownBranch,
-  /recoveryContext = "daemon rejected WebSocket: " \.\. tostring\(msg\.code or reason\)[\s\S]*?client:Close\(\)/,
-  "retryable shutdowns such as WATCHER_LAGGED must close the socket and retain a resync reason",
+  /recoveryContext = "daemon rejected WebSocket: " \.\. tostring\(msg\.code or reason\)[\s\S]*?closeClient\(\)/,
+  "retryable shutdowns such as WATCHER_LAGGED must start nonblocking close and retain a resync reason",
 );
 assert.match(
   wsLoop,
-  /elseif kind == "shutdown"[\s\S]*?client:Close\(\)[\s\S]*?if needResyncAfter then[\s\S]*?disconnectHooks\(\)[\s\S]*?reconnectState\.retryInitialCompare\(recoveryContext\)/,
+  /elseif kind == "shutdown"[\s\S]*?closeClient\(\)[\s\S]*?if needResyncAfter then[\s\S]*?disconnectHooks\(\)[\s\S]*?reconnectState\.retryInitialCompare\(recoveryContext\)/,
   "WATCHER_LAGGED shutdown recovery must tear down hooks and re-enter initial comparison",
 );
 const pushResultBranch = wsLoop.slice(
@@ -113,8 +137,8 @@ assert.match(
 );
 assert.match(
   pushResultBranch,
-  /setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*client:Close\(\)/,
-  "partial push failure must be visible and close into full reconciliation",
+  /setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*closeClient\(\)/,
+  "partial push failure must be visible and start nonblocking close into full reconciliation",
 );
 
 const refreshHello = source.slice(
@@ -1708,6 +1732,31 @@ assert.equal(
 const pushPath = source.slice(
   source.indexOf("local function doPushPath"),
   source.indexOf("local function doPullPath"),
+);
+assert.match(
+  source,
+  /compareHashChunkRecords = 512/,
+  "initial comparison should hash a medium place in one bounded request",
+);
+assert.match(
+  pushPath,
+  /strict and \(type\(initialChoiceId\) ~= "string" or initialChoiceId == ""\)[\s\S]*?return false/,
+  "a destructive Studio push must require the exact initial-choice authorization",
+);
+assert.match(
+  pushPath,
+  /choiceId = if strict then initialChoiceId else nil/,
+  "every strict streamed-push chunk must retain its initial-choice authorization",
+);
+assert.match(
+  pushPath,
+  /response\.ok == false and response\.stale == true[\s\S]*?return nil/,
+  "a stale Studio choice must restart comparison without replaying its rejected push",
+);
+assert.match(
+  initialCompareFlow,
+  /choice == "studio"[\s\S]*?doPushPath\(true, scanGuard, choiceId\)/,
+  "the Studio decision must pass its choiceId into the strict streamed push",
 );
 const partialReceiptValidator = pushPath.slice(
   pushPath.indexOf("local function validatePartialReceipt"),

@@ -192,6 +192,7 @@ fn test_pending_initial(choice_id: &str, paths: &[String]) -> PendingInitial {
         disk_stats: Stats::default(),
         studio_stats: Stats::default(),
         choice: None,
+        service_generations: Vec::new(),
         details: test_choice_details(paths),
         summary: InitialChoiceSummary {
             new_files: 0,
@@ -220,6 +221,7 @@ fn streamed_push_test_body(
         services: Vec::new(),
         plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
         stream_id: Some(stream_id.to_string()),
+        choice_id: Some(stream_id.to_string()),
         service: Some(service.to_string()),
         phase: Some(phase.to_string()),
         chunk_index: Some(chunk_index),
@@ -227,6 +229,25 @@ fn streamed_push_test_body(
         records,
         sources,
     }
+}
+
+fn authorize_studio_push_test(state: &AppState, choice_id: &str) {
+    let service_generations =
+        capture_initial_service_generations(state.canonical_project.as_path()).unwrap();
+    STUDIO_TRANSFER_GRANTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            (
+                state.canonical_project.as_ref().clone(),
+                choice_id.to_string(),
+            ),
+            StudioTransferGrant {
+                service_generations,
+                created_at: Instant::now(),
+            },
+        );
 }
 
 fn streamed_service_records(
@@ -4196,6 +4217,7 @@ async fn push_rejects_over_deep_bootstrap_before_touching_disk() {
         services: vec![over_deep_studio_service("Workspace")],
         plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
         stream_id: None,
+        choice_id: None,
         service: None,
         phase: None,
         chunk_index: None,
@@ -4224,6 +4246,7 @@ async fn streamed_push_commits_services_atomically_and_rebases_live_sources() {
     let state = test_state(&project, None);
     let mut events = state.events.subscribe();
     let stream_id = "push-end-to-end";
+    authorize_studio_push_test(&state, stream_id);
     let source = "return 'studio'\n";
     let source_sha = hash(source.as_bytes())
         .iter()
@@ -4728,6 +4751,8 @@ async fn streamed_push_retains_partial_commit_receipt_and_backup() {
     let session = Arc::new(Mutex::new(PushStreamAccumulator {
         rollback_state: state.clone(),
         stream_id: stream_id.into(),
+        choice_id: Some(stream_id.into()),
+        expected_service_generations: Vec::new(),
         strict: true,
         force_prune: true,
         next_service: 0,
@@ -4801,6 +4826,7 @@ async fn streamed_push_rolls_back_prior_service_and_baseline_when_later_service_
     state
         .conflict
         .record_sync(&config, hash(original), fs_mtime(&config));
+    authorize_studio_push_test(&state, stream_id);
     let replacement_sha = hash(replacement.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -4902,6 +4928,7 @@ async fn abandoned_streamed_push_rolls_back_committed_services() {
     let mut events = state.events.subscribe();
     let stream_id = "abandoned-generation";
     let first_service = "ReplicatedStorage";
+    authorize_studio_push_test(&state, stream_id);
 
     let structure = push(
         State(state.clone()),
@@ -4976,6 +5003,8 @@ fn abandoned_streamed_push_reports_partial_current_service_recovery() {
     let session = PushStreamAccumulator {
         rollback_state: state.clone(),
         stream_id: "abandoned-partial".into(),
+        choice_id: Some("abandoned-partial".into()),
+        expected_service_generations: Vec::new(),
         strict: true,
         force_prune: true,
         next_service: 0,
@@ -5313,6 +5342,7 @@ async fn streamed_push_preserves_a_disk_edit_made_after_its_initial_fence() {
     std::fs::write(&config, "return 'before'\n").unwrap();
     let state = test_state(&project, None);
     let stream_id = "push-after-fence-mutation";
+    authorize_studio_push_test(&state, stream_id);
     let structure = push(
         State(state.clone()),
         Json(streamed_push_test_body(
@@ -7054,6 +7084,8 @@ fn streamed_structure_budgets_reject_repeated_wide_names_before_clone() {
     let mut push_session = PushStreamAccumulator {
         rollback_state: state.clone(),
         stream_id: "wide-name-service-budget".into(),
+        choice_id: Some("wide-name-service-budget".into()),
+        expected_service_generations: Vec::new(),
         strict: true,
         force_prune: true,
         next_service: 0,
@@ -8333,7 +8365,10 @@ async fn initial_choice_releases_the_matching_completed_compare_response() {
     let state = test_state(&project, None);
     let choice_id = "choice-release".to_string();
     let paths = vec!["ReplicatedStorage/Config".into()];
-    *state.pending_initial.lock().unwrap() = Some(test_pending_initial(&choice_id, &paths));
+    let mut pending = test_pending_initial(&choice_id, &paths);
+    pending.service_generations =
+        capture_initial_service_generations(state.canonical_project.as_path()).unwrap();
+    *state.pending_initial.lock().unwrap() = Some(pending);
     let session = Arc::new(Mutex::new(InitialCompareAccumulator {
         compare_id: new_choice_id(),
         disk_stats: Stats::default(),
@@ -8378,6 +8413,116 @@ async fn initial_choice_releases_the_matching_completed_compare_response() {
         .unwrap()
         .get(state.canonical_project.as_path())
         .is_some_and(|current| Arc::ptr_eq(current, &session)));
+}
+
+#[tokio::test]
+async fn studio_choice_turns_stale_when_disk_changes_after_compare() {
+    let project = TempDir::new("initial-studio-choice-disk-race");
+    let state = test_state(&project, None);
+    let storage = project.path().join("ReplicatedStorage");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::write(storage.join("Config.luau"), "return 'disk'\n").unwrap();
+    let choice_id = "choice-disk-race";
+    let mut pending = test_pending_initial(choice_id, &["ReplicatedStorage/Config".to_string()]);
+    pending.service_generations =
+        capture_initial_service_generations(state.canonical_project.as_path()).unwrap();
+    *state.pending_initial.lock().unwrap() = Some(pending);
+
+    let gift = storage.join("Client").join("GiftController.luau");
+    std::fs::create_dir_all(gift.parent().unwrap()).unwrap();
+    std::fs::write(&gift, "return 'newer disk work'\n").unwrap();
+
+    let (status, Json(response)) = initial_choice(
+        State(state.clone()),
+        Json(InitialChoiceBody {
+            choice_id: choice_id.into(),
+            choice: "studio".into(),
+            mode: None,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["stale"], true);
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("changed after the initial comparison"));
+    assert_eq!(
+        std::fs::read_to_string(&gift).unwrap(),
+        "return 'newer disk work'\n"
+    );
+    assert!(state.pending_initial.lock().unwrap().is_none());
+    assert!(!project.path().join(".rosync-backups").exists());
+}
+
+#[tokio::test]
+async fn strict_push_revalidates_choice_generation_before_starting_stream() {
+    let project = TempDir::new("strict-push-choice-fence");
+    let state = test_state(&project, None);
+    let storage = project.path().join("ReplicatedStorage");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::write(storage.join("Config.luau"), "return 'disk'\n").unwrap();
+    let choice_id = "strict-push-choice-fence";
+    let mut pending = test_pending_initial(choice_id, &["ReplicatedStorage/Config".to_string()]);
+    pending.service_generations =
+        capture_initial_service_generations(state.canonical_project.as_path()).unwrap();
+    *state.pending_initial.lock().unwrap() = Some(pending);
+
+    let (status, _) = initial_choice(
+        State(state.clone()),
+        Json(InitialChoiceBody {
+            choice_id: choice_id.into(),
+            choice: "studio".into(),
+            mode: None,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let _ = initial_decision(
+        State(state.clone()),
+        Query(InitialDecisionParams {
+            choice_id: choice_id.into(),
+        }),
+    )
+    .await
+    .into_response();
+
+    let gift = storage.join("Client").join("GiftController.luau");
+    std::fs::create_dir_all(gift.parent().unwrap()).unwrap();
+    std::fs::write(&gift, "return 'created after choice'\n").unwrap();
+    let response = push(
+        State(state.clone()),
+        Json(streamed_push_test_body(
+            choice_id,
+            "ReplicatedStorage",
+            "structure",
+            0,
+            true,
+            streamed_service_records("ReplicatedStorage", None),
+            Vec::new(),
+        )),
+    )
+    .await
+    .0;
+
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["stale"], true);
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("changed after the initial comparison"));
+    assert_eq!(
+        std::fs::read_to_string(&gift).unwrap(),
+        "return 'created after choice'\n"
+    );
+    assert!(!PUSH_STREAM_ACCUMULATORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .contains_key(state.canonical_project.as_path()));
+    assert!(!project.path().join(".rosync-backups").exists());
 }
 
 #[test]
