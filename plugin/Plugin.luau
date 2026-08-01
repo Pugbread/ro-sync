@@ -1707,6 +1707,11 @@ local function mountFallbackUi(reason)
 			status.TextColor3 = Color3.fromRGB(207, 72, 72)
 			stateDot.BackgroundColor3 = Color3.fromRGB(207, 72, 72)
 			connectBtn.Text = "Connect"
+		elseif state == "wrong_place" then
+			status.Text = "Project serves another place of this game"
+			status.TextColor3 = Color3.fromRGB(240, 173, 78)
+			stateDot.BackgroundColor3 = Color3.fromRGB(240, 173, 78)
+			connectBtn.Text = "Connect"
 		elseif state == "error" then
 			status.Text = tostring(detail or "Connection error")
 			status.TextColor3 = Color3.fromRGB(207, 72, 72)
@@ -14831,25 +14836,44 @@ local function trimTrailingSlash(s)
 	return (trimmed:gsub("/+$", ""))
 end
 
-local function probePort(port, gameId)
-	-- Returns (matched: bool, url: string?, hello: table?)
+local function probePort(port, gameId, placeId)
+	-- Returns (matchKind: "place" | "game" | "otherPlace" | nil, url, hello).
+	-- Every place in a universe shares one GameId, so GameId alone cannot
+	-- identify a project: connecting Place B to Place A's daemon makes the
+	-- initial compare read the whole cross-place difference as drift, and
+	-- either overwrite answer destroys one side. The PlaceId decides:
+	--   "place"      — daemon lists this place; the real match.
+	--   "game"       — same game, no recorded placeIds (pre-placeId project
+	--                  or unpublished place); acceptable only when nothing
+	--                  place-exact exists.
+	--   "otherPlace" — same game but the daemon names different places; never
+	--                  auto-connect.
 	local url = string.format("http://127.0.0.1:%d", port)
 	local ok, resp = httpRequestTo(url .. "/hello", "GET")
 	if not ok or not resp.Success then
-		return false, url, nil
+		return nil, url, nil
 	end
 	local hello
 	local decOk = pcall(function()
 		hello = HttpService:JSONDecode(resp.Body or "")
 	end)
 	if not decOk or type(hello) ~= "table" then
-		return false, url, nil
+		return nil, url, nil
 	end
 	local helloGame = tostring(hello.gameId or "")
-	if helloGame == gameId then
-		return true, url, hello
+	if helloGame ~= gameId then
+		return nil, url, hello
 	end
-	return false, url, hello
+	local places = hello.placeIds
+	if type(places) ~= "table" or #places == 0 then
+		return "game", url, hello
+	end
+	for _, id in ipairs(places) do
+		if tostring(id) == placeId then
+			return "place", url, hello
+		end
+	end
+	return "otherPlace", url, hello
 end
 
 applyWallyConfig = function(wallyEnabled, wallyFolder)
@@ -14976,18 +15000,20 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		url = nil,
 		port = nil,
 		sawWrongGame = false,
+		sawWrongPlace = false,
 		initializer = nil,
 		initializerError = nil,
 	}
+	local placeId = tostring(game.PlaceId)
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
 		local remaining = lastPort - firstPort + 1
 		local closed = false
 		for port = firstPort, lastPort do
 			task.spawn(function()
-				local matched, url, hello = probePort(port, gameId)
+				local matchKind, url, hello = probePort(port, gameId, placeId)
 				if not closed then
-					probes[port] = { matched = matched, url = url, hello = hello }
+					probes[port] = { matchKind = matchKind, url = url, hello = hello }
 				end
 				remaining -= 1
 			end)
@@ -15003,19 +15029,39 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 	local probes = probeRange(PORT_RANGE_START, PORT_RANGE_END)
 	local daemonInitializer = nil
 
+	-- Place-exact daemons outrank game-level ones, regardless of port order:
+	-- with one project per place both daemons carry the matching GameId, and
+	-- "first port wins" hands some windows another place's project.
+	local gameLevelFallback = nil
 	for port = PORT_RANGE_START, PORT_RANGE_END do
 		local probe = probes[port]
 		if probe then
-			if probe.matched and not result.found then
+			if probe.matchKind == "place" and not result.found then
 				result.found = true
 				result.url = probe.url
 				result.port = port
-			elseif probe.hello ~= nil then
+			elseif probe.matchKind == "game" and gameLevelFallback == nil then
+				gameLevelFallback = { url = probe.url, port = port }
+			elseif probe.matchKind == "otherPlace" then
+				result.sawWrongPlace = true
+			elseif probe.matchKind == nil and probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
 			if daemonInitializer == nil and probe.hello ~= nil then
 				daemonInitializer = projectInitOffer(probe.url, port, probe.hello)
 			end
+		end
+	end
+	if not result.found and gameLevelFallback ~= nil then
+		result.found = true
+		result.url = gameLevelFallback.url
+		result.port = gameLevelFallback.port
+		if not quiet then
+			log(string.format(
+				"matched daemon on :%d by GameId only (no placeIds recorded); PlaceId %s unverified",
+				gameLevelFallback.port,
+				placeId
+			))
 		end
 	end
 
@@ -15379,16 +15425,31 @@ startConnect = function()
 				if result.initializer ~= nil then
 					projectInitCandidate = result.initializer
 					setPill("project_init")
-					setBanner(
-						"No Ro Sync project exists for this experience. Click Create Project to initialize it under "
-							.. tostring(result.initializer.projectsRoot)
-							.. "."
-					)
+					if result.sawWrongPlace then
+						setBanner(
+							"This game's Ro Sync project serves a different place. Click Create Project to give this place its own project under "
+								.. tostring(result.initializer.projectsRoot)
+								.. "."
+						)
+						log("same-game daemon found, but its placeIds exclude this place; offering a per-place project")
+					else
+						setBanner(
+							"No Ro Sync project exists for this experience. Click Create Project to initialize it under "
+								.. tostring(result.initializer.projectsRoot)
+								.. "."
+						)
+					end
 					log(string.format("project initializer available at %s", tostring(result.initializer.url)))
 				elseif result.initializerError ~= nil then
 					setPill("no_daemon", gameId)
 					setBanner(tostring(result.initializerError))
 					log("Desktop project initializer unavailable: " .. tostring(result.initializerError))
+				elseif result.sawWrongPlace then
+					setPill("wrong_place")
+					setBanner(
+						"Found this game's daemon, but it serves a different place (PlaceId mismatch). Connecting would compare this place against that project's files, so Ro Sync refused."
+					)
+					log("discovery refused a same-game daemon whose placeIds exclude this place")
 				elseif result.sawWrongGame then
 					setPill("wrong_game")
 					setBanner("Ro Sync Desktop is running, but its daemon does not offer project initialization.")
