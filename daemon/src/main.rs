@@ -2470,6 +2470,9 @@ pub struct AppState {
     pub place_ids: Arc<RwLock<Vec<String>>>,
     pub wally_enabled: Arc<RwLock<bool>>,
     pub wally_folder: Arc<RwLock<Option<String>>>,
+    /// Saved full overwrite decision, mirrored from `ro-sync.json` and
+    /// advertised via `/hello` for plugin auto-answer.
+    pub initial_choice_default: Arc<RwLock<Option<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
     /// `spawn_watch_bridge` drops watcher ops for paths whose deadline hasn't
@@ -4578,6 +4581,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         place_ids: Arc::new(RwLock::new(cfg.place_ids.clone())),
         wally_enabled: Arc::new(RwLock::new(cfg.wally_enabled)),
         wally_folder: Arc::new(RwLock::new(cfg.wally_folder.clone())),
+        initial_choice_default: Arc::new(RwLock::new(cfg.initial_choice_default.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
         request_tx,
@@ -16141,6 +16145,11 @@ fn reload_config(state: &AppState, _config_path: &std::path::Path) -> Option<()>
     let prev_name = state.project_name.read().unwrap().clone();
     let prev_wally_enabled = *state.wally_enabled.read().unwrap();
     let prev_wally_folder = state.wally_folder.read().unwrap().clone();
+
+    // Always mirror the saved overwrite default: deleting the field from
+    // ro-sync.json is how a user clears a remembered decision, and that
+    // must take effect without any other field changing.
+    *state.initial_choice_default.write().unwrap() = cfg.initial_choice_default.clone();
 
     let changed = prev_game_id != cfg.game_id
         || prev_group_id != cfg.group_id
