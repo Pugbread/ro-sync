@@ -130,7 +130,9 @@ pub(crate) fn initialize_project(
 ) -> Result<ProjectInitOutcome, ProjectInitError> {
     let root = resolve_projects_root(projects_root)?;
     let metadata = validate_request(request)?;
-    if let Some((existing, directory_name)) = find_existing_project(&root, &metadata.game_id)? {
+    if let Some((existing, directory_name)) =
+        find_existing_project(&root, &metadata.game_id, &metadata.place_id)?
+    {
         if let Some(outcome) =
             merge_existing_project(&root, &existing, &directory_name, metadata.clone())?
         {
@@ -139,11 +141,14 @@ pub(crate) fn initialize_project(
     }
     let base = directory_slug(&metadata.game_name, &metadata.game_id);
     let with_game_id = append_suffix(&base, &metadata.game_id);
-    let candidates = if base == with_game_id {
-        vec![base.clone()]
-    } else {
-        vec![base.clone(), with_game_id.clone()]
-    };
+    // The place-suffixed name makes per-place projects creatable in one
+    // request: with one project per place, a second place of an already-
+    // initialized game finds `base` and `base-gameId` occupied by sibling
+    // places (which merge_existing_project now refuses to reuse), and the
+    // old fallthrough only *suggested* this name instead of trying it.
+    let with_place_id = append_suffix(&with_game_id, &metadata.place_id);
+    let mut candidates = vec![base.clone(), with_game_id.clone(), with_place_id];
+    candidates.dedup();
 
     for directory_name in &candidates {
         let candidate = root.join(directory_name);
@@ -371,6 +376,7 @@ fn init_file_error(label: &str, error: std::io::Error) -> ProjectInitError {
 fn find_existing_project(
     root: &Path,
     game_id: &str,
+    place_id: &str,
 ) -> Result<Option<(PathBuf, String)>, ProjectInitError> {
     let entries = fs::read_dir(root).map_err(|error| {
         ProjectInitError::new(
@@ -378,6 +384,12 @@ fn find_existing_project(
             format!("inspect projects root {}: {error}", root.display()),
         )
     })?;
+    // One project per place: several same-game directories can coexist (one
+    // per place), so returning the first game match could hand a rename to a
+    // sibling place's project. Scan them all; an exact placeIds hit wins, a
+    // same-game directory with no recorded places (pre-placeId project) is
+    // the fallback for adoption.
+    let mut game_level: Option<(PathBuf, String)> = None;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_PROJECT_ROOT_ENTRIES {
             return Err(ProjectInitError::new(
@@ -400,9 +412,14 @@ fn find_existing_project(
         if config.game_id.as_deref() != Some(game_id) {
             continue;
         }
-        return Ok(Some((candidate, directory_name)));
+        if config.place_ids.iter().any(|id| id == place_id) {
+            return Ok(Some((candidate, directory_name)));
+        }
+        if config.place_ids.is_empty() && game_level.is_none() {
+            game_level = Some((candidate, directory_name));
+        }
     }
-    Ok(None)
+    Ok(game_level)
 }
 
 fn merge_existing_project(
@@ -421,6 +438,15 @@ fn merge_existing_project(
         return Ok(None);
     };
     if config.game_id.as_deref() != Some(metadata.game_id.as_str()) {
+        return Ok(None);
+    }
+    // Same game is NOT the same project. Reusing any same-game directory
+    // used to append the new PlaceId to its placeIds, silently merging two
+    // places into one project — after which place-aware discovery correctly
+    // routes both windows there and they overwrite each other. Only reuse a
+    // directory that already claims this place, or one that predates place
+    // recording entirely (empty placeIds — the append below adopts it).
+    if !config.place_ids.is_empty() && !config.place_ids.contains(&metadata.place_id) {
         return Ok(None);
     }
 
@@ -726,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_universe_merges_new_place_and_metadata_without_losing_unknown_settings() {
+    fn same_universe_new_place_forks_a_per_place_project() {
         let root = tempfile::tempdir().unwrap();
         let first = initialize_project(root.path(), request("Race Stars", "123")).unwrap();
         let mut config = project_config::read_from_disk(&first.project)
@@ -738,36 +764,43 @@ mod tests {
         );
         project_config::write(&first.project, &config).unwrap();
 
-        let mut second_request = request("Race Stars Reborn", "123");
+        let mut second_request = request("Race Stars", "123");
         second_request.place_name = "Desert Place".to_string();
         second_request.place_id = "999".to_string();
-        second_request.creator_id = Some("101".to_string());
-        second_request.group_id = Some("101".to_string());
         let second = initialize_project(root.path(), second_request.clone()).unwrap();
-        assert!(!second.created);
-        assert!(second.changed.config);
-        assert_eq!(
-            second.project, first.project,
-            "renames must not fork a universe"
+        assert!(
+            second.created,
+            "a new place of the same game must fork its own project"
         );
-
-        let merged = project_config::read_from_disk(&first.project)
+        assert_ne!(second.project, first.project);
+        let forked = project_config::read_from_disk(&second.project)
             .unwrap()
             .unwrap();
-        assert_eq!(merged.name, "Race Stars");
-        assert_eq!(merged.game_name.as_deref(), Some("Race Stars Reborn"));
-        assert_eq!(merged.place_name.as_deref(), Some("Desert Place"));
-        assert_eq!(merged.place_ids, ["456", "999"]);
-        assert_eq!(merged.group_id.as_deref(), Some("101"));
-        assert_eq!(merged.creator_id.as_deref(), Some("101"));
+        assert_eq!(forked.place_ids, ["999"]);
+
+        // The sibling place's project is untouched by the fork.
+        let original = project_config::read_from_disk(&first.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.place_ids, ["456"]);
         assert_eq!(
-            merged.extra.get("AutoReconnect"),
+            original.extra.get("AutoReconnect"),
             Some(&serde_json::Value::String("on".to_string()))
         );
 
-        let third = initialize_project(root.path(), second_request).unwrap();
-        assert!(!third.created);
-        assert!(!third.changed.config);
+        // Re-initializing an already-forked place is a no-op merge into its
+        // own project — never another fork, even across a game rename.
+        let mut renamed = request("Race Stars Reborn", "123");
+        renamed.place_name = "Desert Place".to_string();
+        renamed.place_id = "999".to_string();
+        let third = initialize_project(root.path(), renamed).unwrap();
+        assert!(!third.created, "renames must not fork the same place again");
+        assert_eq!(third.project, second.project);
+        let merged = project_config::read_from_disk(&second.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.game_name.as_deref(), Some("Race Stars Reborn"));
+        assert_eq!(merged.place_ids, ["999"]);
     }
 
     #[test]
@@ -813,9 +846,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("race-stars")).unwrap();
         fs::create_dir(root.path().join("race-stars-123")).unwrap();
-        let error = initialize_project(root.path(), request("Race Stars", "123")).unwrap_err();
+        // Unrelated occupants of both preferred names: the place-suffixed
+        // candidate absorbs the collision in one request.
+        let outcome = initialize_project(root.path(), request("Race Stars", "123")).unwrap();
+        assert_eq!(outcome.directory_name, "race-stars-123-456");
+
+        // All three candidates taken → refuse, no further guessing.
+        let third_root = tempfile::tempdir().unwrap();
+        fs::create_dir(third_root.path().join("race-stars")).unwrap();
+        fs::create_dir(third_root.path().join("race-stars-123")).unwrap();
+        fs::create_dir(third_root.path().join("race-stars-123-456")).unwrap();
+        let error = initialize_project(third_root.path(), request("Race Stars", "123")).unwrap_err();
         assert_eq!(error.code(), "PROJECT_PATH_COLLISION");
-        assert_eq!(error.suggested_directory_name(), Some("race-stars-123-456"));
 
         #[cfg(unix)]
         {
