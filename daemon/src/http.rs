@@ -918,6 +918,11 @@ struct Hello {
     plugin_capability: &'static str,
     #[serde(rename = "hashChunkNodes")]
     hash_chunk_nodes: usize,
+    #[serde(
+        rename = "initialChoiceDefault",
+        skip_serializing_if = "Option::is_none"
+    )]
+    initial_choice_default: Option<String>,
     #[serde(rename = "projectInit")]
     project_init: ProjectInitHello,
 }
@@ -957,6 +962,7 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
         plugin_capability: crate::ws::plugin_capability(),
         hash_chunk_nodes: STREAM_COMPARE_HASH_CHUNK_NODES,
+        initial_choice_default: state.initial_choice_default.read().unwrap().clone(),
         project_init: ProjectInitHello {
             available: projects_root.is_some(),
             projects_root,
@@ -3167,8 +3173,38 @@ async fn initial_choice(
 
     if newly_chosen {
         finalize_initial_choice(&state, &body.choice_id, choice);
+        persist_initial_choice_default(&state, choice);
     }
     initial_choice_ok(json!({ "ok": true }))
+}
+
+/// Record a full studio/disk decision in `ro-sync.json` so future compares
+/// can auto-answer. Cancel means "ask me again" and clears nothing; the
+/// selective-disk path never reaches here (one-off pulls are not a default).
+fn persist_initial_choice_default(state: &AppState, choice: Choice) {
+    let value = match choice {
+        Choice::Studio => "studio",
+        Choice::Disk => "disk",
+        Choice::Cancel => return,
+    };
+    {
+        let mut slot = state.initial_choice_default.write().unwrap();
+        if slot.as_deref() == Some(value) {
+            return;
+        }
+        *slot = Some(value.to_string());
+    }
+    let root = state.canonical_project.as_ref().clone();
+    match crate::project_config::read_from_disk(&root) {
+        Ok(Some(mut cfg)) => {
+            cfg.initial_choice_default = Some(value.to_string());
+            if let Err(error) = crate::project_config::write(&root, &cfg) {
+                eprintln!("failed to persist initialChoiceDefault: {error}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("failed to reread project config: {error}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -12466,6 +12502,7 @@ mod tests {
             place_ids: Arc::new(RwLock::new(Vec::new())),
             wally_enabled: Arc::new(RwLock::new(false)),
             wally_folder: Arc::new(RwLock::new(None)),
+            initial_choice_default: Arc::new(RwLock::new(None)),
             pending_initial: Arc::new(Mutex::new(None)),
             push_quiet: Arc::new(Mutex::new(HashMap::new())),
             request_tx,

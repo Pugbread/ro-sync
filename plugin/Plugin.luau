@@ -1348,6 +1348,7 @@ toggleButton.Click:Connect(function()
 end)
 
 local startConnect: (() -> ())? = nil
+local cancelProjectInit: (() -> ())? = nil
 
 local function trimUiUrl(s)
 	local trimmed = tostring(s or ""):match("^%s*(.-)%s*$") or ""
@@ -1509,6 +1510,30 @@ local function mountFallbackUi(reason)
 	btnCorner.CornerRadius = UDim.new(0, 6)
 	btnCorner.Parent = connectBtn
 
+	-- Visible only in the project_init state: "Create Project" must be
+	-- refusable, and clicking it is the only other exit.
+	local cancelBtn = Instance.new("TextButton")
+	cancelBtn.LayoutOrder = 3
+	cancelBtn.Size = UDim2.new(0, 68, 1, 0)
+	cancelBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 63)
+	cancelBtn.BorderSizePixel = 0
+	cancelBtn.TextColor3 = Color3.fromRGB(244, 245, 247)
+	cancelBtn.Font = Enum.Font.SourceSansBold
+	cancelBtn.TextSize = 15
+	cancelBtn.Text = "Cancel"
+	cancelBtn.Visible = false
+	cancelBtn.Parent = row
+
+	local cancelCorner = Instance.new("UICorner")
+	cancelCorner.CornerRadius = UDim.new(0, 6)
+	cancelCorner.Parent = cancelBtn
+
+	cancelBtn.Activated:Connect(function()
+		if cancelProjectInit then
+			cancelProjectInit()
+		end
+	end)
+
 	local banner = Instance.new("TextLabel")
 	banner.LayoutOrder = 5
 	banner.Size = UDim2.new(1, 0, 0, 42)
@@ -1655,6 +1680,7 @@ local function mountFallbackUi(reason)
 	end
 
 	function controller.setStatus(state, detail)
+		cancelBtn.Visible = state == "project_init"
 		if state == "idle" then
 			status.Text = "Auto-discover localhost:7878–7890"
 			status.TextColor3 = Color3.fromRGB(119, 125, 134)
@@ -11771,6 +11797,14 @@ reconnectState.refreshHello = function()
 	else
 		scaleState.compareHashChunkRecords = 64
 	end
+	-- Saved full overwrite decision from ro-sync.json. Deleting the
+	-- initialChoiceDefault field there is how a user un-remembers it.
+	local savedChoice = hello.initialChoiceDefault
+	if savedChoice == "studio" or savedChoice == "disk" then
+		reconnectState.savedInitialChoice = savedChoice
+	else
+		reconnectState.savedInitialChoice = nil
+	end
 	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
 	if ui and ui.setProjectName and type(hello.name) == "string" and hello.name ~= "" then
 		ui.setProjectName(hello.name)
@@ -14003,6 +14037,11 @@ end
 local function waitForDecision(choiceId, gen)
 	setPill("waiting")
 	setBanner(string.format("Waiting for overwrite decision… (choice %s)", tostring(choiceId)))
+	-- Consecutive unreachable polls. The daemon can vanish mid-decision (the
+	-- desktop app stops or removes the project); without a bound this loop
+	-- spun forever behind a banner still claiming to wait for the decision.
+	local pollFailures = 0
+	local POLL_FAILURE_LIMIT = 15
 	while busy and gen == decisionGeneration do
 		local url = string.format("%s/initial-decision?choiceId=%s", baseUrl, HttpService:UrlEncode(tostring(choiceId)))
 		local ok, resp = httpRequestTo(url, "GET")
@@ -14010,7 +14049,13 @@ local function waitForDecision(choiceId, gen)
 			return nil
 		end
 		if not ok then
+			pollFailures += 1
 			log("decision poll err: " .. tostring(resp))
+			setBanner(string.format(
+				"Sync app stopped responding during the overwrite decision — reconnecting (%d/%d)…",
+				pollFailures,
+				POLL_FAILURE_LIMIT
+			))
 			local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
 			if gen ~= decisionGeneration or not busy then
 				return nil
@@ -14021,8 +14066,15 @@ local function waitForDecision(choiceId, gen)
 			elseif not helloOk then
 				log("decision recovery: " .. tostring(helloError))
 			end
+			if pollFailures >= POLL_FAILURE_LIMIT then
+				log("daemon unreachable throughout the overwrite decision; giving up")
+				disconnect("the sync daemon went away during the overwrite decision — its project may have been stopped or removed in the desktop app")
+				setBanner("The sync daemon went away during the overwrite decision. Check the project in the Ro Sync desktop app, then Connect again.")
+				return nil
+			end
 			task.wait(2)
 		elseif not resp.Success then
+			pollFailures = 0
 			if resp.StatusCode == 408 or resp.StatusCode == 204 then
 				-- idle timeout, re-issue
 			elseif resp.StatusCode == 404 then
@@ -14033,6 +14085,10 @@ local function waitForDecision(choiceId, gen)
 				task.wait(2)
 			end
 		else
+			if pollFailures > 0 then
+				pollFailures = 0
+				setBanner(string.format("Waiting for overwrite decision… (choice %s)", tostring(choiceId)))
+			end
 			if #(resp.Body or "") > PROTOCOL_STREAM_MAX_BYTES then
 				log("decision response exceeded the 512 KiB protocol limit")
 				return "malformed"
@@ -14719,20 +14775,30 @@ runInitialCompare = function()
 		if deltaItems then
 			log(string.format("delta fast path armed: %d changed script(s) prefetched", #deltaItems))
 		end
-		-- Deliberately NO standing auto-answer here: with disk-side authors
-		-- (agents, other tools) writing into the project, even a
-		-- changed-scripts-only drift is ambiguous about which side is newer.
-		-- The ONE exception is a carried choice: the human just answered this
-		-- exact question and a mid-modal Studio edit voided the cycle — repeat
-		-- their answer (bounded) instead of making them race the dialog.
+		-- Auto-answer only with a choice the human already made:
+		--   1. a carried choice — they answered seconds ago and a mid-modal
+		--      Studio edit voided the cycle; repeat it (bounded), or
+		--   2. the project's saved default — their last full studio/disk
+		--      decision, persisted by the daemon in ro-sync.json and
+		--      advertised via /hello. Deleting that field un-remembers it.
+		-- Anything else still asks: with disk-side authors (agents, other
+		-- tools) writing into the project, drift is ambiguous about which
+		-- side is newer.
+		local autoChoice, autoReason = nil, nil
 		if reconnectState.carriedInitialChoice ~= nil and (reconnectState.carriedChoiceUses or 0) > 0 then
 			reconnectState.carriedChoiceUses -= 1
-			local carried = reconnectState.carriedInitialChoice
-			log(string.format("re-answering '%s' (carried from the voided choice)", carried))
+			autoChoice = reconnectState.carriedInitialChoice
+			autoReason = "carried from the voided choice"
+		elseif reconnectState.savedInitialChoice ~= nil then
+			autoChoice = reconnectState.savedInitialChoice
+			autoReason = "saved project default"
+		end
+		if autoChoice ~= nil then
+			log(string.format("auto-answering '%s' (%s)", autoChoice, autoReason))
 			task.spawn(function()
 				pcall(function()
-					local body = { choiceId = tostring(choiceId), choice = carried }
-					if carried == "disk" then
+					local body = { choiceId = tostring(choiceId), choice = autoChoice }
+					if autoChoice == "disk" then
 						body.mode = "all"
 					end
 					httpRequestTo(baseUrl .. "/initial-choice", "POST", body)
@@ -15303,6 +15369,16 @@ end
 --------------------------------------------------------------------------------
 -- Connect / Disconnect entry point
 --------------------------------------------------------------------------------
+
+cancelProjectInit = function()
+	if projectInitCandidate == nil then
+		return
+	end
+	projectInitCandidate = nil
+	setPill("idle")
+	setBanner(nil)
+	log("project creation declined")
+end
 
 startConnect = function()
 	if connected then

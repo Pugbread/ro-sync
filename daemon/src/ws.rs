@@ -1397,6 +1397,7 @@ mod tests {
             place_ids: Arc::new(RwLock::new(Vec::new())),
             wally_enabled: Arc::new(RwLock::new(false)),
             wally_folder: Arc::new(RwLock::new(None)),
+            initial_choice_default: Arc::new(RwLock::new(None)),
             pending_initial: Arc::new(Mutex::new(None)),
             push_quiet: Arc::new(Mutex::new(HashMap::<PathBuf, std::time::Instant>::new())),
             request_tx,

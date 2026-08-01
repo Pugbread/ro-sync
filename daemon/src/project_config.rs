@@ -44,6 +44,16 @@ pub struct ProjectConfig {
     pub wally_folder: Option<String>,
     #[serde(rename = "wallyFile", default, skip_serializing_if = "Option::is_none")]
     pub wally_file: Option<String>,
+    /// Last full overwrite decision ("studio" | "disk"). Advertised via
+    /// `/hello` so the plugin can auto-answer the next initial compare
+    /// instead of re-asking a question the user already answered for this
+    /// project. Selective disk pulls are one-offs and never recorded.
+    #[serde(
+        rename = "initialChoiceDefault",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_choice_default: Option<String>,
     #[serde(default = "default_version")]
     pub version: u32,
     /// Preserve desktop/user settings that this daemon version does not know
@@ -79,6 +89,7 @@ impl ProjectConfig {
             wally_enabled: false,
             wally_folder: None,
             wally_file: None,
+            initial_choice_default: None,
             version: CONFIG_VERSION,
             extra: BTreeMap::new(),
         }
