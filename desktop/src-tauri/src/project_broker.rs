@@ -443,7 +443,7 @@ fn initialize_project(
     let projects_root =
         storage::open_authorized_directory(&shared.paths.authorized_roots_file, &projects_root)?;
     let (project, reused) =
-        find_or_create_project(&projects_root, &directory_display_name, &game_id)?;
+        find_or_create_project(&projects_root, &directory_display_name, &game_id, &place_id)?;
     let project_path = project.path().to_path_buf();
     let project_name = project_path.file_name().map(OsStr::to_os_string);
     let effective_name = write_project_config(
@@ -632,8 +632,16 @@ fn find_or_create_project(
     projects_root: &storage::PhysicalDirectoryCapability,
     display_name: &str,
     game_id: &str,
+    place_id: &str,
 ) -> Result<(storage::PhysicalDirectoryCapability, bool), String> {
+    // One project per place, mirroring the daemon's project_init rules: a
+    // same-game directory claiming other places must not be reused — routing
+    // a second place into it merges the places, and the place-aware plugin
+    // then refuses the daemon and spins on "waiting for the matching daemon".
+    // Exact placeIds hit wins; a same-game directory with no recorded places
+    // (pre-placeId project) is adoptable; anything else forks a new project.
     let mut existing_names = HashSet::new();
+    let mut game_level: Option<storage::PhysicalDirectoryCapability> = None;
     for name in projects_root.entry_names(MAX_PROJECT_ROOT_ENTRIES)? {
         if let Some(name) = name.to_str() {
             existing_names.insert(name.to_ascii_lowercase());
@@ -641,9 +649,21 @@ fn find_or_create_project(
         let Some(project) = projects_root.optional_child_directory(&name)? else {
             continue;
         };
-        if config_game_id(&project).as_deref() == Some(game_id) {
+        let Some((cfg_game_id, cfg_place_ids)) = config_identity(&project) else {
+            continue;
+        };
+        if cfg_game_id.as_deref() != Some(game_id) {
+            continue;
+        }
+        if cfg_place_ids.iter().any(|id| id == place_id) {
             return Ok((project, true));
         }
+        if cfg_place_ids.is_empty() && game_level.is_none() {
+            game_level = Some(project);
+        }
+    }
+    if let Some(project) = game_level {
+        return Ok((project, true));
     }
 
     let base = if display_name.is_empty() {
@@ -655,7 +675,8 @@ fn find_or_create_project(
         let name = match attempt {
             0 => base.clone(),
             1 => format!("{base}-{game_id}"),
-            _ => format!("{base}-{game_id}-{attempt}"),
+            2 => format!("{base}-{game_id}-{place_id}"),
+            _ => format!("{base}-{game_id}-{place_id}-{attempt}"),
         };
         if existing_names.contains(&name.to_ascii_lowercase()) {
             continue;
@@ -669,15 +690,28 @@ fn find_or_create_project(
     Err("could not allocate a unique project folder name".into())
 }
 
-fn config_game_id(project: &storage::PhysicalDirectoryCapability) -> Option<String> {
+fn config_identity(
+    project: &storage::PhysicalDirectoryCapability,
+) -> Option<(Option<String>, Vec<String>)> {
     let text = project
         .read_optional_utf8(OsStr::new("ro-sync.json"), MAX_CONFIG_BYTES)
         .ok()??;
     let value: Value = serde_json::from_str(&text).ok()?;
-    value
+    let game_id = value
         .get("gameId")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(str::to_string);
+    let place_ids = value
+        .get("placeIds")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((game_id, place_ids))
 }
 
 struct ProjectConfigWrite<'a> {
