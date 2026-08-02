@@ -11755,12 +11755,36 @@ reconnectState.refreshHello = function()
 	end
 
 	local expectedGameId = tostring(game.GameId)
+	-- Reconnects must apply the same place test as fresh discovery: this
+	-- remembered-URL path used to validate GameId only, so a window whose
+	-- project had been rebound (or that had connected before place matching
+	-- existed) resumed straight into a sibling place's project.
+	local function wrongPlace(h)
+		if expectedGameId == "0" then
+			return false
+		end
+		local places = h.placeIds
+		if type(places) ~= "table" or #places == 0 then
+			return false
+		end
+		local placeId = tostring(game.PlaceId)
+		for _, id in ipairs(places) do
+			if tostring(id) == placeId then
+				return false
+			end
+		end
+		return true
+	end
 	local candidateUrl = tostring(baseUrl or ""):gsub("/+$", "")
 	local candidatePort = connectedPort
 	local hello, helloError = readHello(candidateUrl)
 	if hello ~= nil and expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
 		hello = nil
 		helloError = "daemon now belongs to a different GameId"
+	end
+	if hello ~= nil and wrongPlace(hello) then
+		hello = nil
+		helloError = "daemon's project serves a different place of this game"
 	end
 
 	if hello == nil and type(reconnectState.discoverDaemon) == "function" and expectedGameId ~= "0" then
@@ -11777,6 +11801,9 @@ reconnectState.refreshHello = function()
 	end
 	if expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
 		return false, "daemon hello changed to a different GameId during discovery", false
+	end
+	if wrongPlace(hello) then
+		return false, "daemon's project serves a different place of this game", false
 	end
 	local protocol = tonumber(hello.pluginProtocol)
 	if protocol ~= PLUGIN_PROTOCOL_VERSION then
@@ -12077,6 +12104,9 @@ local function wsLoop(gen)
 				-- boot dropped: the daemon replays the disk ops we missed from
 				-- its journal instead of forcing a full re-compare.
 				resumeFrom = reconnectState.lastAppliedOpSeq,
+				-- Server-side one-project-per-place backstop: the daemon
+				-- refuses this hello when its project serves other places.
+				placeId = tostring(game.PlaceId),
 			})
 			if helloOk then
 				lastPongClock = os.clock()
