@@ -4484,7 +4484,10 @@ scaleState.yieldIfSliceExpired = function(): boolean
 	if (os.clock() - sliceStartedAt) < scaleState.sliceBudgetSeconds then
 		return false
 	end
-	task.wait()
+	-- pcall: some callers run in non-yieldable contexts (plugin unload,
+	-- certain signal handlers). Resetting the clock even when the wait
+	-- throws keeps the failure cheap — one attempt per slice, not per item.
+	pcall(task.wait)
 	sliceStartedAt = os.clock()
 	return true
 end
@@ -5574,18 +5577,16 @@ disconnectHooks = function()
 	serviceConnections = {}
 	scaleState.itemChangedAvailable = false
 	pendingEditorSourceByScript = {}
-	local disconnected = 0
+	-- Hundreds of thousands of tracked instances exhaust the per-frame
+	-- execution budget if torn down in one gulp. The old every-20k-items
+	-- yield still left multi-hundred-ms stretches between waits — a visible
+	-- Studio freeze on a 460k-instance place every disconnect/cancel. Slice
+	-- on wall clock like the scans do.
+	scaleState.resetYieldSlice()
 	while next(connections) do
 		local inst = next(connections)
 		disconnectInstance(inst)
-		disconnected += 1
-		if disconnected % 20000 == 0 then
-			-- Hundreds of thousands of tracked instances exhaust the per-frame
-			-- execution budget if torn down in one gulp (observed Script
-			-- timeout in wsLoop on a 459k-instance place). Yield when the
-			-- calling context allows it.
-			pcall(task.wait)
-		end
+		scaleState.yieldIfSliceExpired()
 	end
 	connections = {}
 	table.clear(activeConnectionSet)
