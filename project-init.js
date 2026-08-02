@@ -15,9 +15,19 @@ export function mergeProjectInitEvent(state, event, makeId = defaultProjectId) {
     throw new Error("project initialization event is missing its project path or Roblox IDs");
   }
 
-  const existingIndex = projects.findIndex((project) =>
-    project?.path === path || (gameId && cleanId(project?.gameId) === gameId)
-  );
+  // Match by path first. A same-game entry only counts when it can serve this
+  // place (no recorded placeIds yet, or this place already listed) — other
+  // places of the same game are separate per-place projects.
+  let existingIndex = projects.findIndex((project) => project?.path === path);
+  if (existingIndex < 0) {
+    existingIndex = projects.findIndex((project) => {
+      if (cleanId(project?.gameId) !== gameId) return false;
+      const ids = Array.isArray(project?.placeIds)
+        ? project.placeIds.map(cleanId).filter(Boolean)
+        : [];
+      return ids.length === 0 || ids.includes(placeId);
+    });
+  }
   const existing = existingIndex >= 0 ? projects[existingIndex] : null;
   const id = cleanString(existing?.id) || makeId();
   const placeIds = new Set(
@@ -28,6 +38,7 @@ export function mergeProjectInitEvent(state, event, makeId = defaultProjectId) {
   placeIds.add(placeId);
   const existingName = cleanString(existing?.name);
   const incomingName = cleanString(event?.name)
+    || cleanString(metadata.placeName)
     || cleanString(metadata.gameName)
     || cleanString(metadata.name)
     || cleanString(event?.directoryName);

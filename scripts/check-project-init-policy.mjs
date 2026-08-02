@@ -99,6 +99,45 @@ assert.equal(repeated.patch.projects.length, 1);
 assert.deepEqual(repeated.project.placeIds, ["456", "789"]);
 assert.deepEqual(repeated.patch.servedProjectIds, ["p_race"]);
 
+// A second place of the same game at a different path is a NEW project entry,
+// not a merge into the first one.
+const secondPlace = mergeProjectInitEvent(
+  repeated.patch,
+  {
+    requestId: "second-place",
+    projectPath: "/projects/Race Stars Lobby",
+    name: "Race Stars Lobby",
+    gameId: "123",
+    placeId: "999",
+  },
+  () => "p_lobby",
+);
+assert.equal(secondPlace.created, true);
+assert.equal(secondPlace.project.id, "p_lobby");
+assert.equal(secondPlace.patch.projects.length, 2);
+assert.deepEqual(secondPlace.project.placeIds, ["999"]);
+assert.deepEqual(secondPlace.patch.servedProjectIds, ["p_race", "p_lobby"]);
+assert.equal(secondPlace.patch.activeProjectId, "p_lobby");
+// The original entry is untouched.
+assert.deepEqual(secondPlace.patch.projects[0].placeIds, ["456", "789"]);
+
+// A same-game entry with no recorded placeIds is still adopted (legacy configs).
+const adopted = mergeProjectInitEvent(
+  {
+    projects: [{ id: "p_legacy", path: "/projects/Old", name: "Old", gameId: "555", placeIds: [] }],
+    servedProjectIds: [],
+  },
+  {
+    projectPath: "/projects/Old",
+    name: "Old",
+    gameId: "555",
+    placeId: "556",
+  },
+  () => "must-not-be-used-2",
+);
+assert.equal(adopted.created, false);
+assert.equal(adopted.project.id, "p_legacy");
+
 const daemonEvent = mergeProjectInitEvent(
   { projects: [], servedProjectIds: [] },
   {
