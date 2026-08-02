@@ -1847,6 +1847,15 @@ local function log(msg)
 	ui.addLog(msg)
 end
 
+-- Connection VERDICTS (matched, refused, auto-answered, gave up) also go to
+-- Studio Output: one line per decision, no phase spam. These are what make a
+-- failed connect diagnosable from a pasted log; the full story stays in the
+-- panel.
+local function dbg(msg)
+	print("[Ro Sync] " .. tostring(msg))
+	ui.addLog(msg)
+end
+
 local function setPill(state, detail)
 	ui.setStatus(state, detail)
 end
@@ -12192,9 +12201,37 @@ reconnectState.retryInitialCompare = function(context)
 		if not helloOk then
 			if terminalHelloError then
 				reconnectState.stopTerminal(helloError)
-			else
-				reconnectState.retryInitialCompare(helloError)
+				return
 			end
+			-- A same-game daemon that serves other places will never become
+			-- our match — retrying forever hides the real state behind
+			-- "waiting for the matching daemon". Leave recovery and surface
+			-- the per-place Create Project offer instead.
+			local probe = reconnectState.discoverDaemon(tostring(game.GameId), true)
+			if not reconnectState.desired or generation ~= wsGeneration or not busy then
+				return
+			end
+			if probe ~= nil and not probe.found and probe.sawWrongPlace then
+				dbg("reconnect abandoned: this game's daemon serves a different place (PlaceId mismatch)")
+				busy = false
+				reconnectState.desired = false
+				if probe.initializer ~= nil and reconnectState.offerProjectInit ~= nil then
+					reconnectState.offerProjectInit(probe.initializer)
+					setPill("project_init")
+					setBanner(
+						"This game's Ro Sync project serves a different place. Click Create Project to give this place its own project under "
+							.. tostring(probe.initializer.projectsRoot)
+							.. "."
+					)
+				else
+					setPill("wrong_place")
+					setBanner(
+						"This game's Ro Sync project serves a different place, so it cannot resync here. Click Connect to set up a project for this place."
+					)
+				end
+				return
+			end
+			reconnectState.retryInitialCompare(helloError)
 			return
 		end
 		runInitialCompare()
@@ -13996,6 +14033,11 @@ end
 -- Keep this state near the connection UI that consumes it so the plugin's very
 -- large top-level chunk can reuse earlier compiler registers.
 local projectInitCandidate: any = nil
+-- Bridge for code declared above this local (the reconnect recovery loop):
+-- arms the same Create Project flow the fresh-connect path uses.
+reconnectState.offerProjectInit = function(offer)
+	projectInitCandidate = offer
+end
 local connectionAttempt = 0
 -- Consecutive discovery misses since the last successful connection. A silent
 -- probe timeout (loaded machine, daemon still booting) auto-retries instead of
@@ -14794,7 +14836,7 @@ runInitialCompare = function()
 			autoReason = "saved project default"
 		end
 		if autoChoice ~= nil then
-			log(string.format("auto-answering '%s' (%s)", autoChoice, autoReason))
+			dbg(string.format("auto-answering '%s' (%s)", autoChoice, autoReason))
 			task.spawn(function()
 				pcall(function()
 					local body = { choiceId = tostring(choiceId), choice = autoChoice }
@@ -15123,7 +15165,7 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		result.url = gameLevelFallback.url
 		result.port = gameLevelFallback.port
 		if not quiet then
-			log(string.format(
+			dbg(string.format(
 				"matched daemon on :%d by GameId only (no placeIds recorded); PlaceId %s unverified",
 				gameLevelFallback.port,
 				placeId
@@ -15507,7 +15549,7 @@ startConnect = function()
 								.. tostring(result.initializer.projectsRoot)
 								.. "."
 						)
-						log("same-game daemon found, but its placeIds exclude this place; offering a per-place project")
+						dbg("same-game daemon found, but its placeIds exclude this place; offering a per-place project")
 					else
 						setBanner(
 							"No Ro Sync project exists for this experience. Click Create Project to initialize it under "
@@ -15525,7 +15567,7 @@ startConnect = function()
 					setBanner(
 						"Found this game's daemon, but it serves a different place (PlaceId mismatch). Connecting would compare this place against that project's files, so Ro Sync refused."
 					)
-					log("discovery refused a same-game daemon whose placeIds exclude this place")
+					dbg("discovery refused a same-game daemon whose placeIds exclude this place")
 				elseif result.sawWrongGame then
 					setPill("wrong_game")
 					setBanner("Ro Sync Desktop is running, but its daemon does not offer project initialization.")
@@ -15556,7 +15598,7 @@ startConnect = function()
 			noDaemonRetries = 0
 			chosenUrl = result.url
 			chosenPort = tostring(result.port)
-			log(string.format("matched daemon at %s", chosenUrl))
+			dbg(string.format("matched daemon at %s", chosenUrl))
 		end
 
 		if attempt ~= connectionAttempt or not busy then
