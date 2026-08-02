@@ -13156,7 +13156,7 @@ mod tests {
         assert_eq!(created["ok"], true);
         assert_eq!(created["status"], "created");
         assert_eq!(created["directoryName"], "race-stars");
-        assert_eq!(created["name"], "Race Stars");
+        assert_eq!(created["name"], "Main Place");
         let created_path = PathBuf::from(created["project"].as_str().unwrap());
         assert_eq!(created_path.parent(), Some(canonical_projects.as_path()));
         assert!(created_path
@@ -13166,7 +13166,7 @@ mod tests {
         let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
         assert_eq!(event["type"], "project-init");
         assert_eq!(event["status"], "created");
-        assert_eq!(event["name"], "Race Stars");
+        assert_eq!(event["name"], "Main Place");
         assert_eq!(event["metadata"]["gameId"], "123");
 
         let existing = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
