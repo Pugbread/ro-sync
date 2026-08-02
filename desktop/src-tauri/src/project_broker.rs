@@ -579,7 +579,11 @@ fn sanitize_request_id(raw: &str, game_id: &str, place_id: &str) -> String {
 }
 
 fn preferred_name(game_name: &str, place_name: &str, game_id: &str) -> String {
-    for candidate in [game_name, place_name] {
+    // Place-first: projects are per-place, so the place's own name (from
+    // MarketplaceService product info) is the identity users recognize.
+    // Naming by game put the experience title on every sibling place's
+    // project and made same-game forks collide into suffixed folders.
+    for candidate in [place_name, game_name] {
         let candidate = sanitize_folder_name(candidate);
         if !candidate.is_empty() && !candidate.eq_ignore_ascii_case("game") {
             return candidate;

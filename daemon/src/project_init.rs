@@ -580,7 +580,10 @@ fn is_placeholder_project_name(value: &str) -> bool {
 }
 
 fn preferred_project_name(game_name: &str, place_name: &str) -> String {
-    for candidate in [game_name, place_name] {
+    // Place-first: projects are per-place, and the place name is the
+    // identity users recognize. Game-first stamped the experience title on
+    // every sibling place's project.
+    for candidate in [place_name, game_name] {
         let candidate = candidate.trim();
         if !is_placeholder_project_name(candidate) {
             return candidate.to_string();
@@ -723,11 +726,11 @@ mod tests {
             Some(fs::canonicalize(root.path()).unwrap().as_path())
         );
         assert_eq!(outcome.directory_name, "race-stars");
-        assert_eq!(outcome.name, "Race Stars");
+        assert_eq!(outcome.name, "Main Place");
         let config = project_config::read_from_disk(&outcome.project)
             .unwrap()
             .unwrap();
-        assert_eq!(config.name, "Race Stars");
+        assert_eq!(config.name, "Main Place");
         assert_eq!(config.game_name.as_deref(), Some("Race Stars"));
         assert_eq!(config.game_id.as_deref(), Some("123"));
         assert_eq!(config.group_id.as_deref(), Some("789"));
