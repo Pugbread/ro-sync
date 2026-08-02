@@ -35,6 +35,9 @@ local SETTING_MANUAL_URL = "manualUrl"
 -- plugin re-answers the picker itself instead of parking on "waiting" until a
 -- human clicks the same button again.
 local SETTING_STICKY_CHOICE = "stickyInitialChoice"
+-- Keyed by PlaceId: the port that last served this place with an exact place
+-- match. Probed first on discovery; a hit skips the whole port fan-out.
+local SETTING_LAST_PORT_PREFIX = "lastDaemonPort:"
 local DEFAULT_URL = "http://127.0.0.1:7878"
 local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
@@ -42,6 +45,11 @@ local PORT_RANGE_END = 7890
 -- silently misses every daemon and the pill reads no_daemon while everything
 -- is actually up.
 local PROBE_TIMEOUT_SECONDS = 4
+-- Saved studio/disk defaults only auto-answer routine drift. Past these
+-- bounds the diff no longer resembles the situation the human approved, and
+-- replaying their answer unattended can erase one side's work.
+local AUTO_ANSWER_MAX_DRIFT = 50
+local AUTO_ANSWER_MAX_REMOVED = 10
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
 local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
@@ -2686,7 +2694,15 @@ end
 -- children by Instance identity rather than repeatedly calling FindFirstChild.
 snapshotApplyState = {
 	stepsPerCheck = 64,
+	-- Live-sync applies keep the tight slice so an incoming disk op never
+	-- hitches an actively edited session for long.
 	sliceSeconds = 0.01,
+	-- Initial-sync applies (pull before the connection is live) may hitch as
+	-- hard as the scan budget (scaleState.sliceBudgetSeconds); yielding 3x as
+	-- often as the scans was pure overhead there.
+	initialSyncSliceSeconds = 0.030,
+	-- Assigned after `connected` is declared; nil means "assume live".
+	isInitialSyncApply = nil,
 	diskPathCache = setmetatable({}, { __mode = "k" }),
 	activeMutationGuard = nil,
 }
@@ -2779,7 +2795,11 @@ function snapshotApplyState.checkpoint(ctx)
 	if ctx.shouldContinue and not ctx.shouldContinue() then
 		error("snapshot apply cancelled", 0)
 	end
-	if os.clock() - ctx.lastYield >= snapshotApplyState.sliceSeconds then
+	local sliceSeconds = snapshotApplyState.sliceSeconds
+	if snapshotApplyState.isInitialSyncApply ~= nil and snapshotApplyState.isInitialSyncApply() then
+		sliceSeconds = snapshotApplyState.initialSyncSliceSeconds
+	end
+	if os.clock() - ctx.lastYield >= sliceSeconds then
 		task.wait()
 		lastRemoteApplyClock = os.clock()
 		ctx.lastYield = os.clock()
@@ -4253,6 +4273,13 @@ local reconnectState = {
 local runInitialCompare: () -> ()
 local disconnectHooks
 
+-- Bridge for snapshotApplyState.checkpoint (declared long before `connected`):
+-- initial-sync applies run before the connection is live and may use the wider
+-- slice budget; live applies keep the tight one.
+snapshotApplyState.isInitialSyncApply = function()
+	return not connected
+end
+
 -- Strip NULs and replace invalid UTF-8 bytes with the Unicode replacement
 -- char (EF BF BD). JSONEncode rejects either. We keep valid UTF-8 intact.
 local function scrubString(s)
@@ -4367,19 +4394,25 @@ local function httpRequestTo(url, method, body, internalJsonSafe)
 		Headers = { ["Content-Type"] = "application/json" },
 	}
 	if body ~= nil then
-		-- Snapshot/bootstrap payloads are assembled exclusively from primitive
-		-- schema fields by this plugin. Let those trusted internal callers skip
-		-- sanitizeJson's full-tree copy: on a large service that otherwise
-		-- doubles peak memory and adds another traversal before JSONEncode.
-		-- Every general remote/audit caller keeps the sanitized default.
-		local value = if internalJsonSafe == true then body else sanitizeJson(body)
-		local encOk, enc = pcall(function()
-			return HttpService:JSONEncode(value)
-		end)
-		if not encOk then
-			return false, "JSONEncode failed: " .. tostring(enc)
+		if internalJsonSafe == "encoded" then
+			-- The caller already JSONEncoded this body (its sizing pass reuses
+			-- the same string), so a second encode here would be pure waste.
+			req.Body = body
+		else
+			-- Snapshot/bootstrap payloads are assembled exclusively from primitive
+			-- schema fields by this plugin. Let those trusted internal callers skip
+			-- sanitizeJson's full-tree copy: on a large service that otherwise
+			-- doubles peak memory and adds another traversal before JSONEncode.
+			-- Every general remote/audit caller keeps the sanitized default.
+			local value = if internalJsonSafe == true then body else sanitizeJson(body)
+			local encOk, enc = pcall(function()
+				return HttpService:JSONEncode(value)
+			end)
+			if not encOk then
+				return false, "JSONEncode failed: " .. tostring(enc)
+			end
+			req.Body = enc
 		end
-		req.Body = enc
 	end
 	local ok, resp = pcall(function()
 		return HttpService:RequestAsync(req)
@@ -6111,8 +6144,13 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 			frame.hasSyncableChild = false
 			frame.hasAvoidSyncChild = false
 			frame.projectedChildCount = 0
+			frame.projectedChildren = {}
 			progress.visited += 1
-			scaleState.yieldIfSliceExpired()
+			-- Amortized: two os.clock() calls per node dominated small-node
+			-- walks; one slice check per 64 nodes still bounds the hitch.
+			if progress.visited % 64 == 0 then
+				scaleState.yieldIfSliceExpired()
+			end
 			if SUPPRESS_CLASSES[frame.inst.ClassName] then
 				frame.children = {}
 				frame.suppressed = true
@@ -6153,6 +6191,7 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 					-- even when the ignored reservation is currently empty.
 					hasChildren = mappedClass == "Folder" or frame.actualHasChildren == true,
 					childIndex = frame.childIndex,
+					children = frame.projectedChildren,
 				}
 			elseif not frame.suppressed then
 				local isScript = frame.inst:IsA("LuaSourceContainer")
@@ -6173,6 +6212,11 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 						childCount = frame.projectedChildCount,
 						hasChildren = frame.projectedChildCount > 0,
 						childIndex = frame.childIndex,
+						-- Ordered projected children, recorded so the structure
+						-- stream can walk this index instead of re-walking the
+						-- DataModel (siblings finish in visitation order, so
+						-- appending at pop time preserves child order).
+						children = frame.projectedChildren,
 					}
 				end
 				if syncable and not frame.serviceRoot then
@@ -6187,6 +6231,7 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 			if parent then
 				if projected then
 					parent.projectedChildCount += 1
+					parent.projectedChildren[#parent.projectedChildren + 1] = frame.inst
 				end
 				if syncable then
 					parent.hasSyncableChild = true
@@ -6294,7 +6339,8 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 			frame.entered = true
 			frame.id = nextId
 			nextId += 1
-			if scaleState.yieldIfSliceExpired() then
+			-- Amortized slice check; see scanStudioServiceStats.
+			if nextId % 64 == 0 and scaleState.yieldIfSliceExpired() then
 				if blockedByMutation() then
 					return nil, "Studio changed during streamed structure scan"
 				end
@@ -6326,10 +6372,18 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 					inst = frame.inst,
 				}
 			end
-			frame.children = {}
-			for _, child in ipairs(frame.inst:GetChildren()) do
-				if projectionInfo[child] then
-					frame.children[#frame.children + 1] = child
+			-- The stats pass already recorded this node's projected children in
+			-- order; iterating that index avoids a second full GetChildren walk
+			-- of the DataModel. Structural mutations between the passes set the
+			-- guard dirty (blockedByMutation above) and restart with a fresh
+			-- walk, so a stale list can never stream.
+			frame.children = info.children
+			if frame.children == nil then
+				frame.children = {}
+				for _, child in ipairs(frame.inst:GetChildren()) do
+					if projectionInfo[child] then
+						frame.children[#frame.children + 1] = child
+					end
 				end
 			end
 			frame.nextChild = 1
@@ -6356,12 +6410,80 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	return sourceInstances, nil
 end
 
+-- Memoized normalized source hashes. Re-reading and re-SHA256ing every script
+-- on every compare made instant reconnects pay the full hashing cost again.
+-- Entries are invalidated by the always-on listeners below (installed once at
+-- plugin load, independent of the per-connection hooks, so they cover the
+-- windows where hooks are torn down between reconnects). Weak keys: destroyed
+-- scripts must not pin their hash entries.
+scaleState.sourceHashMemo = setmetatable({}, { __mode = "k" })
+scaleState.sourceHashMemoGeneration = 0
+scaleState.sourceHashMemoEnabled = false
+
+scaleState.invalidateSourceHash = function(inst: Instance?)
+	scaleState.sourceHashMemoGeneration += 1
+	if inst ~= nil then
+		scaleState.sourceHashMemo[inst] = nil
+	end
+end
+
 scaleState.normalizedSourceHash = function(inst: Instance): string
+	if scaleState.sourceHashMemoEnabled then
+		local cached = scaleState.sourceHashMemo[inst]
+		if cached ~= nil then
+			return cached
+		end
+	end
+	local generationAtRead = scaleState.sourceHashMemoGeneration
 	local source = readScriptSource(inst)
 	if string.find(source, "\r\n", 1, true) then
 		source = string.gsub(source, "\r\n", "\n")
 	end
-	return sha256Hex(source)
+	local hash = sha256Hex(source)
+	-- Store only when no source anywhere mutated while reading/hashing: a
+	-- mid-hash edit may already have cleared this key, and caching over it
+	-- would freeze a stale hash.
+	if scaleState.sourceHashMemoEnabled and scaleState.sourceHashMemoGeneration == generationAtRead then
+		scaleState.sourceHashMemo[inst] = hash
+	end
+	return hash
+end
+
+-- Always-on invalidation. A memoized hash is exactly as trustworthy as the
+-- scan guard's own change detection — both ride ItemChanged plus the script
+-- editor signal (including this plugin's own UpdateSourceAsync writes and
+-- Team Create commits). If ItemChanged is unavailable on this Studio channel
+-- the memo stays disabled and every compare hashes from scratch, as before.
+do
+	local itemChangedOk, itemChangedConnection = pcall(function()
+		return game.ItemChanged:Connect(function(item, descriptor)
+			if typeof(item) ~= "Instance" or not item:IsA("LuaSourceContainer") then
+				return
+			end
+			local propertyName = if type(descriptor) == "string" then descriptor else nil
+			if not propertyName and descriptor then
+				pcall(function()
+					propertyName = descriptor.Name
+				end)
+			end
+			if propertyName == "Source" then
+				scaleState.invalidateSourceHash(item)
+			end
+		end)
+	end)
+	if itemChangedOk and itemChangedConnection then
+		scaleState.sourceHashMemoEnabled = true
+		if ScriptEditorService then
+			pcall(function()
+				ScriptEditorService.TextDocumentDidChange:Connect(function(document)
+					local scriptInst = scriptFromDocument(document)
+					if scriptInst then
+						scaleState.invalidateSourceHash(scriptInst)
+					end
+				end)
+			end)
+		end
+	end
 end
 
 scaleState.collectStudioState = function()
@@ -11711,6 +11833,7 @@ reconnectState.stopTerminal = function(reason)
 	wsGeneration += 1
 	decisionGeneration += 1
 	disconnectHooks()
+	table.clear(scaleState.sourceHashMemo)
 	reconnectState.pluginCapability = nil
 	reconnectState.comparedCapability = nil
 	if ws then
@@ -11729,6 +11852,35 @@ reconnectState.stopTerminal = function(reason)
 	log("ws: terminal rejection — " .. message)
 end
 
+-- The winning discovery probe already decoded a full /hello, yet the connect
+-- pipeline used to re-GET the same document three more times in series
+-- (validateDaemonProtocol → refreshDaemonConfig → the first ws refreshHello).
+-- Cache the decoded hello for a few seconds and let those consumers reuse it;
+-- anything older re-fetches, so a daemon restart cannot serve stale state for
+-- longer than the cache window.
+local HELLO_CACHE_SECONDS = 5
+reconnectState.storeHelloCache = function(url, hello)
+	if type(hello) ~= "table" then
+		return
+	end
+	reconnectState.helloCache = {
+		url = (tostring(url or ""):gsub("/+$", "")),
+		hello = hello,
+		at = os.clock(),
+	}
+end
+reconnectState.readCachedHello = function(url)
+	local cache = reconnectState.helloCache
+	if
+		cache ~= nil
+		and cache.url == (tostring(url or ""):gsub("/+$", ""))
+		and (os.clock() - cache.at) < HELLO_CACHE_SECONDS
+	then
+		return cache.hello
+	end
+	return nil
+end
+
 -- A daemon restart rotates the process-scoped plugin capability. Refresh it
 -- immediately before every WebSocket attempt, and rediscover the matching
 -- project daemon when Desktop had to move it to another port.
@@ -11736,6 +11888,10 @@ reconnectState.refreshHello = function()
 	local function readHello(candidateUrl)
 		if type(candidateUrl) ~= "string" or candidateUrl == "" then
 			return nil, "daemon URL is missing"
+		end
+		local cached = reconnectState.readCachedHello(candidateUrl)
+		if cached ~= nil then
+			return cached, nil
 		end
 		local ok, response = httpRequestTo(candidateUrl:gsub("/+$", "") .. "/hello", "GET")
 		if not ok then
@@ -12279,6 +12435,12 @@ local function startHooksAndWs(): boolean
 	end
 	log("installing live-sync hooks — silent for up to a minute on large places")
 	setPill("connecting", "Installing live-sync hooks…")
+	-- Truthful banner for the longest silent stretch of the connect flow; the
+	-- "Authenticating" banner below only goes up once hooks are actually live.
+	-- (Opening the WebSocket concurrently with installHooks was considered and
+	-- rejected: connected=true gates wsLoop, and incoming ops must not mutate
+	-- the DataModel before hooks can suppress the echo.)
+	setBanner("Initial sync complete. Installing live-sync hooks — large places can take a minute…")
 	if not installHooks(shouldContinueInstall) or not shouldContinueInstall() then
 		-- installHooks can yield for very large places. A click-to-cancel or
 		-- generation change must tear down every partially installed signal
@@ -12365,14 +12527,16 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 		return reconnectState.desired and busy and not scaleState.guardBlocksSnapshot(scanGuard)
 	end
 
-	local function encodedSize(body): (number?, string?)
+	-- Returns size AND the encoded string; callers pass the string back down so
+	-- the request body is never encoded a second time.
+	local function encodedSize(body): (number?, string?, string?)
 		local ok, encoded = pcall(function()
 			return HttpService:JSONEncode(body)
 		end)
 		if not ok then
 			return nil, "JSONEncode failed: " .. tostring(encoded)
 		end
-		return #encoded, nil
+		return #encoded, nil, encoded
 	end
 
 	local function validatePartialReceipt(response): (boolean, string?)
@@ -12529,17 +12693,21 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 		return fatalMessage
 	end
 
-	local function postExact(body, label)
-		local bodyBytes, encodeErr = encodedSize(body)
-		if not bodyBytes then
-			return nil, encodeErr
+	local function postExact(body, label, preEncoded)
+		local encodedBody = preEncoded
+		if encodedBody == nil then
+			local bodyBytes, encodeErr, encoded = encodedSize(body)
+			if not bodyBytes then
+				return nil, encodeErr
+			end
+			encodedBody = encoded
 		end
-		if bodyBytes > scaleState.maxStreamRequestBytes then
+		if #encodedBody > scaleState.maxStreamRequestBytes then
 			return nil,
 				string.format(
 					"%s encodes to %d bytes; stream request maximum is %d",
 					label,
-					bodyBytes,
+					#encodedBody,
 					scaleState.maxStreamRequestBytes
 				)
 		end
@@ -12551,7 +12719,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 		local attempt = 0
 		while true do
 			attempt += 1
-			local ok, response = httpJson("/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES)
+			local ok, response = httpJson("/push", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES)
 			local attemptErr = nil
 			if
 				ok
@@ -12672,11 +12840,11 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 		return true, nil
 	end
 
-	local function sendBody(body, label): (boolean, string?)
+	local function sendBody(body, label, preEncoded): (boolean, string?)
 		if cursor.service ~= body.service or cursor.phase ~= body.phase or cursor.chunk ~= body.chunkIndex then
 			return false, "plugin push cursor advanced out of order"
 		end
-		local response, requestErr = postExact(body, label)
+		local response, requestErr = postExact(body, label, preEncoded)
 		if not response then
 			return false, requestErr
 		end
@@ -12711,6 +12879,8 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 	local function drainContinuation(phase, targetPhase): (boolean, string?)
 		local drainStarted = os.clock()
 		local drainTicks = 0
+		-- Same backoff shape as the compare-side diskPrepare loop.
+		local drainWait = 0.05
 		while cursor.phase == phase do
 			if not shouldContinue() then
 				return false, "Studio changed during daemon disk continuation"
@@ -12728,7 +12898,8 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				-- The daemon is still writing/validating disk state; poll gently
 				-- instead of burning the 500 req/min HttpService budget on
 				-- hundreds of empty ticks.
-				task.wait(0.25)
+				task.wait(drainWait)
+				drainWait = math.min(drainWait * 1.5, 0.5)
 			end
 		end
 		if drainTicks > 4 then
@@ -12770,6 +12941,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				while recordIndex <= #records do
 					local take = math.min(scaleState.structureChunkRecords, #records - recordIndex + 1)
 					local body = nil
+					local bodyEncoded = nil
 					while take >= 1 do
 						local batch = {}
 						for offset = 0, take - 1 do
@@ -12778,9 +12950,10 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 						local finishesInput = recordIndex + take - 1 == #records
 						local candidate = makeBody(serviceName, "structure", cursor.chunk, finalChunk and finishesInput)
 						candidate.records = batch
-						local bytes = encodedSize(candidate)
+						local bytes, _, encoded = encodedSize(candidate)
 						if bytes and bytes <= scaleState.maxStreamRequestBytes then
 							body = candidate
+							bodyEncoded = encoded
 							break
 						end
 						take = math.floor(take / 2)
@@ -12789,7 +12962,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 						return false, "one Studio structure record exceeds the bounded request limit"
 					end
 					local sent, sendErr =
-						sendBody(body, string.format("%s structure chunk %d", serviceName, body.chunkIndex))
+						sendBody(body, string.format("%s structure chunk %d", serviceName, body.chunkIndex), bodyEncoded)
 					if not sent then
 						return false, sendErr
 					end
@@ -12837,7 +13010,10 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 			-- places — 1700+ scripts turned the initial push into a
 			-- rate-limit retry loop that could never finish.
 			local BATCH_MAX_PARTS = 64 -- daemon STREAM_HASH_CHUNK_NODES
-			local BATCH_MAX_DATA_BYTES = 224 * 1024 -- raw budget; ~2x JSON-escape margin under both 512 KiB caps
+			-- Raw budget under the 512 KiB caps. Typical Luau sources barely
+			-- escape-expand under JSON, so a 2x margin left batches half empty;
+			-- the overflow-split retry in sendParts handles the rare miss.
+			local BATCH_MAX_DATA_BYTES = 384 * 1024
 			local batch = {}
 			local batchBytes = 0
 
@@ -12847,7 +13023,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				end
 				local body = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
 				body.sources = parts
-				local bytes = encodedSize(body)
+				local bytes, _, encoded = encodedSize(body)
 				if not bytes then
 					return false, "source batch failed to encode"
 				end
@@ -12867,7 +13043,8 @@ local function doPushPath(strictStudio: boolean?, scanGuard)
 				end
 				return sendBody(
 					body,
-					string.format("%s Sources ×%d chunk %d", serviceName, #parts, body.chunkIndex)
+					string.format("%s Sources ×%d chunk %d", serviceName, #parts, body.chunkIndex),
+					encoded
 				)
 			end
 
@@ -13037,7 +13214,7 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 		local attempt = 0
 		while true do
 			attempt += 1
-			local ok, raw = httpRequest("/snapshot/stream", "POST", body, true)
+			local ok, raw = httpRequest("/snapshot/stream", "POST", encoded, "encoded")
 			if not shouldContinue() then
 				return nil, mutationGuard.reason or "disk stream cancelled"
 			end
@@ -14083,6 +14260,9 @@ local function disconnect(reason)
 	wsGeneration += 1
 	decisionGeneration += 1
 	disconnectHooks()
+	-- Deliberate disconnects bound the memo's lifetime; transport-gap
+	-- reconnects keep it (the always-on listeners stay valid throughout).
+	table.clear(scaleState.sourceHashMemo)
 	remoteState.requestRemoteWriteCleanup()
 	if ws then
 		local toClose = ws
@@ -14402,36 +14582,43 @@ runInitialCompare = function()
 				hashes = hashes or {},
 			}
 		end
-		local function encodedCompareBodySize(requestBody): (number?, string?)
+		-- Returns size AND the encoded string so the sizing encode can be
+		-- reused as the request body — encoding twice per chunk doubled the
+		-- JSON cost of the whole stream, worse when the halving loop tripped.
+		local function encodedCompareBodySize(requestBody): (number?, string?, string?)
 			local encodedOk, encoded = pcall(function()
 				return HttpService:JSONEncode(requestBody)
 			end)
 			if not encodedOk then
 				return nil, "comparison JSONEncode failed: " .. tostring(encoded)
 			end
-			return #encoded, nil
+			return #encoded, nil, encoded
 		end
-		local function postCompareChunk(serviceName, phase, chunkIndex, finalChunk, records, hashes)
-			local requestBody = makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
-			local bodyBytes, encodeErr = encodedCompareBodySize(requestBody)
-			if not bodyBytes then
-				return false, encodeErr
+		local function postCompareChunk(serviceName, phase, chunkIndex, finalChunk, records, hashes, preEncoded)
+			local encodedBody = preEncoded
+			if encodedBody == nil then
+				local requestBody = makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
+				local bodyBytes, encodeErr, encoded = encodedCompareBodySize(requestBody)
+				if not bodyBytes then
+					return false, encodeErr
+				end
+				encodedBody = encoded
 			end
-			if bodyBytes > scaleState.maxStreamRequestBytes then
+			if #encodedBody > scaleState.maxStreamRequestBytes then
 				return false,
 					string.format(
 						"comparison %s/%s/%d encodes to %d bytes; maximum is %d",
 						serviceName,
 						phase,
 						chunkIndex,
-						bodyBytes,
+						#encodedBody,
 						scaleState.maxStreamRequestBytes
 					)
 			end
 			local lastErr = nil
 			for attempt = 1, 2 do
 				local requestOk, nextResp =
-					httpJson("/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES)
+					httpJson("/initial-compare", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES)
 				if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
 					return false, "comparison cancelled"
 				end
@@ -14508,6 +14695,7 @@ runInitialCompare = function()
 						end
 						local take = math.min(scaleState.structureChunkRecords, #records - recordIndex + 1)
 						local batch = nil
+						local batchEncoded = nil
 						local finishesInput = false
 						while take >= 1 do
 							local candidateBatch = {}
@@ -14523,9 +14711,10 @@ runInitialCompare = function()
 								candidateBatch,
 								{}
 							)
-							local bytes = encodedCompareBodySize(candidate)
+							local bytes, _, encoded = encodedCompareBodySize(candidate)
 							if bytes and bytes <= scaleState.maxStreamRequestBytes then
 								batch = candidateBatch
+								batchEncoded = encoded
 								break
 							end
 							take = math.floor(take / 2)
@@ -14535,8 +14724,15 @@ runInitialCompare = function()
 								"one Studio comparison structure record exceeds the bounded 512 KiB request limit"
 						end
 						local sendsFinalChunk = finalChunk and finishesInput
-						local sent, sendErr =
-							postCompareChunk(serviceName, "structure", chunkIndex, sendsFinalChunk, batch, {})
+						local sent, sendErr = postCompareChunk(
+							serviceName,
+							"structure",
+							chunkIndex,
+							sendsFinalChunk,
+							batch,
+							{},
+							batchEncoded
+						)
 						if not sent then
 							return false, sendErr
 						end
@@ -14581,6 +14777,10 @@ runInitialCompare = function()
 				return
 			end
 			local preparePolls = 0
+			-- Empty continuation ticks back off toward 0.5s: each tick costs a
+			-- request against Studio's 500/min HttpService budget, and a long
+			-- daemon-side prepare gains nothing from a tight 50ms cadence.
+			local prepareWait = 0.05
 			while resp.phase == "diskPrepare" do
 				local prepareChunk = tonumber(resp.nextChunk)
 				if
@@ -14624,7 +14824,8 @@ runInitialCompare = function()
 							)
 						)
 					end
-					task.wait(0.05)
+					task.wait(prepareWait)
+					prepareWait = math.min(prepareWait * 1.5, 0.5)
 				elseif
 					tostring(resp.action) ~= "compare"
 					or resp.compareId ~= compareId
@@ -14863,8 +15064,24 @@ runInitialCompare = function()
 			autoChoice = reconnectState.carriedInitialChoice
 			autoReason = "carried from the voided choice"
 		elseif reconnectState.savedInitialChoice ~= nil then
-			autoChoice = reconnectState.savedInitialChoice
-			autoReason = "saved project default"
+			-- The saved default was recorded against a routine drift. A large or
+			-- deletion-heavy diff (mass disk edits, a migration in flight) is a
+			-- different situation than the one the human approved — silently
+			-- replaying their old answer can destroy one side's work. Ask again.
+			local summary = type(resp.comparison) == "table" and resp.comparison.summary or nil
+			local newFiles = tonumber(type(summary) == "table" and summary.newFiles) or countArray(resp.comparison and resp.comparison.newFiles)
+			local changedFiles = tonumber(type(summary) == "table" and summary.changedFiles) or countArray(resp.comparison and resp.comparison.changedFiles)
+			local removedFiles = tonumber(type(summary) == "table" and summary.removedFiles) or countArray(resp.comparison and resp.comparison.removedFiles)
+			local totalDrift = newFiles + changedFiles + removedFiles
+			if removedFiles > AUTO_ANSWER_MAX_REMOVED or totalDrift > AUTO_ANSWER_MAX_DRIFT then
+				dbg(string.format(
+					"saved default '%s' withheld: %d changed path(s), %d removal(s) — too destructive to auto-answer, asking",
+					tostring(reconnectState.savedInitialChoice), totalDrift, removedFiles
+				))
+			else
+				autoChoice = reconnectState.savedInitialChoice
+				autoReason = "saved project default"
+			end
 		end
 		if autoChoice ~= nil then
 			dbg(string.format("auto-answering '%s' (%s)", autoChoice, autoReason))
@@ -15026,16 +15243,18 @@ end
 
 local function refreshDaemonConfig(url)
 	wallyRootSegments = nil
-	local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
-	if not ok or not resp.Success then
-		return
-	end
-	local hello
-	local decOk = pcall(function()
-		hello = HttpService:JSONDecode(resp.Body or "")
-	end)
-	if not decOk or type(hello) ~= "table" then
-		return
+	local hello = reconnectState.readCachedHello(url)
+	if hello == nil then
+		local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
+		if not ok or not resp.Success then
+			return
+		end
+		local decOk = pcall(function()
+			hello = HttpService:JSONDecode(resp.Body or "")
+		end)
+		if not decOk or type(hello) ~= "table" then
+			return
+		end
 	end
 	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
 	if ui and ui.setProjectName and type(hello.name) == "string" and hello.name ~= "" then
@@ -15044,16 +15263,18 @@ local function refreshDaemonConfig(url)
 end
 
 local function validateDaemonProtocol(url)
-	local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
-	if not ok or not resp.Success then
-		return false, "daemon hello failed"
-	end
-	local hello
-	local decOk = pcall(function()
-		hello = HttpService:JSONDecode(resp.Body or "")
-	end)
-	if not decOk or type(hello) ~= "table" then
-		return false, "daemon hello was malformed"
+	local hello = reconnectState.readCachedHello(url)
+	if hello == nil then
+		local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
+		if not ok or not resp.Success then
+			return false, "daemon hello failed"
+		end
+		local decOk = pcall(function()
+			hello = HttpService:JSONDecode(resp.Body or "")
+		end)
+		if not decOk or type(hello) ~= "table" then
+			return false, "daemon hello was malformed"
+		end
 	end
 	local protocol = tonumber(hello.pluginProtocol)
 	if protocol ~= PLUGIN_PROTOCOL_VERSION then
@@ -15144,24 +15365,92 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		initializerError = nil,
 	}
 	local placeId = tostring(game.PlaceId)
+
+	-- Probe the port that last served this place FIRST: an exact place match
+	-- always wins ranking (one project per place), so a hit skips the whole
+	-- port fan-out and its multi-second completion wait.
+	local savedPort = tonumber(plugin:GetSetting(SETTING_LAST_PORT_PREFIX .. placeId))
+	if
+		savedPort ~= nil
+		and savedPort % 1 == 0
+		and savedPort >= PORT_RANGE_START
+		and savedPort <= PORT_RANGE_END
+	then
+		-- Bounded like the fan-out: a hung (not refused) port must not stall
+		-- discovery past the probe budget.
+		local outcome = nil
+		local closed = false
+		local done = Instance.new("BindableEvent")
+		task.spawn(function()
+			local matchKind, url, hello = probePort(savedPort, gameId, placeId)
+			if not closed then
+				outcome = { matchKind = matchKind, url = url, hello = hello }
+				done:Fire()
+			end
+		end)
+		local timeoutThread = task.delay(PROBE_TIMEOUT_SECONDS, function()
+			if not closed then
+				done:Fire()
+			end
+		end)
+		if outcome == nil then
+			done.Event:Wait()
+		end
+		closed = true
+		pcall(function()
+			task.cancel(timeoutThread)
+		end)
+		done:Destroy()
+		if outcome ~= nil and outcome.matchKind == "place" then
+			result.found = true
+			result.url = outcome.url
+			result.port = savedPort
+			reconnectState.storeHelloCache(outcome.url, outcome.hello)
+			if not quiet then
+				dbg(string.format("matched daemon on remembered port :%d", savedPort))
+			end
+			return result
+		end
+	end
+
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
 		local remaining = lastPort - firstPort + 1
 		local closed = false
+		local placeMatched = false
+		-- Completion is signalled instead of polled, and an exact place match
+		-- short-circuits the wait — that probe always wins ranking, so the
+		-- slower ports have nothing left to add.
+		local done = Instance.new("BindableEvent")
 		for port = firstPort, lastPort do
 			task.spawn(function()
 				local matchKind, url, hello = probePort(port, gameId, placeId)
 				if not closed then
 					probes[port] = { matchKind = matchKind, url = url, hello = hello }
+					if matchKind == "place" then
+						placeMatched = true
+					end
 				end
 				remaining -= 1
+				if not closed and (remaining <= 0 or placeMatched) then
+					done:Fire()
+				end
 			end)
 		end
+		local timeoutThread = task.delay(PROBE_TIMEOUT_SECONDS, function()
+			if not closed then
+				done:Fire()
+			end
+		end)
 		local started = os.clock()
-		while remaining > 0 and (os.clock() - started) < PROBE_TIMEOUT_SECONDS do
-			task.wait(0.05)
+		while remaining > 0 and not placeMatched and (os.clock() - started) < PROBE_TIMEOUT_SECONDS do
+			done.Event:Wait()
 		end
 		closed = true
+		pcall(function()
+			task.cancel(timeoutThread)
+		end)
+		done:Destroy()
 		return probes
 	end
 
@@ -15179,8 +15468,10 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 				result.found = true
 				result.url = probe.url
 				result.port = port
+				reconnectState.storeHelloCache(probe.url, probe.hello)
+				plugin:SetSetting(SETTING_LAST_PORT_PREFIX .. placeId, port)
 			elseif probe.matchKind == "game" and gameLevelFallback == nil then
-				gameLevelFallback = { url = probe.url, port = port }
+				gameLevelFallback = { url = probe.url, port = port, hello = probe.hello }
 			elseif probe.matchKind == "otherPlace" then
 				result.sawWrongPlace = true
 			elseif probe.matchKind == nil and probe.hello ~= nil then
@@ -15195,6 +15486,7 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer)
 		result.found = true
 		result.url = gameLevelFallback.url
 		result.port = gameLevelFallback.port
+		reconnectState.storeHelloCache(gameLevelFallback.url, gameLevelFallback.hello)
 		if not quiet then
 			dbg(string.format(
 				"matched daemon on :%d by GameId only (no placeIds recorded); PlaceId %s unverified",
@@ -15530,6 +15822,9 @@ startConnect = function()
 						busy = false
 						return
 					end
+				end
+				if type(hello) == "table" then
+					reconnectState.storeHelloCache(chosenUrl, hello)
 				end
 				-- `node` and `requestBody` leave scope at the end of this
 				-- iteration, before the next service's Source tree is scanned.
