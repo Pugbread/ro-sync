@@ -574,6 +574,11 @@ impl SyncedPathValidationCache {
     pub fn completed_scans(&self) -> usize {
         self.completed_scans
     }
+
+    /// The canonical project root captured when this cache was created.
+    pub fn canonical_root(&self) -> &Path {
+        &self.canonical_root
+    }
 }
 
 fn fragment_is_collision_relevant(entry: &PortableDirectoryEntry, policy: DirectoryPolicy) -> bool {
@@ -1035,6 +1040,21 @@ pub fn guard_synced_parent_chain(
 ) -> io::Result<PathParentGuard> {
     let validated = validate_synced_path(root, target, allow_missing_tail)?;
     let canonical_root = stable_canonical_directory(root)?;
+    capture_parent_guard_from_validated(&canonical_root, &validated)
+}
+
+/// Batch counterpart to [`guard_synced_parent_chain`] which reuses one
+/// [`SyncedPathValidationCache`] across a burst of validations so stable wide
+/// parents are scanned once per batch instead of once per file. Every reuse
+/// still pays the per-directory generation fence inside the cache, and the
+/// parent-identity capture below remains a fresh read.
+pub fn guard_synced_parent_chain_cached(
+    cache: &mut SyncedPathValidationCache,
+    target: &Path,
+    allow_missing_tail: bool,
+) -> io::Result<PathParentGuard> {
+    let validated = cache.validate(target, allow_missing_tail)?;
+    let canonical_root = cache.canonical_root().to_path_buf();
     capture_parent_guard_from_validated(&canonical_root, &validated)
 }
 
@@ -1758,6 +1778,39 @@ mod tests {
             2,
             "file-content writes do not invalidate an unchanged directory index"
         );
+    }
+
+    #[test]
+    fn cached_guard_reuses_batch_indices_and_still_detects_parent_swaps() {
+        let project = tempfile::tempdir().unwrap();
+        let workspace = project.path().join("Workspace");
+        fs::create_dir(&workspace).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..16 {
+            let path = workspace.join(format!("Item{index:02}.luau"));
+            fs::write(&path, "return {}").unwrap();
+            paths.push(path);
+        }
+
+        let mut cache = SyncedPathValidationCache::new(project.path()).unwrap();
+        for path in &paths {
+            let guard = guard_synced_parent_chain_cached(&mut cache, path, false).unwrap();
+            guard.verify().unwrap();
+        }
+        assert_eq!(
+            cache.completed_scans(),
+            2,
+            "guarding a burst of siblings should scan the root and service once each"
+        );
+
+        // Replacing the guarded parent with a new physical directory must
+        // still fail a previously captured guard's verification.
+        let guard = guard_synced_parent_chain_cached(&mut cache, &paths[0], false).unwrap();
+        let retired = project.path().join("Workspace-retired");
+        fs::rename(&workspace, &retired).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("Item00.luau"), "return {}").unwrap();
+        assert!(guard.verify().is_err());
     }
 
     #[test]

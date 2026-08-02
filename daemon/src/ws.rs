@@ -627,7 +627,18 @@ async fn recv_loop(
                         );
                         continue;
                     }
-                    let res = apply_push_ops(&state, &ops);
+                    // Push application is synchronous filesystem work; run it
+                    // on the blocking pool so this receive loop's runtime
+                    // worker keeps serving other connections.
+                    let push_state = state.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        apply_push_ops(&push_state, &ops)
+                    })
+                    .await
+                    .unwrap_or_else(|error| crate::http::PushApplyResult {
+                        errors: vec![format!("push worker failed: {error}")],
+                        ..Default::default()
+                    });
                     let _ = send_server_msg(
                         &out_tx,
                         &ServerMsg::PushResult {

@@ -4487,17 +4487,24 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("serve: bind {requested_addr}: {error}"))?;
     let listen_port = listener.local_addr()?.port();
 
-    if let Err(e) = snapshot::write_ro_sync_md_if_missing(&canonical_project) {
-        eprintln!("rosync: failed to write ro-sync.md: {e}");
-    }
-    if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write CLAUDE.md: {e}");
-    }
-    if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write Codex context: {e}");
-    }
-    if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write project tooling files: {e}");
+    // Documentation/config merges are best-effort conveniences; run them off
+    // the readiness path so the daemon starts serving immediately.
+    {
+        let docs_project = canonical_project.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = snapshot::write_ro_sync_md_if_missing(&docs_project) {
+                eprintln!("rosync: failed to write ro-sync.md: {e}");
+            }
+            if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write CLAUDE.md: {e}");
+            }
+            if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write Codex context: {e}");
+            }
+            if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write project tooling files: {e}");
+            }
+        });
     }
 
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
@@ -15626,13 +15633,32 @@ fn spawn_watch_bridge(
     push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>>,
 ) -> Result<(), String> {
     let mut rx = watcher.subscribe();
-    let initial_parent_dirs = collect_existing_parent_candidates(&root)?;
     let hydration_validation = fs_safety::SyncedPathValidationCache::new(&root)
         .map_err(|error| format!("initialize watcher hydration safety cache: {error}"))?;
     // Move the Watch into the task so the debouncer stays alive for the lifetime
     // of the daemon.
     tokio::spawn(async move {
         let _watcher = watcher;
+        // Seed the parent-candidate set off the readiness path. `rx` is
+        // subscribed above, so watcher events raised while the seed walk runs
+        // buffer in the channel and are processed afterwards against the
+        // fully seeded set (an overflow surfaces as the usual lag/resync).
+        let seed_root = root.clone();
+        let initial_parent_dirs = match tokio::task::spawn_blocking(move || {
+            collect_existing_parent_candidates(&seed_root)
+        })
+        .await
+        .map_err(|error| format!("seed watcher parent candidates: {error}"))
+        .and_then(|seed| seed)
+        {
+            Ok(initial_parent_dirs) => initial_parent_dirs,
+            Err(error) => {
+                let _ = events.send(watcher_hydration_shutdown(&format!(
+                    "validate watched filesystem: {error}"
+                )));
+                return;
+            }
+        };
         // Empty folders are intentionally absent from Studio. Seed every
         // existing disk directory and remember newly created ones so the first
         // script added beneath an unmaterialized folder can create its parent
@@ -15645,6 +15671,14 @@ fn spawn_watch_bridge(
         loop {
             match rx.recv().await {
                 Ok(watch::WatchEvent::Op(mut op)) => {
+                    // Any observed change drops the cached content hash for
+                    // the touched paths (correctness never depends on this —
+                    // hash lookups re-check the file generation — it just
+                    // keeps the cache small and current).
+                    http::invalidate_cached_content_hash(&op.path);
+                    if let Some(from) = &op.from {
+                        http::invalidate_cached_content_hash(from);
+                    }
                     if is_synced_service_root_op(&op, &root) {
                         continue;
                     }

@@ -918,6 +918,8 @@ struct Hello {
     plugin_capability: &'static str,
     #[serde(rename = "hashChunkNodes")]
     hash_chunk_nodes: usize,
+    #[serde(rename = "sourceChunkNodes")]
+    source_chunk_nodes: usize,
     #[serde(
         rename = "initialChoiceDefault",
         skip_serializing_if = "Option::is_none"
@@ -962,6 +964,7 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
         plugin_capability: crate::ws::plugin_capability(),
         hash_chunk_nodes: STREAM_COMPARE_HASH_CHUNK_NODES,
+        source_chunk_nodes: STREAM_SOURCE_PART_CHUNK_NODES,
         initial_choice_default: state.initial_choice_default.read().unwrap().clone(),
         project_init: ProjectInitHello {
             available: projects_root.is_some(),
@@ -1487,6 +1490,23 @@ fn initial_compare_request_hash<T: Serialize>(
     Ok(writer.0.finalize().into())
 }
 
+/// Run heavy synchronous handler work on the blocking pool instead of an
+/// async worker thread, keeping the current runtime entered so the body can
+/// still `tokio::spawn` its cleanup timers.
+async fn run_handler_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _guard = handle.enter();
+        f()
+    })
+    .await
+    .map_err(|error| format!("blocking handler worker failed: {error}"))
+}
+
 async fn initial_compare(
     State(state): State<AppState>,
     Json(body): Json<InitialCompareBody>,
@@ -1501,7 +1521,14 @@ async fn initial_compare(
         }));
     }
     if body.compare_id.is_some() || body.service.is_some() {
-        return initial_compare_service_chunk(&state, body);
+        // Chunk processing (validation, disk hashing, bounded worker waits)
+        // is synchronous; keep it off the async worker threads.
+        return match run_handler_blocking(move || initial_compare_service_chunk(&state, body))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => Json(json!({ "ok": false, "error": error })),
+        };
     }
 
     let stats_root = state.canonical_project.clone();
@@ -1614,14 +1641,22 @@ async fn initial_compare(
     // Protocol 5 is mandatory above. Retain the monolithic shape only for
     // early protocol-5 clients that already supplied it; current clients are
     // always instructed to use bounded service/chunk streaming.
-    match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot) {
-        Ok(comparison) => {
-            finish_initial_comparison(&state, disk_stats, body.studio_stats, comparison, None)
+    match run_handler_blocking(move || {
+        match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot)
+        {
+            Ok(comparison) => {
+                finish_initial_comparison(&state, disk_stats, body.studio_stats, comparison, None)
+            }
+            Err(error) => Json(json!({
+                "ok": false,
+                "error": format!("snapshot compare: {error}"),
+            })),
         }
-        Err(error) => Json(json!({
-            "ok": false,
-            "error": format!("snapshot compare: {error}"),
-        })),
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => Json(json!({ "ok": false, "error": error })),
     }
 }
 
@@ -1993,13 +2028,17 @@ fn process_streamed_initial_compare_chunk(
             {
                 return Err("diskPrepare accepts only empty continuation ticks".into());
             }
+            // Bounded server-side wait: one request absorbs several plugin
+            // polling ticks (each otherwise a full HTTP round trip + client
+            // delay). This handler runs on the blocking pool, so a short
+            // blocking wait cannot stall an async worker thread.
             let result = stream
                 .prepare_result
                 .as_ref()
                 .ok_or("diskPrepare worker is missing")?
-                .try_recv();
+                .recv_timeout(STREAM_WORKER_POLL_BUDGET);
             match result {
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     stream.next_chunk += 1;
                     session.started_at = Instant::now();
                     Ok(json!({
@@ -2010,7 +2049,7 @@ fn process_streamed_initial_compare_chunk(
                         "nextChunk": stream.next_chunk,
                     }))
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     Err("diskPrepare worker disconnected".into())
                 }
                 Ok((mut records, Err(error))) => {
@@ -2142,27 +2181,13 @@ fn process_streamed_initial_compare_chunk(
             // Source IO is deliberately deferred until the matching Studio
             // hash chunk arrives. This keeps the final structure request
             // metadata-only and bounds daemon work to one small hash batch.
+            let mut local_baselines =
+                prepare_staged_script_baselines(project, &validated_hashes)?;
             let mut prepared_hashes = Vec::with_capacity(validated_hashes.len());
-            for (id, path, studio_hash, local_source_path) in validated_hashes {
-                let local_baseline = if let Some(source_path) = local_source_path {
-                    let generation = crate::fs_safety::file_generation_no_follow(&source_path)?;
-                    let source_hash = normalized_file_hash(project, &source_path)?;
-                    if crate::fs_safety::file_generation_no_follow(&source_path)? != generation {
-                        return Err(format!(
-                            "disk script {} changed while it was hashed; restart the comparison",
-                            source_path.display()
-                        ));
-                    }
-                    Some(StagedScriptBaseline {
-                        fs_mtime: fs_mtime(&source_path),
-                        path: source_path,
-                        source_hash,
-                        generation,
-                    })
-                } else {
-                    None
-                };
-                prepared_hashes.push((id, path, studio_hash, local_baseline));
+            for ((id, path, studio_hash, _), local_baseline) in
+                validated_hashes.into_iter().zip(local_baselines.iter_mut())
+            {
+                prepared_hashes.push((id, path, studio_hash, local_baseline.take()));
             }
 
             // Commit only after every ID, path, digest, and disk read in the
@@ -2353,17 +2378,179 @@ fn parse_sha256_hex(value: &str) -> Result<crate::conflict::Hash, String> {
     Ok(out)
 }
 
+fn prepare_one_staged_script_baseline(
+    source_path: &Path,
+    validation: &mut crate::fs_safety::SyncedPathValidationCache,
+) -> Result<StagedScriptBaseline, String> {
+    let generation = crate::fs_safety::file_generation_no_follow(source_path)?;
+    let source_hash = normalized_file_hash_cached(source_path, validation)?;
+    if crate::fs_safety::file_generation_no_follow(source_path)? != generation {
+        return Err(format!(
+            "disk script {} changed while it was hashed; restart the comparison",
+            source_path.display()
+        ));
+    }
+    Ok(StagedScriptBaseline {
+        fs_mtime: fs_mtime(source_path),
+        path: source_path.to_path_buf(),
+        source_hash,
+        generation,
+    })
+}
+
+/// Hash every disk script referenced by one compare hash chunk.
+///
+/// Each worker owns one batch-scoped `SyncedPathValidationCache` so a chunk
+/// validates stable ancestors once instead of once per file, and independent
+/// per-file hashing is spread across up to `available_parallelism` scoped
+/// threads. Returned baselines are positionally aligned with
+/// `validated_hashes`; entries without a disk source stay `None`.
+fn prepare_staged_script_baselines(
+    project: &Path,
+    validated_hashes: &[(u64, String, crate::conflict::Hash, Option<PathBuf>)],
+) -> Result<Vec<Option<StagedScriptBaseline>>, String> {
+    let jobs: Vec<(usize, &Path)> = validated_hashes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, _, _, source_path))| {
+            source_path.as_deref().map(|path| (index, path))
+        })
+        .collect();
+    let mut baselines: Vec<Option<StagedScriptBaseline>> = std::iter::repeat_with(|| None)
+        .take(validated_hashes.len())
+        .collect();
+    if jobs.is_empty() {
+        return Ok(baselines);
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(jobs.len());
+    if workers <= 1 {
+        let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project)
+            .map_err(|error| format!("validate compare batch: {error}"))?;
+        for (index, path) in jobs {
+            baselines[index] = Some(prepare_one_staged_script_baseline(path, &mut validation)?);
+        }
+        return Ok(baselines);
+    }
+    let chunk_len = jobs.len().div_ceil(workers);
+    let results = std::thread::scope(|scope| {
+        let handles = jobs
+            .chunks(chunk_len)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut validation =
+                        crate::fs_safety::SyncedPathValidationCache::new(project)
+                            .map_err(|error| format!("validate compare batch: {error}"))?;
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (index, path) in chunk {
+                        out.push((
+                            *index,
+                            prepare_one_staged_script_baseline(path, &mut validation)?,
+                        ));
+                    }
+                    Ok::<_, String>(out)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "compare hash worker panicked".to_string())?
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    for chunk in results {
+        for (index, baseline) in chunk {
+            baselines[index] = Some(baseline);
+        }
+    }
+    Ok(baselines)
+}
+
+/// In-memory cache of normalized (CRLF-folded) content hashes keyed by the
+/// validated canonical path. Every lookup re-stats the file and returns the
+/// cached digest only when the full [`FileGeneration`] (length, mtime ns,
+/// physical identity) still matches, so a stale entry can never satisfy a
+/// lookup — it merely costs one rehash. Entries are additionally invalidated
+/// on watcher events and on daemon writes.
+static CONTENT_HASH_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (crate::fs_safety::FileGeneration, crate::conflict::Hash)>>,
+> = OnceLock::new();
+const CONTENT_HASH_CACHE_MAX_ENTRIES: usize = 65_536;
+
+fn content_hash_cache()
+-> &'static Mutex<HashMap<PathBuf, (crate::fs_safety::FileGeneration, crate::conflict::Hash)>> {
+    CONTENT_HASH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_cached_content_hash(
+    validated: &Path,
+    generation: &crate::fs_safety::FileGeneration,
+) -> Option<crate::conflict::Hash> {
+    let cache = content_hash_cache().lock().unwrap();
+    cache
+        .get(validated)
+        .filter(|(cached_generation, _)| cached_generation == generation)
+        .map(|(_, hash)| *hash)
+}
+
+fn store_cached_content_hash(
+    validated: PathBuf,
+    generation: crate::fs_safety::FileGeneration,
+    hash: crate::conflict::Hash,
+) {
+    let mut cache = content_hash_cache().lock().unwrap();
+    if cache.len() >= CONTENT_HASH_CACHE_MAX_ENTRIES && !cache.contains_key(&validated) {
+        cache.clear();
+    }
+    cache.insert(validated, (generation, hash));
+}
+
+/// Drop any cached content hash for `path`. Called for daemon writes and
+/// watcher events; correctness never depends on this (every hit re-checks the
+/// file generation), it only keeps the map small and current.
+pub(crate) fn invalidate_cached_content_hash(path: &Path) {
+    if let Some(cache) = CONTENT_HASH_CACHE.get() {
+        cache.lock().unwrap().remove(path);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn normalized_file_hash(project_root: &Path, path: &Path) -> Result<crate::conflict::Hash, String> {
+    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
+        .map_err(|error| format!("validate source {}: {error}", path.display()))?;
+    normalized_file_hash_cached(path, &mut validation)
+}
+
+/// Batch variant of [`normalized_file_hash`] which reuses one
+/// [`SyncedPathValidationCache`] across many files (avoiding a fresh
+/// canonicalize + ancestor re-scan per file) and consults the content-hash
+/// cache before re-reading unchanged sources.
+fn normalized_file_hash_cached(
+    path: &Path,
+    validation: &mut crate::fs_safety::SyncedPathValidationCache,
+) -> Result<crate::conflict::Hash, String> {
     use std::io::Read as _;
 
-    let validated = crate::fs_safety::validate_synced_path(project_root, path, false)
+    let validated = validation
+        .validate(path, false)
         .map_err(|error| format!("validate source {}: {error}", path.display()))?;
-    let guard = crate::fs_safety::guard_synced_parent_chain(project_root, &validated, false)
+    let guard = crate::fs_safety::guard_synced_parent_chain_cached(validation, &validated, false)
         .map_err(|error| format!("guard source {}: {error}", path.display()))?;
     guard
         .verify()
         .map_err(|error| format!("verify source parent {}: {error}", path.display()))?;
     let before = crate::fs_safety::file_generation_no_follow(&validated)?;
+    if let Some(cached) = lookup_cached_content_hash(&validated, &before) {
+        guard
+            .verify()
+            .map_err(|error| format!("source parent changed {}: {error}", path.display()))?;
+        return Ok(cached);
+    }
     let file = crate::fs_safety::open_regular_file_no_follow(&validated)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -2414,7 +2601,9 @@ fn normalized_file_hash(project_root: &Path, path: &Path) -> Result<crate::confl
     guard
         .verify()
         .map_err(|error| format!("source parent changed {}: {error}", path.display()))?;
-    Ok(hasher.finalize().into())
+    let digest: crate::conflict::Hash = hasher.finalize().into();
+    store_cached_content_hash(validated, before, digest);
+    Ok(digest)
 }
 
 fn finish_initial_comparison(
@@ -4111,10 +4300,10 @@ fn poll_initial_pull_fingerprint(stream: &mut SnapshotServiceStream) -> Result<b
         .initial_fingerprint_result
         .as_ref()
         .ok_or("snapshot service fingerprint worker is missing")?
-        .try_recv();
+        .recv_timeout(STREAM_WORKER_POLL_BUDGET);
     match result {
-        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err("snapshot service fingerprint worker disconnected".into())
         }
         Ok(Err(error)) => Err(error),
@@ -4147,10 +4336,10 @@ fn poll_revalidated_pull_fingerprint(
         .revalidate_result
         .as_ref()
         .expect("revalidation worker was initialized")
-        .try_recv();
+        .recv_timeout(STREAM_WORKER_POLL_BUDGET);
     match result {
-        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err("snapshot revalidation worker disconnected".into())
         }
         Ok(Err(error)) => Err(error),
@@ -4250,30 +4439,50 @@ fn produce_structure_response(
     stream: &mut SnapshotServiceStream,
 ) -> Result<Value, String> {
     let chunk_index = stream.next_chunk;
-    let mut chunk = Vec::new();
-    while stream.record_offset + chunk.len() < stream.records.len()
-        && chunk.len() < STREAM_STRUCTURE_CHUNK_NODES
+    // Incremental size accounting: measure the envelope once, then charge
+    // each record its own encoded length plus one separator byte. This is a
+    // conservative overestimate of the real encoding (the envelope is
+    // measured with the longer `finalChunk: false` variant and the first
+    // array element has no separator), so nothing the old re-encode-per-
+    // element loop would have rejected is accepted; the exact final check
+    // below is unchanged.
+    let envelope = encoded_stream_response_len(&structure_stream_response(
+        stream_id,
+        &stream.service,
+        chunk_index,
+        false,
+        &[],
+    ))?;
+    let mut encoded = envelope;
+    let mut count = 0usize;
+    while stream.record_offset + count < stream.records.len()
+        && count < STREAM_STRUCTURE_CHUNK_NODES
     {
-        let next = stream.records[stream.record_offset + chunk.len()].clone();
-        chunk.push(next);
-        let final_chunk = stream.record_offset + chunk.len() == stream.records.len();
-        let candidate =
-            structure_stream_response(stream_id, &stream.service, chunk_index, final_chunk, &chunk);
-        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
-            chunk.pop();
+        let record = &stream.records[stream.record_offset + count];
+        let record_bytes = serde_json::to_vec(record)
+            .map_err(|error| format!("encode structure record: {error}"))?
+            .len();
+        let candidate = encoded
+            .checked_add(record_bytes)
+            .and_then(|total| total.checked_add(1))
+            .ok_or("encoded structure response size overflowed")?;
+        if candidate > STREAM_RESPONSE_PACK_TARGET {
             break;
         }
+        encoded = candidate;
+        count += 1;
     }
-    if chunk.is_empty() {
+    if count == 0 {
         return Err(format!(
             "one structure record for {} exceeds the encoded response limit",
             stream.service
         ));
     }
-    stream.record_offset += chunk.len();
-    let final_chunk = stream.record_offset == stream.records.len();
+    let chunk = &stream.records[stream.record_offset..stream.record_offset + count];
+    let final_chunk = stream.record_offset + count == stream.records.len();
     let response =
-        structure_stream_response(stream_id, &stream.service, chunk_index, final_chunk, &chunk);
+        structure_stream_response(stream_id, &stream.service, chunk_index, final_chunk, chunk);
+    stream.record_offset += count;
     if encoded_stream_response_len(&response)? > STREAM_SOURCE_CHUNK_BYTES {
         return Err("encoded structure response exceeds 512 KiB".into());
     }
@@ -4330,8 +4539,22 @@ fn produce_source_response(
         return Ok((response, false));
     }
 
+    // Incremental size accounting mirroring produce_structure_response: the
+    // envelope is measured once and each part charges its encoded length plus
+    // one separator byte, a conservative overestimate of the real encoding.
+    let envelope = encoded_stream_response_len(&source_stream_response(
+        stream_id,
+        &stream.service,
+        chunk_index,
+        false,
+        &[],
+        false,
+    ))?;
+    let mut encoded = envelope;
     let mut parts = Vec::new();
-    while parts.len() < STREAM_HASH_CHUNK_NODES && stream.source_index < stream.source_ids.len() {
+    while parts.len() < STREAM_SOURCE_PART_CHUNK_NODES
+        && stream.source_index < stream.source_ids.len()
+    {
         load_pull_source(stream)?;
         let part = pull_source_part(
             stream
@@ -4339,17 +4562,14 @@ fn produce_source_response(
                 .as_ref()
                 .expect("source loader initialized the active Source"),
         );
-        let mut candidate_parts = parts.clone();
-        candidate_parts.push(part.clone());
-        let candidate = source_stream_response(
-            stream_id,
-            &stream.service,
-            chunk_index,
-            false,
-            &candidate_parts,
-            false,
-        );
-        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
+        let part_bytes = serde_json::to_vec(&part)
+            .map_err(|error| format!("encode Source part: {error}"))?
+            .len();
+        let candidate = encoded
+            .checked_add(part_bytes)
+            .and_then(|total| total.checked_add(1))
+            .ok_or("encoded Source response size overflowed")?;
+        if candidate > STREAM_RESPONSE_PACK_TARGET {
             if parts.is_empty() {
                 return Err(format!(
                     "one Source part for stream ID {} exceeds the encoded response limit",
@@ -4358,6 +4578,7 @@ fn produce_source_response(
             }
             break;
         }
+        encoded = candidate;
         commit_pull_source_part(stream, &part)?;
         parts.push(part);
     }
@@ -4403,31 +4624,44 @@ fn produce_delete_response(
     final_service: bool,
 ) -> Result<(Value, bool), String> {
     let chunk_index = stream.next_chunk;
-    let mut chunk = Vec::new();
-    while stream.delete_offset + chunk.len() < stream.deletes.len()
-        && chunk.len() < STREAM_STRUCTURE_CHUNK_NODES
+    // Incremental size accounting mirroring produce_structure_response: the
+    // envelope is measured once and each delete record charges its encoded
+    // length plus one separator byte (a conservative overestimate).
+    let envelope = encoded_stream_response_len(&delete_stream_response(
+        stream_id,
+        &stream.service,
+        chunk_index,
+        false,
+        &[],
+        false,
+    ))?;
+    let mut encoded = envelope;
+    let mut count = 0usize;
+    while stream.delete_offset + count < stream.deletes.len()
+        && count < STREAM_STRUCTURE_CHUNK_NODES
     {
-        chunk.push(stream.deletes[stream.delete_offset + chunk.len()].clone());
-        let candidate = delete_stream_response(
-            stream_id,
-            &stream.service,
-            chunk_index,
-            false,
-            &chunk,
-            false,
-        );
-        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
-            chunk.pop();
+        let path = &stream.deletes[stream.delete_offset + count];
+        let record_bytes = serde_json::to_vec(&json!({ "path": path, "pathMode": "generated" }))
+            .map_err(|error| format!("encode delete record: {error}"))?
+            .len();
+        let candidate = encoded
+            .checked_add(record_bytes)
+            .and_then(|total| total.checked_add(1))
+            .ok_or("encoded delete response size overflowed")?;
+        if candidate > STREAM_RESPONSE_PACK_TARGET {
             break;
         }
+        encoded = candidate;
+        count += 1;
     }
-    if chunk.is_empty() && stream.delete_offset < stream.deletes.len() {
+    if count == 0 && stream.delete_offset < stream.deletes.len() {
         return Err(format!(
             "one delete record for {} exceeds the encoded response limit",
             stream.service
         ));
     }
-    stream.delete_offset += chunk.len();
+    let chunk = stream.deletes[stream.delete_offset..stream.delete_offset + count].to_vec();
+    stream.delete_offset += count;
     let deletes_complete = stream.delete_offset == stream.deletes.len();
     let revalidated = if deletes_complete {
         poll_revalidated_pull_fingerprint(root, stream)?
@@ -4484,6 +4718,15 @@ async fn snapshot_stream(
     State(state): State<AppState>,
     Json(body): Json<SnapshotStreamBody>,
 ) -> Json<Value> {
+    // Snapshot streaming continuations do synchronous disk reads, packing,
+    // and bounded worker waits; keep them off the async worker threads.
+    match run_handler_blocking(move || snapshot_stream_blocking(&state, body)).await {
+        Ok(response) => response,
+        Err(error) => Json(json!({ "ok": false, "error": error })),
+    }
+}
+
+fn snapshot_stream_blocking(state: &AppState, body: SnapshotStreamBody) -> Json<Value> {
     if body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
         return Json(json!({
             "ok": false,
@@ -5022,7 +5265,18 @@ const MAX_BOOTSTRAP_INSTANCE_DEPTH: usize = 48;
 const MAX_BOOTSTRAP_NODES: usize = 1_000_000;
 const STREAM_REQUEST_BODY_BYTES: usize = 512 * 1024;
 const STREAM_STRUCTURE_CHUNK_NODES: usize = 512;
-const STREAM_HASH_CHUNK_NODES: usize = 64;
+// Source parts were historically capped at 64 per request alongside compare
+// hashes. Requests are already byte-capped at 512 KiB (and packed to
+// STREAM_RESPONSE_PACK_TARGET on the pull side), so the node cap only
+// throttled batches of many small scripts; 512 matches the structure cap.
+// Advertised via /hello (`sourceChunkNodes`); older plugins keep sending 64,
+// which stays within the accept limit.
+const STREAM_SOURCE_PART_CHUNK_NODES: usize = 512;
+// Bounded server-side wait for background disk workers. One plugin request
+// absorbs several polling ticks (each otherwise an HTTP round trip plus a
+// ~50ms client-side delay). Handlers that wait like this run on the blocking
+// pool, never on an async worker thread.
+const STREAM_WORKER_POLL_BUDGET: Duration = Duration::from_millis(200);
 // Compare hashes are {id, sha256} — about 90 bytes each — so sharing the
 // 64-node cap with source parts (which carry real script text) filled roughly
 // 1% of each 512 KiB request. A 2.9k-script place spent ~46 round trips on
@@ -5537,6 +5791,10 @@ fn hash_tree_contents(
     generation: &crate::fs_safety::TreeGeneration,
 ) -> Result<crate::conflict::Hash, String> {
     let mut hasher = Sha256::new();
+    // One batch-scoped validation cache for the whole tree walk; every reuse
+    // is still fenced by the per-directory generation check inside the cache.
+    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
+        .map_err(|error| format!("validate fingerprint root: {error}"))?;
     for entry in generation.entries() {
         if entry.kind != crate::fs_safety::SafeEntryKind::File {
             continue;
@@ -5556,7 +5814,7 @@ fn hash_tree_contents(
                 entry.path.display()
             ));
         }
-        let bytes = read_synced_file(project_root, &entry.path)?;
+        let bytes = read_synced_file_cached(&entry.path, &mut validation)?;
         hasher.update(&bytes);
         if crate::fs_safety::file_generation_no_follow(&entry.path)? != entry.generation {
             return Err(format!(
@@ -5630,6 +5888,8 @@ fn copy_fenced_service_to_stage(
 
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut source_validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
+        .map_err(|error| format!("validate staging source root: {error}"))?;
     for entry in generation.entries() {
         if entry.kind != crate::fs_safety::SafeEntryKind::File {
             continue;
@@ -5652,10 +5912,12 @@ fn copy_fenced_service_to_stage(
             .parent()
             .ok_or_else(|| format!("staged source has no parent: {}", target.display()))?;
         ensure_descendant_directory_chain(stage_root, parent)?;
-        let source_guard =
-            crate::fs_safety::guard_synced_parent_chain(project_root, &entry.path, false).map_err(
-                |error| format!("guard staged source {}: {error}", entry.path.display()),
-            )?;
+        let source_guard = crate::fs_safety::guard_synced_parent_chain_cached(
+            &mut source_validation,
+            &entry.path,
+            false,
+        )
+        .map_err(|error| format!("guard staged source {}: {error}", entry.path.display()))?;
         let target_guard =
             crate::fs_safety::guard_descendant_parent_chain(stage_root, &target, true)
                 .map_err(|error| format!("guard staged target {}: {error}", target.display()))?;
@@ -5687,9 +5949,10 @@ fn copy_fenced_service_to_stage(
                 .write_all(&buffer[..count])
                 .map_err(|error| format!("write {}: {error}", target.display()))?;
         }
-        destination
-            .sync_all()
-            .map_err(|error| format!("sync {}: {error}", target.display()))?;
+        // No per-file fsync here: the stage is a scratch tree whose crash
+        // semantics come from the atomic rename at commit; the whole stage is
+        // flushed once below.
+        drop(destination);
         let permissions = crate::fs_safety::require_metadata_no_follow(&entry.path)
             .map_err(|error| format!("inspect {}: {error}", entry.path.display()))?
             .permissions();
@@ -5711,7 +5974,24 @@ fn copy_fenced_service_to_stage(
             format!("staged target parent changed {}: {error}", target.display())
         })?;
     }
+    // One flush for the whole staged service replaces the removed per-file
+    // fsyncs. Best effort: rename atomicity, the staging transaction, and the
+    // metadata fences provide the crash/consistency guarantees.
+    sync_directory_best_effort(&stage_service);
     Ok(hasher.finalize().into())
+}
+
+/// Best-effort directory flush used after batch writes replaced their
+/// per-file `sync_all` calls. Opening a directory for read is Unix-only;
+/// elsewhere (and on failure) this is a no-op because correctness comes from
+/// atomic renames and generation fences, not from durability of scratch trees.
+fn sync_directory_best_effort(directory: &Path) {
+    #[cfg(unix)]
+    if let Ok(handle) = std::fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
 }
 
 fn create_stream_backup_destination(
@@ -6782,6 +7062,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         force_prune,
         project_root: stage.path(),
         backup_forced_removals: false,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut source_provider = |node: &Value| {
         let id = node
@@ -6807,8 +7088,12 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
     };
 
     let staged_fingerprint = capture_exact_tree_fingerprint(stage.path(), &service)?;
-    let final_fingerprint = capture_exact_tree_fingerprint(root, &service)?;
-    if final_fingerprint != initial_fingerprint {
+    // The staged copy above already re-read the live tree and proved its
+    // content hash still equals `initial_fingerprint.content_hash`. Re-fence
+    // with metadata only (length + mtime ns + physical identity per entry) —
+    // the same generation trust model every other fence in this file uses —
+    // instead of a second full content re-read of the live service.
+    if crate::fs_safety::capture_tree_metadata(root, &service)? != initial_fingerprint.metadata {
         state.conflict.forget_path(&stage_service);
         return Err(format!(
             "disk service {service} changed before atomic commit; no files were replaced"
@@ -7070,6 +7355,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         force_prune,
         project_root: root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     live_ctx.mark_quiet(&live_service);
     Ok(StreamCommitResult {
@@ -7195,9 +7481,9 @@ fn append_source_parts_atomically(
             "encoded Source chunks are limited to {STREAM_SOURCE_CHUNK_BYTES} bytes"
         ));
     }
-    if parts.len() > STREAM_HASH_CHUNK_NODES {
+    if parts.len() > STREAM_SOURCE_PART_CHUNK_NODES {
         return Err(format!(
-            "Source chunks are limited to {STREAM_HASH_CHUNK_NODES} parts"
+            "Source chunks are limited to {STREAM_SOURCE_PART_CHUNK_NODES} parts"
         ));
     }
 
@@ -7454,12 +7740,19 @@ fn process_streamed_push_chunk(
             session.service_stream.records.shrink_to_fit();
             session.service_stream.service_node = Some(validated.service);
             session.service_stream.script_ids = validated.script_ids;
-            session.service_stream.source_dir = Some(
-                tempfile::Builder::new()
-                    .prefix("rosync-push-sources-")
-                    .tempdir()
-                    .map_err(|error| format!("create Source staging directory: {error}"))?,
-            );
+            // Stage sources next to the project rather than in the system
+            // temp directory, which may live on another volume (slower and
+            // unnecessary cross-volume IO for large pushes).
+            let source_stage = match state.canonical_project.as_path().parent() {
+                Some(parent) => tempfile::Builder::new()
+                    .prefix(".rosync-push-sources-")
+                    .tempdir_in(parent),
+                None => tempfile::Builder::new()
+                    .prefix(".rosync-push-sources-")
+                    .tempdir(),
+            }
+            .map_err(|error| format!("create Source staging directory: {error}"))?;
+            session.service_stream.source_dir = Some(source_stage);
             session.service_stream.fence_result = Some(spawn_exact_fingerprint(
                 state.canonical_project.as_ref().clone(),
                 service.to_string(),
@@ -7481,9 +7774,9 @@ fn process_streamed_push_chunk(
                 .fence_result
                 .as_ref()
                 .ok_or("diskFence worker is missing")?
-                .try_recv();
+                .recv_timeout(STREAM_WORKER_POLL_BUDGET);
             match result {
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     session.service_stream.next_chunk += 1;
                     Ok(push_stream_response(
                         session,
@@ -7492,7 +7785,7 @@ fn process_streamed_push_chunk(
                         session.service_stream.next_chunk,
                     ))
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     Err("diskFence worker disconnected".into())
                 }
                 Ok(Err(error)) => Err(error),
@@ -7568,9 +7861,9 @@ fn process_streamed_push_chunk(
                 .commit_result
                 .as_ref()
                 .ok_or("diskRevalidate worker is missing")?
-                .try_recv();
+                .recv_timeout(STREAM_WORKER_POLL_BUDGET);
             match result {
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     session.service_stream.next_chunk += 1;
                     Ok(push_stream_response(
                         session,
@@ -7579,7 +7872,7 @@ fn process_streamed_push_chunk(
                         session.service_stream.next_chunk,
                     ))
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     Err("diskRevalidate worker disconnected".into())
                 }
                 Ok(Err(error)) => Err(error),
@@ -8016,8 +8309,23 @@ fn validate_bootstrap_services_with_limits(
 }
 
 async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json<Value> {
+    // Push application is synchronous filesystem work (validation fences,
+    // staged writes, atomic commits); run it on the blocking pool.
+    match run_handler_blocking(move || push_blocking(&state, body)).await {
+        Ok(response) => response,
+        Err(error) => Json(json!({
+            "ok": false,
+            "applied": 0,
+            "skipped": 0,
+            "conflicts": [],
+            "errors": [error],
+        })),
+    }
+}
+
+fn push_blocking(state: &AppState, body: PushBody) -> Json<Value> {
     if body.stream_id.is_some() || body.phase.is_some() {
-        return streamed_push(&state, body);
+        return streamed_push(state, body);
     }
     if body.bootstrap && body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
         return Json(json!({
@@ -8053,6 +8361,7 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut res = PushApplyResult::default();
 
@@ -8065,6 +8374,7 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
             force_prune: body.force_prune,
             project_root: root,
             backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
         };
         for svc in &body.services {
             match apply_service_node(root, svc, &bootstrap_ctx) {
@@ -8126,6 +8436,7 @@ pub(crate) fn apply_push_ops(state: &AppState, ops: &[Value]) -> PushApplyResult
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut out = PushApplyResult::default();
     apply_ops_into(root, ops, &ctx, &mut out);
@@ -8143,9 +8454,29 @@ pub(crate) struct PushCtx<'a> {
     pub force_prune: bool,
     pub project_root: &'a Path,
     pub backup_forced_removals: bool,
+    /// Parents of files renamed into place this batch. Flushed once each when
+    /// the ctx drops, so a 200-op delta replay costs a handful of directory
+    /// fsyncs instead of one per file.
+    pub dirty_parents: Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+impl<'a> Drop for PushCtx<'a> {
+    fn drop(&mut self) {
+        let parents = std::mem::take(&mut *self.dirty_parents.lock().unwrap());
+        for parent in parents {
+            sync_directory_best_effort(&parent);
+        }
+    }
 }
 
 impl<'a> PushCtx<'a> {
+    fn note_dirty_parent(&self, parent: &Path) {
+        self.dirty_parents
+            .lock()
+            .unwrap()
+            .insert(parent.to_path_buf());
+    }
+
     fn mark_quiet(&self, path: &Path) {
         // Every production path is constructed below the already-canonical
         // project root. Keep the watcher key lexical: canonicalizing a path
@@ -8934,6 +9265,7 @@ async fn resolve(
         force_prune: false,
         project_root: state.canonical_project.as_path(),
         backup_forced_removals: false,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
 
     match decision {
@@ -10667,9 +10999,9 @@ fn copy_backup_path(
                         format!("write backup file {}: {error}", target.display())
                     })?;
                 }
-                target_file
-                    .sync_all()
-                    .map_err(|error| format!("sync backup file {}: {error}", target.display()))?;
+                // Per-file fsync removed: the transaction directory is flushed
+                // once by the caller after the whole backup copy completes.
+                drop(target_file);
                 if crate::fs_safety::file_generation_no_follow(&entry.path)? != *expected {
                     return Err(format!(
                         "backup source changed during copy: {}",
@@ -10752,6 +11084,7 @@ fn backup_forced_removal(path: &Path, project_root: &Path) -> Result<BackupRecei
 
     let destination = transaction.join(relative);
     copy_backup_path(project_root, &source_fence, &transaction, &destination)?;
+    sync_directory_best_effort(&transaction);
     let current = capture_synced_subtree(project_root, path)?
         .ok_or_else(|| format!("backup source disappeared during copy: {}", path.display()))?;
     if current != source_fence {
@@ -10868,9 +11201,21 @@ enum SourceWriteOutcome {
 }
 
 fn read_synced_file(project_root: &Path, path: &Path) -> Result<Vec<u8>, String> {
-    let validated = crate::fs_safety::validate_synced_path(project_root, path, false)
+    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
         .map_err(|error| format!("validate source {}: {error}", path.display()))?;
-    let guard = crate::fs_safety::guard_synced_parent_chain(project_root, &validated, false)
+    read_synced_file_cached(path, &mut validation)
+}
+
+/// Batch variant of [`read_synced_file`] reusing one validation cache across a
+/// burst of reads so stable ancestors are scanned once per batch.
+fn read_synced_file_cached(
+    path: &Path,
+    validation: &mut crate::fs_safety::SyncedPathValidationCache,
+) -> Result<Vec<u8>, String> {
+    let validated = validation
+        .validate(path, false)
+        .map_err(|error| format!("validate source {}: {error}", path.display()))?;
+    let guard = crate::fs_safety::guard_synced_parent_chain_cached(validation, &validated, false)
         .map_err(|error| format!("guard source {}: {error}", path.display()))?;
     guard
         .verify()
@@ -10959,11 +11304,11 @@ where
                         )
                     })?;
                 }
-                file.write_all(bytes)
-                    .and_then(|_| file.sync_all())
-                    .map_err(|error| {
-                        format!("write staged source {}: {error}", candidate.display())
-                    })?;
+                // No per-file fsync: the atomic rename below defines the
+                // commit point and the parent directory is flushed after it.
+                file.write_all(bytes).map_err(|error| {
+                    format!("write staged source {}: {error}", candidate.display())
+                })?;
                 drop(file);
                 temporary = Some(candidate);
                 break;
@@ -10991,6 +11336,7 @@ where
         ));
     }
     ctx.mark_quiet(&validated);
+    invalidate_cached_content_hash(&validated);
     if let Err(error) = crate::lifecycle::replace_file_atomic(&temporary, &validated) {
         if guard.verify().is_ok() {
             let _ = std::fs::remove_file(&temporary);
@@ -11014,6 +11360,9 @@ where
             validated.display()
         ));
     }
+    // The rename is made durable by a parent-directory flush when the batch's
+    // ctx drops; batch service commits also have their own per-service flush.
+    ctx.note_dirty_parent(&parent);
     ctx.mark_quiet(&validated);
     Ok(())
 }
@@ -12420,6 +12769,7 @@ mod tests {
             force_prune: false,
             project_root,
             backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -12436,6 +12786,7 @@ mod tests {
             force_prune: false,
             project_root,
             backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -12452,6 +12803,7 @@ mod tests {
             force_prune: true,
             project_root,
             backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -15998,6 +16350,7 @@ mod tests {
             force_prune: false,
             project_root: project.path(),
             backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
         };
         let followup = json!({
             "name": "Config",
@@ -18380,6 +18733,45 @@ mod tests {
         assert_eq!(
             normalized_file_hash(project.path(), &path).unwrap(),
             hash(normalize_line_endings(&source).as_ref())
+        );
+    }
+
+    #[test]
+    fn content_hash_cache_hits_on_matching_generation_and_recomputes_after_writes() {
+        let project = TempDir::new("content-hash-cache");
+        let service = project.path().join("ReplicatedStorage");
+        std::fs::create_dir_all(&service).unwrap();
+        let path = service.join("Cached.luau");
+        std::fs::write(&path, b"print('one')\r\n").unwrap();
+
+        let first = normalized_file_hash(project.path(), &path).unwrap();
+        assert_eq!(first, hash(normalize_line_endings(b"print('one')\r\n").as_ref()));
+
+        // Prove the second lookup is served by the cache: poison the stored
+        // digest and observe it round-trip while the generation matches.
+        let validated =
+            crate::fs_safety::validate_synced_path(project.path(), &path, false).unwrap();
+        let sentinel: crate::conflict::Hash = [7u8; 32];
+        {
+            let mut cache = content_hash_cache().lock().unwrap();
+            cache.get_mut(&validated).unwrap().1 = sentinel;
+        }
+        assert_eq!(normalized_file_hash(project.path(), &path).unwrap(), sentinel);
+
+        // Explicit invalidation forces a real rehash.
+        invalidate_cached_content_hash(&validated);
+        assert_eq!(normalized_file_hash(project.path(), &path).unwrap(), first);
+
+        // A rewrite changes the file generation, so the (again poisoned)
+        // stale entry can never satisfy a lookup.
+        {
+            let mut cache = content_hash_cache().lock().unwrap();
+            cache.get_mut(&validated).unwrap().1 = sentinel;
+        }
+        std::fs::write(&path, b"print('two')\n").unwrap();
+        assert_eq!(
+            normalized_file_hash(project.path(), &path).unwrap(),
+            hash(b"print('two')\n")
         );
     }
 
