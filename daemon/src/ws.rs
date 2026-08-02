@@ -223,6 +223,12 @@ pub enum ClientMsg {
         /// the plugin skips the full initial compare.
         #[serde(rename = "resumeFrom", default)]
         resume_from: Option<u64>,
+        /// The connecting window's PlaceId. Server-side backstop for the
+        /// one-project-per-place rule: every client-side path (discovery,
+        /// reconnect, init) has independently gotten this wrong at least
+        /// once, so the daemon refuses wrong-place plugins itself.
+        #[serde(rename = "placeId", default)]
+        place_id: Option<String>,
     },
     Push {
         #[serde(default)]
@@ -425,6 +431,7 @@ async fn recv_loop(
                     protocol,
                     plugin_capability: presented_capability,
                     resume_from,
+                    place_id,
                 }) => {
                     if peer_kind != PeerKind::Unidentified {
                         let _ = send_server_msg(
@@ -483,6 +490,31 @@ async fn recv_loop(
                         continue;
                     }
                     if plugin_peer {
+                        let claimed_place = place_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty() && *value != "0");
+                        if let Some(claimed_place) = claimed_place {
+                            let allowed = state.place_ids.read().unwrap().clone();
+                            if !allowed.is_empty()
+                                && !allowed.iter().any(|id| id == claimed_place)
+                            {
+                                let _ = send_server_msg(
+                                    &out_tx,
+                                    &ServerMsg::Shutdown {
+                                        reason: format!(
+                                            "this project serves PlaceId {}, not PlaceId {claimed_place}; create a separate Ro Sync project for this place",
+                                            allowed.join(", "),
+                                        ),
+                                        code: "wrong-place",
+                                        retryable: false,
+                                    },
+                                );
+                                let _ = out_tx.send(Message::Close(None));
+                                rejecting = true;
+                                continue;
+                            }
+                        }
                         if !constant_time_capability_matches(presented_capability.as_deref()) {
                             let _ = send_server_msg(
                                 &out_tx,
