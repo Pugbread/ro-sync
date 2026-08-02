@@ -264,6 +264,29 @@ If you change code while a playtest is running, make the durable edit in this
 directory or in the non-playtest Studio edit view. Do not assume a script change
 made during Play/Solo/Run has synced just because it worked in the playtest.
 
+## 1c. Do not fight the daemon
+
+The daemon and the Studio plugin form one live session. When the connection
+misbehaves, diagnose with `rosync status --project .` and `rosync doctor` and
+let the plugin's auto-reconnect work. Agents must never:
+
+- Run `rosync daemon restart` (or stop/start) to "fix" a connection. Every
+  restart drops Studio's live connection, changes the daemon's boot identity,
+  and can move it to a different port. Repeated restarts present as "Ro Sync
+  keeps disconnecting" in Studio and can cross-wire reconnects between
+  projects.
+- Move, rename, or delete the synced service directories (`ReplicatedStorage/`,
+  `ServerStorage/`, ...) while a daemon is running. The watcher sees a mass
+  deletion and intentionally halts sync to protect the Studio side. To
+  restructure wholesale, stop sync first, or stage the work in a directory
+  outside the project and apply it through normal edits.
+- Restart the daemon to force or escape an overwrite decision. Answer the
+  pending decision instead (`rosync decision`).
+
+A daemon started or restarted via the CLI also stops being managed by the
+Ro Sync Desktop app; the app will report ownership errors for that project
+until it can restart the daemon itself.
+
 ## 2. Filesystem conventions
 
 | On disk                              | Roblox instance                                |
