@@ -238,6 +238,12 @@ fn write_text_replace(root: &Path, path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// Apply CLI overrides to `cfg`. Returns true if any field changed.
+/// Apply caller-supplied identity to the config. `ro-sync.json` is the
+/// source of truth: overrides only FILL EMPTY fields (adopting an
+/// unidentified project), never replace a recorded identity. The desktop
+/// app passes its own cached gameId/placeIds on every daemon start, and
+/// letting that cache win rebound projects to the wrong place whenever it
+/// went stale — the on-disk identity would flip under a running window.
 pub fn apply_overrides(
     cfg: &mut ProjectConfig,
     game_id: Option<String>,
@@ -246,21 +252,34 @@ pub fn apply_overrides(
 ) -> bool {
     let mut changed = false;
     if let Some(gid) = game_id {
-        if cfg.game_id.as_deref() != Some(gid.as_str()) {
-            cfg.game_id = Some(gid);
-            changed = true;
+        match cfg.game_id.as_deref() {
+            None => {
+                cfg.game_id = Some(gid);
+                changed = true;
+            }
+            Some(existing) if existing != gid.as_str() => {
+                eprintln!(
+                    "ignoring gameId override {gid}: ro-sync.json already records {existing}"
+                );
+            }
+            Some(_) => {}
         }
     }
     if let Some(gid) = group_id {
-        if cfg.group_id.as_deref() != Some(gid.as_str()) {
+        if cfg.group_id.is_none() {
             cfg.group_id = Some(gid);
             changed = true;
         }
     }
     if let Some(pids) = place_ids {
-        if cfg.place_ids != pids {
+        if cfg.place_ids.is_empty() && !pids.is_empty() {
             cfg.place_ids = pids;
             changed = true;
+        } else if cfg.place_ids != pids {
+            eprintln!(
+                "ignoring placeIds override {pids:?}: ro-sync.json already records {:?}",
+                cfg.place_ids
+            );
         }
     }
     changed
