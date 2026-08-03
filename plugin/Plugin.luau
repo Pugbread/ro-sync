@@ -11472,6 +11472,7 @@ do
 	local REMOTE_WRITE_HANDLER_RESPONSE_SECONDS = 25
 	local REMOTE_TRANSACTION_HANDLER_RESPONSE_SECONDS = 5
 	local remoteWriteQueue = {}
+	local remoteWriteActiveItem = nil
 	local staleWritesDropped = 0
 	local remoteWriteWorkerRunning = false
 	local remoteWriteActive = false
@@ -11638,6 +11639,18 @@ do
 		if item.started or item.finished then
 			return
 		end
+		-- Name the handler that owns the lane. "write waited more than 10s" alone
+		-- reads as "sync is broken"; "waiting behind playtest_request, running
+		-- 47s" points straight at the culprit.
+		local blocker = remoteWriteActiveItem
+		if blocker ~= nil and blocker.executionStartedAt ~= nil then
+			message = string.format(
+				"%s (behind '%s', running %.0fs)",
+				message,
+				tostring(blocker.op),
+				os.clock() - blocker.executionStartedAt
+			)
+		end
 		-- Explicit rollback remains queued even after its caller receives a bounded
 		-- wait response. Executing it late is safer than abandoning a recording.
 		if not item.mustExecuteAfterTimeout then
@@ -11677,6 +11690,7 @@ do
 			item.started = true
 			item.executionStartedAt = os.clock()
 			remoteWriteActive = true
+			remoteWriteActiveItem = item
 			local responseBound = remoteWriteResponseBound(item)
 			task.delay(responseBound, function()
 				if item.started and not item.finished and not item.responded then
@@ -11719,6 +11733,7 @@ do
 			end
 			laneReleased:Destroy()
 			remoteWriteActive = false
+			remoteWriteActiveItem = nil
 			if not handlerSettled then
 				item.abandoned = true
 				dbg(string.format(
