@@ -562,7 +562,10 @@ mod platform {
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_RENAME_INFO_CLASS: u32 = 3;
+    /// NT FileInformationClass for FILE_RENAME_INFORMATION. Note this is not
+    /// the Win32 FILE_RENAME_INFO value (3) — the two enumerations differ, and
+    /// the rename below goes through the NT entry point.
+    const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
     const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
     const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
     const STATUS_NO_MORE_FILES: NtStatus = 0x8000_0006_u32 as NtStatus;
@@ -621,6 +624,13 @@ mod platform {
             ea_length: u32,
         ) -> NtStatus;
         fn RtlNtStatusToDosError(status: NtStatus) -> u32;
+        fn NtSetInformationFile(
+            file_handle: Handle,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> NtStatus;
         fn NtQueryDirectoryFile(
             file_handle: Handle,
             event: Handle,
@@ -831,7 +841,16 @@ mod platform {
         open_relative(
             parent,
             fragment,
-            FILE_GENERIC_WRITE | DELETE,
+            // FILE_READ_ATTRIBUTES is required, not incidental: every caller
+            // hands the new handle straight to reject_linked_handle, which
+            // queries it with GetFileInformationByHandle to prove the object
+            // is not a reparse point. Win32's FILE_GENERIC_WRITE does not
+            // include that right (see its definition above), so without this
+            // the query fails ERROR_ACCESS_DENIED and the create appears to
+            // fail even though the file was made — leaving an orphaned
+            // zero-byte temp behind, because the error returns before the
+            // caller's cleanup path.
+            FILE_GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
             FILE_ATTRIBUTE_NORMAL,
             FILE_CREATE,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
@@ -854,18 +873,37 @@ mod platform {
         information.file_name[..destination.len()].copy_from_slice(&destination);
         let header_size = std::mem::offset_of!(FileRenameInfoBuffer, file_name);
         let buffer_size = header_size + destination.len() * std::mem::size_of::<u16>();
-        // SAFETY: the buffer has the documented FILE_RENAME_INFO layout and
-        // contains buffer_size initialized bytes.
-        let result = unsafe {
-            SetFileInformationByHandle(
+        // Renaming through the NT entry point rather than Win32's
+        // SetFileInformationByHandle is what makes RootDirectory mean what
+        // this code needs. A directory HANDLE in RootDirectory is an NT-layer
+        // concept; the Win32 wrapper does not resolve names against it, so it
+        // parsed our bare component as a path and failed ERROR_INVALID_NAME
+        // (123) — every atomic write died at the rename, leaving the
+        // zero-byte temp behind and the real file never created.
+        //
+        // Keeping the rename directory-relative is deliberate: every other
+        // operation here resolves against an owned parent handle so a
+        // concurrently swapped path component cannot redirect the write. The
+        // alternative Win32 fix — passing a fully-qualified destination —
+        // would reintroduce exactly the path re-resolution this module avoids.
+        let mut io_status = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        // SAFETY: the buffer has the documented FILE_RENAME_INFORMATION
+        // layout (identical to FILE_RENAME_INFO) and contains buffer_size
+        // initialized bytes; both handles remain live across the call.
+        let status = unsafe {
+            NtSetInformationFile(
                 temporary.as_raw_handle() as Handle,
-                FILE_RENAME_INFO_CLASS,
+                &mut io_status as *mut IoStatusBlock,
                 (&mut information as *mut FileRenameInfoBuffer).cast(),
                 buffer_size as u32,
+                FILE_RENAME_INFORMATION_CLASS,
             )
         };
-        if result == 0 {
-            Err(io::Error::last_os_error())
+        if status < 0 {
+            Err(nt_error(status))
         } else {
             Ok(())
         }
