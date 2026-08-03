@@ -1002,10 +1002,21 @@ struct ProjectInitBody {
 }
 
 async fn project_init(State(state): State<AppState>, body: Bytes) -> Json<Value> {
-    project_init_inner(&state, &body)
+    // Studio reports the place title for both names it sends, so ask the
+    // universe for the experience title before naming the project. Best-effort
+    // and bounded: a failed lookup just leaves Studio's own names in place.
+    let experience_name = match serde_json::from_slice::<ProjectInitBody>(&body) {
+        Ok(parsed) => crate::project_init::resolve_experience_name(&parsed.game_id).await,
+        Err(_) => None,
+    };
+    project_init_inner(&state, &body, experience_name)
 }
 
-fn project_init_inner(state: &AppState, body: &[u8]) -> Json<Value> {
+fn project_init_inner(
+    state: &AppState,
+    body: &[u8],
+    experience_name: Option<String>,
+) -> Json<Value> {
     let Some(projects_root) = state.projects_root.as_ref().as_ref() else {
         return Json(json!({
             "ok": false,
@@ -1043,7 +1054,7 @@ fn project_init_inner(state: &AppState, body: &[u8]) -> Json<Value> {
     let outcome = match crate::project_init::initialize_project(
         projects_root,
         crate::project_init::ProjectInitRequest {
-            game_name: body.game_name,
+            game_name: experience_name.unwrap_or(body.game_name),
             place_name: body.place_name,
             game_id: body.game_id,
             place_id: body.place_id,
@@ -13504,11 +13515,11 @@ mod tests {
             "groupId": "789",
         });
 
-        let created = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
+        let created = project_init_inner(&state, &serde_json::to_vec(&request).unwrap(), None).0;
         assert_eq!(created["ok"], true);
         assert_eq!(created["status"], "created");
         assert_eq!(created["directoryName"], "race-stars");
-        assert_eq!(created["name"], "Main Place");
+        assert_eq!(created["name"], "Race Stars - Main Place");
         let created_path = PathBuf::from(created["project"].as_str().unwrap());
         assert_eq!(created_path.parent(), Some(canonical_projects.as_path()));
         assert!(created_path
@@ -13518,10 +13529,10 @@ mod tests {
         let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
         assert_eq!(event["type"], "project-init");
         assert_eq!(event["status"], "created");
-        assert_eq!(event["name"], "Main Place");
+        assert_eq!(event["name"], "Race Stars - Main Place");
         assert_eq!(event["metadata"]["gameId"], "123");
 
-        let existing = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
+        let existing = project_init_inner(&state, &serde_json::to_vec(&request).unwrap(), None).0;
         assert_eq!(existing["ok"], true);
         assert_eq!(existing["status"], "existing");
         assert_eq!(existing["project"], created["project"]);

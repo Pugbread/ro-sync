@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 
 use crate::{fs_safety, project_config, snapshot};
 
+/// Public universe lookup. Studio's `DataModel.Name` and its place's product
+/// info both report the *place* title, so the experience title has to come
+/// from here — HttpService cannot reach roblox.com from inside Studio.
+const UNIVERSE_LOOKUP_URL: &str = "https://games.roblox.com/v1/games?universeIds=";
+const UNIVERSE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 const MAX_DIRECTORY_NAME_BYTES: usize = 72;
 const MAX_ID_DIGITS: usize = 20;
@@ -579,17 +585,80 @@ fn is_placeholder_project_name(value: &str) -> bool {
     })
 }
 
+/// A name that carries nothing at all — blank, or one of Studio's stand-ins for
+/// a place that has never been titled. Narrower than
+/// [`is_placeholder_project_name`], which also rejects "Game": that one is a
+/// poor name on its own but a legitimate place name beside an experience title.
+fn is_unnamed_placeholder(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "untitled experience" {
+        return true;
+    }
+    normalized.strip_prefix("place").is_some_and(|suffix| {
+        suffix.is_empty() || suffix.chars().all(|value| value.is_ascii_digit())
+    })
+}
+
+/// Best-effort experience title for a universe id.
+///
+/// Never fails a project creation: an offline machine, a rate limit, or a
+/// response shape change all degrade to the names Studio already sent.
+pub(crate) async fn resolve_experience_name(universe_id: &str) -> Option<String> {
+    if universe_id.is_empty() || !universe_id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(UNIVERSE_LOOKUP_TIMEOUT)
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{UNIVERSE_LOOKUP_URL}{universe_id}"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload: serde_json::Value = response.json().await.ok()?;
+    let name = payload
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("name")?
+        .as_str()?
+        .trim();
+    if name.is_empty() || name.len() > MAX_DISPLAY_NAME_BYTES || name.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// `Experience - Place` when both names are known and distinct.
+///
+/// A place name alone is ambiguous across experiences ("Lobby", "Game"), and
+/// an experience name alone collides for every sibling place of one universe.
+/// Naming both keeps a projects folder readable. When Studio only knows one
+/// usable name — or when both resolve to the same title, which is the norm for
+/// a single-place experience — the name stays unduplicated.
 fn preferred_project_name(game_name: &str, place_name: &str) -> String {
-    // Place-first: projects are per-place, and the place name is the
-    // identity users recognize. Game-first stamped the experience title on
-    // every sibling place's project.
-    for candidate in [place_name, game_name] {
-        let candidate = candidate.trim();
+    let game = game_name.trim();
+    let place = place_name.trim();
+    // The experience side must be a real title. The place side only has to be
+    // named at all: "Game" is a useless project name by itself but a useful
+    // half of "Raft - Game", whereas "Place1" is a Studio artifact either way.
+    if !is_placeholder_project_name(game)
+        && !is_unnamed_placeholder(place)
+        && !game.eq_ignore_ascii_case(place)
+    {
+        return format!("{game} - {place}");
+    }
+    for candidate in [place, game] {
         if !is_placeholder_project_name(candidate) {
             return candidate.to_string();
         }
     }
-    game_name.trim().to_string()
+    game.to_string()
 }
 
 fn validate_display_name(value: &str, field: &str) -> Result<String, ProjectInitError> {
@@ -717,6 +786,25 @@ mod tests {
     }
 
     #[test]
+    fn project_names_carry_the_experience_and_the_place() {
+        // Both known and distinct: a projects folder full of "Lobby" tells you
+        // nothing, and every sibling place named "Raft" collides.
+        assert_eq!(preferred_project_name("Raft", "Game"), "Raft - Game");
+        // A single-place experience reports the same title twice; do not
+        // produce "Raft - Raft".
+        assert_eq!(preferred_project_name("Raft", "Raft"), "Raft");
+        // Same title, different casing: still one name, and the place's own
+        // spelling wins as it did before combining.
+        assert_eq!(preferred_project_name("Raft", "raft"), "raft");
+        // Studio placeholders never become half of a name.
+        assert_eq!(preferred_project_name("Raft", "Place1"), "Raft");
+        assert_eq!(preferred_project_name("Place1", "Lobby"), "Lobby");
+        assert_eq!(preferred_project_name("", "Lobby"), "Lobby");
+        // Neither name is usable: keep the previous fallback.
+        assert_eq!(preferred_project_name("Place1", "Place2"), "Place1");
+    }
+
+    #[test]
     fn creates_one_direct_child_with_complete_metadata_and_docs() {
         let root = tempfile::tempdir().unwrap();
         let outcome = initialize_project(root.path(), request("Race Stars", "123")).unwrap();
@@ -726,11 +814,11 @@ mod tests {
             Some(fs::canonicalize(root.path()).unwrap().as_path())
         );
         assert_eq!(outcome.directory_name, "race-stars");
-        assert_eq!(outcome.name, "Main Place");
+        assert_eq!(outcome.name, "Race Stars - Main Place");
         let config = project_config::read_from_disk(&outcome.project)
             .unwrap()
             .unwrap();
-        assert_eq!(config.name, "Main Place");
+        assert_eq!(config.name, "Race Stars - Main Place");
         assert_eq!(config.game_name.as_deref(), Some("Race Stars"));
         assert_eq!(config.game_id.as_deref(), Some("123"));
         assert_eq!(config.group_id.as_deref(), Some("789"));

@@ -578,18 +578,41 @@ fn sanitize_request_id(raw: &str, game_id: &str, place_id: &str) -> String {
     }
 }
 
+/// `Experience - Place`, mirroring the daemon's `preferred_project_name`.
+///
+/// A place name alone is ambiguous across experiences and an experience name
+/// alone collides across sibling places, so a project folder carries both
+/// whenever Studio knows two distinct usable names.
 fn preferred_name(game_name: &str, place_name: &str, game_id: &str) -> String {
-    // Place-first: projects are per-place, so the place's own name (from
-    // MarketplaceService product info) is the identity users recognize.
-    // Naming by game put the experience title on every sibling place's
-    // project and made same-game forks collide into suffixed folders.
-    for candidate in [place_name, game_name] {
-        let candidate = sanitize_folder_name(candidate);
-        if !candidate.is_empty() && !candidate.eq_ignore_ascii_case("game") {
-            return candidate;
+    let game = sanitize_folder_name(game_name);
+    let place = sanitize_folder_name(place_name);
+    // Same asymmetry as the daemon: the experience side must be a real title,
+    // the place side merely has to be named ("Raft - Game" is useful, and
+    // "Raft - Place1" is not).
+    if !is_placeholder_project_name(&game)
+        && !is_unnamed_placeholder(&place)
+        && !game.eq_ignore_ascii_case(&place)
+    {
+        return sanitize_folder_name(&format!("{game} - {place}"));
+    }
+    for candidate in [&place, &game] {
+        if !is_placeholder_project_name(candidate) {
+            return candidate.clone();
         }
     }
     format!("Roblox {game_id}")
+}
+
+/// Blank, or a Studio stand-in for a place that was never titled. Narrower than
+/// [`is_placeholder_project_name`], which also rejects "Game".
+fn is_unnamed_placeholder(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "untitled experience" {
+        return true;
+    }
+    normalized.strip_prefix("place").is_some_and(|suffix| {
+        suffix.is_empty() || suffix.chars().all(|value| value.is_ascii_digit())
+    })
 }
 
 fn is_placeholder_project_name(value: &str) -> bool {
@@ -1006,10 +1029,19 @@ mod tests {
     }
 
     #[test]
+    fn folder_names_carry_the_experience_and_the_place() {
+        assert_eq!(preferred_name("Raft", "Game", "123"), "Raft - Game");
+        assert_eq!(preferred_name("Raft", "Raft", "123"), "Raft");
+        assert_eq!(preferred_name("Raft", "Place1", "123"), "Raft");
+        assert_eq!(preferred_name("Place1", "Lobby", "123"), "Lobby");
+        assert_eq!(preferred_name("", "", "123"), "Roblox 123");
+    }
+
+    #[test]
     fn project_creation_is_idempotent_by_game_id() {
         let directory = tempfile::tempdir().unwrap();
         let projects = test_directory_capability(directory.path());
-        let (first, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        let (first, reused) = find_or_create_project(&projects, "Race Stars", "123", "456").unwrap();
         assert!(!reused);
         write_project_config(
             &first,
@@ -1024,7 +1056,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (second, reused) = find_or_create_project(&projects, "Renamed", "123").unwrap();
+        let (second, reused) = find_or_create_project(&projects, "Renamed", "123", "456").unwrap();
         assert!(reused);
         assert_eq!(first.path(), second.path());
     }
@@ -1094,7 +1126,7 @@ mod tests {
 
         fs::rename(&projects_path, &moved_projects).unwrap();
         symlink(&outside, &projects_path).unwrap();
-        let (project, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        let (project, reused) = find_or_create_project(&projects, "Race Stars", "123", "456").unwrap();
         assert!(!reused);
 
         let original_project_path = moved_projects.join("Race Stars");
@@ -1130,7 +1162,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("Race Stars")).unwrap();
         let projects = test_directory_capability(directory.path());
-        let (created, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        let (created, reused) = find_or_create_project(&projects, "Race Stars", "123", "456").unwrap();
         assert!(!reused);
         assert_eq!(created.path().file_name().unwrap(), "Race Stars-123");
     }
