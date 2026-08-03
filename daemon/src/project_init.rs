@@ -631,6 +631,13 @@ pub(crate) async fn resolve_experience_name(universe_id: &str) -> Option<String>
     {
         return None;
     }
+    // The endpoint answers for universes the caller cannot see with a bracketed
+    // sentinel rather than an error — "[TITLE UNAVAILABLE]" for a private
+    // experience, which is the normal state of a place still in development.
+    // Naming a project after that would be worse than not resolving at all.
+    if name.starts_with('[') && name.ends_with(']') {
+        return None;
+    }
     Some(name.to_string())
 }
 
@@ -783,6 +790,16 @@ mod tests {
         assert!(long.len() <= MAX_DIRECTORY_NAME_BYTES);
         assert!(!long.contains('/'));
         assert!(!long.contains('\\'));
+    }
+
+    #[tokio::test]
+    async fn private_experiences_do_not_name_projects_after_a_sentinel() {
+        // A universe id that cannot resolve must yield None rather than a name.
+        // The live endpoint answers "[TITLE UNAVAILABLE]" for private
+        // experiences, and every place still in development is private.
+        assert_eq!(resolve_experience_name("").await, None);
+        assert_eq!(resolve_experience_name("not-a-number").await, None);
+        assert_eq!(resolve_experience_name("0x1").await, None);
     }
 
     #[test]
