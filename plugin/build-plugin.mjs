@@ -38,6 +38,10 @@ await copyFile(
   path.join(repoRoot, "plugin", "Clipboard.luau"),
   path.join(pluginSrcDir, "src", "Clipboard.luau"),
 );
+await copyFile(
+  path.join(repoRoot, "plugin", "RemoteControl.luau"),
+  path.join(pluginSrcDir, "src", "RemoteControl.luau"),
+);
 
 if (process.env.ROSYNC_SKIP_WALLY !== "1") {
   run("wally", ["install"]);

@@ -51,7 +51,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Check Luau formatting
-        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/Playscript.luau plugin/Photo.luau plugin-src/src/App.luau
+        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/Playscript.luau plugin/Photo.luau plugin/RemoteControl.luau plugin-src/src/App.luau
 
       - name: Install pinned Luau compiler
         run: |
@@ -89,6 +89,7 @@ jobs:
           node scripts/check-luau-bytecode.mjs plugin/Clipboard.luau
           node scripts/check-luau-bytecode.mjs plugin/Playscript.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
+          node scripts/check-luau-bytecode.mjs plugin/RemoteControl.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
 
       - name: Analyze native clipboard Luau
