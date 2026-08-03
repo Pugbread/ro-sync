@@ -12,6 +12,9 @@
       },
       "Clipboard": {
         "$path": "src/Clipboard.luau"
+      },
+      "RemoteControl": {
+        "$path": "src/RemoteControl.luau"
       }
     },
     "App": {
