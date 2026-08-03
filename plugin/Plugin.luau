@@ -14370,9 +14370,12 @@ do
 local function runDecisionTicker(choiceId, gen, isLive)
 	local startedAt = os.clock()
 	task.spawn(function()
-		while isLive() and busy and gen == decisionGeneration do
+		-- Deliberately not gated on `busy`: the point of the tick is to prove the
+		-- wait is alive, so it must not go quiet in the states most likely to
+		-- strand it. The wrapper's terminal banner is what ends it.
+		while isLive() and gen == decisionGeneration do
 			local waited = math.floor(os.clock() - startedAt)
-			if waited >= 3 then
+			if waited >= 1 then
 				setBanner(string.format(
 					"Waiting for your overwrite choice — %ds. Answer in the Ro Sync app or the Studio widget. (choice %s)",
 					waited,
@@ -14507,7 +14510,21 @@ waitForDecision = function(choiceId, gen)
 	end)
 	local choice, selectiveDiskChoice, selectedDiskCount = waitForDecisionInner(choiceId, gen)
 	settled = true
-	if choice == "stale" then
+	-- The answer is the moment the human is watching for. Acknowledge it here,
+	-- before the downstream transfer does its own preparation, so the banner
+	-- never sits on "waiting" after the choice has landed.
+	if choice == "studio" then
+		setBanner("Answer received — keeping Studio. Starting the sync…")
+	elseif choice == "disk" then
+		if selectiveDiskChoice == true and type(selectedDiskCount) == "number" then
+			setBanner(string.format(
+				"Answer received — applying %d selected file(s) from disk…",
+				selectedDiskCount
+			))
+		else
+			setBanner("Answer received — keeping the files on disk. Starting the sync…")
+		end
+	elseif choice == "stale" then
 		setBanner("That choice already expired or was answered elsewhere — re-checking the project…")
 	elseif choice == nil and gen == decisionGeneration and not busy then
 		-- The wait ended without an answer and nothing newer took over: say so
