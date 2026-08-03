@@ -14361,6 +14361,12 @@ end
 -- choice the human had already made. The wait now narrates itself: a ticking
 -- elapsed time proves the poll loop is alive, and every exit path rewrites the
 -- banner.
+--
+-- The helpers live in a `do` block on purpose: this chunk is a single Luau
+-- function and Luau allows 200 locals per function. Block-scoped locals release
+-- their registers at `end`, so only `waitForDecision` costs a top-level slot.
+local waitForDecision
+do
 local function runDecisionTicker(choiceId, gen, isLive)
 	local startedAt = os.clock()
 	task.spawn(function()
@@ -14489,7 +14495,7 @@ local function waitForDecisionInner(choiceId, gen)
 	return nil
 end
 
-local function waitForDecision(choiceId, gen)
+waitForDecision = function(choiceId, gen)
 	setPill("waiting")
 	setBanner(string.format(
 		"Waiting for your overwrite choice. Answer in the Ro Sync app or the Studio widget. (choice %s)",
@@ -14509,6 +14515,7 @@ local function waitForDecision(choiceId, gen)
 		setBanner("Disconnected before your overwrite choice was applied. Connect again to resume.")
 	end
 	return choice, selectiveDiskChoice, selectedDiskCount
+end
 end
 
 local function countArray(value)
