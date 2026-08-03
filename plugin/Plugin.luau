@@ -11472,6 +11472,7 @@ do
 	local REMOTE_WRITE_HANDLER_RESPONSE_SECONDS = 25
 	local REMOTE_TRANSACTION_HANDLER_RESPONSE_SECONDS = 5
 	local remoteWriteQueue = {}
+	local staleWritesDropped = 0
 	local remoteWriteWorkerRunning = false
 	local remoteWriteActive = false
 	local remoteWriteCleanupRequested = false
@@ -11656,6 +11657,22 @@ do
 				item.finished = true
 				continue
 			end
+			-- Work submitted over a WebSocket session that has since gone away has
+			-- nowhere to reply and no reason to run: replaying it (stale playtest
+			-- run/stop requests, for instance) burns the lane for minutes while
+			-- every live write behind it times out.
+			if item.wsGeneration ~= nil and item.wsGeneration ~= wsGeneration and not item.mustExecuteAfterTimeout then
+				item.expired = true
+				sendSyntheticRemoteFailure(
+					item,
+					"SESSION_CLOSED",
+					"queued write belonged to a closed plugin session and was dropped",
+					true
+				)
+				item.finished = true
+				staleWritesDropped += 1
+				continue
+			end
 
 			item.started = true
 			item.executionStartedAt = os.clock()
@@ -11668,7 +11685,7 @@ do
 						item,
 						"HANDLER_TIMEOUT",
 						string.format(
-							"write handler %s exceeded the %.0fs response bound; it remains serialized until it returns",
+							"write handler %s exceeded its %.0fs response bound and was abandoned; the write lane moved on",
 							item.op,
 							responseBound
 						),
@@ -11677,9 +11694,40 @@ do
 				end
 			end)
 
-			local ok, result = pcall(item.handler, item.args)
+			-- The handler runs on its own thread so a handler that never returns
+			-- (a runtime request against a playtest that already ended, a Studio
+			-- API that never calls back) cannot own the lane forever. Past the
+			-- response bound the worker abandons it and continues; the orphan
+			-- still reports its own late completion through finishRemoteRequest.
+			local handlerSettled = false
+			local laneReleased = Instance.new("BindableEvent")
+			task.spawn(function()
+				local ok, result = pcall(item.handler, item.args)
+				handlerSettled = true
+				finishRemoteRequest(item, ok, result)
+				pcall(function()
+					laneReleased:Fire()
+				end)
+			end)
+			if not handlerSettled then
+				task.delay(responseBound, function()
+					pcall(function()
+						laneReleased:Fire()
+					end)
+				end)
+				laneReleased.Event:Wait()
+			end
+			laneReleased:Destroy()
 			remoteWriteActive = false
-			finishRemoteRequest(item, ok, result)
+			if not handlerSettled then
+				item.abandoned = true
+				dbg(string.format(
+					"write lane abandoned '%s' after %.0fs; %d queued write(s) continue",
+					item.op,
+					responseBound,
+					#remoteWriteQueue
+				))
+			end
 
 			if item.executionTimedOut or remoteWriteCleanupRequested then
 				local cleanupReason = if item.executionTimedOut then "handler-timeout" else "disconnect"
@@ -11696,6 +11744,10 @@ do
 			end
 		end
 		remoteWriteWorkerRunning = false
+		if staleWritesDropped > 0 then
+			dbg(string.format("write lane dropped %d write(s) from closed session(s)", staleWritesDropped))
+			staleWritesDropped = 0
+		end
 		if remoteWriteCleanupRequested and not remoteWriteActive then
 			remoteState.cancelActiveWorkflowRecordings()
 			remoteWriteCleanupRequested = false
@@ -11707,6 +11759,7 @@ do
 
 	local function enqueueRemoteWrite(item)
 		item.isWrite = true
+		item.wsGeneration = wsGeneration
 		item.mustExecuteAfterTimeout = item.op == "transaction_finish"
 			and tostring(item.args.action or "commit"):lower() == "cancel"
 		if #remoteWriteQueue >= REMOTE_WRITE_QUEUE_MAX then
@@ -14287,9 +14340,30 @@ end
 -- Initial-sync decision handshake
 --------------------------------------------------------------------------------
 
-local function waitForDecision(choiceId, gen)
-	setPill("waiting")
-	setBanner(string.format("Waiting for overwrite decision… (choice %s)", tostring(choiceId)))
+-- The decision banner used to be written once and never revised, so every exit
+-- that did not run to completion (superseded compare, dropped connection,
+-- answer redeemed elsewhere) left Studio insisting it was still waiting for a
+-- choice the human had already made. The wait now narrates itself: a ticking
+-- elapsed time proves the poll loop is alive, and every exit path rewrites the
+-- banner.
+local function runDecisionTicker(choiceId, gen, isLive)
+	local startedAt = os.clock()
+	task.spawn(function()
+		while isLive() and busy and gen == decisionGeneration do
+			local waited = math.floor(os.clock() - startedAt)
+			if waited >= 3 then
+				setBanner(string.format(
+					"Waiting for your overwrite choice — %ds. Answer in the Ro Sync app or the Studio widget. (choice %s)",
+					waited,
+					tostring(choiceId)
+				))
+			end
+			task.wait(1)
+		end
+	end)
+end
+
+local function waitForDecisionInner(choiceId, gen)
 	-- Consecutive unreachable polls. The daemon can vanish mid-decision (the
 	-- desktop app stops or removes the project); without a bound this loop
 	-- spun forever behind a banner still claiming to wait for the decision.
@@ -14340,7 +14414,10 @@ local function waitForDecision(choiceId, gen)
 		else
 			if pollFailures > 0 then
 				pollFailures = 0
-				setBanner(string.format("Waiting for overwrite decision… (choice %s)", tostring(choiceId)))
+				setBanner(string.format(
+					"Reconnected. Waiting for your overwrite choice. (choice %s)",
+					tostring(choiceId)
+				))
 			end
 			if #(resp.Body or "") > PROTOCOL_STREAM_MAX_BYTES then
 				log("decision response exceeded the 512 KiB protocol limit")
@@ -14395,6 +14472,28 @@ local function waitForDecision(choiceId, gen)
 		end
 	end
 	return nil
+end
+
+local function waitForDecision(choiceId, gen)
+	setPill("waiting")
+	setBanner(string.format(
+		"Waiting for your overwrite choice. Answer in the Ro Sync app or the Studio widget. (choice %s)",
+		tostring(choiceId)
+	))
+	local settled = false
+	runDecisionTicker(choiceId, gen, function()
+		return not settled
+	end)
+	local choice, selectiveDiskChoice, selectedDiskCount = waitForDecisionInner(choiceId, gen)
+	settled = true
+	if choice == "stale" then
+		setBanner("That choice already expired or was answered elsewhere — re-checking the project…")
+	elseif choice == nil and gen == decisionGeneration and not busy then
+		-- The wait ended without an answer and nothing newer took over: say so
+		-- rather than leaving Studio claiming a decision is still pending.
+		setBanner("Disconnected before your overwrite choice was applied. Connect again to resume.")
+	end
+	return choice, selectiveDiskChoice, selectedDiskCount
 end
 
 local function countArray(value)
