@@ -385,7 +385,34 @@ fn discover_project_daemon_port_in_range(
     ports: std::ops::RangeInclusive<u16>,
 ) -> Result<Option<u16>, Box<dyn std::error::Error>> {
     let canonical_project = canonicalize_project_path(project);
-    let requested_hello = fetch_daemon_hello(requested_port).ok();
+
+    // Probe every candidate concurrently rather than one at a time. A closed
+    // port only costs nothing when the OS refuses it immediately; where it
+    // does not, each miss burns the probe's full connect timeout and the
+    // sweep costs their sum. Windows is the case that matters here — a closed
+    // loopback port was measured taking ~2s to refuse on a normal desktop,
+    // far past the 750ms probe timeout, so discovering a daemon across this
+    // 13-port range cost ~10s on every command that had to find its own port
+    // (enough to blow the desktop packaging step's 10s budget). Probing in
+    // parallel bounds the sweep by one timeout instead of fourteen. Results
+    // are still consumed in the original order below, so which daemon wins is
+    // unchanged on every platform.
+    let scanned: Vec<u16> = ports.clone().filter(|port| *port != requested_port).collect();
+    let mut hellos: std::collections::HashMap<u16, serde_json::Value> =
+        std::collections::HashMap::new();
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = std::iter::once(requested_port)
+            .chain(scanned.iter().copied())
+            .map(|port| scope.spawn(move || (port, fetch_daemon_hello(port).ok())))
+            .collect();
+        for probe in probes {
+            if let Ok((port, Some(hello))) = probe.join() {
+                hellos.insert(port, hello);
+            }
+        }
+    });
+
+    let requested_hello = hellos.get(&requested_port).cloned();
     if requested_hello
         .as_ref()
         .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
@@ -393,14 +420,9 @@ fn discover_project_daemon_port_in_range(
         return Ok(Some(requested_port));
     }
 
-    for port in ports {
-        if port == requested_port {
-            continue;
-        }
-
-        if fetch_daemon_hello(port)
-            .ok()
-            .as_ref()
+    for port in scanned {
+        if hellos
+            .get(&port)
             .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
         {
             return Ok(Some(port));
