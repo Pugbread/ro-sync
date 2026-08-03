@@ -2028,7 +2028,7 @@ mod tests {
 
     #[test]
     fn plugin_audit_acknowledgement_requires_json_success_body() {
-        let plugin = include_str!("../../plugin/Plugin.luau");
+        let plugin = include_str!("../../plugin/RemoteControl.luau");
         let helper_start = plugin
             .find("local function postRemoteWriteLogSync")
             .expect("plugin audit helper");
@@ -2045,7 +2045,7 @@ mod tests {
 
     #[test]
     fn plugin_completion_audit_retains_both_script_hashes() {
-        let plugin = include_str!("../../plugin/Plugin.luau");
+        let plugin = include_str!("../../plugin/RemoteControl.luau");
         let helper_start = plugin
             .find("local function auditPlayscriptCompletion")
             .expect("playscript completion audit helper");
@@ -2061,7 +2061,7 @@ mod tests {
 
     #[test]
     fn plugin_decodes_playscript_chunks_with_the_studio_buffer_overload() {
-        let plugin = include_str!("../../plugin/Plugin.luau");
+        let plugin = include_str!("../../plugin/RemoteControl.luau");
         assert!(plugin.contains(
             "EncodingService:Base64Decode(buffer.fromstring(tostring(chunk.bytesBase64 or \"\")))"
         ));
@@ -2072,7 +2072,7 @@ mod tests {
 
     #[test]
     fn plugin_gives_one_player_multiplayer_runs_a_server_context() {
-        let plugin = include_str!("../../plugin/Plugin.luau");
+        let plugin = include_str!("../../plugin/RemoteControl.luau");
         let multiplayer_branch = plugin
             .split_once("elseif mode == \"multiplayer\" then")
             .expect("multiplayer launch branch")
