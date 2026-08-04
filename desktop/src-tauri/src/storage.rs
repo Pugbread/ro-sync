@@ -182,6 +182,21 @@ impl PhysicalDirectory {
         Ok(file)
     }
 
+    /// Same validation as [`Self::open_regular_file`], but the handle also
+    /// carries whatever right the platform needs to delete through it. Kept
+    /// separate so the read-only callers do not silently gain DELETE.
+    fn open_regular_file_for_removal(&self, fragment: &OsStr) -> io::Result<fs::File> {
+        let file = platform::open_regular_file_for_removal(&self.file, fragment)?;
+        let metadata = reject_linked_handle(&file)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem entry is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     fn create_new_file(&self, fragment: &OsStr, mode: u32) -> io::Result<fs::File> {
         let file = platform::create_new_file(&self.file, fragment, mode)?;
         reject_linked_handle(&file)?;
@@ -351,6 +366,15 @@ mod platform {
     }
 
     pub(super) fn open_regular_file(parent: &fs::File, fragment: &OsStr) -> io::Result<fs::File> {
+        open_entry(parent, fragment)
+    }
+
+    /// unlinkat operates on the directory, not the file handle, so removal
+    /// needs no extra right here — this exists to match the Windows shape.
+    pub(super) fn open_regular_file_for_removal(
+        parent: &fs::File,
+        fragment: &OsStr,
+    ) -> io::Result<fs::File> {
         open_entry(parent, fragment)
     }
 
@@ -827,6 +851,25 @@ mod platform {
             parent,
             fragment,
             FILE_GENERIC_READ,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        )
+    }
+
+    /// Deletion here marks the open handle via FILE_DISPOSITION_INFO rather
+    /// than unlinking a path, and that requires DELETE on the handle itself.
+    /// Opening with FILE_GENERIC_READ alone fails the disposition call with
+    /// ERROR_ACCESS_DENIED, so removal gets its own opener instead of widening
+    /// the read path.
+    pub(super) fn open_regular_file_for_removal(
+        parent: &fs::File,
+        fragment: &OsStr,
+    ) -> io::Result<fs::File> {
+        open_relative(
+            parent,
+            fragment,
+            FILE_GENERIC_READ | DELETE,
             FILE_ATTRIBUTE_NORMAL,
             FILE_OPEN,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
@@ -1905,7 +1948,7 @@ pub(crate) fn atomic_write_authorized(
 
 pub(crate) fn remove_authorized_regular_file(store: &Path, path: &Path) -> Result<bool, String> {
     let (parent, _, name) = authorized_parent_for_path(store, path, false)?;
-    let file = match parent.open_regular_file(&name) {
+    let file = match parent.open_regular_file_for_removal(&name) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
