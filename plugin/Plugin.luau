@@ -14862,15 +14862,36 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 	local expectedProjectIdentity = if type(expectedProject) == "string" and expectedProject ~= ""
 		then expectedProject
 		else nil
+	-- Probe the range concurrently. Sequentially, the scan costs one refusal per
+	-- closed port, which is free only where the OS refuses immediately. Windows
+	-- does not: a closed loopback port there was measured taking ~2s to refuse,
+	-- so walking this range plus the broker range one port at a time left the
+	-- panel sitting on "scanning localhost" for over half a minute before it
+	-- could report anything. Issuing the probes together bounds the scan by the
+	-- slowest single port instead of their sum, on every platform.
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
+		local outstanding = 0
 		for port = firstPort, lastPort do
 			if type(shouldContinue) == "function" and not shouldContinue() then
 				result.cancelled = true
 				break
 			end
-			local matched, url, hello = probePort(port, gameId)
-			probes[port] = { matched = matched, url = url, hello = hello }
+			outstanding += 1
+			task.spawn(function()
+				local matched, url, hello = probePort(port, gameId)
+				probes[port] = { matched = matched, url = url, hello = hello }
+				outstanding -= 1
+			end)
+		end
+		-- Wait for the in-flight probes. The deadline is a backstop only: it
+		-- must outlast a slow-to-refuse port so a healthy scan is never cut
+		-- short, while still guaranteeing the scan terminates if a probe never
+		-- returns. Ports that miss it stay absent from `probes`, which callers
+		-- already treat as "nothing answered there".
+		local deadline = os.clock() + 15
+		while outstanding > 0 and os.clock() < deadline do
+			task.wait()
 		end
 		return probes
 	end
@@ -15048,9 +15069,31 @@ local function beginDaemonConnection(chosenUrl, chosenPort)
 	local protocolOk, protocolError, daemonPluginCapability, daemonProject = validateDaemonProtocol(chosenUrl)
 	if not protocolOk then
 		reconnectState.desired = false
-		log("connect blocked: " .. tostring(protocolError))
-		setPill("error", "update Ro Sync")
-		setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
+		local reason = tostring(protocolError)
+		log("connect blocked: " .. reason)
+		-- Only a genuine version skew should tell the user to update Ro Sync and
+		-- reinstall. validateDaemonProtocol also rejects a daemon that is simply
+		-- unreachable, or one serving a different GameId, and naming those a
+		-- version mismatch sends people to reinstall a plugin that was never at
+		-- fault -- while the real cause stays buried in the log.
+		if reason:lower():find("protocol", 1, true) then
+			setPill("error", "update Ro Sync")
+			setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
+		elseif reason:lower():find("gameid", 1, true) then
+			setPill("error", "wrong project")
+			setBanner(
+				string.format(
+					"That daemon serves a different experience. Serve a project whose ro-sync.json GameId is %s, then connect again.",
+					tostring(game.GameId)
+				)
+			)
+		elseif reason:lower():find("hello failed", 1, true) then
+			setPill("error", "no daemon")
+			setBanner("No Ro Sync daemon answered. Serve this project from Ro Sync Desktop, or run `rosync daemon start`, then connect again.")
+		else
+			setPill("error", "action required")
+			setBanner("Ro Sync connection rejected: " .. reason)
+		end
 		busy = false
 		return false
 	end
