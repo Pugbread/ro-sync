@@ -2686,6 +2686,53 @@ function snapshotApplyState.takeCandidate(listState, used, claimed)
 	return nil
 end
 
+function snapshotApplyState.matchesCachedDiskIdentity(parent: Instance, candidate: Instance, node): boolean
+	if type(node) ~= "table" or type(node.diskFragment) ~= "string" then
+		return false
+	end
+	local parentDiskPath = snapshotApplyState.diskPathCache[parent]
+	local candidateDiskPath = snapshotApplyState.diskPathCache[candidate]
+	if not parentDiskPath or not candidateDiskPath or #candidateDiskPath ~= #parentDiskPath + 1 then
+		return false
+	end
+	for index, fragment in ipairs(parentDiskPath) do
+		if candidateDiskPath[index] ~= fragment then
+			return false
+		end
+	end
+	return candidateDiskPath[#candidateDiskPath] == node.diskFragment
+end
+
+function snapshotApplyState.takeExactFallbackCandidate(
+	listState,
+	used,
+	claimed,
+	parent: Instance,
+	node,
+	physical,
+	unprojectedOnly: boolean
+): Instance?
+	if not listState then
+		return nil
+	end
+	while listState.next <= #listState.items do
+		local candidate = listState.items[listState.next]
+		listState.next += 1
+		local projected = physical and physical.byInstance[candidate] ~= nil
+		local sameClaimedIdentity = claimed[candidate]
+			and snapshotApplyState.matchesCachedDiskIdentity(parent, candidate, node)
+		if
+			not used[candidate]
+			and (not claimed[candidate] or sameClaimedIdentity)
+			and (not unprojectedOnly or not projected)
+		then
+			used[candidate] = true
+			return candidate
+		end
+	end
+	return nil
+end
+
 function snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
 	local service = parent
 	while service and service.Parent ~= game do
@@ -3319,7 +3366,16 @@ function snapshotApplyState.buildAssignments(parent, nodes, ctx)
 		local candidate = if type(fragment) == "string" and physical
 			then physical.byFragment[string.lower(fragment)]
 			else nil
-		if candidate and (used[candidate] or ctx.claimedInstances[candidate]) then
+		if
+			candidate
+			and (
+				used[candidate]
+				or (
+					ctx.claimedInstances[candidate]
+					and not snapshotApplyState.matchesCachedDiskIdentity(parent, candidate, node)
+				)
+			)
+		then
 			candidate = nil
 		end
 		if candidate then
@@ -3345,7 +3401,43 @@ function snapshotApplyState.buildAssignments(parent, nodes, ctx)
 			-- If an ignored boundary's portable shape/class changed while it
 			-- was hidden, it still consumes one same-logical-name disk node.
 			-- Exact matches above always win before this safety fallback.
-			candidate = snapshotApplyState.takeCandidate(bucket.boundaries, used, ctx.claimedInstances)
+			candidate = snapshotApplyState.takeExactFallbackCandidate(
+				bucket.boundaries,
+				used,
+				ctx.claimedInstances,
+				parent,
+				node,
+				physical,
+				false
+			)
+			if not candidate and node.diskFragmentIsDir == true then
+				-- Empty folders and bare Studio-owned containers are deliberately
+				-- absent from the physical projection. Repeated watcher sets for a
+				-- newly populated directory must reuse that exact cached identity
+				-- instead of creating another same-name parent. Restrict this to
+				-- directory nodes so a placeholder Folder still cannot shadow a
+				-- same-name leaf script.
+				candidate = snapshotApplyState.takeExactFallbackCandidate(
+					bucket.byClass.Folder,
+					used,
+					ctx.claimedInstances,
+					parent,
+					node,
+					physical,
+					true
+				)
+				if not candidate and className == "Folder" then
+					candidate = snapshotApplyState.takeExactFallbackCandidate(
+						bucket.passThrough,
+						used,
+						ctx.claimedInstances,
+						parent,
+						node,
+						physical,
+						true
+					)
+				end
+			end
 		elseif bucket then
 			candidate = snapshotApplyState.takeCandidate(bucket.byClass[className], used, ctx.claimedInstances)
 			if not candidate and className == "Folder" then
