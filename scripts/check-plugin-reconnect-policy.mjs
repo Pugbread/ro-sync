@@ -673,7 +673,7 @@ assert.match(
 );
 assert.match(
   snapshotMatcher,
-  /takeCandidate\(bucket\.boundaries, used, ctx\.claimedInstances\)/,
+  /takeExactFallbackCandidate\([\s\S]*?bucket\.boundaries[\s\S]*?ctx\.claimedInstances[\s\S]*?false[\s\S]*?\)/,
   "a changed-shape AvoidSync boundary must still consume one same-name disk node",
 );
 assert.equal(
