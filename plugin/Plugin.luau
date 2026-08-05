@@ -35,6 +35,7 @@ local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
 local DAEMON_STARTUP_GRACE_SECONDS = 30
 local DAEMON_DISCOVERY_RETRY_SECONDS = 1
+local DAEMON_PROBE_CONCURRENCY = 4
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
 local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
@@ -2686,6 +2687,53 @@ function snapshotApplyState.takeCandidate(listState, used, claimed)
 	return nil
 end
 
+function snapshotApplyState.matchesCachedDiskIdentity(parent: Instance, candidate: Instance, node): boolean
+	if type(node) ~= "table" or type(node.diskFragment) ~= "string" then
+		return false
+	end
+	local parentDiskPath = snapshotApplyState.diskPathCache[parent]
+	local candidateDiskPath = snapshotApplyState.diskPathCache[candidate]
+	if not parentDiskPath or not candidateDiskPath or #candidateDiskPath ~= #parentDiskPath + 1 then
+		return false
+	end
+	for index, fragment in ipairs(parentDiskPath) do
+		if candidateDiskPath[index] ~= fragment then
+			return false
+		end
+	end
+	return candidateDiskPath[#candidateDiskPath] == node.diskFragment
+end
+
+function snapshotApplyState.takeExactFallbackCandidate(
+	listState,
+	used,
+	claimed,
+	parent: Instance,
+	node,
+	physical,
+	unprojectedOnly: boolean
+): Instance?
+	if not listState then
+		return nil
+	end
+	while listState.next <= #listState.items do
+		local candidate = listState.items[listState.next]
+		listState.next += 1
+		local projected = physical and physical.byInstance[candidate] ~= nil
+		local sameClaimedIdentity = claimed[candidate]
+			and snapshotApplyState.matchesCachedDiskIdentity(parent, candidate, node)
+		if
+			not used[candidate]
+			and (not claimed[candidate] or sameClaimedIdentity)
+			and (not unprojectedOnly or not projected)
+		then
+			used[candidate] = true
+			return candidate
+		end
+	end
+	return nil
+end
+
 function snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
 	local service = parent
 	while service and service.Parent ~= game do
@@ -3319,7 +3367,16 @@ function snapshotApplyState.buildAssignments(parent, nodes, ctx)
 		local candidate = if type(fragment) == "string" and physical
 			then physical.byFragment[string.lower(fragment)]
 			else nil
-		if candidate and (used[candidate] or ctx.claimedInstances[candidate]) then
+		if
+			candidate
+			and (
+				used[candidate]
+				or (
+					ctx.claimedInstances[candidate]
+					and not snapshotApplyState.matchesCachedDiskIdentity(parent, candidate, node)
+				)
+			)
+		then
 			candidate = nil
 		end
 		if candidate then
@@ -3345,7 +3402,43 @@ function snapshotApplyState.buildAssignments(parent, nodes, ctx)
 			-- If an ignored boundary's portable shape/class changed while it
 			-- was hidden, it still consumes one same-logical-name disk node.
 			-- Exact matches above always win before this safety fallback.
-			candidate = snapshotApplyState.takeCandidate(bucket.boundaries, used, ctx.claimedInstances)
+			candidate = snapshotApplyState.takeExactFallbackCandidate(
+				bucket.boundaries,
+				used,
+				ctx.claimedInstances,
+				parent,
+				node,
+				physical,
+				false
+			)
+			if not candidate and node.diskFragmentIsDir == true then
+				-- Empty folders and bare Studio-owned containers are deliberately
+				-- absent from the physical projection. Repeated watcher sets for a
+				-- newly populated directory must reuse that exact cached identity
+				-- instead of creating another same-name parent. Restrict this to
+				-- directory nodes so a placeholder Folder still cannot shadow a
+				-- same-name leaf script.
+				candidate = snapshotApplyState.takeExactFallbackCandidate(
+					bucket.byClass.Folder,
+					used,
+					ctx.claimedInstances,
+					parent,
+					node,
+					physical,
+					true
+				)
+				if not candidate and className == "Folder" then
+					candidate = snapshotApplyState.takeExactFallbackCandidate(
+						bucket.passThrough,
+						used,
+						ctx.claimedInstances,
+						parent,
+						node,
+						physical,
+						true
+					)
+				end
+			end
 		elseif bucket then
 			candidate = snapshotApplyState.takeCandidate(bucket.byClass[className], used, ctx.claimedInstances)
 			if not candidate and className == "Folder" then
@@ -14862,27 +14955,39 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 	local expectedProjectIdentity = if type(expectedProject) == "string" and expectedProject ~= ""
 		then expectedProject
 		else nil
-	-- Probe the range concurrently. Sequentially, the scan costs one refusal per
+	-- Probe the range with bounded concurrency. Sequentially, the scan costs one refusal per
 	-- closed port, which is free only where the OS refuses immediately. Windows
 	-- does not: a closed loopback port there was measured taking ~2s to refuse,
 	-- so walking this range plus the broker range one port at a time left the
-	-- panel sitting on "scanning localhost" for over half a minute before it
-	-- could report anything. Issuing the probes together bounds the scan by the
-	-- slowest single port instead of their sum, on every platform.
+	-- panel sitting on "scanning localhost" for over half a minute. A small worker
+	-- window avoids that serial cost without launching an uncancellable request
+	-- against every port when the user cancels the connection attempt.
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
+		local nextPort = firstPort
 		local outstanding = 0
-		for port = firstPort, lastPort do
-			if type(shouldContinue) == "function" and not shouldContinue() then
-				result.cancelled = true
-				break
+		local acceptingResults = true
+		local function isCurrentAttempt()
+			return type(shouldContinue) ~= "function" or shouldContinue()
+		end
+		local function launchAvailable()
+			while acceptingResults and outstanding < DAEMON_PROBE_CONCURRENCY and nextPort <= lastPort do
+				if not isCurrentAttempt() then
+					result.cancelled = true
+					acceptingResults = false
+					break
+				end
+				local port = nextPort
+				nextPort += 1
+				outstanding += 1
+				task.spawn(function()
+					local matched, url, hello = probePort(port, gameId)
+					if acceptingResults and isCurrentAttempt() then
+						probes[port] = { matched = matched, url = url, hello = hello }
+					end
+					outstanding -= 1
+				end)
 			end
-			outstanding += 1
-			task.spawn(function()
-				local matched, url, hello = probePort(port, gameId)
-				probes[port] = { matched = matched, url = url, hello = hello }
-				outstanding -= 1
-			end)
 		end
 		-- Wait for the in-flight probes. The deadline is a backstop only: it
 		-- must outlast a slow-to-refuse port so a healthy scan is never cut
@@ -14890,9 +14995,18 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 		-- returns. Ports that miss it stay absent from `probes`, which callers
 		-- already treat as "nothing answered there".
 		local deadline = os.clock() + 15
-		while outstanding > 0 and os.clock() < deadline do
-			task.wait()
+		launchAvailable()
+		while (nextPort <= lastPort or outstanding > 0) and os.clock() < deadline do
+			if not isCurrentAttempt() then
+				result.cancelled = true
+				break
+			end
+			launchAvailable()
+			if outstanding > 0 then
+				task.wait()
+			end
 		end
+		acceptingResults = false
 		return probes
 	end
 
@@ -15089,7 +15203,9 @@ local function beginDaemonConnection(chosenUrl, chosenPort)
 			)
 		elseif reason:lower():find("hello failed", 1, true) then
 			setPill("error", "no daemon")
-			setBanner("No Ro Sync daemon answered. Serve this project from Ro Sync Desktop, or run `rosync daemon start`, then connect again.")
+			setBanner(
+				"No Ro Sync daemon answered. Serve this project from Ro Sync Desktop, or run `rosync daemon start`, then connect again."
+			)
 		else
 			setPill("error", "action required")
 			setBanner("Ro Sync connection rejected: " .. reason)
