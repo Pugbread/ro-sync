@@ -177,13 +177,20 @@ const daemonDiscovery = source.slice(
 );
 assert.match(
   daemonDiscovery,
-  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?for port = firstPort, lastPort do[\s\S]*?not shouldContinue\(\)[\s\S]*?result\.cancelled = true[\s\S]*?probePort\(port, gameId\)/,
-  "daemon discovery must stop between deterministic port probes when its connection attempt is cancelled",
+  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?outstanding < DAEMON_PROBE_CONCURRENCY[\s\S]*?not isCurrentAttempt\(\)[\s\S]*?result\.cancelled = true[\s\S]*?acceptingResults = false[\s\S]*?task\.spawn/,
+  "daemon discovery must use bounded workers and stop launching probes when its connection attempt is cancelled",
 );
-assert.doesNotMatch(
+assert.match(
   daemonDiscovery,
-  /for port = firstPort, lastPort do[\s\S]{0,160}?task\.spawn/,
-  "daemon discovery must not launch an uncancellable RequestAsync burst across every port",
+  /task\.spawn[\s\S]*?probePort\(port, gameId\)[\s\S]*?if acceptingResults and isCurrentAttempt\(\) then[\s\S]*?probes\[port\]/,
+  "completed daemon probes must be ignored after cancellation",
+);
+const daemonProbeConcurrency = Number(
+  source.match(/local DAEMON_PROBE_CONCURRENCY = (\d+)/)?.[1],
+);
+assert.ok(
+  Number.isInteger(daemonProbeConcurrency) && daemonProbeConcurrency >= 2 && daemonProbeConcurrency <= 4,
+  "daemon discovery concurrency must remain bounded between two and four requests",
 );
 assert.match(
   daemonDiscovery,
