@@ -38,7 +38,7 @@ fn metadata_is_link(metadata: &Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        return attributes_have_reparse_point(metadata.file_attributes());
+        attributes_have_reparse_point(metadata.file_attributes())
     }
     #[cfg(not(windows))]
     false
@@ -757,10 +757,7 @@ mod platform {
             return Err(nt_error(status));
         }
         if handle.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "NtCreateFile returned an empty handle",
-            ));
+            return Err(io::Error::other("NtCreateFile returned an empty handle"));
         }
         // SAFETY: a successful NtCreateFile returned one newly owned handle.
         Ok(unsafe { fs::File::from_raw_handle(handle) })

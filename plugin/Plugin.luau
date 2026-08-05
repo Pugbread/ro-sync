@@ -30,12 +30,27 @@ local WATCHED_SERVICES = {
 }
 
 local SETTING_MANUAL_URL = "manualUrl"
+-- Remembers the last answered overwrite decision. When set to "studio" and a
+-- reconnect finds only changed script sources (delta-eligible drift), the
+-- plugin re-answers the picker itself instead of parking on "waiting" until a
+-- human clicks the same button again.
+local SETTING_STICKY_CHOICE = "stickyInitialChoice"
+-- Keyed by PlaceId: the port that last served this place with an exact place
+-- match. Probed first on discovery; a hit skips the whole port fan-out.
+local SETTING_LAST_PORT_PREFIX = "lastDaemonPort:"
 local DEFAULT_URL = "http://127.0.0.1:7878"
 local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
-local DAEMON_STARTUP_GRACE_SECONDS = 30
-local DAEMON_DISCOVERY_RETRY_SECONDS = 1
 local DAEMON_PROBE_CONCURRENCY = 4
+-- 4s, not 2: a loaded machine has answered /hello in 2.03s — a 2s timeout
+-- silently misses every daemon and the pill reads no_daemon while everything
+-- is actually up.
+local PROBE_TIMEOUT_SECONDS = 4
+-- Saved studio/disk defaults only auto-answer routine drift. Past these
+-- bounds the diff no longer resembles the situation the human approved, and
+-- replaying their answer unattended can erase one side's work.
+local AUTO_ANSWER_MAX_DRIFT = 50
+local AUTO_ANSWER_MAX_REMOVED = 10
 local MAX_LOG_LINES = 200
 local SOURCE_WRITE_CONCURRENCY = 16
 local PROTOCOL_STREAM_MAX_BYTES = 512 * 1024
@@ -1354,6 +1369,7 @@ toggleButton.Click:Connect(function()
 end)
 
 local startConnect: (() -> ())? = nil
+local cancelProjectInit: (() -> ())? = nil
 
 local function trimUiUrl(s)
 	local trimmed = tostring(s or ""):match("^%s*(.-)%s*$") or ""
@@ -1515,6 +1531,30 @@ local function mountFallbackUi(reason)
 	btnCorner.CornerRadius = UDim.new(0, 6)
 	btnCorner.Parent = connectBtn
 
+	-- Visible only in the project_init state: "Create Project" must be
+	-- refusable, and clicking it is the only other exit.
+	local cancelBtn = Instance.new("TextButton")
+	cancelBtn.LayoutOrder = 3
+	cancelBtn.Size = UDim2.new(0, 68, 1, 0)
+	cancelBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 63)
+	cancelBtn.BorderSizePixel = 0
+	cancelBtn.TextColor3 = Color3.fromRGB(244, 245, 247)
+	cancelBtn.Font = Enum.Font.SourceSansBold
+	cancelBtn.TextSize = 15
+	cancelBtn.Text = "Cancel"
+	cancelBtn.Visible = false
+	cancelBtn.Parent = row
+
+	local cancelCorner = Instance.new("UICorner")
+	cancelCorner.CornerRadius = UDim.new(0, 6)
+	cancelCorner.Parent = cancelBtn
+
+	cancelBtn.Activated:Connect(function()
+		if cancelProjectInit then
+			cancelProjectInit()
+		end
+	end)
+
 	local banner = Instance.new("TextLabel")
 	banner.LayoutOrder = 5
 	banner.Size = UDim2.new(1, 0, 0, 42)
@@ -1661,6 +1701,7 @@ local function mountFallbackUi(reason)
 	end
 
 	function controller.setStatus(state, detail)
+		cancelBtn.Visible = state == "project_init"
 		if state == "idle" then
 			status.Text = "Auto-discover localhost:7878–7890"
 			status.TextColor3 = Color3.fromRGB(119, 125, 134)
@@ -1672,7 +1713,9 @@ local function mountFallbackUi(reason)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
 		elseif state == "connecting" then
-			status.Text = "Connecting..."
+			-- `detail` carries the current initial-sync phase so the multi-
+			-- minute connect on large places reads as progress, not a hang.
+			status.Text = if detail ~= nil then tostring(detail) else "Connecting..."
 			status.TextColor3 = Color3.fromRGB(65, 135, 245)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
@@ -1682,9 +1725,9 @@ local function mountFallbackUi(reason)
 			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
 			connectBtn.Text = "Cancel"
 		elseif state == "waiting" then
-			status.Text = "Waiting for initial sync..."
-			status.TextColor3 = Color3.fromRGB(65, 135, 245)
-			stateDot.BackgroundColor3 = Color3.fromRGB(65, 135, 245)
+			status.Text = if detail ~= nil then tostring(detail) else "Action needed · choose Studio or Disk"
+			status.TextColor3 = Color3.fromRGB(240, 173, 78)
+			stateDot.BackgroundColor3 = Color3.fromRGB(240, 173, 78)
 			connectBtn.Text = "Cancel"
 		elseif state == "project_init" then
 			status.Text = "New Studio project · ready to create"
@@ -1720,6 +1763,11 @@ local function mountFallbackUi(reason)
 			status.Text = "Daemon belongs to another game"
 			status.TextColor3 = Color3.fromRGB(207, 72, 72)
 			stateDot.BackgroundColor3 = Color3.fromRGB(207, 72, 72)
+			connectBtn.Text = "Connect"
+		elseif state == "wrong_place" then
+			status.Text = "Project serves another place of this game"
+			status.TextColor3 = Color3.fromRGB(240, 173, 78)
+			stateDot.BackgroundColor3 = Color3.fromRGB(240, 173, 78)
 			connectBtn.Text = "Connect"
 		elseif state == "error" then
 			status.Text = tostring(detail or "Connection error")
@@ -1827,6 +1875,15 @@ local urlBox = setmetatable({}, {
 })
 
 local function log(msg)
+	ui.addLog(msg)
+end
+
+-- Connection VERDICTS (matched, refused, auto-answered, gave up) also go to
+-- Studio Output: one line per decision, no phase spam. These are what make a
+-- failed connect diagnosable from a pasted log; the full story stays in the
+-- panel.
+local function dbg(msg)
+	print("[Ro Sync] " .. tostring(msg))
 	ui.addLog(msg)
 end
 
@@ -2569,7 +2626,15 @@ end
 -- children by Instance identity rather than repeatedly calling FindFirstChild.
 snapshotApplyState = {
 	stepsPerCheck = 64,
+	-- Live-sync applies keep the tight slice so an incoming disk op never
+	-- hitches an actively edited session for long.
 	sliceSeconds = 0.01,
+	-- Initial-sync applies (pull before the connection is live) may hitch as
+	-- hard as the scan budget (scaleState.sliceBudgetSeconds); yielding 3x as
+	-- often as the scans was pure overhead there.
+	initialSyncSliceSeconds = 0.030,
+	-- Assigned after `connected` is declared; nil means "assume live".
+	isInitialSyncApply = nil,
 	diskPathCache = setmetatable({}, { __mode = "k" }),
 	activeMutationGuard = nil,
 }
@@ -2662,7 +2727,11 @@ function snapshotApplyState.checkpoint(ctx)
 	if ctx.shouldContinue and not ctx.shouldContinue() then
 		error("snapshot apply cancelled", 0)
 	end
-	if os.clock() - ctx.lastYield >= snapshotApplyState.sliceSeconds then
+	local sliceSeconds = snapshotApplyState.sliceSeconds
+	if snapshotApplyState.isInitialSyncApply ~= nil and snapshotApplyState.isInitialSyncApply() then
+		sliceSeconds = snapshotApplyState.initialSyncSliceSeconds
+	end
+	if os.clock() - ctx.lastYield >= sliceSeconds then
 		task.wait()
 		lastRemoteApplyClock = os.clock()
 		ctx.lastYield = os.clock()
@@ -4180,25 +4249,30 @@ local function applyOps(ops, shouldContinue): (boolean, { [any]: boolean }?)
 		return false
 	end
 	local label = "Ro Sync: " .. summarizeOps(ops)
-	snapshotApplyState.recoverOrphanedApplyRecording()
-	local beginOk, beginResult = pcall(function()
-		return ChangeHistoryService:TryBeginRecording(label, label)
-	end)
-	local recordingId = if beginOk then beginResult else nil
-	if recordingId == nil then
-		-- Change history is unavailable: another plugin holds the single
-		-- per-plugin recording slot, a solo playtest is running, or Studio
-		-- refused for its own reasons. None of that is a reason to drop a
-		-- filesystem edit on the floor. Fall back to a plain waypoint — which
-		-- cannot fail — and apply anyway. Undo granularity degrades; the user's
-		-- code still reaches Studio.
-		local reason = if beginOk then "Studio refused the recording" else tostring(beginResult)
-		log("applyOps: applying without a rollback-safe recording (" .. reason .. ")")
-		setWaypoint(label)
-	else
-		pcall(function()
-			plugin:SetAttribute(snapshotApplyState.APPLY_RECORDING_ATTRIBUTE, recordingId)
+	-- Team Create holds the change-history lock during commit/sync windows. A
+	-- single TryBeginRecording refusal here used to cancel the whole apply and
+	-- tear down the transport (full re-compare + decision picker) — the main
+	-- reconnect driver on busy Team Create places. Ride the lock out instead.
+	local recordingId = nil
+	for attempt = 1, 20 do
+		local recordingOk, id = pcall(function()
+			return ChangeHistoryService:TryBeginRecording(label, label)
 		end)
+		if recordingOk and id ~= nil then
+			recordingId = id
+			break
+		end
+		if shouldContinue and not shouldContinue() then
+			return false
+		end
+		if attempt == 1 then
+			log("applyOps: Studio refused a rollback-safe recording (Team Create busy?); retrying for up to 30s")
+		end
+		task.wait(1.5)
+	end
+	if recordingId == nil then
+		log("applyOps error: Studio refused to begin a rollback-safe recording")
+		return false
 	end
 	lastRemoteApplyClock = os.clock()
 	local failedOps = {}
@@ -4475,6 +4549,13 @@ local reconnectState = {
 local runInitialCompare: () -> ()
 local disconnectHooks
 
+-- Bridge for snapshotApplyState.checkpoint (declared long before `connected`):
+-- initial-sync applies run before the connection is live and may use the wider
+-- slice budget; live applies keep the tight one.
+snapshotApplyState.isInitialSyncApply = function()
+	return not connected
+end
+
 -- Strip NULs and replace invalid UTF-8 bytes with the Unicode replacement
 -- char (EF BF BD). JSONEncode rejects either. We keep valid UTF-8 intact.
 local function scrubString(s)
@@ -4608,19 +4689,25 @@ local function httpRequestTo(url, method, body, internalJsonSafe, singleAttempt)
 		Headers = { ["Content-Type"] = "application/json" },
 	}
 	if body ~= nil then
-		-- Snapshot/bootstrap payloads are assembled exclusively from primitive
-		-- schema fields by this plugin. Let those trusted internal callers skip
-		-- sanitizeJson's full-tree copy: on a large service that otherwise
-		-- doubles peak memory and adds another traversal before JSONEncode.
-		-- Every general remote/audit caller keeps the sanitized default.
-		local value = if internalJsonSafe == true then body else sanitizeJson(body)
-		local encOk, enc = pcall(function()
-			return HttpService:JSONEncode(value)
-		end)
-		if not encOk then
-			return false, "JSONEncode failed: " .. tostring(enc)
+		if internalJsonSafe == "encoded" then
+			-- The caller already JSONEncoded this body (its sizing pass reuses
+			-- the same string), so a second encode here would be pure waste.
+			req.Body = body
+		else
+			-- Snapshot/bootstrap payloads are assembled exclusively from primitive
+			-- schema fields by this plugin. Let those trusted internal callers skip
+			-- sanitizeJson's full-tree copy: on a large service that otherwise
+			-- doubles peak memory and adds another traversal before JSONEncode.
+			-- Every general remote/audit caller keeps the sanitized default.
+			local value = if internalJsonSafe == true then body else sanitizeJson(body)
+			local encOk, enc = pcall(function()
+				return HttpService:JSONEncode(value)
+			end)
+			if not encOk then
+				return false, "JSONEncode failed: " .. tostring(enc)
+			end
+			req.Body = enc
 		end
-		req.Body = enc
 	end
 
 	local function liveStampCount(now)
@@ -4750,8 +4837,37 @@ local scaleState = {
 	trackedInstanceCount = 0,
 	trackedConnectionCount = 0,
 	lastKnownParent = {},
+	-- Wall-clock slice budget for the big tree walks. See yieldIfSliceExpired.
+	sliceBudgetSeconds = 0.030,
 }
 local flushPush
+
+-- Yield on elapsed time, not on a fixed instance count.
+--
+-- The walks below used to `task.wait()` every N instances (500 for scans, 750
+-- for hooks). Each wait costs a whole frame, so on a 460k-instance place the
+-- stats scan spent ~918 frames — roughly 15s of a 19s scan — parked rather
+-- than working; hook install paid ~612 more. Total time under a fixed cadence
+-- is work * (1 + frameTime/sliceTime), so a small slice is pathological.
+--
+-- Slicing on wall-clock instead bounds the per-frame hitch directly (the thing
+-- responsiveness actually depends on) and makes the yield count fall out of
+-- how fast the machine is, not how many instances it happens to be holding.
+local sliceStartedAt = os.clock()
+scaleState.resetYieldSlice = function()
+	sliceStartedAt = os.clock()
+end
+scaleState.yieldIfSliceExpired = function(): boolean
+	if (os.clock() - sliceStartedAt) < scaleState.sliceBudgetSeconds then
+		return false
+	end
+	-- pcall: some callers run in non-yieldable contexts (plugin unload,
+	-- certain signal handlers). Resetting the clock even when the wait
+	-- throws keeps the failure cheap — one attempt per slice, not per item.
+	pcall(task.wait)
+	sliceStartedAt = os.clock()
+	return true
+end
 
 scaleState.preflightLiveOp = function(op, shouldContinue): (string?, string?)
 	-- Reject an oversized/cyclic value tree before sanitizeJson duplicates it.
@@ -4794,8 +4910,7 @@ scaleState.preflightLiveOp = function(op, shouldContinue): (string?, string?)
 			return nil, "live operation exceeds the 512 KiB frame limit"
 		end
 		visited += 1
-		if visited % scaleState.studioScanYieldEvery == 0 then
-			task.wait()
+		if scaleState.yieldIfSliceExpired() then
 			if shouldContinue and not shouldContinue() then
 				return nil, "cancelled"
 			end
@@ -5827,8 +5942,7 @@ connectTree = function(inst, progress, shouldContinue): boolean
 				or hasAvoidSyncAttribute(frame.inst)
 			connectInstance(frame.inst, frame.blocked, frame.blocked or frame.inst:IsA("LuaSourceContainer"))
 			meter.visited += 1
-			if meter.visited % scaleState.hookYieldEvery == 0 then
-				task.wait()
+			if scaleState.yieldIfSliceExpired() then
 				if shouldContinue and not shouldContinue() then
 					return false
 				end
@@ -5884,20 +5998,17 @@ disconnectHooks = function()
 	end
 	serviceConnections = {}
 	scaleState.itemChangedAvailable = false
-	sourceSyncState.pending = {}
-	sourceSyncState.expected = {}
-	sourceSyncState.generation = {}
-	-- Drain over a snapshot of the keys rather than re-probing `next(connections)`
-	-- each iteration. The old form depended on disconnectInstance always removing
-	-- the key it was handed; any key that survived made this loop spin forever and
-	-- Studio killed the plugin with "script exhaustion time exceeded" while merely
-	-- disconnecting. A snapshot terminates in O(n) regardless.
-	local hooked = {}
-	for inst in pairs(connections) do
-		hooked[#hooked + 1] = inst
-	end
-	for _, inst in ipairs(hooked) do
+	pendingEditorSourceByScript = {}
+	-- Hundreds of thousands of tracked instances exhaust the per-frame
+	-- execution budget if torn down in one gulp. The old every-20k-items
+	-- yield still left multi-hundred-ms stretches between waits — a visible
+	-- Studio freeze on a 460k-instance place every disconnect/cancel. Slice
+	-- on wall clock like the scans do.
+	scaleState.resetYieldSlice()
+	while next(connections) do
+		local inst = next(connections)
 		disconnectInstance(inst)
+		scaleState.yieldIfSliceExpired()
 	end
 	connections = {}
 	table.clear(activeConnectionSet)
@@ -6017,6 +6128,8 @@ local function hookService(svc, progress, shouldContinue): boolean
 end
 
 local function installHooks(shouldContinue): boolean
+	local hooksStarted = os.clock()
+	scaleState.resetYieldSlice()
 	scaleState.avoidSyncTrackingPaused = true
 	disconnectHooks()
 	table.clear(scaleState.avoidSyncRoots)
@@ -6111,9 +6224,10 @@ local function installHooks(shouldContinue): boolean
 	scaleState.markAvoidSyncPathsDirty()
 	log(
 		string.format(
-			"hooks indexed: %d instance(s), %d property connection(s)",
+			"hooks indexed: %d instance(s), %d property connection(s), %.1fs",
 			scaleState.trackedInstanceCount,
-			scaleState.trackedConnectionCount
+			scaleState.trackedConnectionCount,
+			os.clock() - hooksStarted
 		)
 	)
 	if shouldContinue and not shouldContinue() then
@@ -6133,6 +6247,15 @@ scaleState.beginStudioScanGuard = function(opts)
 		reason = nil,
 		connections = {},
 		expectedMutations = {},
+		-- Source-only mutation tracking: pure script edits during the bootstrap
+		-- stream are recorded here and replayed through the live op channel
+		-- after connect, instead of forcing a full restart (which starved
+		-- busy Team Create places forever).
+		mutatedSources = {},
+		mutatedSourceCount = 0,
+		sourceOverflow = false,
+		structuralDirty = false,
+		tolerateSourceEdits = false,
 	}
 	guard.pushExpectedMutation = function(expected)
 		guard.expectedMutations[#guard.expectedMutations + 1] = expected
@@ -6188,6 +6311,18 @@ scaleState.beginStudioScanGuard = function(opts)
 		end
 		guard.dirty = true
 		guard.reason = guard.reason or reason
+		if eventKind == "Source" and typeof(item) == "Instance" then
+			if guard.mutatedSources[item] == nil then
+				if guard.mutatedSourceCount >= 256 then
+					guard.sourceOverflow = true
+				else
+					guard.mutatedSources[item] = true
+					guard.mutatedSourceCount += 1
+				end
+			end
+		else
+			guard.structuralDirty = true
+		end
 	end
 	local function addConnection(connection)
 		if connection then
@@ -6252,6 +6387,14 @@ scaleState.beginStudioScanGuard = function(opts)
 		end
 	end
 	return guard
+end
+
+-- True when the guarded mutation genuinely invalidates a snapshot in flight:
+-- anything structural (add/remove/rename/reparent/attributes), or more Source
+-- edits than the bounded replay set can hold. Pure Source edits within the cap
+-- are recoverable — the recorded scripts replay through the live op channel.
+scaleState.guardBlocksSnapshot = function(guard)
+	return guard ~= nil and guard.dirty == true and (guard.structuralDirty == true or guard.sourceOverflow == true)
 end
 
 scaleState.disconnectStudioScanGuard = function(guard)
@@ -6327,9 +6470,7 @@ scaleState.scanStudioService = function(service: Instance, stats, progress)
 			frame.outputChildren = {}
 			frame.hasSyncableChild = false
 			progress.visited += 1
-			if progress.visited % scaleState.studioScanYieldEvery == 0 then
-				task.wait()
-			end
+			scaleState.yieldIfSliceExpired()
 			if SUPPRESS_CLASSES[frame.inst.ClassName] then
 				frame.suppressed = true
 				frame.children = {}
@@ -6387,9 +6528,12 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 			frame.hasSyncableChild = false
 			frame.hasAvoidSyncChild = false
 			frame.projectedChildCount = 0
+			frame.projectedChildren = {}
 			progress.visited += 1
-			if progress.visited % scaleState.studioScanYieldEvery == 0 then
-				task.wait()
+			-- Amortized: two os.clock() calls per node dominated small-node
+			-- walks; one slice check per 64 nodes still bounds the hitch.
+			if progress.visited % 64 == 0 then
+				scaleState.yieldIfSliceExpired()
 			end
 			if SUPPRESS_CLASSES[frame.inst.ClassName] then
 				frame.children = {}
@@ -6431,6 +6575,7 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 					-- even when the ignored reservation is currently empty.
 					hasChildren = mappedClass == "Folder" or frame.actualHasChildren == true,
 					childIndex = frame.childIndex,
+					children = frame.projectedChildren,
 				}
 			elseif not frame.suppressed then
 				local isScript = frame.inst:IsA("LuaSourceContainer")
@@ -6451,6 +6596,11 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 						childCount = frame.projectedChildCount,
 						hasChildren = frame.projectedChildCount > 0,
 						childIndex = frame.childIndex,
+						-- Ordered projected children, recorded so the structure
+						-- stream can walk this index instead of re-walking the
+						-- DataModel (siblings finish in visitation order, so
+						-- appending at pop time preserves child order).
+						children = frame.projectedChildren,
 					}
 				end
 				if syncable and not frame.serviceRoot then
@@ -6465,6 +6615,7 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 			if parent then
 				if projected then
 					parent.projectedChildCount += 1
+					parent.projectedChildren[#parent.projectedChildren + 1] = frame.inst
 				end
 				if syncable then
 					parent.hasSyncableChild = true
@@ -6480,14 +6631,12 @@ end
 scaleState.collectStudioStatsWithGuard = function(guard)
 	local stats = { scriptCount = 0, instanceCount = 0 }
 	local progress = { visited = 0 }
-	-- Strong keys, deliberately. Roblox collects an Instance's userdata once no
-	-- other Lua reference exists — even while the instance is still in the
-	-- DataModel — so a weak-keyed entry can vanish between the stats scan and
-	-- the streamed handshake that reads it back. The structure stream then
-	-- silently drops the evicted children while their parent still declares
-	-- scan-time childCount, and the daemon rejects the whole push ("streamed
-	-- parent N declared X children but received Y"). Lifetime stays bounded:
-	-- the owning scan guard is disposed on every handshake exit.
+	scaleState.resetYieldSlice()
+	-- Strong keys on purpose: the initial push streams structure from this index
+	-- after the /initial-compare round trip, and on large places (100k+
+	-- instances) a GC cycle in that window swept a weak-keyed table, leaving
+	-- "Studio projection index is unavailable" retry loops. The guard's disposal
+	-- releases the whole index, so its lifetime is already bounded.
 	local projectionInfo = {}
 	if guard then
 		guard.projectionInfo = projectionInfo
@@ -6499,7 +6648,10 @@ scaleState.collectStudioStatsWithGuard = function(guard)
 		if ok and service then
 			scaleState.scanStudioServiceStats(service, stats, progress, projectionInfo)
 		end
-		if guard and guard.dirty then
+		-- Source-only edits don't change structure counts and the fresh read at
+		-- push time picks up the newer content, so only structural mutations
+		-- invalidate the scan.
+		if scaleState.guardBlocksSnapshot(guard) then
 			break
 		end
 	end
@@ -6517,6 +6669,17 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	local orderingContext = snapshotApplyState.newContext({
 		indexAvoidSyncCarriers = true,
 	})
+	-- The push path opts into surviving Source-only edits (they're recorded and
+	-- replayed after connect); the compare path stays strict.
+	local function blockedByMutation()
+		if guard == nil then
+			return false
+		end
+		if guard.tolerateSourceEdits == true then
+			return scaleState.guardBlocksSnapshot(guard)
+		end
+		return guard.dirty == true
+	end
 	local records = {}
 	local sourceInstances = {}
 	local instanceById = {}
@@ -6542,7 +6705,7 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 		},
 	}
 	while #stack > 0 do
-		if guard and guard.dirty then
+		if blockedByMutation() then
 			return nil, "Studio changed during streamed structure scan"
 		end
 		local frame = stack[#stack]
@@ -6565,9 +6728,9 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 			frame.id = nextId
 			nextId += 1
 			instanceById[frame.id + 1] = frame.inst
-			if nextId % scaleState.studioScanYieldEvery == 0 then
-				task.wait()
-				if guard and guard.dirty then
+			-- Amortized slice check; see scanStudioServiceStats.
+			if nextId % 64 == 0 and scaleState.yieldIfSliceExpired() then
+				if blockedByMutation() then
 					return nil, "Studio changed during streamed structure scan"
 				end
 			end
@@ -6643,15 +6806,80 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	return sourceInstances, nil, instanceById
 end
 
-scaleState.normalizedSourceHash = function(inst: Instance): (string?, string?)
-	local source, sourceErr = tryReadScriptSource(inst)
-	if source == nil then
-		return nil, sourceErr
+-- Memoized normalized source hashes. Re-reading and re-SHA256ing every script
+-- on every compare made instant reconnects pay the full hashing cost again.
+-- Entries are invalidated by the always-on listeners below (installed once at
+-- plugin load, independent of the per-connection hooks, so they cover the
+-- windows where hooks are torn down between reconnects). Weak keys: destroyed
+-- scripts must not pin their hash entries.
+scaleState.sourceHashMemo = setmetatable({}, { __mode = "k" })
+scaleState.sourceHashMemoGeneration = 0
+scaleState.sourceHashMemoEnabled = false
+
+scaleState.invalidateSourceHash = function(inst: Instance?)
+	scaleState.sourceHashMemoGeneration += 1
+	if inst ~= nil then
+		scaleState.sourceHashMemo[inst] = nil
 	end
+end
+
+scaleState.normalizedSourceHash = function(inst: Instance): string
+	if scaleState.sourceHashMemoEnabled then
+		local cached = scaleState.sourceHashMemo[inst]
+		if cached ~= nil then
+			return cached
+		end
+	end
+	local generationAtRead = scaleState.sourceHashMemoGeneration
+	local source = readScriptSource(inst)
 	if string.find(source, "\r\n", 1, true) then
 		source = string.gsub(source, "\r\n", "\n")
 	end
-	return sha256Hex(source), nil
+	local hash = sha256Hex(source)
+	-- Store only when no source anywhere mutated while reading/hashing: a
+	-- mid-hash edit may already have cleared this key, and caching over it
+	-- would freeze a stale hash.
+	if scaleState.sourceHashMemoEnabled and scaleState.sourceHashMemoGeneration == generationAtRead then
+		scaleState.sourceHashMemo[inst] = hash
+	end
+	return hash
+end
+
+-- Always-on invalidation. A memoized hash is exactly as trustworthy as the
+-- scan guard's own change detection — both ride ItemChanged plus the script
+-- editor signal (including this plugin's own UpdateSourceAsync writes and
+-- Team Create commits). If ItemChanged is unavailable on this Studio channel
+-- the memo stays disabled and every compare hashes from scratch, as before.
+do
+	local itemChangedOk, itemChangedConnection = pcall(function()
+		return game.ItemChanged:Connect(function(item, descriptor)
+			if typeof(item) ~= "Instance" or not item:IsA("LuaSourceContainer") then
+				return
+			end
+			local propertyName = if type(descriptor) == "string" then descriptor else nil
+			if not propertyName and descriptor then
+				pcall(function()
+					propertyName = descriptor.Name
+				end)
+			end
+			if propertyName == "Source" then
+				scaleState.invalidateSourceHash(item)
+			end
+		end)
+	end)
+	if itemChangedOk and itemChangedConnection then
+		scaleState.sourceHashMemoEnabled = true
+		if ScriptEditorService then
+			pcall(function()
+				ScriptEditorService.TextDocumentDidChange:Connect(function(document)
+					local scriptInst = scriptFromDocument(document)
+					if scriptInst then
+						scaleState.invalidateSourceHash(scriptInst)
+					end
+				end)
+			end)
+		end
+	end
 end
 
 scaleState.collectStudioState = function()
@@ -6822,4557 +7050,67 @@ end
 --------------------------------------------------------------------------------
 -- Remote-control request/response protocol (CLI-backed)
 --------------------------------------------------------------------------------
--- Schema:
---   C→S (from daemon, initiated by CLI):
---     { type = "request", request_id = <uint>, op = <string>, args = <table> }
---   S→C (this plugin):
---     { type = "response", request_id = <uint>, ok = true,  value = <any>  }
---     { type = "response", request_id = <uint>, ok = false, error = <str>  }
---
--- Ops:
---   get   args: { path = "Workspace/Foo", prop = "Name" }
---           value: codec-encoded property value
---   set   args: { path, prop, value = <codec-encoded> }
---           value: { path, prop }
---   ls    args: { path = "" | "/" | "Workspace/..." }
---           value: [ { class, name, path }, ... ] (shallow children)
---   tree  args: { path?, depth? = 3 }
---           value: { class, name, children = [ ... ] } nested; leaves beyond
---                  depth carry truncated = true if they had children.
---   find  args: { root?, className?, name?, limit? = 500 }
---           value: [ "path", "path", ... ]
---   eval  args: { source = "<luau>" }
---           value: codec-encoded return value(s); compile/runtime errors are
---                  surfaced as ok=false responses.
---
--- Paths are DataModel-rooted and "/"-separated. "" or "/" resolves to `game`.
--- The first segment is tried as a service first, then as a direct child.
---
--- JSON codec:
---   nil / boolean / number / string  → pass through (NaN/Inf stripped)
---   Vector2/3, CFrame, Color3, UDim, UDim2, EnumItem, BrickColor,
---   NumberRange, Instance → tagged { __type = "...", ... } objects
---   tables → recurse; arrays preserved; mixed/object tables keyed by string
---
--- Writes (set / eval) also POST a one-line JSON entry to /writelog. The
--- daemon is responsible for appending to ~/.terminal64/widgets/ro-sync/writes.log
--- (Studio plugins cannot write arbitrary files). POST failures warn but never
--- fail the op.
---
--- 5s timeout is enforced on the daemon side; the plugin always replies when
--- the handler returns.
-
-local TREE_DEPTH_DEFAULT = 3
-local FIND_LIMIT_DEFAULT = 500
-local EVAL_CHUNK_NAME = "rosync-eval"
-
-local remoteCodec
-do
-	local moduleScript = script:FindFirstChild("RemoteCodec")
-	if not moduleScript or not moduleScript:IsA("ModuleScript") then
-		error("[Ro Sync] packaged RemoteCodec module is missing")
-	end
-	local module = require(moduleScript)
-	remoteCodec = module.install({
-		resolvePath = resolvePath,
-	})
-end
-local splitRemotePath = remoteCodec.splitPath
-local resolveRemotePath = remoteCodec.resolvePath
-local instancePathString = remoteCodec.pathOf
-local encodeRemoteValue = remoteCodec.encode
-local decodeRemoteValue = remoteCodec.decode
-
-local remoteHandlers = {}
--- Remote feature helpers are deliberately split into short lexical scopes.
+-- The entire CLI op surface lives in the packaged RemoteControl ModuleScript.
 -- Luau limits every function (including this top-level chunk) to 200 local
--- registers; keeping all handler helpers alive until EOF makes the packaged
--- plugin fail to compile in Studio as the command surface grows.
-local remoteState: any = {}
-
+-- registers; keeping the remote handlers and their helpers here made the
+-- packaged plugin fail to compile in Studio as the command surface grew.
+-- See plugin/RemoteControl.luau for the wire schema, the codec and the op list.
+local remoteHandlers = {}
+local remoteState: any = {
+	handleRemoteRequest = function() end,
+	requestRemoteWriteCleanup = function() end,
+}
 do
-	-- Keep the native instance clipboard in a packaged ModuleScript so this
-	-- already-large top-level chunk stays below Luau's 200-register ceiling.
-	remoteState.clipboardAvailable = false
-	local moduleScript = script:FindFirstChild("Clipboard")
+	local moduleScript = script:FindFirstChild("RemoteControl")
 	if moduleScript and moduleScript:IsA("ModuleScript") then
 		local okModule, module = pcall(require, moduleScript)
-		if okModule and type(module) == "table" and type(module.install) == "function" then
-			local okInstall, controller = pcall(module.install, {
-				resolvePath = resolveRemotePath,
-				pathOf = instancePathString,
+		if okModule and type(module) == "table" and type(module.create) == "function" then
+			local okCreate, controller = pcall(module.create, {
+				HttpService = HttpService,
+				ChangeHistoryService = ChangeHistoryService,
+				AssetService = AssetService,
+				EncodingService = EncodingService,
+				plugin = plugin,
+				sha256Hex = sha256Hex,
 				httpJson = httpJson,
 				readScriptSource = readScriptSource,
+				writeScriptSource = writeScriptSource,
+				resolvePath = resolvePath,
+				readLogRing = readLogRing,
+				wsSend = wsSend,
+				log = log,
+				dbg = dbg,
+				hostDataModelTypeName = hostDataModelTypeName,
+				-- Transmit scripts are compiled without a sandbox on purpose, so the
+				-- chunk inherits the environment of whoever calls loadstring. Compile
+				-- from this Script so they keep seeing the plugin environment (`script`
+				-- pointing at the plugin Script, `plugin` present) rather than the
+				-- packaged module's.
+				loadPluginChunk = function(source, chunkName)
+					return loadstring(source, chunkName)
+				end,
+				getWsGeneration = function()
+					return wsGeneration
+				end,
+				PLUGIN_PROTOCOL_VERSION = PLUGIN_PROTOCOL_VERSION,
+				PLUGIN_VERSION_STRING = PLUGIN_VERSION_STRING,
 			})
-			if okInstall and type(controller) == "table" and type(controller.handlers) == "table" then
-				remoteState.clipboardAvailable = controller.available == true
-				for name, handler in pairs(controller.handlers) do
-					remoteHandlers[name] = handler
-				end
-			else
-				warn("[Ro Sync] native clipboard unavailable: " .. tostring(controller))
-			end
-		else
-			warn("[Ro Sync] packaged Clipboard module failed to load: " .. tostring(module))
-		end
-	end
-end
-
-do
-	-- ---------------------------------------------------------------------------
-	-- Edit-mode playtest coordinator. Runtime copies of this plugin advertise
-	-- themselves over PluginConnectionService; this registry assigns friendly
-	-- context names (`server`, `client:1`, ...) and routes correlated requests.
-	-- ---------------------------------------------------------------------------
-
-	local runtimeContextsById = {}
-	local runtimeContextsByName = {}
-	local runtimePendingRequests = {}
-	local boundRuntimeConnections = setmetatable({}, { __mode = "k" })
-	local nextRuntimeClientIndex = 1
-	local runtimeRequestCounter = 0
-	local playtestJobs = {}
-	local playscriptRunsByClientId = {}
-	local playscriptRunTombstones = {}
-	local latestPlaytestJobId = nil
-	local requestRuntimeContext
-	local fetchPlayscriptResult
-	local playscriptCoordinator = nil
-	do
-		local moduleScript = script:FindFirstChild("Playscript")
-		if moduleScript and moduleScript:IsA("ModuleScript") then
-			local okModule, module = pcall(require, moduleScript)
-			if okModule and type(module) == "table" and type(module.newCoordinator) == "function" then
-				local okCoordinator, coordinator = pcall(module.newCoordinator, {
-					httpService = HttpService,
-					sha256Hex = sha256Hex,
-					onTerminalRequested = function(job, terminal, external)
-						local callback = remoteState.onPlayscriptTerminalRequested
-						if callback then
-							callback(job, terminal, external)
-						end
-					end,
-				})
-				if okCoordinator then
-					playscriptCoordinator = coordinator
-				else
-					warn("[Ro Sync] playscript coordinator initialization failed: " .. tostring(coordinator))
-				end
-			end
-		end
-	end
-
-	local function coordinatorAuth(sessionToken: string, purpose: string): string
-		return sha256Hex(sessionToken .. "|" .. purpose)
-	end
-
-	local function runtimeContextSnapshot(context)
-		return {
-			id = context.name,
-			runtimeId = context.runtimeId,
-			playtestJobId = context.playtestJobId,
-			role = context.role,
-			hostDataModelType = context.hostDataModelType,
-			rawHostDataModelType = context.rawHostDataModelType,
-			canConnectToEdit = context.canConnectToEdit,
-			canConnectToTest = context.canConnectToTest,
-			testArgsAuthenticated = context.testArgsAuthenticated,
-			placeId = context.placeId,
-			gameId = context.gameId,
-			jobId = context.jobId,
-			playerName = context.playerName,
-			userId = context.userId,
-			targetId = context.targetId,
-			connected = context.connection.Connected,
-			lastSeen = context.lastSeen,
-		}
-	end
-
-	local function pruneRuntimeContexts()
-		local changedJobs = {}
-		for runtimeId, context in pairs(runtimeContextsById) do
-			if not context.connection.Connected then
-				changedJobs[context.playtestJobId] = true
-				runtimeContextsById[runtimeId] = nil
-				if runtimeContextsByName[context.name] == context then
-					runtimeContextsByName[context.name] = nil
-				end
-			end
-		end
-		if playscriptCoordinator then
-			for jobId in pairs(changedJobs) do
-				local job = playtestJobs[jobId]
-				if job and job.run then
-					playscriptCoordinator:setContexts(job, runtimeContextsByName)
-					playscriptCoordinator:onContextsChanged(job, runtimeContextsByName)
-				end
-			end
-		end
-	end
-
-	local function registerRuntimeHello(connection, message)
-		local runtimeId = tostring(message.runtimeId or "")
-		if runtimeId == "" then
-			return
-		end
-		local playtestJobId = tostring(message.playtestJobId or "")
-		local job = playtestJobs[playtestJobId]
-		if
-			job == nil
-			or job.sessionToken == nil
-			or (job.status ~= "starting" and job.status ~= "running" and job.status ~= "stopping")
-			or tonumber(message.protocolVersion) ~= PLUGIN_PROTOCOL_VERSION
-			or tostring(message.auth or "") ~= coordinatorAuth(job.sessionToken, "hello|" .. runtimeId)
-		then
-			return
-		end
-		local existing = runtimeContextsById[runtimeId]
-		local name
-		if existing then
-			name = existing.name
-		elseif tostring(message.role) == "server" and runtimeContextsByName.server == nil then
-			name = "server"
-		else
-			repeat
-				name = "client:" .. tostring(nextRuntimeClientIndex)
-				nextRuntimeClientIndex += 1
-			until runtimeContextsByName[name] == nil
-		end
-		local context = {
-			name = name,
-			runtimeId = runtimeId,
-			playtestJobId = playtestJobId,
-			sessionToken = job.sessionToken,
-			role = tostring(message.role or "unknown"),
-			hostDataModelType = tostring(message.hostDataModelType or "Unknown"),
-			rawHostDataModelType = tostring(message.rawHostDataModelType or "Unknown"),
-			canConnectToEdit = message.canConnectToEdit == true,
-			canConnectToTest = message.canConnectToTest == true,
-			testArgsAuthenticated = message.testArgsAuthenticated == true,
-			placeId = message.placeId,
-			gameId = message.gameId,
-			jobId = message.jobId,
-			playerName = message.playerName,
-			userId = message.userId,
-			targetId = connection.TargetId,
-			connection = connection,
-			lastSeen = os.clock(),
-		}
-		runtimeContextsById[runtimeId] = context
-		runtimeContextsByName[name] = context
-		if playscriptCoordinator and job.run then
-			playscriptCoordinator:setContexts(job, runtimeContextsByName)
-			playscriptCoordinator:onContext(job, context, runtimeContextsByName)
-		end
-	end
-
-	local function bindRuntimeConnection(connection)
-		if boundRuntimeConnections[connection] then
-			return
-		end
-		boundRuntimeConnections[connection] = true
-		connection:BindToMessage(function(payload)
-			local ok, message = pcall(function()
-				return HttpService:JSONDecode(tostring(payload))
-			end)
-			if not ok or type(message) ~= "table" then
-				return
-			end
-			if message.kind == "rosync-runtime-hello" then
-				registerRuntimeHello(connection, message)
-				return
-			end
-			if message.kind == "rosync-playscript-frame" then
-				local runtimeId = tostring(message.runtimeId or "")
-				local context = runtimeContextsById[runtimeId]
-				if context and context.connection == connection then
-					local job = playtestJobs[context.playtestJobId]
-					if job and job.run and playscriptCoordinator then
-						local action = playscriptCoordinator:handleFrame(job, context, message)
-						if action then
-							task.spawn(function()
-								if fetchPlayscriptResult then
-									fetchPlayscriptResult(action)
-								else
-									playscriptCoordinator:resolveResult(action, nil, "result transport unavailable")
-								end
-							end)
-						end
-					end
-				end
-				return
-			end
-			if message.kind == "rosync-runtime-response" then
-				local requestId = tostring(message.requestId or "")
-				local pending = runtimePendingRequests[requestId]
-				if
-					pending
-					and pending.connection == connection
-					and tostring(message.auth or "") == pending.expectedAuth
-				then
-					pending.response = message
-					pending.event:Fire()
-				end
-			end
-		end)
-		pcall(function()
-			connection:SendMessage(HttpService:JSONEncode({ kind = "rosync-runtime-discover" }))
-		end)
-	end
-
-	do
-		local ok, service = pcall(function()
-			return game:GetService("PluginConnectionService")
-		end)
-		if ok and service then
-			pcall(function()
-				for _, connection in ipairs(service:GetPluginConnectionsOfType(Enum.PluginConnectionTargetType.Test)) do
-					bindRuntimeConnection(connection)
-				end
-			end)
-			service.Connected:Connect(function(connection)
-				if connection.Type == Enum.PluginConnectionTargetType.Test then
-					bindRuntimeConnection(connection)
-				end
-			end)
-		end
-	end
-
-	requestRuntimeContext = function(context, operation: string, args: any, timeoutSeconds: number)
-		if not context or not context.connection.Connected then
-			error("playtest context is not connected")
-		end
-		runtimeRequestCounter += 1
-		local requestId = HttpService:GenerateGUID(false) .. "-" .. tostring(runtimeRequestCounter)
-		local pending = {
-			event = Instance.new("BindableEvent"),
-			response = nil,
-			timedOut = false,
-			connection = context.connection,
-			expectedAuth = coordinatorAuth(context.sessionToken, "response|" .. requestId),
-		}
-		runtimePendingRequests[requestId] = pending
-		local requestArgs = if type(args) == "table" then table.clone(args) else {}
-		requestArgs.__rosyncTimeoutSeconds = timeoutSeconds
-		local sent, sendError = pcall(function()
-			context.connection:SendMessage(HttpService:JSONEncode({
-				kind = "rosync-runtime-request",
-				requestId = requestId,
-				op = operation,
-				auth = coordinatorAuth(context.sessionToken, "request|" .. requestId .. "|" .. operation),
-				args = requestArgs,
-			}))
-		end)
-		if not sent then
-			runtimePendingRequests[requestId] = nil
-			pending.event:Destroy()
-			error("runtime send failed: " .. tostring(sendError))
-		end
-		task.delay(timeoutSeconds, function()
-			if runtimePendingRequests[requestId] == pending and pending.response == nil then
-				pending.timedOut = true
-				pending.event:Fire()
-			end
-		end)
-		pending.event.Event:Wait()
-		runtimePendingRequests[requestId] = nil
-		pending.event:Destroy()
-		if pending.response == nil then
-			error("runtime request timed out after " .. tostring(timeoutSeconds) .. "s")
-		end
-		context.lastSeen = os.clock()
-		if pending.response.ok ~= true then
-			local runtimeError = pending.response.error
-			if type(runtimeError) == "table" then
-				error(
-					tostring(runtimeError.code or "RUNTIME_ERROR") .. ": " .. tostring(runtimeError.message or "failed")
-				)
-			end
-			error(tostring(runtimeError or "runtime request failed"))
-		end
-		return pending.response.value
-	end
-
-	fetchPlayscriptResult = function(action)
-		local context = action.context
-		local result = action.result
-		local resultId = tostring(result.id or "")
-		local byteLength = math.floor(tonumber(result.bytes) or -1)
-		if resultId == "" or byteLength < 2 or byteLength > 2 * 1024 * 1024 then
-			playscriptCoordinator:resolveResult(action, nil, "runtime returned invalid playscript result metadata")
-			return
-		end
-		local deadline = os.clock() + 20
-		local pieces = {}
-		local offset = 0
-		local transferOk, transferError = pcall(function()
-			while offset < byteLength do
-				local remaining = deadline - os.clock()
-				if remaining <= 0 then
-					error("playscript result transfer timed out")
-				end
-				local chunk = requestRuntimeContext(context, "playscript_result_read", {
-					id = resultId,
-					offset = offset,
-					maxBytes = 96 * 1024,
-				}, math.max(0.1, math.min(remaining, 5)))
-				local chunkOffset = math.floor(tonumber(chunk.offset) or -1)
-				local nextOffset = math.floor(tonumber(chunk.nextOffset) or -1)
-				if chunkOffset ~= offset or nextOffset <= offset or nextOffset > byteLength then
-					error("playscript result returned an invalid chunk offset")
-				end
-				local decoded = EncodingService:Base64Decode(buffer.fromstring(tostring(chunk.bytesBase64 or "")))
-				if typeof(decoded) == "buffer" then
-					decoded = buffer.tostring(decoded)
-				end
-				if type(decoded) ~= "string" or #decoded ~= nextOffset - offset then
-					error("playscript result returned an invalid chunk length")
-				end
-				table.insert(pieces, decoded)
-				offset = nextOffset
-			end
-			local encoded = table.concat(pieces)
-			if #encoded ~= byteLength then
-				error("playscript result length mismatch")
-			end
-			if tostring(result.sha256 or "") ~= sha256Hex(encoded) then
-				error("playscript result SHA-256 mismatch")
-			end
-			local decodeOk, envelope = pcall(function()
-				return HttpService:JSONDecode(encoded)
-			end)
-			if not decodeOk or type(envelope) ~= "table" then
-				error("playscript result is not a valid JSON envelope")
-			end
-			playscriptCoordinator:resolveResult(action, envelope, nil)
-		end)
-		pcall(function()
-			requestRuntimeContext(context, "playscript_result_close", { id = resultId }, 1)
-		end)
-		if not transferOk then
-			playscriptCoordinator:resolveResult(action, nil, tostring(transferError))
-		end
-	end
-
-	local function playtestJobSnapshot(job)
-		if not job then
-			return nil
-		end
-		return {
-			id = job.id,
-			clientRunId = job.clientRunId,
-			mode = job.mode,
-			players = job.players,
-			status = job.status,
-			createdAt = job.createdAt,
-			startedAt = job.startedAt,
-			endedAt = job.endedAt,
-			result = job.result,
-			error = job.error,
-		}
-	end
-
-	local function playscriptFingerprint(args)
-		local main = if type(args.script) == "table" then args.script else {}
-		local client = if type(args.clientScript) == "table" then args.clientScript else nil
-		local mainSource = tostring(main.source or args.source or "")
-		local clientSource = if client then tostring(client.source or "") else ""
-		local argsJson = tostring(args.scriptArgsJson or "")
-		if argsJson == "" then
-			local argsOk, encodedArgs = pcall(function()
-				return HttpService:JSONEncode(if args.scriptArgs == nil then {} else args.scriptArgs)
-			end)
-			if not argsOk then
-				error("playtest run args could not be fingerprinted: " .. tostring(encodedArgs))
-			end
-			argsJson = encodedArgs
-		end
-		local testArgsOk, testArgsJson = pcall(function()
-			return HttpService:JSONEncode(if type(args.testArgs) == "table" then args.testArgs else {})
-		end)
-		if not testArgsOk then
-			error("playtest run test args could not be fingerprinted: " .. tostring(testArgsJson))
-		end
-		local fields = {
-			tostring(args.mode or "play"):lower(),
-			tostring(math.clamp(math.floor(tonumber(args.players) or 1), 1, 8)),
-			tostring(args.context or "server"),
-			tostring(args.identity or "game"):lower(),
-			tostring(math.clamp(tonumber(args.timeout) or 600, 0.1, 3600)),
-			tostring(args.logs or "off"):lower(),
-			if args.keepOpen == true then "true" else "false",
-			tostring(main.path or ""),
-			sha256Hex(mainSource),
-			if clientSource == "" then "" else tostring(client.path or ""),
-			if clientSource == "" then "" else sha256Hex(clientSource),
-			argsJson,
-			testArgsJson,
-		}
-		local framed = {}
-		for _, field in ipairs(fields) do
-			table.insert(framed, tostring(#field) .. ":" .. field)
-		end
-		return sha256Hex(table.concat(framed, "|"))
-	end
-
-	local function prunePlayscriptRunKeys()
-		local now = os.clock()
-		for clientRunId, entry in pairs(playscriptRunsByClientId) do
-			local status = tostring(entry.job.status)
-			local active = status == "starting" or status == "running" or status == "stopping"
-			if not active and now - entry.lastUsed > 600 then
-				playscriptRunsByClientId[clientRunId] = nil
-			end
-		end
-		for clientRunId, tombstone in pairs(playscriptRunTombstones) do
-			if now - tombstone.createdAt > 120 then
-				playscriptRunTombstones[clientRunId] = nil
-			end
-		end
-		while true do
-			local count = 0
-			local oldestId = nil
-			local oldestClock = math.huge
-			for clientRunId, entry in pairs(playscriptRunsByClientId) do
-				count += 1
-				local status = tostring(entry.job.status)
-				local active = status == "starting" or status == "running" or status == "stopping"
-				if not active and entry.lastUsed < oldestClock then
-					oldestClock = entry.lastUsed
-					oldestId = clientRunId
-				end
-			end
-			if count <= 64 or not oldestId then
-				break
-			end
-			playscriptRunsByClientId[oldestId] = nil
-		end
-		while true do
-			local count = 0
-			local oldestId = nil
-			local oldestClock = math.huge
-			for clientRunId, tombstone in pairs(playscriptRunTombstones) do
-				count += 1
-				if tombstone.createdAt < oldestClock then
-					oldestClock = tombstone.createdAt
-					oldestId = clientRunId
-				end
-			end
-			if count <= 64 or not oldestId then
-				break
-			end
-			playscriptRunTombstones[oldestId] = nil
-		end
-	end
-
-	local function playscriptJobForArgs(args)
-		local explicitJobId = tostring(args.jobId or "")
-		local clientRunId = tostring(args.clientRunId or "")
-		if clientRunId ~= "" and (#clientRunId > 128 or string.find(clientRunId, "%c")) then
-			error("playtest run clientRunId must be at most 128 bytes without control characters")
-		end
-		if explicitJobId ~= "" then
-			if clientRunId ~= "" then
-				prunePlayscriptRunKeys()
-				local entry = playscriptRunsByClientId[clientRunId]
-				if not entry or entry.job.id ~= explicitJobId then
-					error("playtest jobId does not match clientRunId")
-				end
-				entry.lastUsed = os.clock()
-				return explicitJobId, entry.job, clientRunId
-			end
-			return explicitJobId, playtestJobs[explicitJobId], clientRunId
-		end
-		if clientRunId ~= "" then
-			prunePlayscriptRunKeys()
-			local entry = playscriptRunsByClientId[clientRunId]
-			if entry then
-				entry.lastUsed = os.clock()
-				return entry.job.id, entry.job, clientRunId
-			end
-			return "", nil, clientRunId
-		end
-		local jobId = tostring(latestPlaytestJobId or "")
-		return jobId, playtestJobs[jobId], ""
-	end
-
-	local function startPlaytestJob(args, runConfiguration)
-		for _, job in pairs(playtestJobs) do
-			if job.status == "starting" or job.status == "running" or job.status == "stopping" then
-				error("a playtest job is already active: " .. job.id)
-			end
-		end
-		local service = game:GetService("StudioTestService")
-		local mode = tostring(args.mode or "play"):lower()
-		if mode ~= "play" and mode ~= "run" and mode ~= "multiplayer" then
-			error("playtest mode must be play, run, or multiplayer")
-		end
-		local players = math.clamp(math.floor(tonumber(args.players) or 1), 1, 8)
-		local jobId = HttpService:GenerateGUID(false)
-		local sessionToken = HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
-		local previousLatestJobId = latestPlaytestJobId
-		local job = {
-			id = jobId,
-			clientRunId = if runConfiguration then tostring(runConfiguration.clientRunId or "") else nil,
-			mode = mode,
-			players = players,
-			status = "starting",
-			createdAt = os.time(),
-			sessionToken = sessionToken,
-			stopRequested = false,
-		}
-		playtestJobs[jobId] = job
-		latestPlaytestJobId = jobId
-		runtimeContextsById = {}
-		runtimeContextsByName = {}
-		nextRuntimeClientIndex = 1
-		if runConfiguration ~= nil then
-			if not playscriptCoordinator then
-				playtestJobs[jobId] = nil
-				latestPlaytestJobId = previousLatestJobId
-				error("packaged playscript coordinator is unavailable; reinstall the Studio plugin")
-			end
-			local configured, configureResult = pcall(function()
-				return playscriptCoordinator:createRun(job, runConfiguration)
-			end)
-			if not configured then
-				playtestJobs[jobId] = nil
-				latestPlaytestJobId = previousLatestJobId
-				error(tostring(configureResult))
-			end
-		end
-		local historicalJobs = {}
-		for id, candidate in pairs(playtestJobs) do
 			if
-				id ~= jobId
-				and candidate.status ~= "starting"
-				and candidate.status ~= "running"
-				and candidate.status ~= "stopping"
+				okCreate
+				and type(controller) == "table"
+				and type(controller.handlers) == "table"
+				and type(controller.state) == "table"
 			then
-				table.insert(historicalJobs, candidate)
-			end
-		end
-		if #historicalJobs > 20 then
-			table.sort(historicalJobs, function(a, b)
-				return (a.createdAt or 0) < (b.createdAt or 0)
-			end)
-			for index = 1, #historicalJobs - 20 do
-				playtestJobs[historicalJobs[index].id] = nil
-			end
-		end
-		task.spawn(function()
-			job.status = "running"
-			job.startedAt = os.time()
-			local ok, result = pcall(function()
-				local testArgs = if type(args.testArgs) == "table" then table.clone(args.testArgs) else {}
-				testArgs.__rosyncSessionToken = sessionToken
-				testArgs.__rosyncJobId = jobId
-				if mode == "run" then
-					return service:ExecuteRunModeAsync(testArgs)
-				elseif mode == "multiplayer" then
-					-- Studio's one-player multiplayer launcher creates only a
-					-- PlayClient DataModel, so there is no server context in which
-					-- to install the main playscript. Play mode provides the same
-					-- one-server/one-client topology while preserving the requested
-					-- mode in the run configuration exposed to playscripts.
-					if players == 1 then
-						return service:ExecutePlayModeAsync(testArgs)
-					end
-					return service:ExecuteMultiplayerTestAsync(players, testArgs)
-				else
-					return service:ExecutePlayModeAsync(testArgs)
-				end
-			end)
-			job.endedAt = os.time()
-			if job.stopRequested then
-				job.status = "stopped"
-				if ok then
-					local encodedOk, encoded = pcall(encodeRemoteValue, result)
-					if encodedOk then
-						job.result = encoded
-					else
-						job.stopDetail = "result encoding failed: " .. tostring(encoded)
-					end
-				else
-					job.stopDetail = tostring(result)
-				end
-			elseif ok then
-				local encodedOk, encoded = pcall(encodeRemoteValue, result)
-				if encodedOk then
-					job.status = "completed"
-					job.result = encoded
-				else
-					job.status = "failed"
-					job.error = "result encoding failed: " .. tostring(encoded)
-				end
+				remoteHandlers = controller.handlers
+				remoteState = controller.state
 			else
-				job.status = "failed"
-				job.error = tostring(result)
-			end
-			pruneRuntimeContexts()
-			if playscriptCoordinator and job.run then
-				playscriptCoordinator:onJobEnded(job)
-			end
-		end)
-		return job
-	end
-
-	remoteHandlers.playtest_start = function(args)
-		return playtestJobSnapshot(startPlaytestJob(args, nil))
-	end
-
-	remoteHandlers.playtest_run_start = function(args)
-		local clientRunId = tostring(args.clientRunId or "")
-		if clientRunId == "" or #clientRunId > 128 or string.find(clientRunId, "%c") then
-			error("playtest run clientRunId must be 1-128 bytes without control characters")
-		end
-		prunePlayscriptRunKeys()
-		if playscriptRunTombstones[clientRunId] then
-			if remoteState.preAuditedWrites then
-				remoteState.preAuditedWrites[args] = true
-			end
-			error("playtest run was cancelled before launch: " .. clientRunId)
-		end
-		local fingerprint = playscriptFingerprint(args)
-		local existing = playscriptRunsByClientId[clientRunId]
-		if existing then
-			if existing.fingerprint ~= fingerprint then
-				error("playtest run clientRunId was already used with different content")
-			end
-			existing.lastUsed = os.clock()
-			if remoteState.preAuditedWrites then
-				remoteState.preAuditedWrites[args] = true
-			end
-			return {
-				job = playtestJobSnapshot(existing.job),
-				run = playscriptCoordinator:snapshot(existing.job),
-				reused = true,
-				replayed = true,
-				clientRunId = clientRunId,
-			}
-		end
-		local job = startPlaytestJob(args, args)
-		playscriptRunsByClientId[clientRunId] = {
-			job = job,
-			fingerprint = fingerprint,
-			createdAt = os.clock(),
-			lastUsed = os.clock(),
-		}
-		prunePlayscriptRunKeys()
-		args.__rosyncAuditJobId = job.id
-		local response = {
-			job = playtestJobSnapshot(job),
-			run = playscriptCoordinator:snapshot(job),
-			reused = false,
-			replayed = false,
-			clientRunId = clientRunId,
-		}
-		local postAudit = remoteState.postRemoteWriteLogSync
-		local preAuditedWrites = remoteState.preAuditedWrites
-		if postAudit and preAuditedWrites then
-			preAuditedWrites[args] = true
-			local auditOk = postAudit({
-				ts = os.time(),
-				op = "playtest_run_start",
-				args = playscriptCoordinator:auditStart(job),
-				ok = true,
-				result = response,
-			})
-			if auditOk then
-				preAuditedWrites[args] = true
-			else
-				preAuditedWrites[args] = nil
-			end
-		end
-		return response
-	end
-
-	remoteState.auditArgsForOp = function(op, args)
-		if op == "clipboard_copy" then
-			return {
-				selection = type(args.paths) ~= "table" or #args.paths == 0,
-				paths = if type(args.paths) == "table" then args.paths else nil,
-				pathCount = if type(args.paths) == "table" then #args.paths else 0,
-			}
-		elseif op == "clipboard_paste" then
-			return {
-				parent = tostring(args.parent or ""),
-				rootCount = if type(args.roots) == "table" then #args.roots else 0,
-				select = args.select ~= false,
-				byteLength = math.floor(tonumber(args.byteLength) or 0),
-			}
-		elseif op ~= "playtest_run_start" then
-			return args
-		end
-		local main = if type(args.script) == "table" then args.script else {}
-		local client = if type(args.clientScript) == "table" then args.clientScript else nil
-		local mainSource = tostring(main.source or args.source or "")
-		local clientSource = if client then tostring(client.source or "") else ""
-		return {
-			subcommand = "playtest run",
-			jobId = args.__rosyncAuditJobId,
-			clientRunId = tostring(args.clientRunId or ""),
-			mode = tostring(args.mode or "play"),
-			players = math.floor(tonumber(args.players) or 1),
-			context = tostring(args.context or "server"),
-			identity = tostring(args.identity or "game"),
-			timeout = tonumber(args.timeout) or 600,
-			keepOpen = args.keepOpen == true,
-			args = args.scriptArgs,
-			argsJson = tostring(args.scriptArgsJson or ""),
-			script = {
-				path = tostring(main.path or ""),
-				sha256 = sha256Hex(mainSource),
-				bytes = #mainSource,
-			},
-			clientScript = if client
-				then {
-					path = tostring(client.path or ""),
-					sha256 = sha256Hex(clientSource),
-					bytes = #clientSource,
-				}
-				else nil,
-		}
-	end
-	remoteState.auditResultForOp = function(op, result)
-		if op == "clipboard_copy" then
-			return {
-				rootCount = if type(result.roots) == "table" then #result.roots else 0,
-				byteLength = math.floor(tonumber(result.byteLength) or 0),
-			}
-		elseif op == "clipboard_paste" then
-			return {
-				count = math.floor(tonumber(result.count) or 0),
-				paths = result.paths,
-				parent = result.parent,
-				selected = result.selected == true,
-			}
-		end
-		return result
-	end
-
-	local function runtimeContextsForJob(playtestJobId: string)
-		pruneRuntimeContexts()
-		local contexts = {}
-		for _, context in pairs(runtimeContextsByName) do
-			if context.playtestJobId == playtestJobId then
-				table.insert(contexts, runtimeContextSnapshot(context))
-			end
-		end
-		table.sort(contexts, function(a, b)
-			return a.id < b.id
-		end)
-		return contexts
-	end
-
-	remoteHandlers.playtest_status = function(args)
-		local jobId, job, clientRunId = playscriptJobForArgs(args)
-		if jobId == "" then
-			return { active = false, contexts = {}, clientRunId = clientRunId }
-		end
-		if not job then
-			error("playtest job not found: " .. jobId)
-		end
-		local contexts = runtimeContextsForJob(jobId)
-		return {
-			active = job.status == "starting" or job.status == "running" or job.status == "stopping",
-			job = playtestJobSnapshot(job),
-			contexts = contexts,
-			run = if playscriptCoordinator and job.run then playscriptCoordinator:snapshot(job) else nil,
-		}
-	end
-
-	remoteHandlers.playtest_run_poll = function(args)
-		local jobId, job = playscriptJobForArgs(args)
-		if jobId == "" or not job or not job.run or not playscriptCoordinator then
-			error("playtest run not found: " .. jobId)
-		end
-		playscriptCoordinator:setContexts(job, runtimeContextsByName)
-		local result = playscriptCoordinator:poll(job, args)
-		result.job = playtestJobSnapshot(job)
-		return result
-	end
-
-	remoteHandlers.playtest_contexts = function(args)
-		local jobId = tostring(args.jobId or latestPlaytestJobId or "")
-		if jobId == "" then
-			return { contexts = {}, count = 0 }
-		end
-		if not playtestJobs[jobId] then
-			error("playtest job not found: " .. jobId)
-		end
-		local contexts = runtimeContextsForJob(jobId)
-		return { contexts = contexts, count = #contexts }
-	end
-
-	remoteHandlers.playtest_wait = function(args)
-		local jobId = tostring(args.jobId or latestPlaytestJobId or "")
-		local job = playtestJobs[jobId]
-		if jobId == "" or not job then
-			error("no matching playtest job")
-		end
-		local minimum = math.clamp(math.floor(tonumber(args.minimum) or 1), 1, 9)
-		local timeoutSeconds = math.clamp(tonumber(args.timeout) or 30, 0.1, 120)
-		local deadline = os.clock() + timeoutSeconds
-		repeat
-			local contexts = runtimeContextsForJob(jobId)
-			local count = #contexts
-			if count >= minimum then
-				return { contexts = contexts, count = count }
-			end
-			if job.status == "failed" or job.status == "completed" or job.status == "stopped" then
-				error("playtest ended before the required runtime contexts connected: " .. tostring(job.status))
-			end
-			task.wait(0.05)
-		until os.clock() >= deadline
-		error("timed out waiting for " .. tostring(minimum) .. " playtest context(s)")
-	end
-
-	remoteHandlers.playtest_request = function(args)
-		pruneRuntimeContexts()
-		local contextName = tostring(args.context or "")
-		local context = runtimeContextsByName[contextName]
-		if not context then
-			error("playtest context not found: " .. contextName)
-		end
-		local job = playtestJobs[context.playtestJobId]
-		if job == nil or (job.status ~= "starting" and job.status ~= "running" and job.status ~= "stopping") then
-			error("playtest context does not belong to an active job")
-		end
-		local operation = tostring(args.op or "")
-		if operation == "" then
-			error("missing runtime op")
-		end
-		local requestArgs = if type(args.args) == "table" then args.args else {}
-		local timeoutSeconds = math.clamp(tonumber(args.timeout) or 15, 0.1, 120)
-		return requestRuntimeContext(context, operation, requestArgs, timeoutSeconds)
-	end
-
-	remoteHandlers.playtest_capture = function(args)
-		pruneRuntimeContexts()
-		local contextName = tostring(args.context or "")
-		local context = runtimeContextsByName[contextName]
-		if not context then
-			error("playtest context not found: " .. contextName)
-		end
-		local job = playtestJobs[context.playtestJobId]
-		if job == nil or (job.status ~= "starting" and job.status ~= "running") then
-			error("playtest context does not belong to an active job")
-		end
-		local timeoutSeconds = math.clamp(tonumber(args.timeout) or 30, 1, 120)
-		local deadline = os.clock() + timeoutSeconds
-		local function remainingTime(): number
-			local remaining = deadline - os.clock()
-			if remaining <= 0 then
-				error("runtime capture exceeded its end-to-end deadline")
-			end
-			return math.max(0.1, remaining)
-		end
-		local options = if type(args.options) == "table" then args.options else {}
-		local prepared = requestRuntimeContext(context, "capture_prepare", options, remainingTime())
-		local byteLength = math.floor(tonumber(prepared.byteLength) or 0)
-		if byteLength < 1 or byteLength > 128 * 1024 * 1024 then
-			pcall(requestRuntimeContext, context, "capture_close", { sessionId = prepared.sessionId }, 1)
-			error("runtime returned invalid capture byte length")
-		end
-		local okLease, leaseResponse = httpJson("/artifacts/lease", "POST", {
-			filename = tostring(args.filename or (contextName:gsub("[^%w_-]", "-")) .. "-capture.png"),
-			mime = "image/png",
-			expectedSize = byteLength,
-		})
-		if not okLease or type(leaseResponse) ~= "table" or leaseResponse.ok ~= true then
-			pcall(requestRuntimeContext, context, "capture_close", { sessionId = prepared.sessionId }, 1)
-			error("unable to create runtime capture artifact lease: " .. tostring(leaseResponse))
-		end
-		local lease = leaseResponse.lease
-		local transferOk, transferResult = pcall(function()
-			local offset = 0
-			while offset < byteLength do
-				local chunk = requestRuntimeContext(context, "capture_read", {
-					sessionId = prepared.sessionId,
-					offset = offset,
-					maxBytes = 384 * 1024,
-				}, remainingTime())
-				local nextOffset = math.floor(tonumber(chunk.nextOffset) or -1)
-				if nextOffset <= offset or nextOffset > byteLength then
-					error("runtime capture returned an invalid chunk offset")
-				end
-				local okChunk, chunkResponse = httpJson("/artifacts/" .. lease.id .. "/chunk", "POST", {
-					token = lease.token,
-					offset = offset,
-					bytesBase64 = chunk.bytesBase64,
-				})
-				if not okChunk or type(chunkResponse) ~= "table" or chunkResponse.ok ~= true then
-					error("runtime artifact chunk upload failed: " .. tostring(chunkResponse))
-				end
-				offset = nextOffset
-			end
-			remainingTime()
-			local okFinalize, finalizeResponse = httpJson("/artifacts/" .. lease.id .. "/finalize", "POST", {
-				token = lease.token,
-			})
-			if not okFinalize or type(finalizeResponse) ~= "table" or finalizeResponse.ok ~= true then
-				error("runtime artifact finalization failed: " .. tostring(finalizeResponse))
-			end
-			return finalizeResponse.artifact
-		end)
-		pcall(requestRuntimeContext, context, "capture_close", { sessionId = prepared.sessionId }, 1)
-		if not transferOk then
-			pcall(function()
-				httpJson("/artifacts/" .. lease.id .. "/abort", "POST", { token = lease.token })
-			end)
-			error(tostring(transferResult))
-		end
-		return {
-			artifact = transferResult,
-			capture = prepared,
-			context = contextName,
-		}
-	end
-
-	local function stopPlaytestJob(job, args, forceStop)
-		local service = game:GetService("StudioTestService")
-		local jobId = job.id
-		if tostring(job.status) == "stopping" then
-			error("playtest stop is already in progress")
-		end
-		if tostring(job.status) ~= "starting" and tostring(job.status) ~= "running" then
-			return { stopped = true, alreadyEnded = true, job = playtestJobSnapshot(job) }
-		end
-		local retryableStatus = job.status
-		local function restoreRetryableState()
-			job.stopRequested = false
-			if tostring(job.status) == "stopping" then
-				job.status = retryableStatus
-			end
-		end
-		local function failStop(message)
-			local detail = tostring(message)
-			if forceStop then
-				-- Timeout and boot-failure cleanup are terminal requests. Studio can
-				-- refuse every teardown API while a runtime context is unavailable;
-				-- do not resurrect that generation as an active job forever.
-				job.status = "failed"
-				job.error = detail
-				job.endedAt = os.time()
-			else
-				restoreRetryableState()
-			end
-			error(detail)
-		end
-		job.stopRequested = true
-		job.status = "stopping"
-		if playscriptCoordinator and job.run then
-			playscriptCoordinator:cancelRunners(job, runtimeContextsByName, args.reason or "playtest stopped")
-		end
-		local serverContext = nil
-		for _, context in pairs(runtimeContextsByName) do
-			if context.playtestJobId == jobId and context.role == "server" and context.connection.Connected then
-				serverContext = context
-				break
-			end
-		end
-		local function leaveFromEdit()
-			local canLeave, allowed = pcall(function()
-				return service:CanLeaveTest()
-			end)
-			local canLeaveError = nil
-			if not canLeave then
-				canLeaveError = "CanLeaveTest failed: " .. tostring(allowed)
-			elseif allowed ~= true then
-				canLeaveError = "Studio reported that it cannot leave this playtest"
-			end
-			if canLeaveError and not forceStop then
-				return false, canLeaveError
-			end
-			local ok, result = pcall(function()
-				return service:LeaveTest()
-			end)
-			if not ok then
-				local detail = "LeaveTest failed: " .. tostring(result)
-				if canLeaveError then
-					detail = canLeaveError .. "; " .. detail
-				end
-				return false, detail
-			end
-			return true, nil
-		end
-		local function waitForEnd(seconds)
-			local deadline = os.clock() + seconds
-			while tostring(job.status) == "stopping" and os.clock() < deadline do
-				task.wait(0.05)
-			end
-			return tostring(job.status) ~= "stopping"
-		end
-		local function endTestFallback(previousError)
-			if not forceStop then
-				return false, previousError
-			end
-			local ended, endResult = pcall(function()
-				return service:EndTest(args.result or "Ro Sync forced playtest cleanup")
-			end)
-			local endError = nil
-			if ended then
-				if waitForEnd(3) then
-					return true, nil
-				end
-				endError = "Studio accepted EndTest but the playtest remained active"
-			else
-				endError = "EndTest failed: " .. tostring(endResult)
-			end
-			if previousError and previousError ~= "" then
-				return false, tostring(previousError) .. "; " .. endError
-			end
-			return false, endError
-		end
-
-		if forceStop then
-			local left, leaveError = leaveFromEdit()
-			if left then
-				if waitForEnd(3) then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.LeaveTest" }
-				end
-				leaveError = "Studio accepted LeaveTest but the playtest remained active"
-			end
-			if not serverContext then
-				local ended, endError = endTestFallback(leaveError)
-				if ended then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
-				end
-				failStop("unable to force-stop playtest: " .. tostring(endError))
-			end
-		end
-
-		if serverContext then
-			local requested, requestError = pcall(function()
-				requestRuntimeContext(serverContext, "end_test", { result = args.result }, if forceStop then 1 else 5)
-			end)
-			if requested then
-				waitForEnd(if forceStop then 3 else 10)
-				if tostring(job.status) == "stopped" then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "PlayServer.EndTest" }
-				end
-				if tostring(job.status) ~= "stopping" then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "PlayServer.EndTest" }
-				end
-			end
-			local left, leaveError = leaveFromEdit()
-			if left then
-				if waitForEnd(3) then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.LeaveTest" }
-				end
-				leaveError = "Studio accepted LeaveTest but the playtest remained active"
-			end
-			local endError = leaveError
-			if forceStop then
-				local ended, fallbackError = endTestFallback(leaveError)
-				if ended then
-					return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
-				end
-				endError = fallbackError
-			end
-			failStop(
-				"unable to stop playtest through PlayServer ("
-					.. tostring(requestError)
-					.. ") or edit mode ("
-					.. tostring(endError)
-					.. ")"
-			)
-		end
-
-		local left, leaveError = leaveFromEdit()
-		if not left then
-			local ended, endError = endTestFallback(leaveError)
-			if ended then
-				return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
-			end
-			failStop("unable to stop playtest: " .. tostring(endError))
-		end
-		if not waitForEnd(3) then
-			local ended, endError = endTestFallback("Studio accepted LeaveTest but the playtest remained active")
-			if ended then
-				return { stopped = true, job = playtestJobSnapshot(job), via = "StudioTestService.EndTest" }
-			end
-			failStop(tostring(endError))
-		end
-		return { stopped = true, job = playtestJobSnapshot(job) }
-	end
-
-	local function completionExitCode(outcome)
-		if outcome == "success" then
-			return 0
-		elseif outcome == "failure" then
-			return 2
-		elseif outcome == "timeout" then
-			return 3
-		elseif outcome == "aborted" then
-			return 4
-		end
-		return 5
-	end
-
-	local function auditPlayscriptCompletion(job, terminal)
-		local postAudit = remoteState.postRemoteWriteLogSync
-		if not postAudit then
-			return false, "synchronous writelog transport is unavailable"
-		end
-		local run = job.run
-		return postAudit({
-			ts = os.time(),
-			op = "playtest_run_complete",
-			ok = terminal.outcome == "success",
-			jobId = job.id,
-			clientRunId = job.clientRunId,
-			outcome = terminal.outcome,
-			exitCode = completionExitCode(terminal.outcome),
-			jobStatus = terminal.jobStatus,
-			elapsed = terminal.elapsed,
-			script = if run and run._main
-				then { path = run._main.path, sha256 = run._main.sha256, bytes = #run._main.source }
-				else nil,
-			clientScript = if run and run._client
-				then { path = run._client.path, sha256 = run._client.sha256, bytes = #run._client.source }
-				else nil,
-		})
-	end
-
-	local function cancelOpenPlayscriptRunners(job, reason)
-		playscriptCoordinator:cancelRunners(job, runtimeContextsByName, reason)
-		local failures = {}
-		for _, context in pairs(runtimeContextsByName) do
-			if context.playtestJobId == job.id and context.connection.Connected then
-				local ok, result = pcall(function()
-					return requestRuntimeContext(context, "playscript_cancel", { reason = reason }, 2)
-				end)
-				if not ok or type(result) ~= "table" or result.cancelled ~= true then
-					local failure = if ok then "runtime did not confirm cancellation" else tostring(result)
-					table.insert(failures, context.name .. ": " .. failure)
-				end
-			end
-		end
-		return if #failures > 0 then table.concat(failures, "; ") else nil
-	end
-
-	remoteState.onPlayscriptTerminalRequested = function(job, terminal, external)
-		if external then
-			terminal.jobStatus = job.status
-			local auditOk, auditError = auditPlayscriptCompletion(job, terminal)
-			if not auditOk then
-				terminal.auditError = tostring(auditError)
-			end
-			playscriptCoordinator:finalizeTerminal(job, terminal)
-			return
-		end
-		local run = job.run
-		if not run or run.terminal then
-			return
-		end
-		if run.keepOpen and terminal.outcome ~= "aborted" and terminal.force ~= true then
-			local cancelError = cancelOpenPlayscriptRunners(job, terminal.outcome)
-			local finalTerminal = terminal
-			if cancelError then
-				finalTerminal = table.clone(terminal)
-				finalTerminal.originalOutcome = terminal.outcome
-				finalTerminal.outcome = "aborted"
-				finalTerminal.kind = "aborted"
-				finalTerminal.ok = false
-				finalTerminal.error = "playscript cleanup could not be confirmed: " .. cancelError
-				finalTerminal.reason = finalTerminal.error
-			end
-			finalTerminal.jobStatus = job.status
-			local auditOk, auditError = auditPlayscriptCompletion(job, finalTerminal)
-			if not auditOk then
-				finalTerminal.auditError = tostring(auditError)
-			end
-			playscriptCoordinator:finalizeTerminal(job, finalTerminal, cancelError)
-			return
-		end
-		local forceStop = terminal.force == true or terminal.outcome == "timeout" or terminal.outcome == "bootFailure"
-		local stopped, stopResult = pcall(function()
-			return stopPlaytestJob(
-				job,
-				{ reason = terminal.outcome, result = "Ro Sync playscript completed" },
-				forceStop
-			)
-		end)
-		local stopConfirmed = stopped and type(stopResult) == "table" and stopResult.stopped == true
-		local finalTerminal = terminal
-		local stopError = nil
-		if not stopConfirmed then
-			stopError = if stopped then "playtest stop returned without confirmation" else tostring(stopResult)
-			finalTerminal = table.clone(terminal)
-			finalTerminal.originalOutcome = terminal.outcome
-			finalTerminal.outcome = "aborted"
-			finalTerminal.kind = "aborted"
-			finalTerminal.ok = false
-			finalTerminal.error = "playtest teardown could not be confirmed: " .. stopError
-			finalTerminal.reason = finalTerminal.error
-		end
-		finalTerminal.jobStatus = job.status
-		local auditOk, auditError = auditPlayscriptCompletion(job, finalTerminal)
-		if not auditOk then
-			finalTerminal.auditError = tostring(auditError)
-		end
-		playscriptCoordinator:finalizeTerminal(job, finalTerminal, stopError)
-	end
-
-	remoteHandlers.playtest_stop = function(args)
-		local jobId = tostring(args.jobId or latestPlaytestJobId or "")
-		if jobId == "" then
-			error("no playtest job is active")
-		end
-		local job = playtestJobs[jobId]
-		if not job then
-			error("playtest job not found: " .. jobId)
-		end
-		if latestPlaytestJobId ~= jobId then
-			error("refusing to stop a stale playtest generation: " .. jobId)
-		end
-		if tostring(job.status) ~= "starting" and tostring(job.status) ~= "running" then
-			error("playtest job is not active: " .. tostring(job.status))
-		end
-		return stopPlaytestJob(job, args, args.force == true)
-	end
-
-	remoteHandlers.playtest_run_cancel = function(args)
-		local jobId, job, clientRunId = playscriptJobForArgs(args)
-		if jobId == "" and not job and clientRunId ~= "" then
-			prunePlayscriptRunKeys()
-			playscriptRunTombstones[clientRunId] = playscriptRunTombstones[clientRunId] or { createdAt = os.clock() }
-			prunePlayscriptRunKeys()
-			local terminal = {
-				outcome = "aborted",
-				kind = "aborted",
-				ok = false,
-				error = tostring(args.reason or "playtest run cancelled before launch"),
-				reason = tostring(args.reason or "playtest run cancelled before launch"),
-				jobStatus = "not-started",
-				elapsed = 0,
-			}
-			return {
-				cancelled = true,
-				cleanupConfirmed = true,
-				pendingStart = true,
-				clientRunId = clientRunId,
-				outcome = terminal,
-			}
-		end
-		if jobId == "" or not job or not job.run or not playscriptCoordinator then
-			error("playtest run not found: " .. jobId)
-		end
-		local cancelOutcome = job.run.terminal
-		local forcedCleanupConfirmed = nil
-		if cancelOutcome and args.force == true then
-			local active = job.status == "starting" or job.status == "running" or job.status == "stopping"
-			if active then
-				local stopped, stopResult = pcall(function()
-					return stopPlaytestJob(job, { reason = args.reason or "playtest run cleanup" }, true)
-				end)
-				forcedCleanupConfirmed = stopped and type(stopResult) == "table" and stopResult.stopped == true
-				cancelOutcome = table.clone(cancelOutcome)
-				cancelOutcome.jobStatus = job.status
-				if forcedCleanupConfirmed then
-					cancelOutcome.stopError = nil
-				else
-					local stopError = if stopped
-						then "playtest stop returned without confirmation"
-						else tostring(stopResult)
-					cancelOutcome.originalOutcome = cancelOutcome.outcome
-					cancelOutcome.outcome = "aborted"
-					cancelOutcome.kind = "aborted"
-					cancelOutcome.ok = false
-					cancelOutcome.error = "playtest teardown could not be confirmed: " .. stopError
-					cancelOutcome.reason = cancelOutcome.error
-					cancelOutcome.stopError = stopError
-				end
-			end
-		end
-		if not job.run.terminal and not job.run._pendingTerminal then
-			local reason = tostring(args.reason or "playtest run cancelled")
-			local requestedOutcome = tostring(args.outcome or ""):lower()
-			local outcome = if requestedOutcome == "timeout" or reason:lower():find("timeout", 1, true)
-				then "timeout"
-				else "aborted"
-			playscriptCoordinator:requestTerminal(job, {
-				outcome = outcome,
-				kind = outcome,
-				error = reason,
-				reason = reason,
-				jobStatus = job.status,
-				force = args.force == true,
-			})
-		end
-		local deadline = os.clock() + 20
-		while not job.run.terminal and os.clock() < deadline do
-			task.wait(0.05)
-		end
-		if not job.run.terminal then
-			error("playtest run cancellation did not finish within 20 seconds")
-		end
-		cancelOutcome = cancelOutcome or job.run.terminal
-		local cleanupConfirmed = if forcedCleanupConfirmed ~= nil
-			then forcedCleanupConfirmed
-			else cancelOutcome.stopError == nil
-		return {
-			cancelled = cleanupConfirmed,
-			cleanupConfirmed = cleanupConfirmed,
-			job = playtestJobSnapshot(job),
-			run = playscriptCoordinator:snapshot(job),
-			outcome = cancelOutcome,
-			clientRunId = job.clientRunId,
-		}
-	end
-end
-
-do
-	-- Broad read-only property sweep. pcall'd per-property so unsupported names on
-	-- this class just get skipped. Not exhaustive — covers what an LLM is likely to
-	-- ask about when inspecting an instance. `rosync get --prop <name>` still
-	-- reaches any property directly.
-	local COMMON_PROPS = {
-		"Name",
-		"ClassName",
-		-- BasePart
-		"Position",
-		"Size",
-		"Orientation",
-		"Rotation",
-		"CFrame",
-		"Anchored",
-		"CanCollide",
-		"CanTouch",
-		"CanQuery",
-		"CastShadow",
-		"Massless",
-		"Transparency",
-		"Reflectance",
-		"Material",
-		"Color",
-		"BrickColor",
-		"TopSurface",
-		"BottomSurface",
-		"CollisionGroup",
-		"Shape",
-		-- MeshPart / SpecialMesh
-		"MeshId",
-		"TextureContent",
-		"TextureID",
-		"MeshScale",
-		"Scale",
-		"MeshType",
-		"VertexColor",
-		-- SpawnLocation
-		"Enabled",
-		"Neutral",
-		"AllowTeamChangeOnTouch",
-		"Duration",
-		"TeamColor",
-		-- Script / LocalScript / ModuleScript
-		"Source",
-		"Disabled",
-		"RunContext",
-		-- GuiObject
-		"AnchorPoint",
-		"BackgroundColor3",
-		"BackgroundTransparency",
-		"BorderColor3",
-		"BorderSizePixel",
-		"ZIndex",
-		"Visible",
-		"LayoutOrder",
-		"Active",
-		"AutomaticSize",
-		-- TextLabel / TextButton / TextBox
-		"Text",
-		"TextColor3",
-		"TextSize",
-		"TextScaled",
-		"Font",
-		"FontFace",
-		"TextXAlignment",
-		"TextYAlignment",
-		"RichText",
-		"TextWrapped",
-		"TextStrokeColor3",
-		"TextStrokeTransparency",
-		"LineHeight",
-		-- ImageLabel / ImageButton
-		"Image",
-		"ImageColor3",
-		"ImageTransparency",
-		"ScaleType",
-		"ImageRectSize",
-		"ImageRectOffset",
-		"SliceCenter",
-		"SliceScale",
-		-- Attachment
-		"Axis",
-		"SecondaryAxis",
-		"WorldPosition",
-		"WorldCFrame",
-		-- Beam / Trail
-		"Attachment0",
-		"Attachment1",
-		"Width0",
-		"Width1",
-		"Texture",
-		"TextureLength",
-		"TextureSpeed",
-		"TextureMode",
-		"LightEmission",
-		"LightInfluence",
-		"FaceCamera",
-		"Segments",
-		-- ParticleEmitter
-		"Rate",
-		"Lifetime",
-		"Speed",
-		"SpreadAngle",
-		"Rotation",
-		"RotSpeed",
-		"EmissionDirection",
-		"Acceleration",
-		"Drag",
-		-- Camera
-		"Focus",
-		"FieldOfView",
-		"CameraType",
-		"CameraSubject",
-		"HeadScale",
-		-- Light
-		"Brightness",
-		"Range",
-		"Shadows",
-		"Angle",
-		"Face",
-		-- Sound
-		"SoundId",
-		"Volume",
-		"Pitch",
-		"PlaybackSpeed",
-		"Looped",
-		"Playing",
-		"TimePosition",
-		"PlayOnRemove",
-		"RollOffMode",
-		"RollOffMaxDistance",
-		-- Decal / Texture
-		"Face",
-		"StudsPerTileU",
-		"StudsPerTileV",
-		-- Instance meta
-		"Archivable",
-		"Parent",
-	}
-
-	-- Extra property names used when inst:GetProperties() isn't exposed by this
-	-- Studio build. Combined with COMMON_PROPS inside buildInspectPropsList —
-	-- pcall-guarded, so unknown props on the target class are skipped.
-	local BROAD_INSPECT_PROPS = {
-		-- BasePart physics / misc
-		"Locked",
-		"Velocity",
-		"RotVelocity",
-		"AssemblyLinearVelocity",
-		"AssemblyAngularVelocity",
-		"AssemblyMass",
-		"PivotOffset",
-		"WorldPivot",
-		"RootPriority",
-		"CustomPhysicalProperties",
-		"CollisionGroupId",
-		"LocalTransparencyModifier",
-		"ReceiveAge",
-		"NetworkOwnershipAuto",
-		-- DataModel / services
-		"HttpEnabled",
-		"LoadStringEnabled",
-		"StreamingEnabled",
-		"StreamingTargetRadius",
-		"Gravity",
-		"FallenPartsDestroyHeight",
-		-- Lighting
-		"Ambient",
-		"OutdoorAmbient",
-		"GlobalShadows",
-		"GeographicLatitude",
-		"ClockTime",
-		"TimeOfDay",
-		"FogStart",
-		"FogEnd",
-		"FogColor",
-		"EnvironmentSpecularScale",
-		"EnvironmentDiffuseScale",
-		"Technology",
-		-- Model
-		"PrimaryPart",
-		"ModelStreamingMode",
-		"LevelOfDetail",
-		"ScaleTo",
-		-- Gui containers
-		"AutoLocalize",
-		"RootLocalizationTable",
-		"ClipsDescendants",
-		"SelectionImageObject",
-		"SelectionOrder",
-		"NextSelectionLeft",
-		"NextSelectionRight",
-		"NextSelectionUp",
-		"NextSelectionDown",
-		"SizeConstraint",
-		-- ScrollingFrame
-		"CanvasSize",
-		"CanvasPosition",
-		"AutomaticCanvasSize",
-		"ScrollingDirection",
-		"ScrollBarThickness",
-		"ScrollBarImageColor3",
-		"ScrollBarImageTransparency",
-		"BottomImage",
-		"MidImage",
-		"TopImage",
-		"ElasticBehavior",
-		"ScrollingEnabled",
-		"VerticalScrollBarInset",
-		"HorizontalScrollBarInset",
-		"VerticalScrollBarPosition",
-		-- TextBox
-		"PlaceholderText",
-		"PlaceholderColor3",
-		"ClearTextOnFocus",
-		"MultiLine",
-		"TextEditable",
-		"CursorPosition",
-		"SelectionStart",
-		-- Buttons
-		"AutoButtonColor",
-		"HoverColor3",
-		"PressedColor3",
-		-- Sound / ParticleEmitter extras
-		"MaxDistance",
-		"EmitterSize",
-		"DistanceFactor",
-		"DopplerScale",
-		"RollOffGain",
-		"AmbientReverb",
-		"TimeScale",
-		"PlaybackRegion",
-		"PlaybackRegionsEnabled",
-		"ZOffset",
-		"LockedToPart",
-		-- UIScale / text
-		"UIScale",
-		"MaxVisibleGraphemes",
-		-- Generic holders
-		"Value",
-	}
-
-	-- Pick the property-name list used to populate `inspectInstance`.
-	-- Prefers `inst:GetProperties()` when this Studio build exposes it (yields
-	-- the exact list valid for this class); otherwise falls back to a broader
-	-- pcall sweep built from COMMON_PROPS + BROAD_INSPECT_PROPS, deduped,
-	-- original order preserved.
-	local function buildInspectPropsList(inst)
-		local ok, raw = pcall(function()
-			return inst:GetProperties()
-		end)
-		if ok and type(raw) == "table" and #raw > 0 then
-			local names = {}
-			for _, entry in ipairs(raw) do
-				local name
-				if type(entry) == "string" then
-					name = entry
-				elseif type(entry) == "table" then
-					name = entry.Name or entry.name
-				end
-				if type(name) == "string" and name ~= "" then
-					table.insert(names, name)
-				end
-			end
-			if #names > 0 then
-				return names
-			end
-		end
-		local seen = {}
-		local merged = {}
-		for _, list in ipairs({ COMMON_PROPS, BROAD_INSPECT_PROPS }) do
-			for _, name in ipairs(list) do
-				if not seen[name] then
-					seen[name] = true
-					table.insert(merged, name)
-				end
-			end
-		end
-		return merged
-	end
-
-	local function inspectInstance(inst)
-		local props = {}
-		for _, name in ipairs(buildInspectPropsList(inst)) do
-			local ok, raw = pcall(function()
-				if name == "Source" and inst:IsA("LuaSourceContainer") then
-					return readScriptSource(inst)
-				end
-				return inst[name]
-			end)
-			if ok and raw ~= nil then
-				local eok, encoded = pcall(encodeRemoteValue, raw)
-				if eok then
-					props[name] = encoded
-				end
-			end
-		end
-		local attrs = {}
-		local aok, rawAttrs = pcall(function()
-			return inst:GetAttributes()
-		end)
-		if aok and typeof(rawAttrs) == "table" then
-			for k, v in pairs(rawAttrs) do
-				local eok, encoded = pcall(encodeRemoteValue, v)
-				if eok then
-					attrs[tostring(k)] = encoded
-				end
-			end
-		end
-		local tags = {}
-		local tok, rawTags = pcall(function()
-			return game:GetService("CollectionService"):GetTags(inst)
-		end)
-		if tok and typeof(rawTags) == "table" then
-			for _, t in ipairs(rawTags) do
-				table.insert(tags, tostring(t))
-			end
-		end
-		local kids = {}
-		for _, child in ipairs(inst:GetChildren()) do
-			table.insert(kids, { class = child.ClassName, name = child.Name })
-		end
-		return {
-			class = inst.ClassName,
-			name = inst.Name,
-			path = instancePathString(inst),
-			properties = props,
-			attributes = attrs,
-			tags = tags,
-			children = kids,
-		}
-	end
-
-	remoteHandlers.get = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local prop = tostring(args.prop or "")
-		if prop == "" then
-			return inspectInstance(inst)
-		end
-		if prop == "Source" and inst:IsA("LuaSourceContainer") then
-			return encodeRemoteValue(readScriptSource(inst))
-		end
-		return encodeRemoteValue(inst[prop])
-	end
-
-	local function canonicalEtagValue(value: any, depth: number?, seen: any?): string
-		local currentDepth = depth or 0
-		if currentDepth > 72 then
-			return "<max-depth>"
-		end
-		local valueType = type(value)
-		if valueType == "nil" then
-			return "n"
-		elseif valueType == "boolean" then
-			return if value then "b1" else "b0"
-		elseif valueType == "number" then
-			return "d" .. tostring(value)
-		elseif valueType == "string" then
-			return "s" .. tostring(#value) .. ":" .. value
-		elseif valueType ~= "table" then
-			return valueType .. ":" .. tostring(value)
-		end
-
-		local visited = seen or {}
-		if visited[value] then
-			return "<cycle>"
-		end
-		visited[value] = true
-		local keys = {}
-		for key in pairs(value) do
-			table.insert(keys, { key = key, order = type(key) .. ":" .. tostring(key) })
-		end
-		table.sort(keys, function(a, b)
-			return a.order < b.order
-		end)
-		local parts = { "{" }
-		for _, entry in ipairs(keys) do
-			table.insert(parts, canonicalEtagValue(entry.key, currentDepth + 1, visited))
-			table.insert(parts, "=")
-			table.insert(parts, canonicalEtagValue(value[entry.key], currentDepth + 1, visited))
-			table.insert(parts, ";")
-		end
-		table.insert(parts, "}")
-		visited[value] = nil
-		return table.concat(parts)
-	end
-
-	local function instanceEtag(inst: Instance): string
-		local identity = ""
-		pcall(function()
-			identity = inst:GetDebugId(32)
-		end)
-		if identity == "" then
-			identity = instancePathString(inst) .. "\0" .. inst.ClassName
-		end
-		-- The identity alone only detects replacement at a path. Include a stable,
-		-- canonical snapshot so an etag precondition also rejects intervening
-		-- property, attribute, tag, name, parent, or direct-child changes.
-		local state = inspectInstance(inst)
-		return sha256Hex(identity .. "\0" .. canonicalEtagValue(state))
-	end
-
-	remoteState.instanceEtag = instanceEtag
-
-	remoteHandlers.inspect_ref = function(args)
-		local path = tostring(args.path or "")
-		local inst = resolveRemotePath(path)
-		if not inst then
-			error("path not found: " .. path)
-		end
-		local expectedClass = tostring(args.expectedClass or "")
-		if expectedClass ~= "" and inst.ClassName ~= expectedClass then
-			error(
-				"class precondition failed at "
-					.. path
-					.. ": expected "
-					.. expectedClass
-					.. ", found "
-					.. inst.ClassName
-			)
-		end
-		local etag = instanceEtag(inst)
-		local expectedEtag = tostring(args.etag or "")
-		if expectedEtag ~= "" and etag ~= expectedEtag then
-			error("etag precondition failed at " .. path .. ": expected " .. expectedEtag .. ", found " .. etag)
-		end
-		local result = {
-			path = instancePathString(inst),
-			class = inst.ClassName,
-			name = inst.Name,
-			etag = etag,
-		}
-		local prop = tostring(args.prop or args.property or "")
-		if prop ~= "" then
-			result.prop = prop
-			if prop == "Source" and inst:IsA("LuaSourceContainer") then
-				result.value = encodeRemoteValue(readScriptSource(inst))
-			else
-				result.value = encodeRemoteValue(inst[prop])
-			end
-		end
-		if type(args.props) == "table" then
-			if #args.props > 64 then
-				error("inspect_ref supports at most 64 properties")
-			end
-			result.values = {}
-			for _, rawProp in ipairs(args.props) do
-				local requestedProp = tostring(rawProp)
-				if requestedProp == "" or #requestedProp > 128 then
-					error("inspect_ref property names must contain 1-128 bytes")
-				end
-				if requestedProp == "Source" and inst:IsA("LuaSourceContainer") then
-					result.values[requestedProp] = encodeRemoteValue(readScriptSource(inst))
-				else
-					result.values[requestedProp] = encodeRemoteValue(inst[requestedProp])
-				end
-			end
-		end
-		return result
-	end
-
-	local activeWorkflowRecordings = {}
-	local WORKFLOW_RECORDING_ATTRIBUTE = "RoSyncActiveWorkflowRecording"
-
-	-- Studio recordings survive a plugin reload. Recover the identifier before
-	-- accepting any new workflow so an interrupted prior transaction cannot leave
-	-- ChangeHistoryService permanently occupied.
-	local staleRecording = nil
-	pcall(function()
-		staleRecording = plugin:GetAttribute(WORKFLOW_RECORDING_ATTRIBUTE)
-	end)
-	if type(staleRecording) == "string" and staleRecording ~= "" then
-		pcall(function()
-			ChangeHistoryService:FinishRecording(staleRecording, Enum.FinishRecordingOperation.Cancel)
-		end)
-		pcall(function()
-			plugin:SetAttribute(WORKFLOW_RECORDING_ATTRIBUTE, nil)
-		end)
-	end
-
-	local function cancelActiveWorkflowRecordings()
-		local cancelledCount = 0
-		for transactionId, recordingId in pairs(activeWorkflowRecordings) do
-			local ok = pcall(function()
-				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Cancel)
-			end)
-			if ok then
-				activeWorkflowRecordings[transactionId] = nil
-				cancelledCount += 1
-			end
-		end
-		if next(activeWorkflowRecordings) == nil then
-			pcall(function()
-				plugin:SetAttribute(WORKFLOW_RECORDING_ATTRIBUTE, nil)
-			end)
-		end
-		local remainingCount = 0
-		for _ in pairs(activeWorkflowRecordings) do
-			remainingCount += 1
-		end
-		return cancelledCount, remainingCount
-	end
-
-	remoteState.cancelActiveWorkflowRecordings = cancelActiveWorkflowRecordings
-
-	remoteHandlers.transaction_begin = function(args)
-		local transactionId = tostring(args.id or "")
-		if transactionId == "" then
-			error("missing transaction id")
-		end
-		if activeWorkflowRecordings[transactionId] then
-			error("transaction already active: " .. transactionId)
-		end
-		for activeId in pairs(activeWorkflowRecordings) do
-			error("transaction already active: " .. tostring(activeId))
-		end
-		local name = tostring(args.name or ("Ro Sync workflow " .. transactionId))
-		local recordingId = ChangeHistoryService:TryBeginRecording(name, name)
-		if recordingId == nil then
-			error("Studio refused to begin change-history recording")
-		end
-		activeWorkflowRecordings[transactionId] = recordingId
-		local stored, storeError = pcall(function()
-			plugin:SetAttribute(WORKFLOW_RECORDING_ATTRIBUTE, recordingId)
-		end)
-		if not stored then
-			pcall(function()
-				ChangeHistoryService:FinishRecording(recordingId, Enum.FinishRecordingOperation.Cancel)
-			end)
-			activeWorkflowRecordings[transactionId] = nil
-			error("failed to persist transaction recovery state: " .. tostring(storeError))
-		end
-		return { id = transactionId, recordingId = recordingId, active = true }
-	end
-
-	remoteHandlers.transaction_finish = function(args)
-		local transactionId = tostring(args.id or "")
-		local action = tostring(args.action or "commit"):lower()
-		local recordingId = activeWorkflowRecordings[transactionId]
-		if recordingId == nil then
-			-- Cancellation is deliberately idempotent. The ordered write lane may
-			-- already have auto-canceled a timed-out transaction before a queued
-			-- explicit cancel reaches this handler.
-			if action == "cancel" then
-				return { id = transactionId, action = action, active = false, alreadyFinished = true }
-			end
-			error("transaction is not active: " .. transactionId)
-		end
-		local operation
-		if action == "commit" then
-			operation = Enum.FinishRecordingOperation.Commit
-		elseif action == "cancel" then
-			operation = Enum.FinishRecordingOperation.Cancel
-		elseif action == "append" then
-			operation = Enum.FinishRecordingOperation.Append
-		else
-			error("transaction action must be commit, cancel, or append")
-		end
-		ChangeHistoryService:FinishRecording(recordingId, operation)
-		activeWorkflowRecordings[transactionId] = nil
-		pcall(function()
-			plugin:SetAttribute(WORKFLOW_RECORDING_ATTRIBUTE, nil)
-		end)
-		return { id = transactionId, action = action, active = false }
-	end
-
-	remoteHandlers.set = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local prop = tostring(args.prop or "")
-		if prop == "" then
-			error("missing prop")
-		end
-		local decoded = decodeRemoteValue(args.value)
-		-- Route script Source through ScriptEditorService so Studio's open editor
-		-- sees the new text, matching applyProperties behavior for daemon-driven ops.
-		if prop == "Source" and inst:IsA("LuaSourceContainer") then
-			if not writeScriptSource(inst, tostring(decoded or ""), false) then
-				error("source write was not applied for " .. instancePathString(inst))
+				warn("[Ro Sync] remote-control surface failed to initialize: " .. tostring(controller))
 			end
 		else
-			inst[prop] = decoded
+			warn("[Ro Sync] packaged RemoteControl module failed to load: " .. tostring(module))
 		end
-		return { path = instancePathString(inst), prop = prop, etag = instanceEtag(inst) }
-	end
-
-	remoteHandlers.ls = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local out = {}
-		for _, child in ipairs(inst:GetChildren()) do
-			table.insert(out, {
-				class = child.ClassName,
-				name = child.Name,
-				path = instancePathString(child),
-			})
-		end
-		return out
-	end
-
-	local function buildRemoteTree(inst, remaining)
-		local node = { class = inst.ClassName, name = inst.Name, children = {} }
-		if remaining <= 0 then
-			if #inst:GetChildren() > 0 then
-				node.truncated = true
-			end
-			return node
-		end
-		for _, child in ipairs(inst:GetChildren()) do
-			table.insert(node.children, buildRemoteTree(child, remaining - 1))
-		end
-		return node
-	end
-
-	remoteHandlers.tree = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local depth = tonumber(args.depth) or TREE_DEPTH_DEFAULT
-		if depth < 0 then
-			depth = 0
-		end
-		return buildRemoteTree(inst, math.floor(depth))
-	end
-
-	remoteHandlers.query = function(args)
-		local selector = tostring(args.selector or "")
-		if selector == "" then
-			error("missing selector")
-		end
-		if #selector > 4096 then
-			error("selector exceeds 4096 bytes")
-		end
-		local pattern = splitRemotePath(selector)
-		if #pattern > 128 then
-			error("selector exceeds 128 path segments")
-		end
-		local limit = math.clamp(math.floor(tonumber(args.limit) or 5000), 1, 10000)
-		local requestedProps = {}
-		if type(args.props) == "table" then
-			for _, rawProp in ipairs(args.props) do
-				if #requestedProps >= 32 then
-					error("query supports at most 32 projected properties")
-				end
-				local prop = tostring(rawProp)
-				if prop == "" or #prop > 128 then
-					error("query property names must contain 1-128 bytes")
-				end
-				table.insert(requestedProps, prop)
-			end
-		end
-		local includeAttributes = args.attributes == true
-		local includeTags = args.tags == true
-		local collectionService = game:GetService("CollectionService")
-		local matches = {}
-		local truncated = false
-		local truncationReason = nil
-		local nodeBudget = math.clamp(math.floor(tonumber(args.nodeBudget) or 100000), 1, 200000)
-		local timeBudget = math.clamp(tonumber(args.timeoutSeconds) or 2, 0.05, 5)
-		local deadline = os.clock() + timeBudget
-		local responseBytes = 0
-		local responseBudget = 4 * 1024 * 1024
-
-		local function pathMatches(path, pathIndex, patternIndex)
-			local memo = {}
-			local function visit(currentPathIndex, currentPatternIndex)
-				local key = tostring(currentPathIndex) .. ":" .. tostring(currentPatternIndex)
-				if memo[key] ~= nil then
-					return memo[key]
-				end
-				local result
-				if currentPatternIndex > #pattern then
-					result = currentPathIndex > #path
-				else
-					local token = pattern[currentPatternIndex]
-					if token == "**" then
-						result = visit(currentPathIndex, currentPatternIndex + 1)
-							or (currentPathIndex <= #path and visit(currentPathIndex + 1, currentPatternIndex))
-					elseif currentPathIndex <= #path and (token == "*" or token == path[currentPathIndex]) then
-						result = visit(currentPathIndex + 1, currentPatternIndex + 1)
-					else
-						result = false
-					end
-				end
-				memo[key] = result
-				return result
-			end
-			return visit(pathIndex, patternIndex)
-		end
-
-		local function appendMatch(inst, segments)
-			local item = {
-				path = table.concat(segments, "/"),
-				class = inst.ClassName,
-				name = inst.Name,
-				childrenCount = #inst:GetChildren(),
-			}
-			local encodeState = { nodes = 0, stringBytes = 0, seen = {} }
-			if #requestedProps > 0 then
-				item.properties = {}
-				for _, prop in ipairs(requestedProps) do
-					local ok, value = pcall(function()
-						return inst[prop]
-					end)
-					if ok then
-						local encodeOk, encoded = pcall(encodeRemoteValue, value, 0, encodeState)
-						if encodeOk then
-							item.properties[prop] = encoded
-						end
-					end
-				end
-			end
-			if includeAttributes then
-				item.attributes = encodeRemoteValue(inst:GetAttributes(), 0, encodeState)
-			end
-			if includeTags then
-				item.tags = collectionService:GetTags(inst)
-				table.sort(item.tags)
-			end
-			local okSize, encoded = pcall(function()
-				return HttpService:JSONEncode(item)
-			end)
-			local itemBytes = if okSize then #encoded else 1024
-			if responseBytes + itemBytes > responseBudget then
-				truncated = true
-				truncationReason = "response-bytes"
-				return false
-			end
-			responseBytes += itemBytes
-			table.insert(matches, item)
-			return true
-		end
-
-		local stack = {}
-		local services = game:GetChildren()
-		for index = #services, 1, -1 do
-			local service = services[index]
-			table.insert(stack, { inst = service, segments = { service.Name } })
-		end
-		local visitedNodes = 0
-		while #stack > 0 do
-			if #matches >= limit then
-				truncated = true
-				truncationReason = "matches"
-				break
-			end
-			if visitedNodes >= nodeBudget then
-				truncated = true
-				truncationReason = "nodes"
-				break
-			end
-			if os.clock() >= deadline then
-				truncated = true
-				truncationReason = "time"
-				break
-			end
-			local entry = table.remove(stack)
-			visitedNodes += 1
-			if pathMatches(entry.segments, 1, 1) and not appendMatch(entry.inst, entry.segments) then
-				break
-			end
-			local children = entry.inst:GetChildren()
-			for index = #children, 1, -1 do
-				local child = children[index]
-				local childSegments = table.clone(entry.segments)
-				table.insert(childSegments, child.Name)
-				table.insert(stack, { inst = child, segments = childSegments })
-			end
-		end
-		return {
-			matches = matches,
-			count = #matches,
-			truncated = truncated,
-			truncationReason = truncationReason,
-			limit = limit,
-			visitedNodes = visitedNodes,
-			responseBytes = responseBytes,
-		}
-	end
-
-	remoteHandlers.find = function(args)
-		-- Accept either `under` (new, scoped traversal) or `root` (legacy).
-		-- Empty string resolves to the DataModel root.
-		local rootPath = args.under or args.root or ""
-		local root = resolveRemotePath(tostring(rootPath))
-		if not root then
-			error("root not found: " .. tostring(rootPath))
-		end
-		local className = args.className and tostring(args.className) or nil
-		local nameFilter = args.name and tostring(args.name) or nil
-		local limit = tonumber(args.limit) or FIND_LIMIT_DEFAULT
-		local out = {}
-		local function walk(inst)
-			for _, c in ipairs(inst:GetChildren()) do
-				if #out >= limit then
-					return
-				end
-				local classOk = className == nil
-				if not classOk then
-					classOk = c.ClassName == className
-					if not classOk then
-						local ok, isA = pcall(function()
-							return c:IsA(className)
-						end)
-						if ok and isA then
-							classOk = true
-						end
-					end
-				end
-				local nameOk = nameFilter == nil or c.Name == nameFilter
-				if classOk and nameOk then
-					table.insert(out, instancePathString(c))
-				end
-				walk(c)
-			end
-		end
-		walk(root)
-		return out
-	end
-
-	remoteHandlers.eval = function(args)
-		local src = tostring(args.source or "")
-		if src == "" then
-			error("missing source")
-		end
-		local env = {
-			game = game,
-			workspace = workspace,
-			string = string,
-			table = table,
-			math = math,
-			task = { wait = task.wait },
-			-- Minimal extras so evals are actually usable; the spec's list
-			-- (game/workspace/string/table/math/task.wait) is hostile on its own.
-			print = print,
-			tostring = tostring,
-			tonumber = tonumber,
-			type = type,
-			typeof = typeof,
-			ipairs = ipairs,
-			pairs = pairs,
-			next = next,
-			select = select,
-			pcall = pcall,
-			error = error,
-			assert = assert,
-			unpack = unpack,
-			Instance = Instance,
-			Vector2 = Vector2,
-			Vector3 = Vector3,
-			CFrame = CFrame,
-			Color3 = Color3,
-			UDim = UDim,
-			UDim2 = UDim2,
-			Enum = Enum,
-			BrickColor = BrickColor,
-			NumberRange = NumberRange,
-		}
-		local fn, compileErr = loadstring(src, EVAL_CHUNK_NAME)
-		if not fn then
-			error("compile: " .. tostring(compileErr))
-		end
-		local setEnvOk, setEnvErr = pcall(function()
-			setfenv(fn, env)
-		end)
-		if not setEnvOk then
-			error("sandbox: " .. tostring(setEnvErr))
-		end
-		local results = table.pack(pcall(fn))
-		local ok = results[1]
-		if not ok then
-			error("runtime: " .. tostring(results[2]))
-		end
-		local n = results.n - 1
-		if n == 0 then
-			return nil
-		end
-		if n == 1 then
-			return encodeRemoteValue(results[2])
-		end
-		local enc = {}
-		local encodeState = { nodes = 0, stringBytes = 0, seen = {} }
-		for i = 1, n do
-			enc[i] = encodeRemoteValue(results[i + 1], 0, encodeState)
-		end
-		return enc
-	end
-end
-
-do
-	local function encodeRemoteBuffer(buf)
-		local encoded = EncodingService:Base64Encode(buf)
-		if typeof(encoded) == "buffer" then
-			return buffer.tostring(encoded)
-		end
-		return tostring(encoded)
-	end
-
-	remoteState.encodeRemoteBuffer = encodeRemoteBuffer
-
-	local function runTransmitSource(src: string): any
-		if src == "" then
-			return nil
-		end
-
-		local function collectResults(results: { any })
-			if not results[1] then
-				error("runtime: " .. tostring(results[2]))
-			end
-			local n = (results :: any).n - 1
-			if n == 0 then
-				return nil
-			end
-			if n == 1 then
-				return results[2]
-			end
-			local out = {}
-			for i = 1, n do
-				out[i] = results[i + 1]
-			end
-			return out
-		end
-
-		-- Run transmit scripts in the plugin's real Studio environment. This keeps
-		-- globals such as game/workspace/require/Rect available without the old
-		-- custom sandbox getting between render code and place-owned modules.
-		local fn, compileErr = loadstring(src, "rosync-transmit")
-		if not fn then
-			error("compile: " .. tostring(compileErr))
-		end
-		return collectResults(table.pack(pcall(fn)))
-	end
-
-	local function isEmptyContentValue(value: any): boolean
-		if value == nil then
-			return true
-		end
-		if typeof(value) == "string" then
-			return value == ""
-		end
-
-		local valueString = ""
-		local ok = pcall(function()
-			valueString = tostring(value)
-		end)
-		return ok and (valueString == "" or valueString == "Content()")
-	end
-
-	local function objectFromContentValue(content: any): any
-		if typeof(content) == "string" then
-			return nil
-		end
-
-		local object
-		local ok = pcall(function()
-			object = content.Object
-		end)
-		if ok and object ~= nil then
-			return object
-		end
-		return nil
-	end
-
-	local function editableFromContentValue(content: any, context: string): any
-		local object = objectFromContentValue(content)
-		if object ~= nil then
-			return object
-		end
-
-		local resolvedContent = content
-		if typeof(resolvedContent) == "string" then
-			resolvedContent = Content.fromUri(resolvedContent)
-		end
-
-		local editable
-		local ok, err = pcall(function()
-			editable = AssetService:CreateEditableImageAsync(resolvedContent)
-		end)
-		if ok and editable then
-			return editable
-		end
-		error("CreateEditableImageAsync failed for " .. context .. ": " .. tostring(err))
-	end
-
-	local function editableFromImageGui(gui: Instance): any
-		local okContent, content = pcall(function()
-			return (gui :: any).ImageContent
-		end)
-		if okContent and content ~= nil then
-			return editableFromContentValue(content, "ImageContent for " .. instancePathString(gui))
-		end
-
-		local image = ""
-		pcall(function()
-			image = tostring((gui :: any).Image or "")
-		end)
-		if image == "" then
-			error("image gui has no Image/ImageContent: " .. instancePathString(gui))
-		end
-		return editableFromContentValue(image, "Image for " .. instancePathString(gui))
-	end
-
-	local function editableFromMeshPart(meshPart: Instance): any
-		local okContent, content = pcall(function()
-			return (meshPart :: any).TextureContent
-		end)
-		if okContent and not isEmptyContentValue(content) then
-			return editableFromContentValue(content, "TextureContent for " .. instancePathString(meshPart))
-		end
-
-		local textureId = ""
-		pcall(function()
-			textureId = tostring((meshPart :: any).TextureID or "")
-		end)
-		if textureId == "" then
-			return nil
-		end
-		return editableFromContentValue(textureId, "TextureID for " .. instancePathString(meshPart))
-	end
-
-	local resolveTransmitImage
-
-	resolveTransmitImage = function(value: any, nameHint: string?, pathHint: string?)
-		local target = value
-		local isInstance = typeof(target) == "Instance"
-		local editable = target
-		if
-			(isInstance and (target :: Instance):IsA("ImageLabel"))
-			or (isInstance and (target :: Instance):IsA("ImageButton"))
-		then
-			editable = editableFromImageGui(target)
-		elseif isInstance and (target :: Instance):IsA("MeshPart") then
-			local meshEditable = editableFromMeshPart(target)
-			if meshEditable == nil then
-				return nil
-			end
-			editable = meshEditable
-		else
-			local object = objectFromContentValue(target)
-			if object ~= nil then
-				editable = object
-			end
-		end
-
-		local targetName = nameHint
-		if targetName == nil then
-			targetName = if isInstance then (target :: Instance).Name else typeof(target)
-		end
-
-		local size
-		local okSize = pcall(function()
-			size = (editable :: any).Size
-		end)
-		if not okSize or typeof(size) ~= "Vector2" then
-			return nil
-		end
-
-		local width = math.floor(size.X)
-		local height = math.floor(size.Y)
-		if width <= 0 or height <= 0 then
-			error("invalid EditableImage size for " .. tostring(targetName))
-		end
-
-		return {
-			editable = editable,
-			name = targetName,
-			path = pathHint or (if isInstance then instancePathString(target) else nil),
-			class = if isInstance then (target :: Instance).ClassName else typeof(target),
-			width = width,
-			height = height,
-		}
-	end
-
-	local transmitSessionCounter = 0
-	local transmitSessions = {}
-
-	local function appendTransmitPrepared(
-		value: any,
-		sessionImages: { any },
-		out: { any },
-		seen: { [any]: boolean },
-		nameHint: string?,
-		pathHint: string?
-	)
-		if value == nil then
-			return
-		end
-		local t = typeof(value)
-		if t == "table" then
-			local image = value.image or value.capture or value.editableImage or value.editable
-			if image ~= nil then
-				appendTransmitPrepared(
-					image,
-					sessionImages,
-					out,
-					seen,
-					value.name or value.Name or nameHint,
-					value.path or pathHint
-				)
-				return
-			end
-			for key, item in pairs(value) do
-				local childName = nameHint
-				if type(key) == "string" then
-					childName = key
-				end
-				appendTransmitPrepared(item, sessionImages, out, seen, childName, pathHint)
-			end
-			return
-		end
-
-		if seen[value] then
-			return
-		end
-		seen[value] = true
-		local image = resolveTransmitImage(value, nameHint, pathHint)
-		if image == nil then
-			return
-		end
-
-		local index = #sessionImages + 1
-		sessionImages[index] = image
-		table.insert(out, {
-			token = tostring(index),
-			name = image.name,
-			path = image.path,
-			class = image.class,
-			width = image.width,
-			height = image.height,
-		})
-	end
-
-	local function appendTransmitPreparedPath(
-		path: string,
-		sessionImages: { any },
-		out: { any },
-		seen: { [any]: boolean }
-	)
-		local inst = resolveRemotePath(path)
-		if not inst then
-			error("path not found: " .. path)
-		end
-		appendTransmitPrepared(inst, sessionImages, out, seen, nil, instancePathString(inst))
-	end
-
-	local function appendTransmitPreparedFrom(
-		path: string,
-		sessionImages: { any },
-		out: { any },
-		seen: { [any]: boolean }
-	)
-		local root = resolveRemotePath(path)
-		if not root then
-			error("from path not found: " .. path)
-		end
-		appendTransmitPrepared(root, sessionImages, out, seen, nil, instancePathString(root))
-		for _, inst in ipairs(root:GetDescendants()) do
-			appendTransmitPrepared(inst, sessionImages, out, seen, nil, instancePathString(inst))
-		end
-	end
-
-	remoteHandlers.transmit_prepare = function(args)
-		local out = {}
-		local seen = {}
-		local sessionImages = {}
-
-		local source = tostring(args.source or "")
-		local result = runTransmitSource(source)
-		appendTransmitPrepared(result, sessionImages, out, seen, nil, nil)
-
-		local paths = args.paths
-		if type(paths) == "table" then
-			for _, path in ipairs(paths) do
-				appendTransmitPreparedPath(tostring(path), sessionImages, out, seen)
-			end
-		end
-
-		local fromPath = args.from
-		if fromPath ~= nil and tostring(fromPath) ~= "" then
-			appendTransmitPreparedFrom(tostring(fromPath), sessionImages, out, seen)
-		end
-
-		transmitSessionCounter += 1
-		local sessionId = tostring(transmitSessionCounter)
-		transmitSessions[sessionId] = sessionImages
-
-		return {
-			sessionId = sessionId,
-			images = out,
-		}
-	end
-
-	remoteHandlers.transmit_read = function(args)
-		local sessionId = tostring(args.sessionId or "")
-		local token = tostring(args.token or "")
-		local sessionImages = transmitSessions[sessionId]
-		if sessionImages == nil then
-			error("transmit session not found: " .. sessionId)
-		end
-
-		local image = sessionImages[tonumber(token) or -1]
-		if image == nil then
-			error("transmit image token not found: " .. token)
-		end
-
-		local pixels
-		local okPixels, err = pcall(function()
-			pixels = (image.editable :: any):ReadPixelsBuffer(Vector2.zero, Vector2.new(image.width, image.height))
-		end)
-		if not okPixels or pixels == nil then
-			error("ReadPixelsBuffer failed for " .. tostring(image.name) .. ": " .. tostring(err))
-		end
-
-		return {
-			name = image.name,
-			path = image.path,
-			class = image.class,
-			width = image.width,
-			height = image.height,
-			pixelsBase64 = encodeRemoteBuffer(pixels),
-		}
-	end
-
-	remoteHandlers.transmit_close = function(args)
-		local sessionId = tostring(args.sessionId or "")
-		transmitSessions[sessionId] = nil
-		return true
-	end
-end
-
-do
-	-- ---------------------------------------------------------------------------
-	-- Locally packaged Photo capture. This never requires capture code from the
-	-- open place. The module owns all temporary scene changes; this bridge validates the
-	-- request and exposes the resulting RGBA buffer in bounded chunks.
-	-- ---------------------------------------------------------------------------
-
-	local PHOTO_SESSION_TTL_SECONDS = 120
-	local PHOTO_MAX_CHUNK_BYTES = 512 * 1024
-	local PHOTO_MAX_AXIS = 4096
-	local PHOTO_MAX_PIXELS = 16 * 1024 * 1024
-	local PHOTO_MAX_BYTES = PHOTO_MAX_PIXELS * 4
-	local PHOTO_MAX_SESSIONS = 2
-	local PHOTO_CFRAME_EPSILON = 1e-3
-	local photoSessionCounter = 0
-	local photoSessions = {}
-	local photoPrepareBusy = false
-	local photoModule = nil
-
-	local function getPhotoModule()
-		if photoModule ~= nil then
-			return photoModule
-		end
-		local moduleScript = script:FindFirstChild("Photo")
-		if moduleScript == nil or not moduleScript:IsA("ModuleScript") then
-			error("Ro Sync Photo module is not packaged in this plugin; reinstall Ro Sync")
-		end
-		photoModule = require(moduleScript)
-		return photoModule
-	end
-
-	local function finiteNumber(value: any, fieldName: string): number
-		local number = tonumber(value)
-		if number == nil or number ~= number or number == math.huge or number == -math.huge then
-			error(fieldName .. " must be a finite number")
-		end
-		return number
-	end
-
-	local function photoSize(value: any, fieldName: string): Vector2?
-		if value == nil then
-			return nil
-		end
-		if type(value) ~= "table" then
-			error(fieldName .. " must be an object with x and y")
-		end
-		local x = math.floor(finiteNumber(value.x, fieldName .. ".x"))
-		local y = math.floor(finiteNumber(value.y, fieldName .. ".y"))
-		if x < 1 or y < 1 then
-			error(fieldName .. " dimensions must be positive")
-		end
-		if x > PHOTO_MAX_AXIS or y > PHOTO_MAX_AXIS or x * y > PHOTO_MAX_PIXELS then
-			error(fieldName .. " exceeds the Ro Sync Photo size limit")
-		end
-		return Vector2.new(x, y)
-	end
-
-	local function photoRect(value: any): Rect?
-		if value == nil then
-			return nil
-		end
-		if type(value) ~= "table" then
-			error("nativeRect must be an object with x, y, width, and height")
-		end
-		local x = math.floor(finiteNumber(value.x, "nativeRect.x"))
-		local y = math.floor(finiteNumber(value.y, "nativeRect.y"))
-		local width = math.floor(finiteNumber(value.width, "nativeRect.width"))
-		local height = math.floor(finiteNumber(value.height, "nativeRect.height"))
-		if x < 0 or y < 0 or width < 1 or height < 1 then
-			error("nativeRect coordinates must be non-negative and dimensions must be positive")
-		end
-		if width > PHOTO_MAX_AXIS or height > PHOTO_MAX_AXIS or width * height > PHOTO_MAX_PIXELS then
-			error("nativeRect exceeds the Ro Sync Photo size limit")
-		end
-		return Rect.new(x, y, x + width, y + height)
-	end
-
-	local function photoDirection(value: any): Vector3?
-		if value == nil then
-			return nil
-		end
-		if type(value) ~= "table" then
-			error("direction must be an object with x, y, and z")
-		end
-		local direction = Vector3.new(
-			finiteNumber(value.x, "direction.x"),
-			finiteNumber(value.y, "direction.y"),
-			finiteNumber(value.z, "direction.z")
-		)
-		if direction.Magnitude <= 1e-6 then
-			error("direction cannot be the zero vector")
-		end
-		return direction.Unit
-	end
-
-	local function photoCameraCFrame(value: any): CFrame?
-		if value == nil then
-			return nil
-		end
-		if type(value) ~= "table" or value.__type ~= "CFrame" then
-			error('cameraCFrame must be a tagged CFrame object with __type = "CFrame" and 12 components')
-		end
-		local supplied = value.components
-		if type(supplied) ~= "table" or #supplied ~= 12 then
-			error("cameraCFrame components must contain exactly 12 numbers")
-		end
-
-		local components = table.create(12)
-		for index = 1, 12 do
-			if type(supplied[index]) ~= "number" then
-				error("cameraCFrame components must contain exactly 12 finite numbers")
-			end
-			components[index] = finiteNumber(supplied[index], "cameraCFrame.components[" .. tostring(index) .. "]")
-		end
-
-		-- CFrame's final nine components are a rigid rotation matrix. Validate
-		-- both orthonormality and handedness before constructing it so malformed
-		-- remote input cannot create a skewed, reflected, or degenerate camera.
-		local row0 = Vector3.new(components[4], components[5], components[6])
-		local row1 = Vector3.new(components[7], components[8], components[9])
-		local row2 = Vector3.new(components[10], components[11], components[12])
-		local determinant = row0:Dot(row1:Cross(row2))
-		if
-			math.abs(row0.Magnitude - 1) > PHOTO_CFRAME_EPSILON
-			or math.abs(row1.Magnitude - 1) > PHOTO_CFRAME_EPSILON
-			or math.abs(row2.Magnitude - 1) > PHOTO_CFRAME_EPSILON
-			or math.abs(row0:Dot(row1)) > PHOTO_CFRAME_EPSILON
-			or math.abs(row0:Dot(row2)) > PHOTO_CFRAME_EPSILON
-			or math.abs(row1:Dot(row2)) > PHOTO_CFRAME_EPSILON
-			or math.abs(determinant - 1) > PHOTO_CFRAME_EPSILON
-		then
-			error("cameraCFrame rotation must be a rigid right-handed matrix")
-		end
-
-		return CFrame.new(
-			components[1],
-			components[2],
-			components[3],
-			components[4],
-			components[5],
-			components[6],
-			components[7],
-			components[8],
-			components[9],
-			components[10],
-			components[11],
-			components[12]
-		)
-	end
-
-	local function encodedPhotoCameraCFrame(value: CFrame?): any
-		if value == nil then
-			return nil
-		end
-		return {
-			__type = "CFrame",
-			components = { value:GetComponents() },
-		}
-	end
-
-	local function photoUiTarget(value: any): Instance?
-		if value == nil then
-			return nil
-		end
-		if type(value) ~= "string" or value == "" then
-			error("uiTarget must be a non-empty Studio instance path")
-		end
-		local target = resolveRemotePath(value)
-		if target == nil then
-			error("photo UI target path not found: " .. value)
-		end
-
-		local screenGui: ScreenGui?
-		if target:IsA("ScreenGui") then
-			screenGui = target
-		elseif target:IsA("GuiObject") then
-			local ancestor = target:FindFirstAncestorWhichIsA("ScreenGui")
-			if ancestor ~= nil then
-				screenGui = ancestor :: ScreenGui
-			end
-		else
-			error("uiTarget must resolve to a ScreenGui or GuiObject")
-		end
-		if screenGui == nil then
-			error("uiTarget GuiObject must be a descendant of a ScreenGui")
-		end
-
-		local starterGui = game:GetService("StarterGui")
-		local coreGui = game:GetService("CoreGui")
-		if not screenGui:IsDescendantOf(starterGui) and not screenGui:IsDescendantOf(coreGui) then
-			error("uiTarget must belong to an edit-mode ScreenGui under StarterGui or CoreGui")
-		end
-		return target
-	end
-
-	local function photoRegionMetadata(value: any): any
-		if value == nil then
-			return nil
-		end
-		if typeof(value) ~= "Rect" then
-			error("Photo capture region metadata must be a Rect")
-		end
-		return {
-			x = value.Min.X,
-			y = value.Min.Y,
-			width = value.Width,
-			height = value.Height,
-		}
-	end
-
-	local function photoFullSizeMetadata(value: any): any
-		if value == nil then
-			return nil
-		end
-		if typeof(value) ~= "Vector2" then
-			error("Photo capture fullSize metadata must be a Vector2")
-		end
-		return {
-			x = value.X,
-			y = value.Y,
-		}
-	end
-
-	local function photoUiMode(args): string
-		local mode = args.uiMode
-		if mode == nil then
-			return if args.hideUI == false then "overlay" else "none"
-		end
-		mode = tostring(mode)
-		if mode ~= "none" and mode ~= "overlay" and mode ~= "only" then
-			error("uiMode must be none, overlay, or only")
-		end
-		return mode
-	end
-
-	local function cleanupExpiredPhotoSessions()
-		local now = os.clock()
-		for id, session in pairs(photoSessions) do
-			if now - session.createdAt > PHOTO_SESSION_TTL_SECONDS then
-				photoSessions[id] = nil
-			end
-		end
-	end
-
-	local function makePhotoSessionRoom()
-		cleanupExpiredPhotoSessions()
-		local active = {}
-		for id, session in pairs(photoSessions) do
-			table.insert(active, { id = id, createdAt = session.createdAt })
-		end
-		-- Evict only when preparing to insert; reads must preserve both valid slots.
-		while #active >= PHOTO_MAX_SESSIONS do
-			table.sort(active, function(a, b)
-				return a.createdAt < b.createdAt
-			end)
-			local oldest = table.remove(active, 1)
-			photoSessions[oldest.id] = nil
-		end
-	end
-
-	local function schedulePhotoSessionExpiry(sessionId: string)
-		-- Defined outside preparePhoto so the delayed closure cannot retain RGBA pixels.
-		task.delay(PHOTO_SESSION_TTL_SECONDS, function()
-			photoSessions[sessionId] = nil
-		end)
-	end
-
-	local function preparePhoto(args)
-		cleanupExpiredPhotoSessions()
-		local Photo = getPhotoModule()
-		local background = tostring(args.background or "transparent")
-		if background ~= "transparent" and background ~= "scene" then
-			error("background must be transparent or scene")
-		end
-		local uiMode = photoUiMode(args)
-		local hideUI = uiMode == "none"
-		if uiMode == "only" and background ~= "transparent" then
-			error("uiMode only requires a transparent background")
-		end
-		local outputSize = photoSize(args.outputSize, "outputSize")
-		local nativeRect = photoRect(args.nativeRect)
-		local cameraCFrame = photoCameraCFrame(args.cameraCFrame)
-		local uiTarget = photoUiTarget(args.uiTarget)
-		if uiTarget ~= nil and uiMode ~= "only" then
-			error("uiTarget requires uiMode only")
-		end
-		local timeoutSeconds = math.clamp(finiteNumber(args.timeoutSeconds or 120, "timeoutSeconds"), 1, 120)
-		local delay = math.clamp(finiteNumber(args.delay or 0, "delay"), 0, 5)
-		local options = {
-			background = background,
-			region = nativeRect,
-			size = outputSize,
-			delay = delay,
-			timeout = timeoutSeconds,
-			alphaBleed = args.alphaBleed == true,
-			uiMode = uiMode,
-			hideUI = hideUI,
-			uiTarget = uiTarget,
-		}
-
-		local focusPath = tostring(args.focus or "")
-		if uiMode == "only" and focusPath ~= "" then
-			error("uiMode only captures the current viewport and cannot be combined with focus")
-		end
-		if cameraCFrame ~= nil and focusPath == "" then
-			error("cameraCFrame requires a photo focus target")
-		end
-		if cameraCFrame ~= nil and args.direction ~= nil then
-			error("cameraCFrame cannot be combined with direction")
-		end
-		local capture
-		local isolated = false
-		local instanceTightCrop = false
-		local fieldOfViewMetadata = nil
-		if focusPath ~= "" then
-			local target = resolveRemotePath(focusPath)
-			if target == nil then
-				error("photo focus path not found: " .. focusPath)
-			end
-			if nativeRect ~= nil then
-				error("nativeRect cannot be combined with a photo focus target")
-			end
-			if outputSize == nil then
-				outputSize = Vector2.new(1024, 1024)
-				options.size = outputSize
-			end
-			local padding = finiteNumber(args.padding or 1.25, "padding")
-			local fieldOfView = finiteNumber(args.fieldOfView or 32, "fieldOfView")
-			if padding < 1 or padding > 4 then
-				error("padding must be between 1 and 4")
-			end
-			if fieldOfView < 1 or fieldOfView > 120 then
-				error("fieldOfView must be between 1 and 120")
-			end
-			fieldOfViewMetadata = fieldOfView
-			isolated = args.isolate ~= false
-			instanceTightCrop = isolated and background == "transparent" and args.tightCrop ~= false
-			capture = Photo.renderInstance(target, {
-				view = tostring(args.view or "isometric"),
-				direction = photoDirection(args.direction),
-				padding = padding,
-				tightCrop = instanceTightCrop,
-				size = outputSize,
-				fieldOfView = fieldOfView,
-				cameraCFrame = cameraCFrame,
-				background = background,
-				delay = delay,
-				timeout = timeoutSeconds,
-				alphaBleed = args.alphaBleed == true,
-				uiMode = uiMode,
-				hideUI = hideUI,
-				isolate = isolated,
-			})
-		else
-			capture = Photo.captureView(options)
-		end
-		if type(capture) ~= "table" then
-			error("Photo capture returned an invalid result")
-		end
-
-		local size = capture.size
-		local rawPixels = capture.buffer
-		if typeof(size) ~= "Vector2" or typeof(rawPixels) ~= "buffer" then
-			error("Photo capture must return a Vector2 size and RGBA buffer")
-		end
-		local width = math.floor(size.X)
-		local height = math.floor(size.Y)
-		if
-			width < 1
-			or height < 1
-			or width > PHOTO_MAX_AXIS
-			or height > PHOTO_MAX_AXIS
-			or width * height > PHOTO_MAX_PIXELS
-		then
-			error("Photo returned dimensions outside the Ro Sync size limit")
-		end
-
-		local expected = width * height * 4
-		if buffer.len(rawPixels) ~= expected then
-			error("Photo RGBA buffer length does not match its dimensions")
-		end
-		local pixels = buffer.create(expected)
-		buffer.copy(pixels, 0, rawPixels, 0, expected)
-		local byteLength = buffer.len(pixels)
-		if byteLength ~= width * height * 4 or byteLength > PHOTO_MAX_BYTES then
-			error("Photo returned an invalid RGBA byte length")
-		end
-
-		local region = photoRegionMetadata(capture.region)
-		if region == nil then
-			region = photoRegionMetadata(nativeRect)
-		end
-		local fullSize = photoFullSizeMetadata(capture.fullSize)
-		local uiTargetPath = nil
-		local uiTargetClass = nil
-		if uiTarget ~= nil then
-			uiTargetPath = instancePathString(uiTarget)
-			uiTargetClass = uiTarget.ClassName
-		end
-		local regionSource = capture.regionSource
-		if regionSource ~= nil and type(regionSource) ~= "string" then
-			error("Photo capture regionSource metadata must be a string")
-		end
-		if regionSource == nil then
-			if nativeRect ~= nil then
-				regionSource = "explicit"
-			elseif uiTarget ~= nil then
-				regionSource = "target-alpha"
-			elseif focusPath ~= "" and instanceTightCrop then
-				regionSource = "subject-alpha"
-			elseif focusPath ~= "" then
-				regionSource = "framed"
-			else
-				regionSource = "full"
-			end
-		end
-
-		photoSessionCounter += 1
-		local sessionId = tostring(photoSessionCounter) .. "-" .. HttpService:GenerateGUID(false)
-		makePhotoSessionRoom()
-		photoSessions[sessionId] = {
-			pixels = pixels,
-			createdAt = os.clock(),
-		}
-		schedulePhotoSessionExpiry(sessionId)
-
-		return {
-			sessionId = sessionId,
-			width = width,
-			height = height,
-			byteLength = byteLength,
-			background = background,
-			uiMode = uiMode,
-			isolated = isolated,
-			tightCrop = instanceTightCrop,
-			region = region,
-			fullSize = fullSize,
-			regionSource = regionSource,
-			uiTarget = uiTargetPath,
-			uiTargetClass = uiTargetClass,
-			cameraCFrame = encodedPhotoCameraCFrame(cameraCFrame),
-			fieldOfView = fieldOfViewMetadata,
-		}
-	end
-
-	remoteHandlers.photo_prepare = function(args)
-		if photoPrepareBusy then
-			error("another Photo capture is already in progress")
-		end
-		photoPrepareBusy = true
-		local ok, result = pcall(preparePhoto, args)
-		photoPrepareBusy = false
-		if not ok then
-			error(result)
-		end
-		return result
-	end
-
-	remoteHandlers.photo_read = function(args)
-		cleanupExpiredPhotoSessions()
-		local sessionId = tostring(args.sessionId or "")
-		local session = photoSessions[sessionId]
-		if session == nil then
-			error("photo session not found or expired: " .. sessionId)
-		end
-		local total = buffer.len(session.pixels)
-		local offset = math.floor(tonumber(args.offset) or 0)
-		local maxBytes = math.floor(tonumber(args.maxBytes) or PHOTO_MAX_CHUNK_BYTES)
-		if offset < 0 or offset >= total then
-			error("photo offset is outside the RGBA buffer")
-		end
-		maxBytes = math.clamp(maxBytes, 1, PHOTO_MAX_CHUNK_BYTES)
-		local count = math.min(maxBytes, total - offset)
-		local chunk = buffer.fromstring(buffer.readstring(session.pixels, offset, count))
-		local nextOffset = offset + count
-		return {
-			offset = offset,
-			nextOffset = nextOffset,
-			eof = nextOffset >= total,
-			bytesBase64 = remoteState.encodeRemoteBuffer(chunk),
-		}
-	end
-
-	remoteHandlers.photo_close = function(args)
-		local sessionId = tostring(args.sessionId or "")
-		photoSessions[sessionId] = nil
-		return true
-	end
-end
-
-do
-	-- ---------------------------------------------------------------------------
-	-- Studio screen capture. Captures stay in Studio as short-lived buffers and
-	-- are read in bounded chunks so a 4K image never becomes one enormous JSON
-	-- frame. Permission is never requested implicitly: `capture_authorize` is the
-	-- only operation allowed to show Studio's privacy prompt.
-	-- ---------------------------------------------------------------------------
-
-	local CAPTURE_SESSION_TTL_SECONDS = 120
-	local CAPTURE_MAX_CHUNK_BYTES = 512 * 1024
-	local CAPTURE_MAX_AXIS = 16 * 1024
-	local CAPTURE_MAX_PIXELS = 64 * 1024 * 1024
-	local CAPTURE_MAX_BYTES = 128 * 1024 * 1024
-	local CAPTURE_MAX_SESSIONS = 4
-	local captureSessionCounter = 0
-	local captureSessions = {}
-	local capturePrepareBusy = false
-	local captureProviderUnsupported = false
-	local captureProviderError = nil
-
-	local function getStudioCaptureService()
-		local ok, service = pcall(function()
-			return game:GetService("StudioCaptureService")
-		end)
-		if not ok or service == nil then
-			return nil
-		end
-		return service
-	end
-
-	local function canCaptureScreenshot(service): boolean
-		local ok, allowed = pcall(function()
-			return service:CanCaptureScreenshot()
-		end)
-		return ok and allowed == true
-	end
-
-	local function isUnsupportedCaptureProviderError(value: any): boolean
-		return tostring(value):lower():find("feature not supported yet", 1, true) ~= nil
-	end
-
-	local function captureVector(value: any, fieldName: string, allowNegative: boolean?): Vector2?
-		if value == nil then
-			return nil
-		end
-		if type(value) ~= "table" then
-			error(fieldName .. " must be an object with x and y")
-		end
-		local x = tonumber(value.x)
-		local y = tonumber(value.y)
-		if
-			x == nil
-			or y == nil
-			or x ~= x
-			or y ~= y
-			or x == math.huge
-			or y == math.huge
-			or x == -math.huge
-			or y == -math.huge
-			or (not allowNegative and (x < 0 or y < 0))
-		then
-			error(fieldName .. " must contain valid numeric x and y")
-		end
-		if not allowNegative and (x > CAPTURE_MAX_AXIS or y > CAPTURE_MAX_AXIS) then
-			error(fieldName .. " exceeds the per-axis capture limit")
-		end
-		return Vector2.new(math.floor(x), math.floor(y))
-	end
-
-	local function focusCameraForCapture(path: string, viewName: string, padding: number?): () -> ()
-		local target = resolveRemotePath(path)
-		if not target then
-			error("capture focus path not found: " .. path)
-		end
-
-		-- Build the bounds from every rotated part corner. Position +/- Size/2
-		-- underestimates rotated parts and is the common reason isometric captures
-		-- clip limbs, tools, or diagonal map geometry.
-		local corners = {}
-		local minimum = Vector3.new(math.huge, math.huge, math.huge)
-		local maximum = Vector3.new(-math.huge, -math.huge, -math.huge)
-		local function includePart(part: BasePart)
-			local half = part.Size * 0.5
-			for xSign = -1, 1, 2 do
-				for ySign = -1, 1, 2 do
-					for zSign = -1, 1, 2 do
-						local corner =
-							part.CFrame:PointToWorldSpace(Vector3.new(half.X * xSign, half.Y * ySign, half.Z * zSign))
-						table.insert(corners, corner)
-						minimum = Vector3.new(
-							math.min(minimum.X, corner.X),
-							math.min(minimum.Y, corner.Y),
-							math.min(minimum.Z, corner.Z)
-						)
-						maximum = Vector3.new(
-							math.max(maximum.X, corner.X),
-							math.max(maximum.Y, corner.Y),
-							math.max(maximum.Z, corner.Z)
-						)
-					end
-				end
-			end
-		end
-		if target:IsA("BasePart") then
-			includePart(target)
-		end
-		for _, descendant in ipairs(target:GetDescendants()) do
-			if descendant:IsA("BasePart") then
-				includePart(descendant)
-			end
-		end
-		if #corners == 0 then
-			error("capture focus target has no BaseParts: " .. path)
-		end
-
-		local camera = workspace.CurrentCamera
-		if not camera then
-			error("Workspace.CurrentCamera is unavailable")
-		end
-		local oldCFrame = camera.CFrame
-		local oldFocus = camera.Focus
-		local view = viewName:lower()
-		local direction = if view == "front"
-			then Vector3.new(0, 0, 1)
-			elseif view == "back" then Vector3.new(0, 0, -1)
-			elseif view == "left" then Vector3.new(-1, 0, 0)
-			elseif view == "right" then Vector3.new(1, 0, 0)
-			elseif view == "top" then Vector3.new(0, 1, 0)
-			elseif view == "bottom" then Vector3.new(0, -1, 0)
-			else Vector3.new(1, 0.75, 1)
-		direction = direction.Unit
-		local center = (minimum + maximum) * 0.5
-		local upHint = if math.abs(direction.Y) > 0.99 then Vector3.new(0, 0, -1) else Vector3.yAxis
-		local orientation = CFrame.lookAt(center + direction, center, upHint)
-		local right = orientation.RightVector
-		local up = orientation.UpVector
-		local viewport = camera.ViewportSize
-		local aspect = if viewport.Y > 0 then math.max(viewport.X / viewport.Y, 0.01) else 16 / 9
-		local verticalTangent = math.tan(math.rad(math.clamp(camera.FieldOfView, 1, 120) * 0.5))
-		local horizontalTangent = verticalTangent * aspect
-		local margin = math.clamp(tonumber(padding) or 1.25, 1, 4)
-		local distance = 1
-		local nearestOffset = 0
-		for _, corner in ipairs(corners) do
-			local relative = corner - center
-			local depthOffset = relative:Dot(direction)
-			nearestOffset = math.max(nearestOffset, depthOffset)
-			distance = math.max(
-				distance,
-				depthOffset + math.abs(relative:Dot(right)) * margin / horizontalTangent,
-				depthOffset + math.abs(relative:Dot(up)) * margin / verticalTangent
-			)
-		end
-		-- Keep the nearest corner safely beyond the camera's near plane even for
-		-- very deep subjects whose screen-space extents are otherwise tiny.
-		distance = math.max(distance, nearestOffset + 0.5)
-		local restored = false
-		local function restore()
-			if restored then
-				return
-			end
-			restored = true
-			pcall(function()
-				camera.CFrame = oldCFrame
-				camera.Focus = oldFocus
-			end)
-		end
-		local focused, focusError = pcall(function()
-			camera.CFrame = CFrame.lookAt(center + direction * distance, center, upHint)
-			camera.Focus = CFrame.new(center)
-			task.wait(0.1)
-		end)
-		if not focused then
-			restore()
-			error("unable to frame capture camera: " .. tostring(focusError))
-		end
-		return restore
-	end
-
-	local function destroyCaptureSession(session)
-		if session == nil then
-			return
-		end
-		pcall(function()
-			if session.capture then
-				session.capture:Destroy()
-			end
-		end)
-	end
-
-	local function cleanupCaptureSessions()
-		local now = os.clock()
-		local active = {}
-		for id, session in pairs(captureSessions) do
-			if now - session.createdAt > CAPTURE_SESSION_TTL_SECONDS then
-				destroyCaptureSession(session)
-				captureSessions[id] = nil
-			else
-				table.insert(active, { id = id, createdAt = session.createdAt })
-			end
-		end
-		if #active >= CAPTURE_MAX_SESSIONS then
-			table.sort(active, function(a, b)
-				return a.createdAt < b.createdAt
-			end)
-			local oldest = active[1]
-			destroyCaptureSession(captureSessions[oldest.id])
-			captureSessions[oldest.id] = nil
-		end
-	end
-
-	remoteHandlers.capabilities = function(_args)
-		local captureService = getStudioCaptureService()
-		local photoChild = script:FindFirstChild("Photo")
-		local photoAvailable = photoChild ~= nil and photoChild:IsA("ModuleScript")
-		local playscriptChild = script:FindFirstChild("Playscript")
-		local playscriptAvailable = playscriptChild ~= nil and playscriptChild:IsA("ModuleScript")
-		local hostType = hostDataModelTypeName()
-		local pluginConnectionOk, pluginConnection = pcall(function()
-			local service = game:GetService("PluginConnectionService")
-			local anyService: any = service
-			if anyService.CanHaveConnectionType ~= nil then
-				return service:CanHaveConnectionType(Enum.PluginConnectionTargetType.Test)
-			end
-			return service ~= nil
-		end)
-		pluginConnection = pluginConnectionOk and pluginConnection == true
-		local studioTestOk, studioTest = pcall(function()
-			local service = game:GetService("StudioTestService")
-			local anyService: any = service
-			return anyService.ExecutePlayModeAsync ~= nil
-				and anyService.ExecuteRunModeAsync ~= nil
-				and anyService.ExecuteMultiplayerTestAsync ~= nil
-		end)
-		studioTest = studioTestOk and studioTest == true
-		local virtualInputOk, virtualInput = pcall(function()
-			local userInput = game:GetService("UserInputService")
-			return (userInput :: any).CreateVirtualInput ~= nil
-		end)
-		virtualInput = virtualInputOk and virtualInput == true
-		return {
-			pluginVersion = PLUGIN_VERSION_STRING,
-			protocolVersion = PLUGIN_PROTOCOL_VERSION,
-			buildCommit = PLUGIN_BUILD_COMMIT,
-			buildDirty = PLUGIN_BUILD_DIRTY,
-			hostDataModelType = hostType,
-			placeId = tostring(game.PlaceId),
-			gameId = tostring(game.GameId),
-			features = {
-				capture = captureService ~= nil,
-				captureAuthorized = captureService ~= nil and canCaptureScreenshot(captureService),
-				captureRegion = captureService ~= nil,
-				photo = photoAvailable,
-				photoTransparent = photoAvailable,
-				photoUiOnly = photoAvailable,
-				photoCameraCFrame = photoAvailable,
-				photoUiTarget = photoAvailable,
-				photoInstanceTightCrop = photoAvailable,
-				artifactChunks = true,
-				instanceClipboard = remoteState.clipboardAvailable == true,
-				copyPaste = remoteState.clipboardAvailable == true,
-				pluginConnection = pluginConnection,
-				studioTest = studioTest,
-				virtualInput = virtualInput,
-				playtest = studioTest and pluginConnection,
-				playtestRun = studioTest and pluginConnection and playscriptAvailable,
-				runtimeExec = pluginConnection,
-				uiInspect = pluginConnection,
-				playtestLogs = pluginConnection,
-				virtualInputRouting = pluginConnection and virtualInput,
-				workflows = true,
-				transactions = true,
-				structuredErrors = true,
-				stableRefs = true,
-			},
-			limits = {
-				captureChunkBytes = CAPTURE_MAX_CHUNK_BYTES,
-				captureAxis = CAPTURE_MAX_AXIS,
-				capturePixels = CAPTURE_MAX_PIXELS,
-				captureBytes = CAPTURE_MAX_BYTES,
-				captureSessions = CAPTURE_MAX_SESSIONS,
-				captureSessionTtlSeconds = CAPTURE_SESSION_TTL_SECONDS,
-				photoAxis = 4096,
-				photoPixels = 16 * 1024 * 1024,
-				photoChunkBytes = 512 * 1024,
-				clipboardBytes = 128 * 1024 * 1024,
-				clipboardRoots = 256,
-				playscriptEventBytes = 64 * 1024,
-				playscriptResultBytes = 1024 * 1024,
-				playscriptResultChunkBytes = 96 * 1024,
-				playscriptEventsPerSecond = 20,
-				playscriptEventBurst = 40,
-				playscriptPollEvents = 64,
-				playscriptPollBytes = 512 * 1024,
-			},
-		}
-	end
-
-	remoteHandlers.capture_status = function(_args)
-		local service = getStudioCaptureService()
-		local photoChild = script:FindFirstChild("Photo")
-		local photoAvailable = photoChild ~= nil and photoChild:IsA("ModuleScript")
-		return {
-			available = service ~= nil,
-			authorized = service ~= nil and canCaptureScreenshot(service),
-			photoAvailable = photoAvailable,
-			photoUiOnlyAvailable = photoAvailable,
-			photoCameraCFrameAvailable = photoAvailable,
-			photoUiTargetAvailable = photoAvailable,
-			photoInstanceTightCropAvailable = photoAvailable,
-			photoAuthorizationRequired = false,
-			permissionPromptRequired = service ~= nil
-				and not canCaptureScreenshot(service)
-				and not captureProviderUnsupported,
-			providerUnsupported = captureProviderUnsupported,
-			providerError = captureProviderError,
-		}
-	end
-
-	remoteHandlers.capture_authorize = function(_args)
-		local service = getStudioCaptureService()
-		if service == nil then
-			error("StudioCaptureService is unavailable in this Studio build")
-		end
-		if captureProviderUnsupported then
-			return {
-				authorized = false,
-				providerUnsupported = true,
-				providerError = captureProviderError,
-			}
-		end
-		local ok, authorized = pcall(function()
-			return service:RequestScreenshotPermissionAsync()
-		end)
-		if not ok then
-			if isUnsupportedCaptureProviderError(authorized) then
-				captureProviderUnsupported = true
-				captureProviderError = tostring(authorized)
-				return {
-					authorized = false,
-					providerUnsupported = true,
-					providerError = captureProviderError,
-				}
-			end
-			error("screenshot permission request failed: " .. tostring(authorized))
-		end
-		captureProviderUnsupported = false
-		captureProviderError = nil
-		return {
-			authorized = authorized == true and canCaptureScreenshot(service),
-			providerUnsupported = false,
-		}
-	end
-
-	local function prepareCapture(args)
-		cleanupCaptureSessions()
-		local service = getStudioCaptureService()
-		if service == nil then
-			error("StudioCaptureService is unavailable in this Studio build")
-		end
-		if captureProviderUnsupported then
-			error(
-				"Studio screenshot provider is unsupported after explicit capture authorization: "
-					.. tostring(captureProviderError or "Feature not supported yet")
-			)
-		end
-		if not canCaptureScreenshot(service) then
-			error("screenshot permission is not granted; run `rosync capture authorize` first")
-		end
-
-		local position = captureVector(args.position, "position", true)
-		local captureSize = captureVector(args.captureSize, "captureSize")
-		local outputSize = captureVector(args.outputSize, "outputSize")
-		if (position == nil) ~= (captureSize == nil) then
-			error("position and captureSize must be provided together")
-		end
-		if captureSize and (captureSize.X < 1 or captureSize.Y < 1) then
-			error("captureSize dimensions must be positive")
-		end
-		if outputSize and (outputSize.X < 1 or outputSize.Y < 1) then
-			error("outputSize dimensions must be positive")
-		end
-		for _, checkedSize in pairs({ captureSize, outputSize }) do
-			if checkedSize and checkedSize.X * checkedSize.Y > CAPTURE_MAX_PIXELS then
-				error("requested capture exceeds the pixel limit")
-			end
-		end
-
-		local options = {
-			Format = Enum.StudioCaptureScreenshotFormat.PNG,
-			UICaptureMode = if tostring(args.ui or "all"):lower() == "none"
-				then Enum.UICaptureMode.None
-				else Enum.UICaptureMode.All,
-			ResampleMode = if tostring(args.resample or "default"):lower() == "pixelated"
-				then Enum.ResamplerMode.Pixelated
-				else Enum.ResamplerMode.Default,
-		}
-		if position then
-			options.Position = position
-			options.CaptureSize = captureSize
-		end
-		if outputSize then
-			options.OutputSize = outputSize
-		end
-		local restoreCamera = nil
-		local focusPath = tostring(args.focus or "")
-		if focusPath ~= "" then
-			restoreCamera = focusCameraForCapture(focusPath, tostring(args.view or "isometric"), tonumber(args.padding))
-		end
-
-		local capture = nil
-		local okCapture, captureError = pcall(function()
-			capture = service:CaptureScreenshot(options)
-			if capture == nil then
-				error("Studio returned no capture")
-			end
-			local captureTimeout = math.clamp(tonumber(args.timeoutSeconds) or 30, 0.1, 30)
-			local deadline = os.clock() + captureTimeout
-			while
-				capture.BufferStatus == Enum.StudioCaptureBufferStatus.NotStarted
-				or capture.BufferStatus == Enum.StudioCaptureBufferStatus.Pending
-			do
-				if os.clock() >= deadline then
-					error("Studio screenshot timed out")
-				end
-				task.wait(0.02)
-			end
-		end)
-		-- Restore immediately after Studio has finished reading the viewport. The
-		-- protected region above guarantees this runs for capture and polling errors.
-		if restoreCamera then
-			restoreCamera()
-		end
-		if not okCapture or capture == nil then
-			destroyCaptureSession({ capture = capture })
-			error("CaptureScreenshot failed: " .. tostring(captureError))
-		end
-		if capture.BufferStatus ~= Enum.StudioCaptureBufferStatus.Ready then
-			local errors = {}
-			pcall(function()
-				for _, captureError in ipairs(capture:GetErrors()) do
-					table.insert(errors, tostring(captureError))
-				end
-			end)
-			destroyCaptureSession({ capture = capture })
-			error("Studio screenshot failed: " .. (#errors > 0 and table.concat(errors, "; ") or "unknown error"))
-		end
-
-		local okBuffer, bytes = pcall(function()
-			return capture:GetBuffer()
-		end)
-		if not okBuffer or typeof(bytes) ~= "buffer" then
-			destroyCaptureSession({ capture = capture })
-			error("GetBuffer failed: " .. tostring(bytes))
-		end
-		local resolution = capture.Resolution
-		if
-			resolution.X < 1
-			or resolution.Y < 1
-			or resolution.X > CAPTURE_MAX_AXIS
-			or resolution.Y > CAPTURE_MAX_AXIS
-			or resolution.X * resolution.Y > CAPTURE_MAX_PIXELS
-		then
-			destroyCaptureSession({ capture = capture })
-			error("Studio returned invalid screenshot dimensions")
-		end
-		if buffer.len(bytes) < 1 or buffer.len(bytes) > CAPTURE_MAX_BYTES then
-			destroyCaptureSession({ capture = capture })
-			error("Studio returned an invalid screenshot byte length")
-		end
-
-		captureSessionCounter += 1
-		local sessionId = tostring(captureSessionCounter) .. "-" .. HttpService:GenerateGUID(false)
-		local session = {
-			capture = capture,
-			bytes = bytes,
-			createdAt = os.clock(),
-		}
-		captureSessions[sessionId] = session
-		task.delay(CAPTURE_SESSION_TTL_SECONDS, function()
-			if captureSessions[sessionId] == session then
-				destroyCaptureSession(session)
-				captureSessions[sessionId] = nil
-			end
-		end)
-		return {
-			sessionId = sessionId,
-			width = math.floor(resolution.X),
-			height = math.floor(resolution.Y),
-			byteLength = buffer.len(bytes),
-			position = { x = capture.Position.X, y = capture.Position.Y },
-			originalSize = { x = capture.OriginalSize.X, y = capture.OriginalSize.Y },
-			format = capture.BufferFormat.Name,
-			ui = capture.UICaptureMode.Name,
-		}
-	end
-
-	remoteHandlers.capture_prepare = function(args)
-		if capturePrepareBusy then
-			error("another screenshot capture is already in progress")
-		end
-		capturePrepareBusy = true
-		local ok, result = pcall(prepareCapture, args)
-		capturePrepareBusy = false
-		if not ok then
-			error(result)
-		end
-		return result
-	end
-
-	remoteHandlers.capture_read = function(args)
-		cleanupCaptureSessions()
-		local sessionId = tostring(args.sessionId or "")
-		local session = captureSessions[sessionId]
-		if session == nil then
-			error("capture session not found or expired: " .. sessionId)
-		end
-		local total = buffer.len(session.bytes)
-		local offset = math.floor(tonumber(args.offset) or 0)
-		local maxBytes = math.floor(tonumber(args.maxBytes) or CAPTURE_MAX_CHUNK_BYTES)
-		if offset < 0 or offset >= total then
-			error("capture offset is outside the artifact")
-		end
-		maxBytes = math.clamp(maxBytes, 1, CAPTURE_MAX_CHUNK_BYTES)
-		local count = math.min(maxBytes, total - offset)
-		local chunk = buffer.fromstring(buffer.readstring(session.bytes, offset, count))
-		local nextOffset = offset + count
-		return {
-			offset = offset,
-			nextOffset = nextOffset,
-			eof = nextOffset >= total,
-			bytesBase64 = remoteState.encodeRemoteBuffer(chunk),
-		}
-	end
-
-	remoteHandlers.capture_export = function(args)
-		cleanupCaptureSessions()
-		local sessionId = tostring(args.sessionId or "")
-		local session = captureSessions[sessionId]
-		if session == nil then
-			error("capture session not found or expired: " .. sessionId)
-		end
-		local lease = args.lease
-		if type(lease) ~= "table" then
-			error("capture export requires an artifact lease")
-		end
-		local artifactId = tostring(lease.id or "")
-		local token = tostring(lease.token or "")
-		if artifactId == "" or token == "" then
-			error("artifact lease is missing id or token")
-		end
-
-		local total = buffer.len(session.bytes)
-		local deadline = os.clock() + math.clamp(tonumber(args.timeoutSeconds) or 30, 0.1, 120)
-		local offset = 0
-		while offset < total do
-			if os.clock() >= deadline then
-				error("capture export exceeded its end-to-end deadline")
-			end
-			local count = math.min(384 * 1024, total - offset)
-			local chunk = buffer.fromstring(buffer.readstring(session.bytes, offset, count))
-			local ok, response = httpJson("/artifacts/" .. artifactId .. "/chunk", "POST", {
-				token = token,
-				offset = offset,
-				bytesBase64 = remoteState.encodeRemoteBuffer(chunk),
-			})
-			if not ok or type(response) ~= "table" or response.ok ~= true then
-				local detail = if type(response) == "table" then response.error else response
-				if type(detail) == "table" then
-					detail = detail.message or detail.code
-				end
-				error("artifact chunk upload failed at offset " .. tostring(offset) .. ": " .. tostring(detail))
-			end
-			offset += count
-		end
-
-		local ok, response = httpJson("/artifacts/" .. artifactId .. "/finalize", "POST", {
-			token = token,
-			expectedSha256 = args.expectedSha256,
-		})
-		if not ok or type(response) ~= "table" or response.ok ~= true then
-			local detail = if type(response) == "table" then response.error else response
-			if type(detail) == "table" then
-				detail = detail.message or detail.code
-			end
-			error("artifact finalization failed: " .. tostring(detail))
-		end
-		destroyCaptureSession(session)
-		captureSessions[sessionId] = nil
-		return response.artifact
-	end
-
-	remoteHandlers.capture_close = function(args)
-		local sessionId = tostring(args.sessionId or "")
-		local session = captureSessions[sessionId]
-		if session then
-			destroyCaptureSession(session)
-			captureSessions[sessionId] = nil
-		end
-		return true
-	end
-end
-
-do
-	-- ---------------------------------------------------------------------------
-	-- Tier 1: construction / destruction / reparent / attributes / tags / method
-	-- calls / selection. These all POST a /writelog entry on success (see
-	-- REMOTE_WRITE_OPS below).
-	-- ---------------------------------------------------------------------------
-
-	local CollectionService = game:GetService("CollectionService")
-	local Selection = game:GetService("Selection")
-
-	remoteHandlers.new = function(args)
-		local parentPath = tostring(args.parent or args.path or "")
-		local parent = resolveRemotePath(parentPath)
-		if not parent then
-			error("parent not found: " .. parentPath)
-		end
-		local className = tostring(args.class or "")
-		if className == "" then
-			error("missing class")
-		end
-		local createOk, inst = pcall(Instance.new, className)
-		if not createOk or not inst then
-			error("Instance.new failed for class " .. className .. ": " .. tostring(inst))
-		end
-		if args.name ~= nil then
-			inst.Name = tostring(args.name)
-		end
-		local props = args.initial_props or args.props
-		local pendingSource = nil
-		if type(props) == "table" then
-			for k, v in pairs(props) do
-				local key = tostring(k)
-				local decoded = decodeRemoteValue(v)
-				-- Skip Parent here — we set it last so every other property is in
-				-- place before AncestryChanged fires.
-				if key == "Source" and inst:IsA("LuaSourceContainer") then
-					pendingSource = tostring(decoded or "")
-				elseif key ~= "Parent" then
-					inst[key] = decoded
-				end
-			end
-		end
-		inst.Parent = parent
-		if pendingSource ~= nil and not writeScriptSource(inst, pendingSource, false) then
-			inst:Destroy()
-			error("source write was not applied for new " .. className)
-		end
-		return {
-			path = instancePathString(inst),
-			class = inst.ClassName,
-			name = inst.Name,
-			etag = remoteState.instanceEtag(inst),
-		}
-	end
-
-	remoteHandlers.rm = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		if inst == game then
-			error("cannot destroy the DataModel root")
-		end
-		local path = instancePathString(inst)
-		inst:Destroy()
-		return { path = path, destroyed = true }
-	end
-
-	remoteHandlers.mv = function(args)
-		local fromPath = tostring(args.from or "")
-		local toPath = tostring(args.to or "")
-		local inst = resolveRemotePath(fromPath)
-		if not inst then
-			error("from not found: " .. fromPath)
-		end
-		if inst == game then
-			error("cannot reparent the DataModel root")
-		end
-		local newParent = resolveRemotePath(toPath)
-		if not newParent then
-			error("to not found: " .. toPath)
-		end
-		-- Top-level service boundary = segs[1]. Cross-service reparenting requires
-		-- args.force because dropping an instance into the wrong service
-		-- (e.g. Workspace -> ServerStorage) usually means losing replication.
-		local oldSegs = splitRemotePath(instancePathString(inst))
-		local newParentSegs = splitRemotePath(instancePathString(newParent))
-		local oldService = oldSegs[1] or ""
-		local newService = newParentSegs[1] or ""
-		if oldService ~= newService and not args.force then
-			error(
-				string.format(
-					"refusing to reparent across service boundary %q -> %q (pass force=true to override)",
-					oldService,
-					newService
-				)
-			)
-		end
-		inst.Parent = newParent
-		return {
-			path = instancePathString(inst),
-			parent = instancePathString(newParent),
-			etag = remoteState.instanceEtag(inst),
-		}
-	end
-
-	remoteHandlers.set_attr = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local name = tostring(args.name or "")
-		if name == "" then
-			error("missing attribute name")
-		end
-		local decoded = decodeRemoteValue(args.value)
-		inst:SetAttribute(name, decoded)
-		return { path = instancePathString(inst), name = name }
-	end
-
-	remoteHandlers.rm_attr = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local name = tostring(args.name or "")
-		if name == "" then
-			error("missing attribute name")
-		end
-		inst:SetAttribute(name, nil)
-		return { path = instancePathString(inst), name = name, cleared = true }
-	end
-
-	remoteHandlers.attr_ls = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local out = {}
-		local aok, raw = pcall(function()
-			return inst:GetAttributes()
-		end)
-		if aok and typeof(raw) == "table" then
-			for k, v in pairs(raw) do
-				local eok, encoded = pcall(encodeRemoteValue, v)
-				if eok then
-					out[tostring(k)] = encoded
-				end
-			end
-		end
-		return out
-	end
-
-	remoteHandlers.add_tag = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local tag = tostring(args.tag or "")
-		if tag == "" then
-			error("missing tag")
-		end
-		CollectionService:AddTag(inst, tag)
-		return { path = instancePathString(inst), tag = tag, added = true }
-	end
-
-	remoteHandlers.rm_tag = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local tag = tostring(args.tag or "")
-		if tag == "" then
-			error("missing tag")
-		end
-		CollectionService:RemoveTag(inst, tag)
-		return { path = instancePathString(inst), tag = tag, removed = true }
-	end
-
-	remoteHandlers.tag_ls = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local tags = CollectionService:GetTags(inst)
-		table.sort(tags)
-		return tags
-	end
-
-	remoteHandlers.call = function(args)
-		local inst = resolveRemotePath(tostring(args.path or ""))
-		if not inst then
-			error("path not found: " .. tostring(args.path))
-		end
-		local method = tostring(args.method or "")
-		if method == "" then
-			error("missing method")
-		end
-		local rawArgs = args.args
-		local decoded = {}
-		local n = 0
-		if type(rawArgs) == "table" then
-			n = #rawArgs
-			for i = 1, n do
-				decoded[i] = decodeRemoteValue(rawArgs[i])
-			end
-		end
-		local fn = inst[method]
-		if type(fn) ~= "function" then
-			error("method not callable: " .. method)
-		end
-		local callResults = table.pack(fn(inst, table.unpack(decoded, 1, n)))
-		if callResults.n == 0 then
-			return nil
-		end
-		if callResults.n == 1 then
-			return encodeRemoteValue(callResults[1])
-		end
-		local callOut = {}
-		local encodeState = { nodes = 0, stringBytes = 0, seen = {} }
-		for i = 1, callResults.n do
-			callOut[i] = encodeRemoteValue(callResults[i], 0, encodeState)
-		end
-		return callOut
-	end
-
-	remoteHandlers.select_get = function(_args)
-		local out = {}
-		local selOk, sel = pcall(function()
-			return Selection:Get()
-		end)
-		if selOk and typeof(sel) == "table" then
-			for _, inst in ipairs(sel) do
-				table.insert(out, instancePathString(inst))
-			end
-		end
-		return out
-	end
-
-	remoteHandlers.select_set = function(args)
-		local paths = args.paths
-		if type(paths) ~= "table" then
-			error("paths must be an array")
-		end
-		local list = {}
-		for i, p in ipairs(paths) do
-			local inst = resolveRemotePath(tostring(p))
-			if not inst then
-				error("path not found (index " .. i .. "): " .. tostring(p))
-			end
-			table.insert(list, inst)
-		end
-		Selection:Set(list)
-		return { count = #list }
-	end
-
-	remoteHandlers.logs = function(args)
-		local sinceSeconds = tonumber(args.since_seconds)
-		local sinceSeq = tonumber(args.since_seq)
-		local levelMin = args.level_min and tostring(args.level_min) or nil
-		local limit = tonumber(args.limit)
-		local entries = readLogRing(sinceSeconds, sinceSeq, levelMin, limit)
-		return { entries = entries, now = os.clock(), wall = os.time() }
-	end
-
-	remoteHandlers.save = function(_args)
-		-- game:Save() can take several seconds; yielding here would blow the WS
-		-- request timeout. Fire-and-forget; surface any error to the plugin log.
-		task.spawn(function()
-			local ok, err = pcall(function()
-				(game :: any):Save()
-			end)
-			if not ok then
-				warn("[Ro Sync] game:Save() failed: " .. tostring(err))
-			end
-		end)
-		return { ok = true, started = true }
-	end
-
-	remoteHandlers.undo = function(_args)
-		ChangeHistoryService:Undo()
-		return { ok = true }
-	end
-
-	remoteHandlers.redo = function(_args)
-		ChangeHistoryService:Redo()
-		return { ok = true }
-	end
-
-	remoteHandlers.waypoint = function(args)
-		local name = tostring(args.name or "")
-		if name == "" then
-			error("missing name")
-		end
-		ChangeHistoryService:SetWaypoint(name)
-		return { ok = true, name = name }
-	end
-
-	remoteHandlers.version = function(_args)
-		local studioVersion
-		local ok, v = pcall(function()
-			return game:GetService("RunService"):GetRobloxVersion()
-		end)
-		if ok then
-			studioVersion = tostring(v)
-		end
-		return {
-			plugin_version = PLUGIN_VERSION_STRING,
-			protocol = PLUGIN_PROTOCOL_VERSION,
-			build_commit = PLUGIN_BUILD_COMMIT,
-			build_dirty = PLUGIN_BUILD_DIRTY,
-			studio_version = studioVersion,
-		}
-	end
-
-	remoteHandlers.ping = function(_args)
-		return { pong = os.clock() }
-	end
-
-	-- Class, enum, and attribute introspection lives in a packaged child
-	-- module so its large fallback metadata table is compiled independently.
-	do
-		local moduleScript = script:FindFirstChild("Reflection")
-		if not moduleScript or not moduleScript:IsA("ModuleScript") then
-			error("[Ro Sync] packaged Reflection module is missing")
-		end
-		local module = require(moduleScript)
-		local controller = module.install({
-			resolvePath = resolveRemotePath,
-			pathOf = instancePathString,
-			decode = decodeRemoteValue,
-			findLimitDefault = FIND_LIMIT_DEFAULT,
-		})
-		for name, handler in pairs(controller.handlers) do
-			remoteHandlers[name] = handler
-		end
-	end
-end
-
-do
-	local REMOTE_WRITE_OPS = {
-		set = true,
-		eval = true,
-		transmit_prepare = true,
-		capture_authorize = true,
-		capture_prepare = true,
-		capture_export = true,
-		photo_prepare = true,
-		playtest_start = true,
-		playtest_run_start = true,
-		playtest_run_cancel = true,
-		playtest_stop = true,
-		playtest_request = true,
-		playtest_capture = true,
-		transaction_begin = true,
-		transaction_finish = true,
-		undo = true,
-		redo = true,
-		save = true,
-		waypoint = true,
-		new = true,
-		rm = true,
-		mv = true,
-		set_attr = true,
-		rm_attr = true,
-		add_tag = true,
-		rm_tag = true,
-		call = true,
-		select_set = true,
-		clipboard_copy = true,
-		clipboard_paste = true,
-	}
-	-- Runtime requests are still audited as writes, but they mutate temporary,
-	-- generation-scoped playtest DataModels and have their own correlated
-	-- responses. Serializing them behind the edit-mode transaction lane causes
-	-- unrelated server/client execs to exhaust the queue while a peer yields.
-	local REMOTE_CONCURRENT_WRITE_OPS = {
-		playtest_request = true,
-		playtest_run_cancel = true,
-	}
-
-	local function redactRemoteAuditValue(value: any, depth: number?, seen: any?): any
-		local currentDepth = depth or 0
-		local visited = seen or {}
-		if currentDepth > 8 then
-			return "<max-depth>"
-		end
-		if type(value) == "string" then
-			if #value > 16 * 1024 then
-				return string.sub(value, 1, 16 * 1024) .. "<truncated>"
-			end
-			return value
-		end
-		if type(value) ~= "table" then
-			return value
-		end
-		if visited[value] then
-			return "<cycle>"
-		end
-		visited[value] = true
-		local out = {}
-		local count = 0
-		for key, child in pairs(value) do
-			count += 1
-			if count > 500 then
-				out.__rosyncTruncated = true
-				break
-			end
-			local normalizedKey = tostring(key):lower():gsub("[^%w]", "")
-			if
-				normalizedKey == "token"
-				or normalizedKey:find("apikey", 1, true)
-				or normalizedKey:find("authorization", 1, true)
-				or normalizedKey:find("credential", 1, true)
-				or normalizedKey:find("password", 1, true)
-				or normalizedKey:find("secret", 1, true)
-			then
-				out[key] = "[REDACTED]"
-			else
-				out[key] = redactRemoteAuditValue(child, currentDepth + 1, visited)
-			end
-		end
-		visited[value] = nil
-		return out
-	end
-
-	local function postRemoteWriteLogSync(entry)
-		local redacted = redactRemoteAuditValue(entry)
-		local ok, response = httpJson("/writelog", "POST", redacted)
-		if ok and (type(response) ~= "table" or response.ok ~= true) then
-			ok = false
-			response = if type(response) == "table"
-				then tostring(response.error or "writelog rejected the audit entry")
-				else "invalid writelog response"
-		end
-		if not ok then
-			warn("[Ro Sync] writelog POST failed: " .. tostring(response))
-		end
-		return ok, response
-	end
-
-	local function postRemoteWriteLog(entry)
-		task.spawn(function()
-			postRemoteWriteLogSync(entry)
-		end)
-	end
-	remoteState.postRemoteWriteLog = postRemoteWriteLog
-	remoteState.postRemoteWriteLogSync = postRemoteWriteLogSync
-	remoteState.preAuditedWrites = setmetatable({}, { __mode = "k" })
-
-	local function remoteAuditArgs(op, args)
-		local transform = remoteState.auditArgsForOp
-		if transform then
-			local ok, transformed = pcall(transform, op, args)
-			if ok and type(transformed) == "table" then
-				return transformed
-			end
-		end
-		return args
-	end
-
-	-- Every remote write enters one cooperative lane. Roblox event callbacks can
-	-- overlap when a handler yields, so a plain boolean mutex is insufficient:
-	-- transaction_finish could otherwise cancel/commit while an earlier
-	-- UpdateSourceAsync, screenshot, playtest request, or eval is still running.
-	local REMOTE_WRITE_QUEUE_MAX = 64
-	local REMOTE_WRITE_QUEUE_WAIT_SECONDS = 10
-	local REMOTE_WRITE_HANDLER_RESPONSE_SECONDS = 25
-	local REMOTE_TRANSACTION_HANDLER_RESPONSE_SECONDS = 5
-	local remoteWriteQueue = {}
-	local remoteWriteWorkerRunning = false
-	local remoteWriteActive = false
-	local remoteWriteCleanupRequested = false
-	local runRemoteWriteWorker
-
-	local function remoteWriteResponseBound(item): number
-		if item.op == "transaction_begin" or item.op == "transaction_finish" then
-			return REMOTE_TRANSACTION_HANDLER_RESPONSE_SECONDS
-		elseif item.op == "capture_prepare" then
-			return math.clamp(tonumber(item.args.timeoutSeconds) or 30, 0.1, 30) + 5
-		elseif item.op == "capture_export" then
-			return math.clamp(tonumber(item.args.timeoutSeconds) or 30, 0.1, 120) + 5
-		elseif item.op == "photo_prepare" then
-			return math.clamp(tonumber(item.args.timeoutSeconds) or 120, 1, 120) + 5
-		elseif item.op == "playtest_request" then
-			return math.clamp(tonumber(item.args.timeout) or 15, 0.1, 120) + 5
-		elseif item.op == "playtest_capture" then
-			return math.clamp(tonumber(item.args.timeout) or 30, 1, 120) + 5
-		elseif item.op == "capture_authorize" then
-			-- The privacy prompt is user-driven, but it must not retain the write lane
-			-- forever if Studio never completes the authorization request.
-			return 120
-		elseif item.op == "clipboard_copy" or item.op == "clipboard_paste" then
-			return math.clamp(tonumber(item.args.timeoutSeconds) or 120, 1, 300) + 5
-		end
-		return REMOTE_WRITE_HANDLER_RESPONSE_SECONDS
-	end
-
-	local function classifyRemoteHandlerError(op: string, result: any)
-		local message = tostring(result)
-		local lower = message:lower()
-		local code = "PLUGIN_ERROR"
-		local retryable = false
-		if lower:find("not found", 1, true) then
-			code = "NOT_FOUND"
-		elseif lower:find("permission", 1, true) or lower:find("authorize", 1, true) then
-			code = "PERMISSION_REQUIRED"
-		elseif lower:find("timed out", 1, true) or lower:find("timeout", 1, true) then
-			code = "TIMEOUT"
-			retryable = true
-		elseif lower:find("missing", 1, true) or lower:find("invalid", 1, true) or lower:find("must be", 1, true) then
-			code = "INVALID_ARGUMENT"
-		elseif lower:find("already active", 1, true) or lower:find("in progress", 1, true) then
-			code = "CONFLICT"
-		elseif lower:find("precondition failed", 1, true) then
-			code = "PRECONDITION_FAILED"
-		end
-		return {
-			code = code,
-			message = message,
-			retryable = retryable,
-			details = { op = op },
-		}
-	end
-
-	local function remoteRequestMeta(item)
-		return {
-			op = item.op,
-			durationMs = math.floor((os.clock() - item.receivedAt) * 1000),
-			queueMs = if item.executionStartedAt
-				then math.floor((item.executionStartedAt - item.receivedAt) * 1000)
-				else math.floor((os.clock() - item.receivedAt) * 1000),
-			protocol = PLUGIN_PROTOCOL_VERSION,
-		}
-	end
-
-	local function sendSyntheticRemoteFailure(item, code: string, message: string, retryable: boolean, details: any?)
-		if item.responded then
-			return
-		end
-		item.responded = true
-		local remoteError = {
-			code = code,
-			message = message,
-			retryable = retryable,
-			details = details or { op = item.op },
-		}
-		wsSend(item.client, {
-			type = "response",
-			request_id = item.reqId,
-			ok = false,
-			error = remoteError,
-			meta = remoteRequestMeta(item),
-		})
-		local preAudited = remoteState.preAuditedWrites and remoteState.preAuditedWrites[item.args] == true
-		if preAudited then
-			remoteState.preAuditedWrites[item.args] = nil
-		end
-		if item.isWrite and not preAudited and not item.auditHandled then
-			postRemoteWriteLog({
-				ts = os.time(),
-				op = item.op,
-				args = remoteAuditArgs(item.op, item.args),
-				ok = false,
-				synthetic = true,
-				error = remoteError,
-			})
-			item.auditHandled = true
-		end
-	end
-
-	local function finishRemoteRequest(item, ok: boolean, result: any)
-		item.finished = true
-		local late = item.responded == true
-		if not late then
-			item.responded = true
-			if ok then
-				wsSend(item.client, {
-					type = "response",
-					request_id = item.reqId,
-					ok = true,
-					value = result,
-					meta = remoteRequestMeta(item),
-				})
-			else
-				wsSend(item.client, {
-					type = "response",
-					request_id = item.reqId,
-					ok = false,
-					error = classifyRemoteHandlerError(item.op, result),
-					meta = remoteRequestMeta(item),
-				})
-			end
-		end
-		local preAudited = remoteState.preAuditedWrites and remoteState.preAuditedWrites[item.args] == true
-		if preAudited then
-			remoteState.preAuditedWrites[item.args] = nil
-			item.auditHandled = true
-		end
-		if item.isWrite and not item.auditHandled then
-			local audit = {
-				ts = os.time(),
-				op = item.op,
-				args = remoteAuditArgs(item.op, item.args),
-				ok = ok,
-				late = late,
-			}
-			if ok then
-				local transformResult = remoteState.auditResultForOp
-				if transformResult then
-					local transformedOk, transformed = pcall(transformResult, item.op, result)
-					audit.result = if transformedOk then transformed else "<result-redacted>"
-				else
-					audit.result = result
-				end
-			else
-				audit.error = classifyRemoteHandlerError(item.op, result)
-			end
-			postRemoteWriteLog(audit)
-			item.auditHandled = true
-		end
-	end
-
-	local function ensureRemoteWriteWorker()
-		if remoteWriteWorkerRunning then
-			return
-		end
-		remoteWriteWorkerRunning = true
-		task.spawn(runRemoteWriteWorker)
-	end
-
-	local function expireQueuedWrite(item, code: string, message: string)
-		if item.started or item.finished then
-			return
-		end
-		-- Explicit rollback remains queued even after its caller receives a bounded
-		-- wait response. Executing it late is safer than abandoning a recording.
-		if not item.mustExecuteAfterTimeout then
-			item.expired = true
-		end
-		sendSyntheticRemoteFailure(item, code, message, true, {
-			op = item.op,
-			queueLength = #remoteWriteQueue,
-			queueLimit = REMOTE_WRITE_QUEUE_MAX,
-		})
-	end
-
-	runRemoteWriteWorker = function()
-		while #remoteWriteQueue > 0 do
-			local item = table.remove(remoteWriteQueue, 1)
-			if item.expired and not item.mustExecuteAfterTimeout then
-				item.finished = true
-				continue
-			end
-
-			item.started = true
-			item.executionStartedAt = os.clock()
-			remoteWriteActive = true
-			local responseBound = remoteWriteResponseBound(item)
-			task.delay(responseBound, function()
-				if item.started and not item.finished and not item.responded then
-					item.executionTimedOut = true
-					sendSyntheticRemoteFailure(
-						item,
-						"HANDLER_TIMEOUT",
-						string.format(
-							"write handler %s exceeded the %.0fs response bound; it remains serialized until it returns",
-							item.op,
-							responseBound
-						),
-						true
-					)
-				end
-			end)
-
-			local ok, result = pcall(item.handler, item.args)
-			remoteWriteActive = false
-			finishRemoteRequest(item, ok, result)
-
-			if item.executionTimedOut or remoteWriteCleanupRequested then
-				local cleanupReason = if item.executionTimedOut then "handler-timeout" else "disconnect"
-				local cancelledCount, remainingCount = remoteState.requestRemoteWriteCleanup(cleanupReason)
-				postRemoteWriteLog({
-					ts = os.time(),
-					op = "transaction_auto_cancel",
-					ok = remainingCount == 0,
-					reason = cleanupReason,
-					cancelledCount = cancelledCount,
-					remainingCount = remainingCount,
-				})
-				remoteWriteCleanupRequested = false
-			end
-		end
-		remoteWriteWorkerRunning = false
-		if remoteWriteCleanupRequested and not remoteWriteActive then
-			remoteState.cancelActiveWorkflowRecordings()
-			remoteWriteCleanupRequested = false
-		end
-		if #remoteWriteQueue > 0 then
-			ensureRemoteWriteWorker()
-		end
-	end
-
-	local function enqueueRemoteWrite(item)
-		item.isWrite = true
-		item.mustExecuteAfterTimeout = item.op == "transaction_finish"
-			and tostring(item.args.action or "commit"):lower() == "cancel"
-		if #remoteWriteQueue >= REMOTE_WRITE_QUEUE_MAX then
-			if item.mustExecuteAfterTimeout then
-				-- Preserve rollback by evicting the newest ordinary queued write.
-				local evicted = nil
-				for index = #remoteWriteQueue, 1, -1 do
-					if not remoteWriteQueue[index].mustExecuteAfterTimeout then
-						evicted = table.remove(remoteWriteQueue, index)
-						break
-					end
-				end
-				if evicted then
-					expireQueuedWrite(evicted, "QUEUE_EVICTED", "write queue entry was evicted to admit rollback")
-					evicted.finished = true
-				end
-			end
-			if #remoteWriteQueue >= REMOTE_WRITE_QUEUE_MAX then
-				sendSyntheticRemoteFailure(item, "BUSY", "remote write queue is full", true, {
-					op = item.op,
-					queueLength = #remoteWriteQueue,
-					queueLimit = REMOTE_WRITE_QUEUE_MAX,
-				})
-				item.finished = true
-				return
-			end
-		end
-		table.insert(remoteWriteQueue, item)
-		task.delay(REMOTE_WRITE_QUEUE_WAIT_SECONDS, function()
-			expireQueuedWrite(
-				item,
-				"QUEUE_TIMEOUT",
-				string.format("write waited more than %.0fs in the ordered queue", REMOTE_WRITE_QUEUE_WAIT_SECONDS)
-			)
-		end)
-		ensureRemoteWriteWorker()
-	end
-
-	remoteState.requestRemoteWriteCleanup = function(reason: string?)
-		local code = if reason == "handler-timeout" then "UPSTREAM_TIMEOUT" else "SESSION_CLOSED"
-		local message = if reason == "handler-timeout"
-			then "queued write was canceled because the active handler exceeded its response bound"
-			else "plugin session closed before queued write execution"
-		for _, item in ipairs(remoteWriteQueue) do
-			if not item.started and not item.finished then
-				item.expired = true
-				sendSyntheticRemoteFailure(item, code, message, true)
-			end
-		end
-		if remoteWriteActive then
-			remoteWriteCleanupRequested = true
-			return nil, nil
-		else
-			local cancelledCount, remainingCount = remoteState.cancelActiveWorkflowRecordings()
-			remoteWriteCleanupRequested = false
-			return cancelledCount, remainingCount
-		end
-	end
-
-	remoteState.handleRemoteRequest = function(client, msg)
-		local reqId = msg.request_id
-		if type(reqId) ~= "number" then
-			-- Without a request_id we have nothing to correlate a reply to — drop.
-			log("ws: request missing numeric request_id")
-			return
-		end
-		local op = tostring(msg.op or "")
-		local args = msg.args
-		if type(args) ~= "table" then
-			args = {}
-		end
-		local handler = remoteHandlers[op]
-		if not handler then
-			wsSend(client, {
-				type = "response",
-				request_id = reqId,
-				ok = false,
-				error = {
-					code = "UNKNOWN_OP",
-					message = "unknown op: " .. op,
-					retryable = false,
-					details = { op = op },
-				},
-			})
-			return
-		end
-		local receivedAt = os.clock()
-		if op == "clipboard_copy" or op == "clipboard_paste" then
-			-- Clipboard deadlines are end-to-end. The handler deducts time spent
-			-- waiting behind another serialized write before it can mutate Studio.
-			args.__rosyncReceivedAt = receivedAt
-		end
-		local item = {
-			client = client,
-			reqId = reqId,
-			op = op,
-			args = args,
-			handler = handler,
-			receivedAt = receivedAt,
-			responded = false,
-			started = false,
-			finished = false,
-			isWrite = REMOTE_WRITE_OPS[op] == true,
-		}
-		if item.isWrite and REMOTE_CONCURRENT_WRITE_OPS[op] ~= true then
-			enqueueRemoteWrite(item)
-		else
-			item.started = true
-			item.executionStartedAt = os.clock()
-			local ok, result = pcall(handler, args)
-			finishRemoteRequest(item, ok, result)
-		end
+	else
+		warn("[Ro Sync] packaged RemoteControl module is not packaged in this plugin; reinstall Ro Sync")
 	end
 end
 
@@ -11387,6 +7125,7 @@ reconnectState.stopTerminal = function(reason)
 	wsGeneration += 1
 	decisionGeneration += 1
 	disconnectHooks()
+	table.clear(scaleState.sourceHashMemo)
 	reconnectState.pluginCapability = nil
 	reconnectState.comparedCapability = nil
 	if ws then
@@ -11396,14 +7135,42 @@ reconnectState.stopTerminal = function(reason)
 			toClose:Close()
 		end)
 	end
+	setPill("error", "update Ro Sync")
 	if message:lower():find("protocol", 1, true) then
-		setPill("error", "update Ro Sync")
 		setBanner("Daemon/plugin versions are incompatible. Update Ro Sync and reinstall the Studio plugin.")
 	else
-		setPill("error", "action required")
 		setBanner("Ro Sync connection rejected: " .. message)
 	end
 	log("ws: terminal rejection — " .. message)
+end
+
+-- The winning discovery probe already decoded a full /hello, yet the connect
+-- pipeline used to re-GET the same document three more times in series
+-- (validateDaemonProtocol → refreshDaemonConfig → the first ws refreshHello).
+-- Cache the decoded hello for a few seconds and let those consumers reuse it;
+-- anything older re-fetches, so a daemon restart cannot serve stale state for
+-- longer than the cache window.
+local HELLO_CACHE_SECONDS = 5
+reconnectState.storeHelloCache = function(url, hello)
+	if type(hello) ~= "table" then
+		return
+	end
+	reconnectState.helloCache = {
+		url = (tostring(url or ""):gsub("/+$", "")),
+		hello = hello,
+		at = os.clock(),
+	}
+end
+reconnectState.readCachedHello = function(url)
+	local cache = reconnectState.helloCache
+	if
+		cache ~= nil
+		and cache.url == (tostring(url or ""):gsub("/+$", ""))
+		and (os.clock() - cache.at) < HELLO_CACHE_SECONDS
+	then
+		return cache.hello
+	end
+	return nil
 end
 
 -- A daemon restart rotates the process-scoped plugin capability. Refresh it
@@ -11413,6 +7180,10 @@ reconnectState.refreshHello = function()
 	local function readHello(candidateUrl)
 		if type(candidateUrl) ~= "string" or candidateUrl == "" then
 			return nil, "daemon URL is missing"
+		end
+		local cached = reconnectState.readCachedHello(candidateUrl)
+		if cached ~= nil then
+			return cached, nil
 		end
 		local ok, response = httpRequestTo(candidateUrl:gsub("/+$", "") .. "/hello", "GET")
 		if not ok then
@@ -11442,12 +7213,36 @@ reconnectState.refreshHello = function()
 			and type(helloValue.project) == "string"
 			and helloValue.project == pinnedProject
 	end
+	-- Reconnects must apply the same place test as fresh discovery: this
+	-- remembered-URL path used to validate GameId only, so a window whose
+	-- project had been rebound (or that had connected before place matching
+	-- existed) resumed straight into a sibling place's project.
+	local function wrongPlace(h)
+		if expectedGameId == "0" then
+			return false
+		end
+		local places = h.placeIds
+		if type(places) ~= "table" or #places == 0 then
+			return false
+		end
+		local placeId = tostring(game.PlaceId)
+		for _, id in ipairs(places) do
+			if tostring(id) == placeId then
+				return false
+			end
+		end
+		return true
+	end
 	local candidateUrl = tostring(baseUrl or ""):gsub("/+$", "")
 	local candidatePort = connectedPort
 	local hello, helloError = readHello(candidateUrl)
 	if hello ~= nil and expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
 		hello = nil
 		helloError = "daemon now belongs to a different GameId"
+	end
+	if hello ~= nil and wrongPlace(hello) then
+		hello = nil
+		helloError = "daemon's project serves a different place of this game"
 	end
 	if hello ~= nil and not matchesPinnedProject(hello) then
 		hello = nil
@@ -11474,6 +7269,9 @@ reconnectState.refreshHello = function()
 	if not matchesPinnedProject(hello) then
 		return false, "daemon hello changed to a different project during discovery", false
 	end
+	if wrongPlace(hello) then
+		return false, "daemon's project serves a different place of this game", false
+	end
 	local protocol = tonumber(hello.pluginProtocol)
 	if protocol ~= PLUGIN_PROTOCOL_VERSION then
 		return false,
@@ -11492,6 +7290,24 @@ reconnectState.refreshHello = function()
 	baseUrl = candidateUrl
 	connectedPort = candidatePort or candidateUrl:match(":(%d+)$") or "?"
 	reconnectState.pluginCapability = capability
+	-- Negotiate the compare-hash batch size. A daemon that predates the
+	-- advertisement omits the field, so we stay at the conservative 64 it
+	-- still enforces; a newer one lets a 2.9k-script place send ~6 chunks
+	-- instead of ~46 against Studio's 500 requests/minute budget.
+	local advertisedHashChunk = tonumber(hello.hashChunkNodes)
+	if advertisedHashChunk and advertisedHashChunk >= 1 then
+		scaleState.compareHashChunkRecords = math.clamp(math.floor(advertisedHashChunk), 1, 512)
+	else
+		scaleState.compareHashChunkRecords = 64
+	end
+	-- Saved full overwrite decision from ro-sync.json. Deleting the
+	-- initialChoiceDefault field there is how a user un-remembers it.
+	local savedChoice = hello.initialChoiceDefault
+	if savedChoice == "studio" or savedChoice == "disk" then
+		reconnectState.savedInitialChoice = savedChoice
+	else
+		reconnectState.savedInitialChoice = nil
+	end
 	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
 	if ui and ui.setProjectName and type(hello.name) == "string" and hello.name ~= "" then
 		ui.setProjectName(hello.name)
@@ -11501,6 +7317,7 @@ end
 
 local function wsLoop(gen)
 	local clientId = tostring(game.GameId)
+	local resumeAttempts = 0
 	while connected and gen == wsGeneration do
 		local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
 		if not reconnectState.desired or not connected or gen ~= wsGeneration then
@@ -11616,9 +7433,13 @@ local function wsLoop(gen)
 							table.clear(opQueue)
 							break
 						end
-						local batch = opQueue
+						local entries = opQueue
 						opQueue = {}
 						opQueueBytes = 0
+						local batch = {}
+						for index, entry in ipairs(entries) do
+							batch[index] = entry.op
+						end
 						local batchOk, failedOps = applyOps(batch, shouldContinueApply)
 						if batchOk and shouldContinueApply() then
 							-- Echo the source Studio actually accepted. The daemon uses
@@ -11627,7 +7448,8 @@ local function wsLoop(gen)
 							-- Source Studio rejected are skipped individually so their
 							-- siblings still advance.
 							local acks = {}
-							for _, op in ipairs(batch) do
+							for _, entry in ipairs(entries) do
+								local op = entry.op
 								if failedOps == nil or not failedOps[op] then
 									local ack = sourceAckForAppliedOp(op)
 									if ack then
@@ -11637,6 +7459,13 @@ local function wsLoop(gen)
 							end
 							if #acks > 0 then
 								wsSend(client, { type = "push", ops = acks })
+							end
+							if failedOps == nil or next(failedOps) == nil then
+								for _, entry in ipairs(entries) do
+									if entry.seq ~= nil then
+										reconnectState.lastAppliedOpSeq = entry.seq
+									end
+								end
 							end
 							if failedOps ~= nil and next(failedOps) ~= nil and shouldContinueApply() then
 								-- Successful siblings are committed and acknowledged, but
@@ -11707,25 +7536,35 @@ local function wsLoop(gen)
 					if kind == "op" or kind == "ops" then
 						local incoming = {}
 						local malformedFrame = false
-						if kind == "op" and type(msg.op) == "table" then
-							incoming[1] = msg.op
-						elseif
-							kind == "ops"
-							and type(msg.ops) == "table"
-							and #msg.ops > 0
-							and #msg.ops <= OP_FRAME_MAX
-						then
-							for _, op in ipairs(msg.ops) do
+						local frameSeq = tonumber(msg.seq)
+						if kind == "op" then
+							if type(msg.op) == "table" then
+								incoming[1] = { op = msg.op, seq = frameSeq }
+							else
+								malformedFrame = true
+							end
+						elseif type(msg.ops) == "table" and #msg.ops > 0 and #msg.ops <= OP_FRAME_MAX then
+							for index, op in ipairs(msg.ops) do
 								if type(op) ~= "table" then
 									malformedFrame = true
-									table.clear(incoming)
 									break
 								end
-								incoming[#incoming + 1] = op
+								incoming[index] = {
+									op = op,
+									seq = if index == #msg.ops then frameSeq else nil,
+								}
 							end
 						else
 							malformedFrame = true
 						end
+						-- The daemon wraps single operations under msg.op.
+						-- MessageReceived fires one coroutine per frame; applying
+						-- inline meant a burst of N disk-side ops ran N concurrent
+						-- applyOps — one held the undo recording while the rest
+						-- starved against it (and children raced their parent
+						-- folders: "parent path not found"). Queue instead: one
+						-- worker drains in arrival order, batching a burst under a
+						-- single recording.
 						if malformedFrame then
 							log("ws: operation frame was malformed or exceeded its bounded count")
 							scaleState.requestControlledLiveResync("malformed or oversized inbound operation frame")
@@ -11756,6 +7595,21 @@ local function wsLoop(gen)
 								runOpWorker()
 							end
 						end
+					elseif kind == "resume-ok" then
+						resumeAttempts = 0
+						local missed = tonumber(msg.missed) or 0
+						if missed > 0 then
+							log(string.format("ws: resumed — daemon replaying %d missed disk op(s)", missed))
+						elseif tonumber(msg.seqHead) ~= nil then
+							-- Fresh baseline: nothing missed; remember the journal
+							-- head so the NEXT transport drop can resume.
+							reconnectState.lastAppliedOpSeq = tonumber(msg.seqHead)
+						end
+					elseif kind == "resume-reject" then
+						log("ws: daemon cannot replay the gap (journal rolled over); falling back to full compare")
+						reconnectState.lastAppliedOpSeq = nil
+						recoveryContext = "resume rejected — journal gap"
+						closeClient()
 					elseif kind == "lagged" then
 						log("ws: daemon broadcast lagged — will resync via /initial-compare")
 						recoveryContext = "daemon broadcast lagged"
@@ -11870,6 +7724,13 @@ local function wsLoop(gen)
 					role = "plugin",
 					protocol = PLUGIN_PROTOCOL_VERSION,
 					pluginCapability = reconnectState.pluginCapability,
+					-- Present when a previous authenticated session on this daemon
+					-- boot dropped: the daemon replays the disk ops we missed from
+					-- its journal instead of forcing a full re-compare.
+					resumeFrom = reconnectState.lastAppliedOpSeq,
+					-- Server-side one-project-per-place backstop: the daemon
+					-- refuses this hello when its project serves other places.
+					placeId = tostring(game.PlaceId),
 				})
 			elseif openError ~= nil then
 				log("ws: open error: " .. openError)
@@ -11951,12 +7812,30 @@ local function wsLoop(gen)
 			break
 		end
 
-		if needResyncAfter then
+		if needResyncAfter and reconnectState.lastAppliedOpSeq ~= nil and resumeAttempts < 5 then
+			-- Resume-first recovery: hooks are still installed and pendingOps
+			-- still buffer Studio-side edits, so if the daemon can replay the
+			-- disk ops we missed (its op journal), the entire rebuild — scan,
+			-- hash compare, decision — is unnecessary. The next hello carries
+			-- resumeFrom; an explicit reject clears the baseline and falls
+			-- through to the full path on the following iteration.
+			resumeAttempts += 1
+			log(
+				string.format(
+					"ws: transport gap — resuming from op seq %d (attempt %d/5, no re-compare)",
+					reconnectState.lastAppliedOpSeq,
+					resumeAttempts
+				)
+			)
+			setPill("connecting")
+			task.wait(math.min(2 * resumeAttempts, 6))
+		elseif needResyncAfter then
 			-- Tear down Studio hooks and re-enter the full initial-sync handshake.
 			-- Bumping wsGeneration ensures any other in-flight wsLoop iteration
 			-- exits. Pending point ops are represented by the fresh Studio snapshot,
 			-- so discard them before a disk-win decision can accidentally replay one.
 			log("ws: transport gap — scheduling full /initial-compare")
+			reconnectState.lastAppliedOpSeq = nil
 			disconnectHooks()
 			pendingOps = {}
 			pushPending = false
@@ -12007,9 +7886,37 @@ reconnectState.retryInitialCompare = function(context)
 		if not helloOk then
 			if terminalHelloError then
 				reconnectState.stopTerminal(helloError)
-			else
-				reconnectState.retryInitialCompare(helloError)
+				return
 			end
+			-- A same-game daemon that serves other places will never become
+			-- our match — retrying forever hides the real state behind
+			-- "waiting for the matching daemon". Leave recovery and surface
+			-- the per-place Create Project offer instead.
+			local probe = reconnectState.discoverDaemon(tostring(game.GameId), true)
+			if not reconnectState.desired or generation ~= wsGeneration or not busy then
+				return
+			end
+			if probe ~= nil and not probe.found and probe.sawWrongPlace then
+				dbg("reconnect abandoned: this game's daemon serves a different place (PlaceId mismatch)")
+				busy = false
+				reconnectState.desired = false
+				if probe.initializer ~= nil and reconnectState.offerProjectInit ~= nil then
+					reconnectState.offerProjectInit(probe.initializer)
+					setPill("project_init")
+					setBanner(
+						"This game's Ro Sync project serves a different place. Click Create Project to give this place its own project under "
+							.. tostring(probe.initializer.projectsRoot)
+							.. "."
+					)
+				else
+					setPill("wrong_place")
+					setBanner(
+						"This game's Ro Sync project serves a different place, so it cannot resync here. Click Connect to set up a project for this place."
+					)
+				end
+				return
+			end
+			reconnectState.retryInitialCompare(helloError)
 			return
 		end
 		runInitialCompare()
@@ -12024,6 +7931,14 @@ local function startHooksAndWs(): boolean
 	local function shouldContinueInstall()
 		return reconnectState.desired and busy and installGeneration == wsGeneration
 	end
+	log("installing live-sync hooks — silent for up to a minute on large places")
+	setPill("connecting", "Installing live-sync hooks…")
+	-- Truthful banner for the longest silent stretch of the connect flow; the
+	-- "Authenticating" banner below only goes up once hooks are actually live.
+	-- (Opening the WebSocket concurrently with installHooks was considered and
+	-- rejected: connected=true gates wsLoop, and incoming ops must not mutate
+	-- the DataModel before hooks can suppress the echo.)
+	setBanner("Initial sync complete. Installing live-sync hooks — large places can take a minute…")
 	if not installHooks(shouldContinueInstall) or not shouldContinueInstall() then
 		-- installHooks can yield for very large places. A click-to-cancel or
 		-- generation change must tear down every partially installed signal
@@ -12034,9 +7949,11 @@ local function startHooksAndWs(): boolean
 		return false
 	end
 	local scanGuard = scaleState.activeScanGuard
-	if scanGuard and scanGuard.dirty then
-		-- A mutation on a not-yet-hooked branch may have happened while the
-		-- time-sliced install was running. Tear down and compare a fresh view.
+	if scaleState.guardBlocksSnapshot(scanGuard) then
+		-- A structural mutation on a not-yet-hooked branch may have happened
+		-- while the time-sliced install was running. Tear down and compare a
+		-- fresh view. Source-only edits are recorded on the guard and replayed
+		-- below instead of forcing this restart.
 		disconnectHooks()
 		pendingOps = {}
 		pushPending = false
@@ -12054,9 +7971,27 @@ local function startHooksAndWs(): boolean
 	busy = false
 	wsGeneration += 1
 	local gen = wsGeneration
-	setPill("connecting")
+	setPill("connecting", "Authenticating live connection…")
 	setBanner("Initial sync complete. Authenticating the live Studio connection...")
 	log("initial sync complete — watching " .. #WATCHED_SERVICES .. " services; authenticating WebSocket")
+	if scanGuard and next(scanGuard.mutatedSources or {}) ~= nil then
+		-- Replay collaborator Source edits that landed while the bootstrap
+		-- stream was in flight — the disk snapshot predates them. Deleted or
+		-- reparented scripts would have set structuralDirty and restarted, so
+		-- everything recorded here is still a live script.
+		local replayed = 0
+		for inst in pairs(scanGuard.mutatedSources) do
+			pcall(function()
+				if inst:IsDescendantOf(game) and inst:IsA("LuaSourceContainer") then
+					queueScriptUpdateOp(inst, readScriptSource(inst))
+					replayed += 1
+				end
+			end)
+		end
+		if replayed > 0 then
+			log(string.format("replaying %d Source edit(s) recorded during the bootstrap stream", replayed))
+		end
+	end
 	task.spawn(function()
 		wsLoop(gen)
 	end)
@@ -12069,6 +8004,13 @@ end
 
 local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: string?)
 	log("initial-compare → push: streaming bounded Studio structure + Sources")
+	setPill("connecting", "Pushing Studio → files…")
+	local pushStarted = os.clock()
+	if scanGuard then
+		-- Survive collaborator Source commits during the multi-minute bootstrap
+		-- stream (Team Create); recorded scripts replay once live sync is up.
+		scanGuard.tolerateSourceEdits = true
+	end
 	local strict = strictStudio == true
 	if strict and (type(initialChoiceId) ~= "string" or initialChoiceId == "") then
 		log("initial-compare → strict push rejected a missing choiceId")
@@ -12084,17 +8026,19 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 	local totalSources = 0
 
 	local function shouldContinue()
-		return reconnectState.desired and busy and (not scanGuard or not scanGuard.dirty)
+		return reconnectState.desired and busy and not scaleState.guardBlocksSnapshot(scanGuard)
 	end
 
-	local function encodedSize(body): (number?, string?)
+	-- Returns size AND the encoded string; callers pass the string back down so
+	-- the request body is never encoded a second time.
+	local function encodedSize(body): (number?, string?, string?)
 		local ok, encoded = pcall(function()
 			return HttpService:JSONEncode(body)
 		end)
 		if not ok then
 			return nil, "JSONEncode failed: " .. tostring(encoded)
 		end
-		return #encoded, nil
+		return #encoded, nil, encoded
 	end
 
 	local function validatePartialReceipt(response): (boolean, string?)
@@ -12251,23 +8195,33 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 		return fatalMessage
 	end
 
-	local function postExact(body, label)
-		local bodyBytes, encodeErr = encodedSize(body)
-		if not bodyBytes then
-			return nil, encodeErr
+	local function postExact(body, label, preEncoded)
+		local encodedBody = preEncoded
+		if encodedBody == nil then
+			local bodyBytes, encodeErr, encoded = encodedSize(body)
+			if not bodyBytes then
+				return nil, encodeErr
+			end
+			encodedBody = encoded
 		end
-		if bodyBytes > scaleState.maxStreamRequestBytes then
+		if #encodedBody > scaleState.maxStreamRequestBytes then
 			return nil,
 				string.format(
 					"%s encodes to %d bytes; stream request maximum is %d",
 					label,
-					bodyBytes,
+					#encodedBody,
 					scaleState.maxStreamRequestBytes
 				)
 		end
 		local lastErr = nil
-		for attempt = 1, 2 do
-			local ok, response = httpJson("/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES)
+		-- Roblox's client-side HttpService throttle (500 requests/min) rejects
+		-- the call before it leaves Studio, so replaying the exact body is safe.
+		-- Wait out the budget window instead of aborting the whole stream —
+		-- aborting restarts the scan and burns even more budget.
+		local attempt = 0
+		while true do
+			attempt += 1
+			local ok, response = httpJson("/push", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES)
 			local attemptErr = nil
 			if
 				ok
@@ -12301,10 +8255,13 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 				attemptErr = tostring(response)
 			end
 			lastErr = attemptErr
-			if attempt < 2 then
-				log(string.format("  ↻ %s — exact retry (%s)", label, lastErr:sub(1, 150)))
-				task.wait(0.15)
+			local isRateLimit = tostring(lastErr):find("Number of requests exceeded limit", 1, true) ~= nil
+			local maxAttempts = if isRateLimit then 40 else 2
+			if attempt >= maxAttempts then
+				break
 			end
+			log(string.format("  ↻ %s — exact retry (%s)", label, lastErr:sub(1, 150)))
+			task.wait(if isRateLimit then 3 else 0.15)
 		end
 		return nil, lastErr or "stream request failed"
 	end
@@ -12388,11 +8345,11 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 		return true, nil
 	end
 
-	local function sendBody(body, label): (boolean, string?)
+	local function sendBody(body, label, preEncoded): (boolean, string?)
 		if cursor.service ~= body.service or cursor.phase ~= body.phase or cursor.chunk ~= body.chunkIndex then
 			return false, "plugin push cursor advanced out of order"
 		end
-		local response, requestErr = postExact(body, label)
+		local response, requestErr = postExact(body, label, preEncoded)
 		if not response then
 			return false, requestErr
 		end
@@ -12426,6 +8383,10 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 	end
 
 	local function drainContinuation(phase, targetPhase): (boolean, string?)
+		local drainStarted = os.clock()
+		local drainTicks = 0
+		-- Same backoff shape as the compare-side diskPrepare loop.
+		local drainWait = 0.05
 		while cursor.phase == phase do
 			if not shouldContinue() then
 				return false, "Studio changed during daemon disk continuation"
@@ -12438,6 +8399,25 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 			if not sent then
 				return false, sendErr
 			end
+			drainTicks += 1
+			if cursor.phase == phase then
+				-- The daemon is still writing/validating disk state; poll gently
+				-- instead of burning the 500 req/min HttpService budget on
+				-- hundreds of empty ticks.
+				task.wait(drainWait)
+				drainWait = math.min(drainWait * 1.5, 0.5)
+			end
+		end
+		if drainTicks > 4 then
+			log(
+				string.format(
+					"  … %s %s drained after %d tick(s), %.1fs",
+					tostring(cursor.service),
+					phase,
+					drainTicks,
+					os.clock() - drainStarted
+				)
+			)
 		end
 		if cursor.phase ~= targetPhase then
 			return false, string.format("daemon did not advance %s to %s", phase, targetPhase)
@@ -12469,6 +8449,7 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 				while recordIndex <= #records do
 					local take = math.min(scaleState.structureChunkRecords, #records - recordIndex + 1)
 					local body = nil
+					local bodyEncoded = nil
 					while take >= 1 do
 						local batch = {}
 						for offset = 0, take - 1 do
@@ -12477,9 +8458,10 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 						local finishesInput = recordIndex + take - 1 == #records
 						local candidate = makeBody(serviceName, "structure", cursor.chunk, finalChunk and finishesInput)
 						candidate.records = batch
-						local bytes = encodedSize(candidate)
+						local bytes, _, encoded = encodedSize(candidate)
 						if bytes and bytes <= scaleState.maxStreamRequestBytes then
 							body = candidate
+							bodyEncoded = encoded
 							break
 						end
 						take = math.floor(take / 2)
@@ -12487,8 +8469,11 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 					if not body then
 						return false, "one Studio structure record exceeds the bounded request limit"
 					end
-					local sent, sendErr =
-						sendBody(body, string.format("%s structure chunk %d", serviceName, body.chunkIndex))
+					local sent, sendErr = sendBody(
+						body,
+						string.format("%s structure chunk %d", serviceName, body.chunkIndex),
+						bodyEncoded
+					)
 					if not sent then
 						return false, sendErr
 					end
@@ -12502,6 +8487,15 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 			log(string.format("push %s structure failed: %s", serviceName, tostring(structureErr):sub(1, 200)))
 			return false
 		end
+		log(
+			string.format(
+				"  ✓ %s structure streamed (%d/%d services); %d Source(s) next",
+				serviceName,
+				serviceIndex,
+				#WATCHED_SERVICES,
+				#sourceInstances
+			)
+		)
 		if cursor.phase == "diskFence" then
 			local drained, drainErr = drainContinuation("diskFence", "sources")
 			if not drained then
@@ -12523,40 +8517,63 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 				return false
 			end
 		else
-			-- Pack as many bounded Source parts as fit into every request. The
-			-- daemon accepts up to sourcePartChunkRecords parts and a 512 KiB
-			-- body per Sources chunk; one request per part made a 1,200-script
-			-- push cost 1,200+ HTTP requests, which the HttpService budget
-			-- pacing then stretched into minutes.
-			local envelopeBody = makeBody(serviceName, "sources", cursor.chunk, false)
-			envelopeBody.sources = {}
-			local envelopeBytes = encodedSize(envelopeBody)
-			if not envelopeBytes then
-				log("push source stream failed: could not measure the request envelope")
-				return false
-			end
-			-- Slack covers chunkIndex/finalChunk digit drift between the
-			-- envelope measured above and the eventual flush bodies. postExact
-			-- still hard-verifies every encoded body against the wire limit.
-			local packedBudget = scaleState.maxStreamRequestBytes - envelopeBytes - 64
+			-- Batch many Sources into each request. The daemon accepts up to 64
+			-- parts / 512 KiB encoded per chunk, but one request per script
+			-- starves Studio's HttpService budget (500 requests/min) on large
+			-- places — 1700+ scripts turned the initial push into a
+			-- rate-limit retry loop that could never finish.
+			local BATCH_MAX_PARTS = 64 -- daemon STREAM_HASH_CHUNK_NODES
+			-- Raw budget under the 512 KiB caps. Typical Luau sources barely
+			-- escape-expand under JSON, so a 2x margin left batches half empty;
+			-- the overflow-split retry in sendParts handles the rare miss.
+			local BATCH_MAX_DATA_BYTES = 384 * 1024
 			local batch = {}
 			local batchBytes = 0
-			local function flushBatch(finalChunk): (boolean, string?)
-				local body = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
-				body.sources = batch
-				local lastPart = batch[#batch]
-				local sent, sendErr =
-					sendBody(body, string.format("%s Sources x%d (through id %d)", serviceName, #batch, lastPart.id))
-				if not sent then
-					return false, sendErr
+
+			local function sendParts(parts, finalChunk)
+				if #parts == 0 then
+					return true
 				end
+				local body = makeBody(serviceName, "sources", cursor.chunk, finalChunk)
+				body.sources = parts
+				local bytes, _, encoded = encodedSize(body)
+				if not bytes then
+					return false, "source batch failed to encode"
+				end
+				if bytes > scaleState.maxStreamRequestBytes and #parts > 1 then
+					-- Escaping outgrew the raw-byte estimate; split and resend.
+					local mid = math.floor(#parts / 2)
+					local first = table.move(parts, 1, mid, 1, {})
+					local second = table.move(parts, mid + 1, #parts, 1, {})
+					local sentFirst, firstErr = sendParts(first, false)
+					if not sentFirst then
+						return false, firstErr
+					end
+					return sendParts(second, finalChunk)
+				end
+				if bytes > scaleState.maxStreamRequestBytes then
+					return false, "push Source part cannot fit one bounded request"
+				end
+				return sendBody(
+					body,
+					string.format("%s Sources ×%d chunk %d", serviceName, #parts, body.chunkIndex),
+					encoded
+				)
+			end
+
+			local function flushBatch(finalChunk)
+				local parts = batch
 				batch = {}
 				batchBytes = 0
-				return true
+				return sendParts(parts, finalChunk)
 			end
+
 			for sourceIndex, sourceEntry in ipairs(sourceInstances) do
 				if not shouldContinue() then
 					return false
+				end
+				if sourceIndex % 200 == 0 then
+					log(string.format("  … %s Sources %d/%d", serviceName, sourceIndex, #sourceInstances))
 				end
 				local source, sourceErr = tryReadScriptSource(sourceEntry.inst)
 				if source == nil then
@@ -12585,82 +8602,38 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 				local partIndex = 0
 				repeat
 					local budget = math.min(scaleState.sourceChunkBytes, math.max(0, #source - offset))
-					local part = nil
-					local partBytes = nil
-					while budget >= 0 do
-						local stop = utf8ChunkEnd(source, offset, budget)
-						if not stop then
-							return false
-						end
-						local candidate = {
-							id = sourceEntry.id,
-							partIndex = partIndex,
-							offset = offset,
-							totalBytes = #source,
-							data = string.sub(source, offset + 1, stop),
-							finalPart = stop == #source,
-							sha256 = sourceHash,
-						}
-						local bytes = encodedSize(candidate)
-						if bytes and bytes <= packedBudget then
-							part = candidate
-							partBytes = bytes
-							break
-						end
-						if budget == 0 then
-							break
-						end
-						budget = math.floor(budget / 2)
-					end
-					if not part then
+					local stop = utf8ChunkEnd(source, offset, budget)
+					if not stop then
 						log("push Source contains invalid UTF-8 or cannot fit one bounded request")
 						return false
 					end
-					-- Flush before appending, never after: the final part of the
-					-- final script must ride the finalChunk flush below. A JSON
-					-- array's size is the sum of its independently encoded
-					-- elements plus one comma per element, so this bound is exact.
-					if
-						#batch > 0
-						and (
-							#batch >= scaleState.sourcePartChunkRecords
-							or batchBytes + #batch + partBytes > packedBudget
-						)
-					then
-						local flushed, flushErr = flushBatch(false)
-						if not flushed then
-							log("push source stream failed: " .. tostring(flushErr))
-							return false
-						end
-						if not shouldContinue() then
-							return false
-						end
-					end
-					batch[#batch + 1] = part
-					batchBytes += partBytes
-					offset += #part.data
+					local finalPart = stop == #source
+					local data = string.sub(source, offset + 1, stop)
+					batch[#batch + 1] = {
+						id = sourceEntry.id,
+						partIndex = partIndex,
+						offset = offset,
+						totalBytes = #source,
+						data = data,
+						finalPart = finalPart,
+						sha256 = sourceHash,
+					}
+					batchBytes += #data
+					offset = stop
 					partIndex += 1
-					if partIndex % 8 == 0 then
-						task.wait()
-						if not shouldContinue() then
+					local finalChunk = finalPart and sourceIndex == #sourceInstances
+					if finalChunk or #batch >= BATCH_MAX_PARTS or batchBytes >= BATCH_MAX_DATA_BYTES then
+						local sent, sendErr = flushBatch(finalChunk)
+						if not sent then
+							log("push source stream failed: " .. tostring(sendErr))
 							return false
 						end
 					end
 				until offset == #source and partIndex > 0
 				totalSources += 1
-				-- Requests are rare now, so yield periodically between scripts to
-				-- keep Studio responsive through the hash/encode CPU work.
 				if sourceIndex % 16 == 0 then
 					task.wait()
-					if not shouldContinue() then
-						return false
-					end
 				end
-			end
-			local flushed, flushErr = flushBatch(true)
-			if not flushed then
-				log("push source stream failed: " .. tostring(flushErr))
-				return false
 			end
 		end
 
@@ -12691,10 +8664,11 @@ local function doPushPath(strictStudio: boolean?, scanGuard, initialChoiceId: st
 
 	log(
 		string.format(
-			"bootstrap stream done: %d structure record(s), %d Source(s), %d service(s)",
+			"bootstrap stream done: %d structure record(s), %d Source(s), %d service(s), %.1fs",
 			totalRecords,
 			totalSources,
-			#WATCHED_SERVICES
+			#WATCHED_SERVICES,
+			os.clock() - pushStarted
 		)
 	)
 	return shouldContinue() and cursor.phase == "complete"
@@ -12702,6 +8676,7 @@ end
 
 local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?, selectionChoiceId: string?)
 	log("initial-compare → pull: streaming bounded disk structure + Sources")
+	setPill("connecting", "Pulling files → Studio…")
 	local pullGeneration = wsGeneration
 	local selective = selectiveSelectedCount ~= nil
 	local strict = strictDisk == true and not selective
@@ -12756,8 +8731,13 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 			return nil, string.format("%s request exceeds %d bytes", label, scaleState.maxStreamRequestBytes)
 		end
 		local lastErr = nil
-		for attempt = 1, 2 do
-			local ok, raw = httpRequest("/snapshot/stream", "POST", body, true)
+		-- See the push-path postExact: wait out Studio's HttpService throttle
+		-- (500 requests/min) rather than aborting; the throttled call never
+		-- left Studio so an exact replay is safe.
+		local attempt = 0
+		while true do
+			attempt += 1
+			local ok, raw = httpRequest("/snapshot/stream", "POST", encoded, "encoded")
 			if not shouldContinue() then
 				return nil, mutationGuard.reason or "disk stream cancelled"
 			end
@@ -12779,10 +8759,13 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 			else
 				lastErr = tostring(raw)
 			end
-			if attempt < 2 then
-				log(string.format("  ↻ %s — exact retry (%s)", label, tostring(lastErr):sub(1, 150)))
-				task.wait(0.15)
+			local isRateLimit = tostring(lastErr):find("Number of requests exceeded limit", 1, true) ~= nil
+			local maxAttempts = if isRateLimit then 40 else 2
+			if attempt >= maxAttempts then
+				break
 			end
+			log(string.format("  ↻ %s — exact retry (%s)", label, tostring(lastErr):sub(1, 150)))
+			task.wait(if isRateLimit then 3 else 0.15)
 		end
 		return nil, lastErr or "snapshot stream request failed"
 	end
@@ -12981,8 +8964,7 @@ local function doPullPath(strictDisk: boolean?, selectiveSelectedCount: number?,
 				staged.Name = record.name
 				staged.Parent = parent
 				state.stagedInstances[id + 1] = staged
-				if id % scaleState.studioScanYieldEvery == 0 then
-					task.wait()
+				if scaleState.yieldIfSliceExpired() then
 					if not shouldContinue() then
 						error("detached snapshot staging cancelled", 0)
 					end
@@ -13792,8 +9774,16 @@ end
 -- Keep this state near the connection UI that consumes it so the plugin's very
 -- large top-level chunk can reuse earlier compiler registers.
 local projectInitCandidate: any = nil
+-- Bridge for code declared above this local (the reconnect recovery loop):
+-- arms the same Create Project flow the fresh-connect path uses.
+reconnectState.offerProjectInit = function(offer)
+	projectInitCandidate = offer
+end
 local connectionAttempt = 0
-local activeInitialChoiceId: any = nil
+-- Consecutive discovery misses since the last successful connection. A silent
+-- probe timeout (loaded machine, daemon still booting) auto-retries instead of
+-- parking on no_daemon until a human clicks Connect again.
+local noDaemonRetries = 0
 
 local function disconnect(reason)
 	reconnectState.desired = false
@@ -13803,6 +9793,9 @@ local function disconnect(reason)
 	wsGeneration += 1
 	decisionGeneration += 1
 	disconnectHooks()
+	-- Deliberate disconnects bound the memo's lifetime; transport-gap
+	-- reconnects keep it (the always-on listeners stay valid throughout).
+	table.clear(scaleState.sourceHashMemo)
 	remoteState.requestRemoteWriteCleanup()
 	if ws then
 		local toClose = ws
@@ -13828,93 +9821,193 @@ end
 -- Initial-sync decision handshake
 --------------------------------------------------------------------------------
 
-local function waitForDecision(choiceId, gen)
-	activeInitialChoiceId = choiceId
-	setPill("waiting")
-	setBanner(string.format("Waiting for overwrite decision… (choice %s)", tostring(choiceId)))
-	while busy and gen == decisionGeneration do
-		local url = string.format("%s/initial-decision?choiceId=%s", baseUrl, HttpService:UrlEncode(tostring(choiceId)))
-		local ok, resp = httpRequestTo(url, "GET")
-		if gen ~= decisionGeneration then
-			return nil
-		end
-		if not ok then
-			log("decision poll err: " .. tostring(resp))
-			local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
-			if gen ~= decisionGeneration or not busy then
+-- The decision banner used to be written once and never revised, so every exit
+-- that did not run to completion (superseded compare, dropped connection,
+-- answer redeemed elsewhere) left Studio insisting it was still waiting for a
+-- choice the human had already made. The wait now narrates itself: a ticking
+-- elapsed time proves the poll loop is alive, and every exit path rewrites the
+-- banner.
+--
+-- The helpers live in a `do` block on purpose: this chunk is a single Luau
+-- function and Luau allows 200 locals per function. Block-scoped locals release
+-- their registers at `end`, so only `waitForDecision` costs a top-level slot.
+local waitForDecision
+do
+	local function runDecisionTicker(choiceId, gen, isLive)
+		local startedAt = os.clock()
+		task.spawn(function()
+			-- Deliberately not gated on `busy`: the point of the tick is to prove the
+			-- wait is alive, so it must not go quiet in the states most likely to
+			-- strand it. The wrapper's terminal banner is what ends it.
+			while isLive() and gen == decisionGeneration do
+				local waited = math.floor(os.clock() - startedAt)
+				if waited >= 1 then
+					setBanner(
+						string.format(
+							"Waiting for your overwrite choice — %ds. Answer in the Ro Sync app or the Studio widget. (choice %s)",
+							waited,
+							tostring(choiceId)
+						)
+					)
+				end
+				task.wait(1)
+			end
+		end)
+	end
+
+	local function waitForDecisionInner(choiceId, gen)
+		-- Consecutive unreachable polls. The daemon can vanish mid-decision (the
+		-- desktop app stops or removes the project); without a bound this loop
+		-- spun forever behind a banner still claiming to wait for the decision.
+		local pollFailures = 0
+		local POLL_FAILURE_LIMIT = 15
+		while busy and gen == decisionGeneration do
+			local url =
+				string.format("%s/initial-decision?choiceId=%s", baseUrl, HttpService:UrlEncode(tostring(choiceId)))
+			local ok, resp = httpRequestTo(url, "GET")
+			if gen ~= decisionGeneration then
 				return nil
 			end
-			if terminalHelloError then
-				reconnectState.stopTerminal(helloError)
-				return nil
-			elseif not helloOk then
-				log("decision recovery: " .. tostring(helloError))
-			end
-			task.wait(2)
-		elseif not resp.Success then
-			if resp.StatusCode == 408 or resp.StatusCode == 204 then
-				-- idle timeout, re-issue
-			elseif resp.StatusCode == 404 then
-				log(string.format("decision HTTP 404 for stale choice %s; re-comparing", tostring(choiceId)))
-				return "stale"
-			else
-				log(string.format("decision HTTP %d", resp.StatusCode))
+			if not ok then
+				pollFailures += 1
+				log("decision poll err: " .. tostring(resp))
+				setBanner(
+					string.format(
+						"Sync app stopped responding during the overwrite decision — reconnecting (%d/%d)…",
+						pollFailures,
+						POLL_FAILURE_LIMIT
+					)
+				)
+				local helloOk, helloError, terminalHelloError = reconnectState.refreshHello()
+				if gen ~= decisionGeneration or not busy then
+					return nil
+				end
+				if terminalHelloError then
+					reconnectState.stopTerminal(helloError)
+					return nil
+				elseif not helloOk then
+					log("decision recovery: " .. tostring(helloError))
+				end
+				if pollFailures >= POLL_FAILURE_LIMIT then
+					log("daemon unreachable throughout the overwrite decision; giving up")
+					disconnect(
+						"the sync daemon went away during the overwrite decision — its project may have been stopped or removed in the desktop app"
+					)
+					setBanner(
+						"The sync daemon went away during the overwrite decision. Check the project in the Ro Sync desktop app, then Connect again."
+					)
+					return nil
+				end
 				task.wait(2)
-			end
-		else
-			if #(resp.Body or "") > PROTOCOL_STREAM_MAX_BYTES then
-				log("decision response exceeded the 512 KiB protocol limit")
-				return "malformed"
-			end
-			local decoded
-			local decOk = pcall(function()
-				decoded = HttpService:JSONDecode(resp.Body or "")
-			end)
-			if decOk and type(decoded) == "table" then
-				if decoded.paths ~= nil then
-					log("decision response rejected obsolete paths payload")
+			elseif not resp.Success then
+				pollFailures = 0
+				if resp.StatusCode == 408 or resp.StatusCode == 204 then
+				-- idle timeout, re-issue
+				elseif resp.StatusCode == 404 then
+					log(string.format("decision HTTP 404 for stale choice %s; re-comparing", tostring(choiceId)))
+					return "stale"
+				else
+					log(string.format("decision HTTP %d", resp.StatusCode))
+					task.wait(2)
+				end
+			else
+				if pollFailures > 0 then
+					pollFailures = 0
+					setBanner(
+						string.format("Reconnected. Waiting for your overwrite choice. (choice %s)", tostring(choiceId))
+					)
+				end
+				if #(resp.Body or "") > PROTOCOL_STREAM_MAX_BYTES then
+					log("decision response exceeded the 512 KiB protocol limit")
 					return "malformed"
-				elseif decoded.pending == true then
-					if decoded.selective ~= nil or decoded.selectedCount ~= nil then
-						log("pending decision response contained premature disk selection metadata")
+				end
+				local decoded
+				local decOk = pcall(function()
+					decoded = HttpService:JSONDecode(resp.Body or "")
+				end)
+				if decOk and type(decoded) == "table" then
+					if decoded.paths ~= nil then
+						log("decision response rejected obsolete paths payload")
 						return "malformed"
-					end
-					-- keep polling
-				elseif decoded.choice then
-					local choice = tostring(decoded.choice)
-					local hasSelective = decoded.selective ~= nil
-					local hasSelectedCount = decoded.selectedCount ~= nil
-					if choice == "disk" and decoded.selective == true then
-						local selectedCount = decoded.selectedCount
-						if
-							type(selectedCount) ~= "number"
-							or selectedCount <= 0
-							or selectedCount % 1 ~= 0
-							or selectedCount > scaleState.maxStreamNodes
-						then
-							log("decision response rejected invalid selective selectedCount")
+					elseif decoded.pending == true then
+						if decoded.selective ~= nil or decoded.selectedCount ~= nil then
+							log("pending decision response contained premature disk selection metadata")
 							return "malformed"
 						end
-						return choice, true, selectedCount
-					elseif choice == "disk" then
-						if hasSelective or hasSelectedCount then
-							log("decision response rejected malformed full-disk selection metadata")
+					-- keep polling
+					elseif decoded.choice then
+						local choice = tostring(decoded.choice)
+						local hasSelective = decoded.selective ~= nil
+						local hasSelectedCount = decoded.selectedCount ~= nil
+						if choice == "disk" and decoded.selective == true then
+							local selectedCount = decoded.selectedCount
+							if
+								type(selectedCount) ~= "number"
+								or selectedCount <= 0
+								or selectedCount % 1 ~= 0
+								or selectedCount > scaleState.maxStreamNodes
+							then
+								log("decision response rejected invalid selective selectedCount")
+								return "malformed"
+							end
+							return choice, true, selectedCount
+						elseif choice == "disk" then
+							if hasSelective or hasSelectedCount then
+								log("decision response rejected malformed full-disk selection metadata")
+								return "malformed"
+							end
+							return choice, false, nil
+						elseif hasSelective or hasSelectedCount then
+							log("decision response attached disk selection metadata to a non-disk choice")
 							return "malformed"
 						end
 						return choice, false, nil
-					elseif hasSelective or hasSelectedCount then
-						log("decision response attached disk selection metadata to a non-disk choice")
-						return "malformed"
 					end
-					return choice, false, nil
+				elseif decOk then
+					log("decision response was not a JSON object")
+					return "malformed"
 				end
-			elseif decOk then
-				log("decision response was not a JSON object")
-				return "malformed"
 			end
 		end
+		return nil
 	end
-	return nil
+
+	waitForDecision = function(choiceId, gen)
+		setPill("waiting")
+		setBanner(
+			string.format(
+				"Waiting for your overwrite choice. Answer in the Ro Sync app or the Studio widget. (choice %s)",
+				tostring(choiceId)
+			)
+		)
+		local settled = false
+		runDecisionTicker(choiceId, gen, function()
+			return not settled
+		end)
+		local choice, selectiveDiskChoice, selectedDiskCount = waitForDecisionInner(choiceId, gen)
+		settled = true
+		-- The answer is the moment the human is watching for. Acknowledge it here,
+		-- before the downstream transfer does its own preparation, so the banner
+		-- never sits on "waiting" after the choice has landed.
+		if choice == "studio" then
+			setBanner("Answer received — keeping Studio. Starting the sync…")
+		elseif choice == "disk" then
+			if selectiveDiskChoice == true and type(selectedDiskCount) == "number" then
+				setBanner(
+					string.format("Answer received — applying %d selected file(s) from disk…", selectedDiskCount)
+				)
+			else
+				setBanner("Answer received — keeping the files on disk. Starting the sync…")
+			end
+		elseif choice == "stale" then
+			setBanner("That choice already expired or was answered elsewhere — re-checking the project…")
+		elseif choice == nil and gen == decisionGeneration and not busy then
+			-- The wait ended without an answer and nothing newer took over: say so
+			-- rather than leaving Studio claiming a decision is still pending.
+			setBanner("Disconnected before your overwrite choice was applied. Connect again to resume.")
+		end
+		return choice, selectiveDiskChoice, selectedDiskCount
+	end
 end
 
 local function countArray(value)
@@ -13949,6 +10042,10 @@ end
 -- section so wsLoop's transport-gap recovery can reach it without a circular
 -- declaration.
 runInitialCompare = function()
+	-- A fresh compare supersedes any resume baseline: the snapshot it
+	-- establishes is the new ground truth, and the post-compare hello learns
+	-- the current journal head from the daemon's resume-ok.
+	reconnectState.lastAppliedOpSeq = nil
 	local compareGeneration = wsGeneration
 	local compareCapability = reconnectState.pluginCapability
 	local scanGuard = nil
@@ -13992,9 +10089,19 @@ runInitialCompare = function()
 	end
 
 	local function scanBecameDirty(context): boolean
-		if scanGuard and scanGuard.dirty then
+		if scaleState.guardBlocksSnapshot(scanGuard) then
 			restartForMutation(context)
 			return true
+		end
+		if scanGuard and scanGuard.dirty and not scanGuard.sourceToleranceLogged then
+			scanGuard.sourceToleranceLogged = true
+			log(
+				string.format(
+					"%s — Source-only edit(s) recorded (%d script(s)); continuing, will replay after connect",
+					context,
+					scanGuard.mutatedSourceCount or 0
+				)
+			)
 		end
 		return false
 	end
@@ -14008,6 +10115,9 @@ runInitialCompare = function()
 			return
 		end
 		reconnectState.comparedCapability = compareCapability
+		-- The sync landed; any carried decision is spent.
+		reconnectState.carriedInitialChoice = nil
+		reconnectState.carriedChoiceUses = 0
 		scaleState.activeScanGuard = scanGuard
 		if startHooksAndWs() then
 			reconnectState.mutationRestarts = 0
@@ -14019,6 +10129,7 @@ runInitialCompare = function()
 	end
 
 	scanGuard = scaleState.beginStudioScanGuard()
+	setPill("connecting", "Scanning place…")
 	local statsStarted = os.clock()
 	local studioStats, statsProgress = scaleState.collectStudioStatsWithGuard(scanGuard)
 	if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
@@ -14040,6 +10151,7 @@ runInitialCompare = function()
 	-- Stats-first lets a brand-new empty project choose `push` without ever
 	-- serializing every Source into one place-sized comparison body.
 	log("initial-compare: checking project stats")
+	setPill("connecting", string.format("Checking project · %d scripts", studioStats.scriptCount))
 	local ok, resp = httpJson("/initial-compare", "POST", {
 		studioStats = studioStats,
 		studioSnapshot = {},
@@ -14129,14 +10241,17 @@ runInitialCompare = function()
 				hashes = hashes or {},
 			}
 		end
-		local function encodedCompareBodySize(requestBody): (number?, string?)
+		-- Returns size AND the encoded string so the sizing encode can be
+		-- reused as the request body — encoding twice per chunk doubled the
+		-- JSON cost of the whole stream, worse when the halving loop tripped.
+		local function encodedCompareBodySize(requestBody): (number?, string?, string?)
 			local encodedOk, encoded = pcall(function()
 				return HttpService:JSONEncode(requestBody)
 			end)
 			if not encodedOk then
 				return nil, "comparison JSONEncode failed: " .. tostring(encoded)
 			end
-			return #encoded, nil
+			return #encoded, nil, encoded
 		end
 		local terminalCompareFailure = nil
 		local function retryOrStopStreamedCompare(reason)
@@ -14149,27 +10264,31 @@ runInitialCompare = function()
 			end
 			reconnectState.retryInitialCompare(reason)
 		end
-		local function postCompareChunk(serviceName, phase, chunkIndex, finalChunk, records, hashes)
-			local requestBody = makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
-			local bodyBytes, encodeErr = encodedCompareBodySize(requestBody)
-			if not bodyBytes then
-				return false, encodeErr
+		local function postCompareChunk(serviceName, phase, chunkIndex, finalChunk, records, hashes, preEncoded)
+			local encodedBody = preEncoded
+			if encodedBody == nil then
+				local requestBody = makeCompareBody(serviceName, phase, chunkIndex, finalChunk, records, hashes)
+				local bodyBytes, encodeErr, encoded = encodedCompareBodySize(requestBody)
+				if not bodyBytes then
+					return false, encodeErr
+				end
+				encodedBody = encoded
 			end
-			if bodyBytes > scaleState.maxStreamRequestBytes then
+			if #encodedBody > scaleState.maxStreamRequestBytes then
 				return false,
 					string.format(
 						"comparison %s/%s/%d encodes to %d bytes; maximum is %d",
 						serviceName,
 						phase,
 						chunkIndex,
-						bodyBytes,
+						#encodedBody,
 						scaleState.maxStreamRequestBytes
 					)
 			end
 			local lastErr = nil
 			for attempt = 1, 2 do
 				local requestOk, nextResp =
-					httpJson("/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES)
+					httpJson("/initial-compare", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES)
 				if not reconnectState.desired or not busy or compareGeneration ~= wsGeneration then
 					return false, "comparison cancelled"
 				end
@@ -14209,6 +10328,7 @@ runInitialCompare = function()
 		end
 
 		for index, serviceName in ipairs(advertisedServices) do
+			setPill("connecting", string.format("Comparing %s · %d/%d", serviceName, index, #advertisedServices))
 			if
 				type(resp) ~= "table"
 				or tostring(resp.action) ~= "compare"
@@ -14252,6 +10372,7 @@ runInitialCompare = function()
 						end
 						local take = math.min(scaleState.structureChunkRecords, #records - recordIndex + 1)
 						local batch = nil
+						local batchEncoded = nil
 						local finishesInput = false
 						while take >= 1 do
 							local candidateBatch = {}
@@ -14267,9 +10388,10 @@ runInitialCompare = function()
 								candidateBatch,
 								{}
 							)
-							local bytes = encodedCompareBodySize(candidate)
+							local bytes, _, encoded = encodedCompareBodySize(candidate)
 							if bytes and bytes <= scaleState.maxStreamRequestBytes then
 								batch = candidateBatch
+								batchEncoded = encoded
 								break
 							end
 							take = math.floor(take / 2)
@@ -14279,8 +10401,15 @@ runInitialCompare = function()
 								"one Studio comparison structure record exceeds the bounded 512 KiB request limit"
 						end
 						local sendsFinalChunk = finalChunk and finishesInput
-						local sent, sendErr =
-							postCompareChunk(serviceName, "structure", chunkIndex, sendsFinalChunk, batch, {})
+						local sent, sendErr = postCompareChunk(
+							serviceName,
+							"structure",
+							chunkIndex,
+							sendsFinalChunk,
+							batch,
+							{},
+							batchEncoded
+						)
 						if not sent then
 							return false, sendErr
 						end
@@ -14325,6 +10454,10 @@ runInitialCompare = function()
 				return
 			end
 			local preparePolls = 0
+			-- Empty continuation ticks back off toward 0.5s: each tick costs a
+			-- request against Studio's 500/min HttpService budget, and a long
+			-- daemon-side prepare gains nothing from a tight 50ms cadence.
+			local prepareWait = 0.05
 			while resp.phase == "diskPrepare" do
 				local prepareChunk = tonumber(resp.nextChunk)
 				if
@@ -14368,7 +10501,8 @@ runInitialCompare = function()
 							)
 						)
 					end
-					task.wait(0.05)
+					task.wait(prepareWait)
+					prepareWait = math.min(prepareWait * 1.5, 0.5)
 				elseif
 					tostring(resp.action) ~= "compare"
 					or resp.compareId ~= compareId
@@ -14580,8 +10714,9 @@ runInitialCompare = function()
 						sha256 = sourceHash,
 					}
 					sourceIndex += 1
-					if sourceIndex % scaleState.compareHashChunkRecords == 0 then
-						task.wait()
+					-- Hashing cost scales with source bytes, not script count,
+					-- so pace this on elapsed time rather than the batch size.
+					if scaleState.yieldIfSliceExpired() then
 						if scanGuard.dirty then
 							disposeScanGuard()
 							reconnectState.retryInitialCompare("Studio changed while hashing scripts")
@@ -14642,6 +10777,100 @@ runInitialCompare = function()
 	if scanBecameDirty("Studio changed during snapshot comparison") then
 		return
 	end
+	-- Delta fast path support: when the divergence is only changed script
+	-- sources (nothing created or removed), "Keep Studio" doesn't need a full
+	-- place push — the changed scripts replay through the live op channel
+	-- after connect. A 7-file drift used to cost a multi-minute re-push.
+	local function prefetchStudioDeltaItems(choiceId, comparison)
+		local summary = if type(comparison) == "table" then comparison.summary else nil
+		local newFiles, changedFiles, removedFiles
+		if type(summary) == "table" then
+			newFiles = tonumber(summary.newFiles) or 0
+			changedFiles = tonumber(summary.changedFiles) or 0
+			removedFiles = tonumber(summary.removedFiles) or 0
+		elseif type(comparison) == "table" then
+			newFiles = countArray(comparison.newFiles)
+			changedFiles = countArray(comparison.changedFiles)
+			removedFiles = countArray(comparison.removedFiles)
+		else
+			return nil
+		end
+		if newFiles ~= 0 or removedFiles ~= 0 or changedFiles < 1 or changedFiles > 200 then
+			return nil
+		end
+		local items = {}
+		local cursor = nil
+		for _ = 1, 8 do
+			local url = string.format(
+				"%s/initial-choice/details?choiceId=%s&limit=512",
+				baseUrl,
+				HttpService:UrlEncode(tostring(choiceId))
+			)
+			if cursor then
+				url ..= "&cursor=" .. HttpService:UrlEncode(tostring(cursor))
+			end
+			local ok, detailResp = httpRequestTo(url, "GET")
+			if not ok or not detailResp.Success then
+				return nil
+			end
+			local decoded
+			local decOk = pcall(function()
+				decoded = HttpService:JSONDecode(detailResp.Body or "")
+			end)
+			if not decOk or type(decoded) ~= "table" or decoded.ok ~= true or type(decoded.items) ~= "table" then
+				return nil
+			end
+			for _, item in ipairs(decoded.items) do
+				items[#items + 1] = item
+			end
+			if decoded.complete == true or decoded.nextCursor == nil then
+				break
+			end
+			cursor = decoded.nextCursor
+		end
+		if #items ~= changedFiles then
+			return nil
+		end
+		return items
+	end
+
+	local function applyStudioDeltaFastPath(items)
+		if type(items) ~= "table" or #items == 0 or not scanGuard then
+			return false
+		end
+		local resolved = {}
+		for _, item in ipairs(items) do
+			if
+				type(item) ~= "table"
+				or tostring(item.action) ~= "overwrite"
+				or item.classChanged == true
+				or item.sourceChanged ~= true
+				or type(item.path) ~= "string"
+			then
+				return false
+			end
+			local inst = resolvePath(string.split(item.path, "/"))
+			if not inst or not inst:IsA("LuaSourceContainer") then
+				return false
+			end
+			resolved[#resolved + 1] = inst
+		end
+		for _, inst in ipairs(resolved) do
+			if scanGuard.mutatedSources[inst] == nil then
+				scanGuard.mutatedSources[inst] = true
+				scanGuard.mutatedSourceCount += 1
+			end
+		end
+		log(
+			string.format(
+				"decision studio → delta fast path: replaying %d changed script(s) instead of a full push",
+				#resolved
+			)
+		)
+		setPill("connecting", string.format("Syncing %d changed script(s)…", #resolved))
+		return true
+	end
+
 	local action = tostring(resp.action)
 	if action == "in-sync" then
 		-- Seed only daemon-authored physical identities from the exact disk
@@ -14707,12 +10936,78 @@ runInitialCompare = function()
 	elseif action == "decide" then
 		local choiceId = resp.choiceId
 		log("decide: " .. describeInitialComparison(resp.comparison))
+		-- Prefetch changed-path details while the choice is still pending — the
+		-- daemon drops them once the decision is redeemed. Powers the studio
+		-- delta fast path.
+		local deltaItems = prefetchStudioDeltaItems(choiceId, resp.comparison)
+		if deltaItems then
+			log(string.format("delta fast path armed: %d changed script(s) prefetched", #deltaItems))
+		end
+		-- Auto-answer only with a choice the human already made:
+		--   1. a carried choice — they answered seconds ago and a mid-modal
+		--      Studio edit voided the cycle; repeat it (bounded), or
+		--   2. the project's saved default — their last full studio/disk
+		--      decision, persisted by the daemon in ro-sync.json and
+		--      advertised via /hello. Deleting that field un-remembers it.
+		-- Anything else still asks: with disk-side authors (agents, other
+		-- tools) writing into the project, drift is ambiguous about which
+		-- side is newer.
+		local autoChoice, autoReason = nil, nil
+		if reconnectState.carriedInitialChoice ~= nil and (reconnectState.carriedChoiceUses or 0) > 0 then
+			reconnectState.carriedChoiceUses -= 1
+			autoChoice = reconnectState.carriedInitialChoice
+			autoReason = "carried from the voided choice"
+		elseif reconnectState.savedInitialChoice ~= nil then
+			-- The saved default was recorded against a routine drift. A large or
+			-- deletion-heavy diff (mass disk edits, a migration in flight) is a
+			-- different situation than the one the human approved — silently
+			-- replaying their old answer can destroy one side's work. Ask again.
+			local summary = type(resp.comparison) == "table" and resp.comparison.summary or nil
+			local newFiles = tonumber(type(summary) == "table" and summary.newFiles)
+				or countArray(resp.comparison and resp.comparison.newFiles)
+			local changedFiles = tonumber(type(summary) == "table" and summary.changedFiles)
+				or countArray(resp.comparison and resp.comparison.changedFiles)
+			local removedFiles = tonumber(type(summary) == "table" and summary.removedFiles)
+				or countArray(resp.comparison and resp.comparison.removedFiles)
+			local totalDrift = newFiles + changedFiles + removedFiles
+			if removedFiles > AUTO_ANSWER_MAX_REMOVED or totalDrift > AUTO_ANSWER_MAX_DRIFT then
+				dbg(
+					string.format(
+						"saved default '%s' withheld: %d changed path(s), %d removal(s) — too destructive to auto-answer, asking",
+						tostring(reconnectState.savedInitialChoice),
+						totalDrift,
+						removedFiles
+					)
+				)
+			else
+				autoChoice = reconnectState.savedInitialChoice
+				autoReason = "saved project default"
+			end
+		end
+		if autoChoice ~= nil then
+			dbg(string.format("auto-answering '%s' (%s)", autoChoice, autoReason))
+			task.spawn(function()
+				pcall(function()
+					local body = { choiceId = tostring(choiceId), choice = autoChoice }
+					if autoChoice == "disk" then
+						body.mode = "all"
+					end
+					httpRequestTo(baseUrl .. "/initial-choice", "POST", body)
+				end)
+			end)
+		end
 		decisionGeneration += 1
 		local gen = decisionGeneration
 		task.spawn(function()
+			local decisionWaitStarted = os.clock()
 			local choice, selectiveDiskChoice, selectedDiskCount = waitForDecision(choiceId, gen)
-			if activeInitialChoiceId == choiceId then
-				activeInitialChoiceId = nil
+			if choice ~= nil then
+				log(string.format("decision '%s' after %.1fs", tostring(choice), os.clock() - decisionWaitStarted))
+			end
+			if choice == "studio" then
+				plugin:SetSetting(SETTING_STICKY_CHOICE, "studio")
+			elseif choice == "disk" then
+				plugin:SetSetting(SETTING_STICKY_CHOICE, nil)
 			end
 			if gen ~= decisionGeneration then
 				disposeScanGuard()
@@ -14723,6 +11018,17 @@ runInitialCompare = function()
 				log("decision: malformed daemon response")
 				disconnect("malformed initial decision")
 				return
+			end
+			if scaleState.guardBlocksSnapshot(scanGuard) then
+				-- The compare must rerun (a structural edit landed while the
+				-- modal was open), but the HUMAN's answer doesn't expire with
+				-- it. Carry the choice into the next cycle so they aren't
+				-- racing their own teammates to a dialog button.
+				if choice == "studio" or (choice == "disk" and selectiveDiskChoice ~= true) then
+					reconnectState.carriedInitialChoice = choice
+					reconnectState.carriedChoiceUses = 3
+					log(string.format("choice '%s' carried forward to the restarted compare", choice))
+				end
 			end
 			if scanBecameDirty("Studio changed while the overwrite choice was open") then
 				return
@@ -14739,6 +11045,10 @@ runInitialCompare = function()
 					reconnectState.retryInitialCompare("strict snapshot pull failed")
 				end
 			elseif choice == "studio" then
+				if deltaItems ~= nil and applyStudioDeltaFastPath(deltaItems) then
+					completeInitialCompare()
+					return
+				end
 				-- The guard keeps the tree coherent while the modal is open;
 				-- rescan and push one service at a time without retaining the
 				-- comparison Sources.
@@ -14783,27 +11093,44 @@ local function trimTrailingSlash(s)
 	return (trimmed:gsub("/+$", ""))
 end
 
-local function probePort(port, gameId)
-	-- Returns (matched: bool, url: string?, hello: table?)
-	-- Single-attempt: a whole-range scan must fail fast while the shared
-	-- HttpService budget is exhausted, not wait a minute per probed port.
+local function probePort(port, gameId, placeId)
+	-- Returns (matchKind: "place" | "game" | "otherPlace" | nil, url, hello).
+	-- Every place in a universe shares one GameId, so GameId alone cannot
+	-- identify a project: connecting Place B to Place A's daemon makes the
+	-- initial compare read the whole cross-place difference as drift, and
+	-- either overwrite answer destroys one side. The PlaceId decides:
+	--   "place"      — daemon lists this place; the real match.
+	--   "game"       — same game, no recorded placeIds (pre-placeId project
+	--                  or unpublished place); acceptable only when nothing
+	--                  place-exact exists.
+	--   "otherPlace" — same game but the daemon names different places; never
+	--                  auto-connect.
 	local url = string.format("http://127.0.0.1:%d", port)
 	local ok, resp = httpRequestTo(url .. "/hello", "GET", nil, nil, true)
 	if not ok or not resp.Success then
-		return false, url, nil
+		return nil, url, nil
 	end
 	local hello
 	local decOk = pcall(function()
 		hello = HttpService:JSONDecode(resp.Body or "")
 	end)
 	if not decOk or type(hello) ~= "table" then
-		return false, url, nil
+		return nil, url, nil
 	end
 	local helloGame = tostring(hello.gameId or "")
-	if helloGame == gameId then
-		return true, url, hello
+	if helloGame ~= gameId then
+		return nil, url, hello
 	end
-	return false, url, hello
+	local places = hello.placeIds
+	if type(places) ~= "table" or #places == 0 then
+		return "game", url, hello
+	end
+	for _, id in ipairs(places) do
+		if tostring(id) == placeId then
+			return "place", url, hello
+		end
+	end
+	return "otherPlace", url, hello
 end
 
 applyWallyConfig = function(wallyEnabled, wallyFolder)
@@ -14817,16 +11144,18 @@ end
 
 local function refreshDaemonConfig(url)
 	wallyRootSegments = nil
-	local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
-	if not ok or not resp.Success then
-		return
-	end
-	local hello
-	local decOk = pcall(function()
-		hello = HttpService:JSONDecode(resp.Body or "")
-	end)
-	if not decOk or type(hello) ~= "table" then
-		return
+	local hello = reconnectState.readCachedHello(url)
+	if hello == nil then
+		local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
+		if not ok or not resp.Success then
+			return
+		end
+		local decOk = pcall(function()
+			hello = HttpService:JSONDecode(resp.Body or "")
+		end)
+		if not decOk or type(hello) ~= "table" then
+			return
+		end
 	end
 	applyWallyConfig(hello.wallyEnabled, hello.wallyFolder)
 	if ui and ui.setProjectName and type(hello.name) == "string" and hello.name ~= "" then
@@ -14835,16 +11164,18 @@ local function refreshDaemonConfig(url)
 end
 
 local function validateDaemonProtocol(url)
-	local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
-	if not ok or not resp.Success then
-		return false, "daemon hello failed"
-	end
-	local hello
-	local decOk = pcall(function()
-		hello = HttpService:JSONDecode(resp.Body or "")
-	end)
-	if not decOk or type(hello) ~= "table" then
-		return false, "daemon hello was malformed"
+	local hello = reconnectState.readCachedHello(url)
+	if hello == nil then
+		local ok, resp = httpRequestTo(trimTrailingSlash(url) .. "/hello", "GET")
+		if not ok or not resp.Success then
+			return false, "daemon hello failed"
+		end
+		local decOk = pcall(function()
+			hello = HttpService:JSONDecode(resp.Body or "")
+		end)
+		if not decOk or type(hello) ~= "table" then
+			return false, "daemon hello was malformed"
+		end
 	end
 	local expectedGameId = tostring(game.GameId)
 	if expectedGameId ~= "0" and tostring(hello.gameId or "") ~= expectedGameId then
@@ -14927,10 +11258,10 @@ local function projectInitUnavailableMessage(hello)
 end
 
 reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expectedProject, shouldContinue)
-	-- Probe deterministically. Roblox throttles a burst of localhost
-	-- RequestAsync calls, and those requests cannot be cancelled after Connect
-	-- is cancelled. A sequential scan keeps at most one stale request alive and
-	-- checks the connection generation before starting every next port.
+	-- Probe deterministically with a small bounded worker window. Roblox
+	-- throttles a large burst of localhost RequestAsync calls, and those
+	-- requests cannot be cancelled after Connect is cancelled, so each launch
+	-- checks the connection generation before starting the next port.
 	--
 	-- A PlaceId match may select one project among several daemons for the same
 	-- experience. During automatic recovery, first restrict candidates to the
@@ -14945,6 +11276,7 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 		url = nil,
 		port = nil,
 		sawWrongGame = false,
+		sawWrongPlace = false,
 		sawWrongProject = false,
 		ambiguous = false,
 		candidateCount = 0,
@@ -14955,21 +11287,68 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 	local expectedProjectIdentity = if type(expectedProject) == "string" and expectedProject ~= ""
 		then expectedProject
 		else nil
-	-- Probe the range with bounded concurrency. Sequentially, the scan costs one refusal per
-	-- closed port, which is free only where the OS refuses immediately. Windows
-	-- does not: a closed loopback port there was measured taking ~2s to refuse,
-	-- so walking this range plus the broker range one port at a time left the
-	-- panel sitting on "scanning localhost" for over half a minute. A small worker
-	-- window avoids that serial cost without launching an uncancellable request
-	-- against every port when the user cancels the connection attempt.
+	local currentPlaceId = tostring(game.PlaceId)
+	local function isCurrentAttempt()
+		return type(shouldContinue) ~= "function" or shouldContinue()
+	end
+
+	-- Probe the port that last served this place FIRST: an exact place match
+	-- always wins ranking (one project per place), so a hit skips the whole
+	-- port fan-out and its multi-second completion wait.
+	local savedPort = tonumber(plugin:GetSetting(SETTING_LAST_PORT_PREFIX .. currentPlaceId))
+	if savedPort ~= nil and savedPort % 1 == 0 and savedPort >= PORT_RANGE_START and savedPort <= PORT_RANGE_END then
+		-- Bounded like the fan-out: a hung (not refused) port must not stall
+		-- discovery past the probe budget.
+		local outcome = nil
+		local closed = false
+		local done = Instance.new("BindableEvent")
+		task.spawn(function()
+			local matchKind, url, hello = probePort(savedPort, gameId, currentPlaceId)
+			if not closed and isCurrentAttempt() then
+				outcome = { matchKind = matchKind, url = url, hello = hello }
+				done:Fire()
+			end
+		end)
+		local timeoutThread = task.delay(PROBE_TIMEOUT_SECONDS, function()
+			if not closed then
+				done:Fire()
+			end
+		end)
+		if outcome == nil then
+			done.Event:Wait()
+		end
+		closed = true
+		pcall(function()
+			task.cancel(timeoutThread)
+		end)
+		done:Destroy()
+		if not isCurrentAttempt() then
+			result.cancelled = true
+			return result
+		end
+		local exactSavedProject = expectedProjectIdentity == nil
+			or (
+				type(outcome) == "table"
+				and type(outcome.hello) == "table"
+				and outcome.hello.project == expectedProjectIdentity
+			)
+		if outcome ~= nil and outcome.matchKind == "place" and exactSavedProject then
+			result.found = true
+			result.url = outcome.url
+			result.port = savedPort
+			reconnectState.storeHelloCache(outcome.url, outcome.hello)
+			if not quiet then
+				dbg(string.format("matched daemon on remembered port :%d", savedPort))
+			end
+			return result
+		end
+	end
+
 	local function probeRange(firstPort, lastPort)
 		local probes = {}
 		local nextPort = firstPort
 		local outstanding = 0
 		local acceptingResults = true
-		local function isCurrentAttempt()
-			return type(shouldContinue) ~= "function" or shouldContinue()
-		end
 		local function launchAvailable()
 			while acceptingResults and outstanding < DAEMON_PROBE_CONCURRENCY and nextPort <= lastPort do
 				if not isCurrentAttempt() then
@@ -14981,20 +11360,16 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 				nextPort += 1
 				outstanding += 1
 				task.spawn(function()
-					local matched, url, hello = probePort(port, gameId)
+					local matchKind, url, hello = probePort(port, gameId, currentPlaceId)
 					if acceptingResults and isCurrentAttempt() then
-						probes[port] = { matched = matched, url = url, hello = hello }
+						probes[port] = { matchKind = matchKind, url = url, hello = hello }
 					end
 					outstanding -= 1
 				end)
 			end
 		end
-		-- Wait for the in-flight probes. The deadline is a backstop only: it
-		-- must outlast a slow-to-refuse port so a healthy scan is never cut
-		-- short, while still guaranteeing the scan terminates if a probe never
-		-- returns. Ports that miss it stay absent from `probes`, which callers
-		-- already treat as "nothing answered there".
-		local deadline = os.clock() + 15
+		local rangeTimeout = PROBE_TIMEOUT_SECONDS * math.ceil((lastPort - firstPort + 1) / DAEMON_PROBE_CONCURRENCY)
+		local deadline = os.clock() + rangeTimeout
 		launchAvailable()
 		while (nextPort <= lastPort or outstanding > 0) and os.clock() < deadline do
 			if not isCurrentAttempt() then
@@ -15020,16 +11395,18 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 			local exactProject = expectedProjectIdentity ~= nil
 				and type(probe.hello) == "table"
 				and probe.hello.project == expectedProjectIdentity
-			if probe.matched or (gameId == "0" and exactProject) then
+			if probe.matchKind == "place" or probe.matchKind == "game" or (gameId == "0" and exactProject) then
 				gameMatches[#gameMatches + 1] = {
 					url = probe.url,
 					port = port,
 					hello = probe.hello,
 				}
-				if not probe.matched then
+				if probe.matchKind == nil then
 					result.sawWrongGame = true
 				end
-			elseif probe.hello ~= nil then
+			elseif probe.matchKind == "otherPlace" then
+				result.sawWrongPlace = true
+			elseif probe.matchKind == nil and probe.hello ~= nil then
 				result.sawWrongGame = true
 			end
 			if daemonInitializer == nil and probe.hello ~= nil then
@@ -15054,7 +11431,6 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 		gameMatches = projectMatches
 	end
 
-	local currentPlaceId = tostring(game.PlaceId)
 	local exactPlaceMatches = {}
 	for _, candidate in ipairs(gameMatches) do
 		local placeIds = candidate.hello and candidate.hello.placeIds
@@ -15073,6 +11449,8 @@ reconnectState.discoverDaemon = function(gameId, quiet, includeInitializer, expe
 		result.found = true
 		result.url = candidates[1].url
 		result.port = candidates[1].port
+		reconnectState.storeHelloCache(candidates[1].url, candidates[1].hello)
+		plugin:SetSetting(SETTING_LAST_PORT_PREFIX .. currentPlaceId, candidates[1].port)
 	elseif #candidates > 1 then
 		result.ambiguous = true
 	end
@@ -15349,6 +11727,16 @@ end
 -- Connect / Disconnect entry point
 --------------------------------------------------------------------------------
 
+cancelProjectInit = function()
+	if projectInitCandidate == nil then
+		return
+	end
+	projectInitCandidate = nil
+	setPill("idle")
+	setBanner(nil)
+	log("project creation declined")
+end
+
 startConnect = function()
 	if connected then
 		disconnect("user")
@@ -15448,6 +11836,9 @@ startConnect = function()
 						return
 					end
 				end
+				if type(hello) == "table" then
+					reconnectState.storeHelloCache(chosenUrl, hello)
+				end
 				-- `node` and `requestBody` leave scope at the end of this
 				-- iteration, before the next service's Source tree is scanned.
 			end
@@ -15537,29 +11928,64 @@ startConnect = function()
 				elseif result.initializer ~= nil then
 					projectInitCandidate = result.initializer
 					setPill("project_init")
-					setBanner(
-						"No Ro Sync project exists for this experience. Click Create Project to initialize it under "
-							.. tostring(result.initializer.projectsRoot)
-							.. "."
-					)
+					if result.sawWrongPlace then
+						setBanner(
+							"This game's Ro Sync project serves a different place. Click Create Project to give this place its own project under "
+								.. tostring(result.initializer.projectsRoot)
+								.. "."
+						)
+						dbg("same-game daemon found, but its placeIds exclude this place; offering a per-place project")
+					else
+						setBanner(
+							"No Ro Sync project exists for this experience. Click Create Project to initialize it under "
+								.. tostring(result.initializer.projectsRoot)
+								.. "."
+						)
+					end
 					log(string.format("project initializer available at %s", tostring(result.initializer.url)))
 				elseif result.initializerError ~= nil then
 					setPill("no_daemon", gameId)
 					setBanner(tostring(result.initializerError))
 					log("Desktop project initializer unavailable: " .. tostring(result.initializerError))
+				elseif result.sawWrongPlace then
+					setPill("wrong_place")
+					setBanner(
+						"Found this game's daemon, but it serves a different place (PlaceId mismatch). Connecting would compare this place against that project's files, so Ro Sync refused."
+					)
+					dbg("discovery refused a same-game daemon whose placeIds exclude this place")
 				elseif result.sawWrongGame then
 					setPill("wrong_game")
 					setBanner("Ro Sync Desktop is running, but its daemon does not offer project initialization.")
 					log("found a daemon on a probed port, but no gameId match or project initializer")
 				else
 					setPill("no_daemon", gameId)
+					noDaemonRetries += 1
+					if noDaemonRetries <= 20 then
+						local retryAttempt = connectionAttempt
+						local delaySeconds = math.min(15, 3 * noDaemonRetries)
+						log(
+							string.format(
+								"no daemon answered; auto-retrying discovery in %ds (retry %d/20)",
+								delaySeconds,
+								noDaemonRetries
+							)
+						)
+						task.delay(delaySeconds, function()
+							if connectionAttempt == retryAttempt and not busy and not connected and startConnect then
+								startConnect()
+							end
+						end)
+					else
+						log("auto-retry limit reached; click Connect to try again")
+					end
 				end
 				busy = false
 				return
 			end
+			noDaemonRetries = 0
 			chosenUrl = result.url
 			chosenPort = tostring(result.port)
-			log(string.format("matched daemon at %s", chosenUrl))
+			dbg(string.format("matched daemon at %s", chosenUrl))
 		end
 
 		if attempt ~= connectionAttempt or not busy then

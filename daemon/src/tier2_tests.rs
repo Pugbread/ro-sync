@@ -471,8 +471,9 @@ fn watcher_reserved_init_leaf_requires_terminal_canonical_migration() {
     let message = watcher_legacy_reserved_leaf_migration(temp.path(), &op)
         .unwrap()
         .expect("legacy reserved leaf must require migration");
-    assert!(message.contains("ReplicatedStorage/Misc/init (Notifications).luau"));
-    assert!(message.contains("ReplicatedStorage/Misc/%69nit (Notifications).luau"));
+    let portable_message = message.replace('\\', "/");
+    assert!(portable_message.contains("ReplicatedStorage/Misc/init (Notifications).luau"));
+    assert!(portable_message.contains("ReplicatedStorage/Misc/%69nit (Notifications).luau"));
 
     let shutdown: serde_json::Value =
         serde_json::from_str(&watcher_projection_migration_shutdown(&message)).unwrap();

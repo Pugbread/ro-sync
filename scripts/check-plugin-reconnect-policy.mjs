@@ -182,7 +182,7 @@ assert.match(
 );
 assert.match(
   daemonDiscovery,
-  /task\.spawn[\s\S]*?probePort\(port, gameId\)[\s\S]*?if acceptingResults and isCurrentAttempt\(\) then[\s\S]*?probes\[port\]/,
+  /task\.spawn[\s\S]*?probePort\(port, gameId, currentPlaceId\)[\s\S]*?if acceptingResults and isCurrentAttempt\(\) then[\s\S]*?probes\[port\]/,
   "completed daemon probes must be ignored after cancellation",
 );
 const daemonProbeConcurrency = Number(
@@ -199,7 +199,7 @@ assert.match(
 );
 assert.match(
   daemonDiscovery,
-  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local currentPlaceId/,
+  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?local currentPlaceId[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local exactPlaceMatches/,
   "automatic discovery must restrict candidates by canonical project before applying PlaceId preference",
 );
 assert.match(
@@ -972,7 +972,7 @@ const pullPath = source.slice(
 );
 assert.match(
   pullPath,
-  /httpRequest\("\/snapshot\/stream", "POST", body, true\)/,
+  /httpRequest\("\/snapshot\/stream", "POST", encoded, "encoded"\)/,
   "full initial pulls must use the protocol-6 bounded snapshot stream",
 );
 assert.match(
@@ -1606,12 +1606,12 @@ assert.match(
 );
 assert.match(
   initialCompareFlow,
-  /compareId = compareId,[\s\S]*?service = serviceName,[\s\S]*?for attempt = 1, 2 do[\s\S]*?httpJson\("\/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  /compareId = compareId,[\s\S]*?service = serviceName,[\s\S]*?for attempt = 1, 2 do[\s\S]*?httpJson\("\/initial-compare", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES\)/,
   "streamed comparison must use the trusted JSON path with bounded idempotent retries",
 );
 assert.match(
   initialCompareFlow,
-  /encodedCompareBodySize[\s\S]*?HttpService:JSONEncode\(requestBody\)[\s\S]*?bodyBytes > scaleState\.maxStreamRequestBytes/,
+  /encodedCompareBodySize[\s\S]*?HttpService:JSONEncode\(requestBody\)[\s\S]*?#encodedBody > scaleState\.maxStreamRequestBytes/,
   "every streamed comparison request must enforce its actual encoded 512 KiB wire size",
 );
 assert.match(
@@ -1821,7 +1821,7 @@ assert.match(
 );
 assert.ok(
   pushPostExact.indexOf("return nil, stopForPartialReceipt(response, label)")
-    < pushPostExact.indexOf("if attempt < 2 then"),
+    < pushPostExact.indexOf("if attempt >= maxAttempts then"),
   "a valid partial receipt must terminally return before the exact-chunk retry branch",
 );
 assert.match(
@@ -2123,12 +2123,12 @@ assert.match(
 );
 assert.match(
   pushPath,
-  /for attempt = 1, 2 do[\s\S]*?httpJson\("\/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  /local attempt = 0[\s\S]*?while true do[\s\S]*?httpJson\("\/push", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES\)[\s\S]*?maxAttempts/,
   "push chunks must use exact bounded idempotent retries",
 );
 assert.match(
   initialCompareFlow,
-  /httpJson\("\/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  /httpJson\("\/initial-compare", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES\)/,
   "every streamed comparison response must be capped before decode",
 );
 assert.match(
@@ -2138,7 +2138,7 @@ assert.match(
 );
 assert.match(
   pushPath,
-  /bodyBytes > scaleState\.maxStreamRequestBytes/,
+  /#encodedBody > scaleState\.maxStreamRequestBytes/,
   "push must enforce actual encoded request size before every send",
 );
 assert.match(
@@ -2148,7 +2148,7 @@ assert.match(
 );
 assert.match(
   pushPath,
-  /#source > scaleState\.maxScriptSourceBytes[\s\S]*?#part\.data/,
+  /#source > scaleState\.maxScriptSourceBytes[\s\S]*?local budget = math\.min\(scaleState\.sourceChunkBytes[\s\S]*?data = data[\s\S]*?batchBytes \+= #data/,
   "push must cap one script and advance offsets using raw Source bytes",
 );
 assert.match(
@@ -2205,12 +2205,12 @@ assert.match(
 );
 assert.match(
   projectBroker,
-  /"pluginProtocol": 6,/,
+  /const PLUGIN_PROTOCOL_VERSION: u64 = 6;[\s\S]*?"pluginProtocol": PLUGIN_PROTOCOL_VERSION,/,
   "the Desktop project broker must advertise the same current protocol",
 );
 assert.match(
   projectBroker,
-  /assert_eq!\(unavailable\["pluginProtocol"\], 6\);/,
+  /assert_eq!\(unavailable\["pluginProtocol"\], PLUGIN_PROTOCOL_VERSION\);/,
   "the Desktop project broker compatibility test must pin the current protocol",
 );
 assert.match(readme, /plugin_protocol-6-/);

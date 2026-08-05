@@ -11,10 +11,13 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 $built = Join-Path $PSScriptRoot "target\$target\release\rosync.exe"
 $destination = Join-Path $PSScriptRoot 'rosync-windows-x86_64.exe'
 $staged = Join-Path $PSScriptRoot ('.rosync-windows-x86_64.' + $PID + '.tmp')
+$backup = Join-Path $PSScriptRoot ('.rosync-windows-x86_64.' + $PID + '.bak')
 try {
     Copy-Item -LiteralPath $built -Destination $staged -Force
     if (Test-Path -LiteralPath $destination) {
-        [IO.File]::Replace($staged, $destination, $null, $true)
+        # Windows PowerShell's .NET Framework rejects a null backup path for
+        # File.Replace, even though newer .NET runtimes accept it.
+        [IO.File]::Replace($staged, $destination, $backup, $true)
     }
     else {
         [IO.File]::Move($staged, $destination)
@@ -23,6 +26,9 @@ try {
 finally {
     if (Test-Path -LiteralPath $staged) {
         Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $backup) {
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     }
 }
 Write-Host "built: $((Resolve-Path 'rosync-windows-x86_64.exe').Path)"

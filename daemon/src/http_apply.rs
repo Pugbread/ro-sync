@@ -972,6 +972,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         force_prune,
         project_root: stage.path(),
         backup_forced_removals: false,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut source_provider = |node: &Value| {
         let id = node
@@ -996,8 +997,10 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
     let staged_fingerprint = capture_exact_tree_fingerprint(stage.path(), &service)?;
     let live_service = root.join(&service);
     let prepared_baselines = prepare_stream_baselines(stage.path(), &stage_service, &live_service)?;
-    let final_fingerprint = capture_exact_tree_fingerprint(root, &service)?;
-    if final_fingerprint != initial_fingerprint {
+    // The staged copy already re-read and content-verified the live service;
+    // a metadata generation fence is sufficient here and avoids hashing it a
+    // second time immediately before commit.
+    if crate::fs_safety::capture_tree_metadata(root, &service)? != initial_fingerprint.metadata {
         return Err(format!(
             "disk service {service} changed before atomic commit; no files were replaced"
         ));
@@ -1250,6 +1253,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         force_prune,
         project_root: root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     live_ctx.mark_quiet(&live_service);
     Ok(StreamCommitResult {
@@ -1917,6 +1921,7 @@ fn rollback_created_stream_service(
         force_prune: false,
         project_root: root,
         backup_forced_removals: false,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     if !remove_synced_subtree(&live_service, &ctx, Some(&expected))? {
         return Err(format!(
@@ -1982,6 +1987,7 @@ fn rollback_replaced_stream_service(
         force_prune: false,
         project_root: root,
         backup_forced_removals: false,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
     .mark_quiet(&live_service);
     Ok(result)
@@ -2518,8 +2524,21 @@ fn validate_bootstrap_services_with_limits(
 }
 
 async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json<Value> {
+    match run_handler_blocking(move || push_blocking(&state, body)).await {
+        Ok(response) => response,
+        Err(error) => Json(json!({
+            "ok": false,
+            "applied": 0,
+            "skipped": 0,
+            "conflicts": [],
+            "errors": [error],
+        })),
+    }
+}
+
+fn push_blocking(state: &AppState, body: PushBody) -> Json<Value> {
     if body.stream_id.is_some() || body.phase.is_some() {
-        return streamed_push(&state, body);
+        return streamed_push(state, body);
     }
     if body.bootstrap && body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
         return Json(json!({
@@ -2555,6 +2574,7 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut res = PushApplyResult::default();
 
@@ -2567,6 +2587,7 @@ async fn push(State(state): State<AppState>, Json(body): Json<PushBody>) -> Json
             force_prune: body.force_prune,
             project_root: root,
             backup_forced_removals: true,
+            dirty_parents: Mutex::new(std::collections::HashSet::new()),
         };
         for svc in &body.services {
             match apply_service_node(root, svc, &bootstrap_ctx) {
@@ -2628,6 +2649,7 @@ pub(crate) fn apply_push_ops(state: &AppState, ops: &[Value]) -> PushApplyResult
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut out = PushApplyResult::default();
     apply_ops_into(root, ops, &ctx, &mut out);
@@ -2645,9 +2667,27 @@ pub(crate) struct PushCtx<'a> {
     pub force_prune: bool,
     pub project_root: &'a Path,
     pub backup_forced_removals: bool,
+    /// Parents that received an atomic file replacement in this batch.
+    pub dirty_parents: Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+impl<'a> Drop for PushCtx<'a> {
+    fn drop(&mut self) {
+        let parents = std::mem::take(&mut *self.dirty_parents.lock().unwrap());
+        for parent in parents {
+            sync_directory_best_effort(&parent);
+        }
+    }
 }
 
 impl<'a> PushCtx<'a> {
+    fn note_dirty_parent(&self, parent: &Path) {
+        self.dirty_parents
+            .lock()
+            .unwrap()
+            .insert(parent.to_path_buf());
+    }
+
     fn mark_quiet(&self, path: &Path) {
         // Every production path is constructed below the already-canonical
         // project root. Keep the watcher key lexical: canonicalizing a path
@@ -2739,6 +2779,12 @@ pub(crate) fn event_to_plugin_ops(root: &Path, event: &str) -> Vec<Value> {
     let Some(raw_op) = value.get("op").cloned() else {
         return Vec::new();
     };
+    // Journaled protocol-6 events already contain plugin-shaped operations.
+    // Legacy filesystem events contain the daemon's typed Op and still need
+    // conversion at this compatibility boundary.
+    if raw_op.get("op").and_then(Value::as_str).is_some() {
+        return flatten_plugin_op(raw_op);
+    }
     let Ok(op) = serde_json::from_value::<Op>(raw_op) else {
         return Vec::new();
     };
@@ -2747,9 +2793,15 @@ pub(crate) fn event_to_plugin_ops(root: &Path, event: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn broadcast_filtered_op(events: &broadcast::Sender<String>, op: &Op) -> Result<(), String> {
-    let payload = serde_json::to_string(&json!({ "type": "op", "op": op }))
-        .map_err(|error| format!("serialize op: {error}"))?;
+fn broadcast_filtered_op(
+    events: &broadcast::Sender<String>,
+    root: &Path,
+    op: &Op,
+) -> Result<(), String> {
+    let plugin_op = fs_op_to_plugin_op(root, op)
+        .ok_or_else(|| "resolved operation could not be projected for Studio".to_string())?;
+    let payload = crate::ws::journal_op_event(&plugin_op)
+        .ok_or_else(|| "serialize journaled operation".to_string())?;
     events
         .send(payload)
         .map(|_| ())
@@ -2758,8 +2810,8 @@ fn broadcast_filtered_op(events: &broadcast::Sender<String>, op: &Op) -> Result<
 
 fn broadcast_plugin_op(events: &broadcast::Sender<String>, op: Value) -> Result<(), String> {
     for nested in flatten_plugin_op(op) {
-        let payload = serde_json::to_string(&json!({ "type": "plugin-op", "op": nested }))
-            .map_err(|error| format!("serialize plugin op: {error}"))?;
+        let payload = crate::ws::journal_op_event(&nested)
+            .ok_or_else(|| "serialize journaled plugin operation".to_string())?;
         events
             .send(payload)
             .map_err(|_| "no connected client can receive the resolved conflict".to_string())?;
@@ -3459,6 +3511,7 @@ async fn resolve(
         force_prune: false,
         project_root: state.canonical_project.as_path(),
         backup_forced_removals: false,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
 
     match decision {
@@ -3505,7 +3558,9 @@ async fn resolve(
             };
             let delivery = ops
                 .iter()
-                .try_for_each(|op| broadcast_filtered_op(&state.events, op));
+                .try_for_each(|op| {
+                    broadcast_filtered_op(&state.events, state.canonical_project.as_path(), op)
+                });
             if let Err(error) = delivery {
                 restore_resolved_conflict(&state, &target, bytes, is_dir, rejected_studio);
                 return Json(json!({ "ok": false, "error": error }));
@@ -3551,7 +3606,11 @@ async fn resolve(
                     "error": format!("cannot map disk delete {} to a Studio path", path.display()),
                 }));
             }
-            if let Err(error) = broadcast_filtered_op(&state.events, &op) {
+            if let Err(error) = broadcast_filtered_op(
+                &state.events,
+                state.canonical_project.as_path(),
+                &op,
+            ) {
                 state
                     .conflict
                     .park_fs_delete_conflict(&conflict_path, &path, studio_bytes, is_dir);
@@ -5249,9 +5308,8 @@ fn copy_backup_path(
                         format!("write backup file {}: {error}", target.display())
                     })?;
                 }
-                target_file
-                    .sync_all()
-                    .map_err(|error| format!("sync backup file {}: {error}", target.display()))?;
+                // The transaction directory is flushed once after the batch.
+                drop(target_file);
                 if crate::fs_safety::file_generation_no_follow(&entry.path)? != *expected {
                     return Err(format!(
                         "backup source changed during copy: {}",
@@ -5334,6 +5392,7 @@ fn backup_forced_removal(path: &Path, project_root: &Path) -> Result<BackupRecei
 
     let destination = transaction.join(relative);
     copy_backup_path(project_root, &source_fence, &transaction, &destination)?;
+    sync_directory_best_effort(&transaction);
     let current = capture_synced_subtree(project_root, path)?
         .ok_or_else(|| format!("backup source disappeared during copy: {}", path.display()))?;
     if current != source_fence {
@@ -5497,9 +5556,19 @@ enum SourceWriteOutcome {
 }
 
 fn read_synced_file(project_root: &Path, path: &Path) -> Result<Vec<u8>, String> {
-    let validated = crate::fs_safety::validate_synced_path(project_root, path, false)
+    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
         .map_err(|error| format!("validate source {}: {error}", path.display()))?;
-    let guard = crate::fs_safety::guard_synced_parent_chain(project_root, &validated, false)
+    read_synced_file_cached(path, &mut validation)
+}
+
+fn read_synced_file_cached(
+    path: &Path,
+    validation: &mut crate::fs_safety::SyncedPathValidationCache,
+) -> Result<Vec<u8>, String> {
+    let validated = validation
+        .validate(path, false)
+        .map_err(|error| format!("validate source {}: {error}", path.display()))?;
+    let guard = crate::fs_safety::guard_synced_parent_chain_cached(validation, &validated, false)
         .map_err(|error| format!("guard source {}: {error}", path.display()))?;
     guard
         .verify()
@@ -5588,11 +5657,9 @@ where
                         )
                     })?;
                 }
-                file.write_all(bytes)
-                    .and_then(|_| file.sync_all())
-                    .map_err(|error| {
-                        format!("write staged source {}: {error}", candidate.display())
-                    })?;
+                file.write_all(bytes).map_err(|error| {
+                    format!("write staged source {}: {error}", candidate.display())
+                })?;
                 drop(file);
                 temporary = Some(candidate);
                 break;
@@ -5620,6 +5687,7 @@ where
         ));
     }
     ctx.mark_quiet(&validated);
+    invalidate_cached_content_hash(&validated);
     if let Err(error) = crate::lifecycle::replace_file_atomic(&temporary, &validated) {
         if guard.verify().is_ok() {
             let _ = std::fs::remove_file(&temporary);
@@ -5643,6 +5711,7 @@ where
             validated.display()
         ));
     }
+    ctx.note_dirty_parent(parent);
     ctx.mark_quiet(&validated);
     Ok(())
 }

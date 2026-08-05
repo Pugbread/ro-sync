@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 
 use crate::{fs_safety, project_config, snapshot};
 
+/// Public universe lookup. Studio's `DataModel.Name` and its place's product
+/// info both report the *place* title, so the experience title has to come
+/// from here — HttpService cannot reach roblox.com from inside Studio.
+const UNIVERSE_LOOKUP_URL: &str = "https://games.roblox.com/v1/games?universeIds=";
+const UNIVERSE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 const MAX_DIRECTORY_NAME_BYTES: usize = 72;
 const MAX_ID_DIGITS: usize = 20;
@@ -130,7 +136,9 @@ pub(crate) fn initialize_project(
 ) -> Result<ProjectInitOutcome, ProjectInitError> {
     let root = resolve_projects_root(projects_root)?;
     let metadata = validate_request(request)?;
-    if let Some((existing, directory_name)) = find_existing_project(&root, &metadata.game_id)? {
+    if let Some((existing, directory_name)) =
+        find_existing_project(&root, &metadata.game_id, &metadata.place_id)?
+    {
         if let Some(outcome) =
             merge_existing_project(&root, &existing, &directory_name, metadata.clone())?
         {
@@ -139,11 +147,14 @@ pub(crate) fn initialize_project(
     }
     let base = directory_slug(&metadata.game_name, &metadata.game_id);
     let with_game_id = append_suffix(&base, &metadata.game_id);
-    let candidates = if base == with_game_id {
-        vec![base.clone()]
-    } else {
-        vec![base.clone(), with_game_id.clone()]
-    };
+    // The place-suffixed name makes per-place projects creatable in one
+    // request: with one project per place, a second place of an already-
+    // initialized game finds `base` and `base-gameId` occupied by sibling
+    // places (which merge_existing_project now refuses to reuse), and the
+    // old fallthrough only *suggested* this name instead of trying it.
+    let with_place_id = append_suffix(&with_game_id, &metadata.place_id);
+    let mut candidates = vec![base.clone(), with_game_id.clone(), with_place_id];
+    candidates.dedup();
 
     for directory_name in &candidates {
         let candidate = root.join(directory_name);
@@ -371,6 +382,7 @@ fn init_file_error(label: &str, error: std::io::Error) -> ProjectInitError {
 fn find_existing_project(
     root: &Path,
     game_id: &str,
+    place_id: &str,
 ) -> Result<Option<(PathBuf, String)>, ProjectInitError> {
     let entries = fs::read_dir(root).map_err(|error| {
         ProjectInitError::new(
@@ -378,6 +390,12 @@ fn find_existing_project(
             format!("inspect projects root {}: {error}", root.display()),
         )
     })?;
+    // One project per place: several same-game directories can coexist (one
+    // per place), so returning the first game match could hand a rename to a
+    // sibling place's project. Scan them all; an exact placeIds hit wins, a
+    // same-game directory with no recorded places (pre-placeId project) is
+    // the fallback for adoption.
+    let mut game_level: Option<(PathBuf, String)> = None;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_PROJECT_ROOT_ENTRIES {
             return Err(ProjectInitError::new(
@@ -400,9 +418,14 @@ fn find_existing_project(
         if config.game_id.as_deref() != Some(game_id) {
             continue;
         }
-        return Ok(Some((candidate, directory_name)));
+        if config.place_ids.iter().any(|id| id == place_id) {
+            return Ok(Some((candidate, directory_name)));
+        }
+        if config.place_ids.is_empty() && game_level.is_none() {
+            game_level = Some((candidate, directory_name));
+        }
     }
-    Ok(None)
+    Ok(game_level)
 }
 
 fn merge_existing_project(
@@ -421,6 +444,15 @@ fn merge_existing_project(
         return Ok(None);
     };
     if config.game_id.as_deref() != Some(metadata.game_id.as_str()) {
+        return Ok(None);
+    }
+    // Same game is NOT the same project. Reusing any same-game directory
+    // used to append the new PlaceId to its placeIds, silently merging two
+    // places into one project — after which place-aware discovery correctly
+    // routes both windows there and they overwrite each other. Only reuse a
+    // directory that already claims this place, or one that predates place
+    // recording entirely (empty placeIds — the append below adopts it).
+    if !config.place_ids.is_empty() && !config.place_ids.contains(&metadata.place_id) {
         return Ok(None);
     }
 
@@ -553,14 +585,87 @@ fn is_placeholder_project_name(value: &str) -> bool {
     })
 }
 
+/// A name that carries nothing at all — blank, or one of Studio's stand-ins for
+/// a place that has never been titled. Narrower than
+/// [`is_placeholder_project_name`], which also rejects "Game": that one is a
+/// poor name on its own but a legitimate place name beside an experience title.
+fn is_unnamed_placeholder(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "untitled experience" {
+        return true;
+    }
+    normalized.strip_prefix("place").is_some_and(|suffix| {
+        suffix.is_empty() || suffix.chars().all(|value| value.is_ascii_digit())
+    })
+}
+
+/// Best-effort experience title for a universe id.
+///
+/// Never fails a project creation: an offline machine, a rate limit, or a
+/// response shape change all degrade to the names Studio already sent.
+pub(crate) async fn resolve_experience_name(universe_id: &str) -> Option<String> {
+    if universe_id.is_empty() || !universe_id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(UNIVERSE_LOOKUP_TIMEOUT)
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{UNIVERSE_LOOKUP_URL}{universe_id}"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload: serde_json::Value = response.json().await.ok()?;
+    let name = payload
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("name")?
+        .as_str()?
+        .trim();
+    if name.is_empty() || name.len() > MAX_DISPLAY_NAME_BYTES || name.chars().any(char::is_control)
+    {
+        return None;
+    }
+    // The endpoint answers for universes the caller cannot see with a bracketed
+    // sentinel rather than an error — "[TITLE UNAVAILABLE]" for a private
+    // experience, which is the normal state of a place still in development.
+    // Naming a project after that would be worse than not resolving at all.
+    if name.starts_with('[') && name.ends_with(']') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// `Experience - Place` when both names are known and distinct.
+///
+/// A place name alone is ambiguous across experiences ("Lobby", "Game"), and
+/// an experience name alone collides for every sibling place of one universe.
+/// Naming both keeps a projects folder readable. When Studio only knows one
+/// usable name — or when both resolve to the same title, which is the norm for
+/// a single-place experience — the name stays unduplicated.
 fn preferred_project_name(game_name: &str, place_name: &str) -> String {
-    for candidate in [game_name, place_name] {
-        let candidate = candidate.trim();
+    let game = game_name.trim();
+    let place = place_name.trim();
+    // The experience side must be a real title. The place side only has to be
+    // named at all: "Game" is a useless project name by itself but a useful
+    // half of "Raft - Game", whereas "Place1" is a Studio artifact either way.
+    if !is_placeholder_project_name(game)
+        && !is_unnamed_placeholder(place)
+        && !game.eq_ignore_ascii_case(place)
+    {
+        return format!("{game} - {place}");
+    }
+    for candidate in [place, game] {
         if !is_placeholder_project_name(candidate) {
             return candidate.to_string();
         }
     }
-    game_name.trim().to_string()
+    game.to_string()
 }
 
 fn validate_display_name(value: &str, field: &str) -> Result<String, ProjectInitError> {
@@ -687,6 +792,35 @@ mod tests {
         assert!(!long.contains('\\'));
     }
 
+    #[tokio::test]
+    async fn private_experiences_do_not_name_projects_after_a_sentinel() {
+        // A universe id that cannot resolve must yield None rather than a name.
+        // The live endpoint answers "[TITLE UNAVAILABLE]" for private
+        // experiences, and every place still in development is private.
+        assert_eq!(resolve_experience_name("").await, None);
+        assert_eq!(resolve_experience_name("not-a-number").await, None);
+        assert_eq!(resolve_experience_name("0x1").await, None);
+    }
+
+    #[test]
+    fn project_names_carry_the_experience_and_the_place() {
+        // Both known and distinct: a projects folder full of "Lobby" tells you
+        // nothing, and every sibling place named "Raft" collides.
+        assert_eq!(preferred_project_name("Raft", "Game"), "Raft - Game");
+        // A single-place experience reports the same title twice; do not
+        // produce "Raft - Raft".
+        assert_eq!(preferred_project_name("Raft", "Raft"), "Raft");
+        // Same title, different casing: still one name, and the place's own
+        // spelling wins as it did before combining.
+        assert_eq!(preferred_project_name("Raft", "raft"), "raft");
+        // Studio placeholders never become half of a name.
+        assert_eq!(preferred_project_name("Raft", "Place1"), "Raft");
+        assert_eq!(preferred_project_name("Place1", "Lobby"), "Lobby");
+        assert_eq!(preferred_project_name("", "Lobby"), "Lobby");
+        // Neither name is usable: keep the previous fallback.
+        assert_eq!(preferred_project_name("Place1", "Place2"), "Place1");
+    }
+
     #[test]
     fn creates_one_direct_child_with_complete_metadata_and_docs() {
         let root = tempfile::tempdir().unwrap();
@@ -697,11 +831,11 @@ mod tests {
             Some(fs::canonicalize(root.path()).unwrap().as_path())
         );
         assert_eq!(outcome.directory_name, "race-stars");
-        assert_eq!(outcome.name, "Race Stars");
+        assert_eq!(outcome.name, "Race Stars - Main Place");
         let config = project_config::read_from_disk(&outcome.project)
             .unwrap()
             .unwrap();
-        assert_eq!(config.name, "Race Stars");
+        assert_eq!(config.name, "Race Stars - Main Place");
         assert_eq!(config.game_name.as_deref(), Some("Race Stars"));
         assert_eq!(config.game_id.as_deref(), Some("123"));
         assert_eq!(config.group_id.as_deref(), Some("789"));
@@ -726,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_universe_merges_new_place_and_metadata_without_losing_unknown_settings() {
+    fn same_universe_new_place_forks_a_per_place_project() {
         let root = tempfile::tempdir().unwrap();
         let first = initialize_project(root.path(), request("Race Stars", "123")).unwrap();
         let mut config = project_config::read_from_disk(&first.project)
@@ -738,36 +872,43 @@ mod tests {
         );
         project_config::write(&first.project, &config).unwrap();
 
-        let mut second_request = request("Race Stars Reborn", "123");
+        let mut second_request = request("Race Stars", "123");
         second_request.place_name = "Desert Place".to_string();
         second_request.place_id = "999".to_string();
-        second_request.creator_id = Some("101".to_string());
-        second_request.group_id = Some("101".to_string());
         let second = initialize_project(root.path(), second_request.clone()).unwrap();
-        assert!(!second.created);
-        assert!(second.changed.config);
-        assert_eq!(
-            second.project, first.project,
-            "renames must not fork a universe"
+        assert!(
+            second.created,
+            "a new place of the same game must fork its own project"
         );
-
-        let merged = project_config::read_from_disk(&first.project)
+        assert_ne!(second.project, first.project);
+        let forked = project_config::read_from_disk(&second.project)
             .unwrap()
             .unwrap();
-        assert_eq!(merged.name, "Race Stars");
-        assert_eq!(merged.game_name.as_deref(), Some("Race Stars Reborn"));
-        assert_eq!(merged.place_name.as_deref(), Some("Desert Place"));
-        assert_eq!(merged.place_ids, ["456", "999"]);
-        assert_eq!(merged.group_id.as_deref(), Some("101"));
-        assert_eq!(merged.creator_id.as_deref(), Some("101"));
+        assert_eq!(forked.place_ids, ["999"]);
+
+        // The sibling place's project is untouched by the fork.
+        let original = project_config::read_from_disk(&first.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.place_ids, ["456"]);
         assert_eq!(
-            merged.extra.get("AutoReconnect"),
+            original.extra.get("AutoReconnect"),
             Some(&serde_json::Value::String("on".to_string()))
         );
 
-        let third = initialize_project(root.path(), second_request).unwrap();
-        assert!(!third.created);
-        assert!(!third.changed.config);
+        // Re-initializing an already-forked place is a no-op merge into its
+        // own project — never another fork, even across a game rename.
+        let mut renamed = request("Race Stars Reborn", "123");
+        renamed.place_name = "Desert Place".to_string();
+        renamed.place_id = "999".to_string();
+        let third = initialize_project(root.path(), renamed).unwrap();
+        assert!(!third.created, "renames must not fork the same place again");
+        assert_eq!(third.project, second.project);
+        let merged = project_config::read_from_disk(&second.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.game_name.as_deref(), Some("Race Stars Reborn"));
+        assert_eq!(merged.place_ids, ["999"]);
     }
 
     #[test]
@@ -813,9 +954,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("race-stars")).unwrap();
         fs::create_dir(root.path().join("race-stars-123")).unwrap();
-        let error = initialize_project(root.path(), request("Race Stars", "123")).unwrap_err();
+        // Unrelated occupants of both preferred names: the place-suffixed
+        // candidate absorbs the collision in one request.
+        let outcome = initialize_project(root.path(), request("Race Stars", "123")).unwrap();
+        assert_eq!(outcome.directory_name, "race-stars-123-456");
+
+        // All three candidates taken → refuse, no further guessing.
+        let third_root = tempfile::tempdir().unwrap();
+        fs::create_dir(third_root.path().join("race-stars")).unwrap();
+        fs::create_dir(third_root.path().join("race-stars-123")).unwrap();
+        fs::create_dir(third_root.path().join("race-stars-123-456")).unwrap();
+        let error =
+            initialize_project(third_root.path(), request("Race Stars", "123")).unwrap_err();
         assert_eq!(error.code(), "PROJECT_PATH_COLLISION");
-        assert_eq!(error.suggested_directory_name(), Some("race-stars-123-456"));
 
         #[cfg(unix)]
         {

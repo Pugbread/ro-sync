@@ -48,6 +48,13 @@ pub(super) fn spawn_watch_bridge(
             }
             match rx.recv().await {
                 Ok(watch::WatchEvent::Op(mut op)) => {
+                    // Drop content hashes for paths touched by the watcher.
+                    // Generation checks keep stale entries safe, while eager
+                    // invalidation keeps the bounded cache useful during long runs.
+                    http::invalidate_cached_content_hash(&op.path);
+                    if let Some(from) = &op.from {
+                        http::invalidate_cached_content_hash(from);
+                    }
                     if is_synced_service_root_op(&op, &root) {
                         continue;
                     }
@@ -815,6 +822,10 @@ pub(super) fn reload_config(state: &AppState, _config_path: &std::path::Path) ->
     let prev_wally_enabled = *state.wally_enabled.read().unwrap();
     let prev_wally_folder = state.wally_folder.read().unwrap().clone();
 
+    // Deleting this field from ro-sync.json clears the remembered decision,
+    // so mirror it even when no connection-routing field changed.
+    *state.initial_choice_default.write().unwrap() = cfg.initial_choice_default.clone();
+
     let changed = prev_game_id != cfg.game_id
         || prev_group_id != cfg.group_id
         || prev_place_ids != cfg.place_ids
@@ -926,9 +937,8 @@ pub(super) fn emit_op(events: &broadcast::Sender<String>, root: &Path, op: &Op) 
     // Convert once at the watcher boundary. Keeping file contents as raw byte
     // arrays in the broadcast channel multiplied allocation and JSON parsing
     // work for every subscriber before the WebSocket layer converted them.
-    let payload = serde_json::json!({ "type": "plugin-op", "op": plugin_op });
-    if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = events.send(s);
+    if let Some(payload) = crate::ws::journal_op_event(&plugin_op) {
+        let _ = events.send(payload);
     }
 }
 

@@ -91,6 +91,9 @@ pub struct AppState {
     pub place_ids: Arc<RwLock<Vec<String>>>,
     pub wally_enabled: Arc<RwLock<bool>>,
     pub wally_folder: Arc<RwLock<Option<String>>>,
+    /// Saved full overwrite decision, mirrored from `ro-sync.json` and
+    /// advertised via `/hello` for plugin auto-answer.
+    pub initial_choice_default: Arc<RwLock<Option<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
     /// `spawn_watch_bridge` drops watcher ops for paths whose deadline hasn't
@@ -1020,17 +1023,24 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("serve: bind {requested_addr}: {error}"))?;
     let listen_port = listener.local_addr()?.port();
 
-    if let Err(e) = snapshot::write_ro_sync_md_if_missing(&canonical_project) {
-        eprintln!("rosync: failed to write ro-sync.md: {e}");
-    }
-    if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write CLAUDE.md: {e}");
-    }
-    if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write Codex context: {e}");
-    }
-    if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write project tooling files: {e}");
+    // Documentation/config merges are best-effort conveniences; keep them off
+    // the readiness path so the daemon can begin accepting Studio immediately.
+    {
+        let docs_project = canonical_project.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = snapshot::write_ro_sync_md_if_missing(&docs_project) {
+                eprintln!("rosync: failed to write ro-sync.md: {e}");
+            }
+            if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write CLAUDE.md: {e}");
+            }
+            if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write Codex context: {e}");
+            }
+            if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write project tooling files: {e}");
+            }
+        });
     }
 
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
@@ -1117,6 +1127,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         place_ids: Arc::new(RwLock::new(cfg.place_ids.clone())),
         wally_enabled: Arc::new(RwLock::new(cfg.wally_enabled)),
         wally_folder: Arc::new(RwLock::new(cfg.wally_folder.clone())),
+        initial_choice_default: Arc::new(RwLock::new(cfg.initial_choice_default.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
         request_tx,
@@ -2678,13 +2689,14 @@ async fn run_decision(args: DecisionArgs) -> Result<(), Box<dyn std::error::Erro
                 .map(str::to_string)
         })
         .ok_or("decision: pending choice has no choiceId")?;
-    let value = http_post_json(
-        args.port,
-        "/initial-choice",
-        &serde_json::json!({ "choiceId": choice_id, "choice": choice }),
-    )
-    .await
-    .map_err(|e| format!("decision: {e}"))?;
+    let body = if choice == "disk" {
+        serde_json::json!({ "choiceId": choice_id, "choice": choice, "mode": "all" })
+    } else {
+        serde_json::json!({ "choiceId": choice_id, "choice": choice })
+    };
+    let value = http_post_json(args.port, "/initial-choice", &body)
+        .await
+        .map_err(|e| format!("decision: {e}"))?;
     if args.raw {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if value

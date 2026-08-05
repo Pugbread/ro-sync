@@ -66,6 +66,7 @@ fn harness<'a>(
         force_prune: false,
         project_root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
 }
 
@@ -82,6 +83,7 @@ fn force_harness<'a>(
         force_prune: false,
         project_root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
 }
 
@@ -98,6 +100,7 @@ fn strict_force_harness<'a>(
         force_prune: true,
         project_root,
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
 }
 
@@ -148,6 +151,7 @@ fn test_state(temp: &TempDir, projects_root: Option<PathBuf>) -> AppState {
         place_ids: Arc::new(RwLock::new(Vec::new())),
         wally_enabled: Arc::new(RwLock::new(false)),
         wally_folder: Arc::new(RwLock::new(None)),
+        initial_choice_default: Arc::new(RwLock::new(None)),
         pending_initial: Arc::new(Mutex::new(None)),
         push_quiet: Arc::new(Mutex::new(HashMap::new())),
         request_tx,
@@ -840,11 +844,11 @@ fn project_init_creates_once_broadcasts_and_audits_without_exposing_capability()
         "groupId": "789",
     });
 
-    let created = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
+    let created = project_init_inner(&state, &serde_json::to_vec(&request).unwrap(), None).0;
     assert_eq!(created["ok"], true);
     assert_eq!(created["status"], "created");
     assert_eq!(created["directoryName"], "race-stars");
-    assert_eq!(created["name"], "Race Stars");
+    assert_eq!(created["name"], "Race Stars - Main Place");
     let created_path = PathBuf::from(created["project"].as_str().unwrap());
     assert_eq!(created_path.parent(), Some(canonical_projects.as_path()));
     assert!(created_path
@@ -854,10 +858,10 @@ fn project_init_creates_once_broadcasts_and_audits_without_exposing_capability()
     let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
     assert_eq!(event["type"], "project-init");
     assert_eq!(event["status"], "created");
-    assert_eq!(event["name"], "Race Stars");
+    assert_eq!(event["name"], "Race Stars - Main Place");
     assert_eq!(event["metadata"]["gameId"], "123");
 
-    let existing = project_init_inner(&state, &serde_json::to_vec(&request).unwrap()).0;
+    let existing = project_init_inner(&state, &serde_json::to_vec(&request).unwrap(), None).0;
     assert_eq!(existing["ok"], true);
     assert_eq!(existing["status"], "existing");
     assert_eq!(existing["project"], created["project"]);
@@ -2112,7 +2116,8 @@ fn partial_keep_disk_rename_queues_source_and_name_compensation() {
     ));
 
     let source_restore: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-    assert_eq!(source_restore["type"], "plugin-op");
+    assert_eq!(source_restore["type"], "op");
+    assert!(source_restore["seq"].is_number());
     assert_eq!(source_restore["op"]["op"], "update");
     assert_eq!(source_restore["op"]["path"], json!(["Workspace", "New"]));
     assert_eq!(
@@ -2121,6 +2126,8 @@ fn partial_keep_disk_rename_queues_source_and_name_compensation() {
     );
 
     let reverse: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(reverse["type"], "op");
+    assert!(reverse["seq"].is_number());
     assert_eq!(reverse["op"]["op"], "rename");
     assert_eq!(reverse["op"]["from"], json!(["Workspace", "New"]));
     assert_eq!(reverse["op"]["to"], json!(["Workspace", "Old"]));
@@ -2387,6 +2394,27 @@ fn fs_rename_of_parent_init_to_raw_reserved_leaf_is_rejected() {
     assert!(fs_op_to_plugin_op(d.path(), &op).is_none());
     let event = serde_json::json!({ "type": "op", "op": op }).to_string();
     assert!(event_to_plugin_ops(d.path(), &event).is_empty());
+}
+
+#[test]
+fn sequenced_journal_event_preserves_plugin_shaped_batch_operations() {
+    let event = serde_json::json!({
+        "type": "op",
+        "seq": 42,
+        "op": {
+            "op": "batch",
+            "ops": [
+                { "op": "delete", "path": ["Workspace", "Old"] },
+                { "op": "set", "path": ["Workspace", "New"], "node": { "class": "Folder", "name": "New" } }
+            ]
+        }
+    })
+    .to_string();
+
+    let ops = event_to_plugin_ops(Path::new("C:/unused"), &event);
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0]["op"], "delete");
+    assert_eq!(ops[1]["op"], "set");
 }
 
 #[test]
@@ -4368,6 +4396,7 @@ async fn streamed_push_commits_services_atomically_and_rebases_live_sources() {
         force_prune: false,
         project_root: project.path(),
         backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let followup = json!({
         "name": "Config",
@@ -5964,6 +5993,7 @@ fn initial_compare_prunes_expired_abandoned_and_completed_metadata() {
             compare_id: new_choice_id(),
             disk_stats: Stats::default(),
             studio_stats: Stats::default(),
+            disk_prewarm: HashMap::new(),
             next_service: 0,
             comparison: InitialComparison::default(),
             staged_baselines: Vec::new(),
@@ -6817,7 +6847,8 @@ fn final_structure_preparation_does_not_read_or_hash_disk_sources() {
         .unwrap();
     }
     let studio = validate_flat_snapshot(&studio_records, "ReplicatedStorage", false).unwrap();
-    let prepared = prepare_streamed_initial_service_comparison(project.path(), studio).unwrap();
+    let prepared =
+        prepare_streamed_initial_service_comparison(project.path(), studio, None).unwrap();
     assert_eq!(prepared.local_source_paths_by_path.len(), 2_048);
     assert_eq!(prepared.expected_hash_ids.len(), 2_048);
     assert!(prepared
@@ -6858,7 +6889,8 @@ fn streamed_initial_compare_receipts_preserve_exact_duplicate_fragments() {
         record.disk_fragment_is_dir = None;
     }
     let studio = validate_flat_snapshot(&studio_records, "ReplicatedStorage", false).unwrap();
-    let prepared = prepare_streamed_initial_service_comparison(project.path(), studio).unwrap();
+    let prepared =
+        prepare_streamed_initial_service_comparison(project.path(), studio, None).unwrap();
 
     assert!(prepared.identity_complete);
     assert_eq!(prepared.identities.len(), expected.len());
@@ -7128,6 +7160,7 @@ fn streamed_structure_budgets_reject_repeated_wide_names_before_clone() {
         compare_id: "wide-name-session-budget".into(),
         disk_stats: Stats::default(),
         studio_stats: Stats::default(),
+        disk_prewarm: HashMap::new(),
         next_service: 0,
         comparison: InitialComparison::default(),
         staged_baselines: Vec::new(),
@@ -7457,9 +7490,10 @@ fn initial_snapshot_compare_requires_reserved_leaf_filename_migration() {
 
     let error = initial_snapshot_comparison(d.path(), &studio).unwrap_err();
 
-    assert!(error.contains("reserved init-marker filename grammar"));
-    assert!(error.contains("ReplicatedStorage/Misc/init (Notifications).luau"));
-    assert!(error.contains("ReplicatedStorage/Misc/%69nit (Notifications).luau"));
+    let portable_error = error.replace('\\', "/");
+    assert!(portable_error.contains("reserved init-marker filename grammar"));
+    assert!(portable_error.contains("ReplicatedStorage/Misc/init (Notifications).luau"));
+    assert!(portable_error.contains("ReplicatedStorage/Misc/%69nit (Notifications).luau"));
 }
 
 #[test]
@@ -8373,6 +8407,7 @@ async fn initial_choice_releases_the_matching_completed_compare_response() {
         compare_id: new_choice_id(),
         disk_stats: Stats::default(),
         studio_stats: Stats::default(),
+        disk_prewarm: HashMap::new(),
         next_service: snapshot::SYNCED_SERVICES.len(),
         comparison: InitialComparison::default(),
         staged_baselines: Vec::new(),

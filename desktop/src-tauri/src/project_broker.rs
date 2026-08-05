@@ -278,12 +278,17 @@ fn handle_connection(stream: &mut TcpStream, shared: &BrokerShared) -> Result<()
     }
 }
 
+// Must match PLUGIN_PROTOCOL_VERSION in daemon/src/ws.rs and plugin/Plugin.luau.
+// The plugin refuses a broker's projectInit offer on any mismatch, which
+// silently disables Connect → Create Project.
+const PLUGIN_PROTOCOL_VERSION: u64 = 6;
+
 fn broker_hello(shared: &BrokerShared) -> Value {
     let (projects_root, projects_root_error) = configured_projects_root(shared);
     json!({
         "ok": true,
         "name": "Ro Sync Desktop",
-        "pluginProtocol": 6,
+        "pluginProtocol": PLUGIN_PROTOCOL_VERSION,
         "pluginCapability": shared.capability,
         "projectInit": {
             "available": projects_root.is_some(),
@@ -438,7 +443,7 @@ fn initialize_project(
     let projects_root =
         storage::open_authorized_directory(&shared.paths.authorized_roots_file, &projects_root)?;
     let (project, reused) =
-        find_or_create_project(&projects_root, &directory_display_name, &game_id)?;
+        find_or_create_project(&projects_root, &directory_display_name, &game_id, &place_id)?;
     let project_path = project.path().to_path_buf();
     let project_name = project_path.file_name().map(OsStr::to_os_string);
     let effective_name = write_project_config(
@@ -573,14 +578,41 @@ fn sanitize_request_id(raw: &str, game_id: &str, place_id: &str) -> String {
     }
 }
 
+/// `Experience - Place`, mirroring the daemon's `preferred_project_name`.
+///
+/// A place name alone is ambiguous across experiences and an experience name
+/// alone collides across sibling places, so a project folder carries both
+/// whenever Studio knows two distinct usable names.
 fn preferred_name(game_name: &str, place_name: &str, game_id: &str) -> String {
-    for candidate in [game_name, place_name] {
-        let candidate = sanitize_folder_name(candidate);
-        if !candidate.is_empty() && !candidate.eq_ignore_ascii_case("game") {
-            return candidate;
+    let game = sanitize_folder_name(game_name);
+    let place = sanitize_folder_name(place_name);
+    // Same asymmetry as the daemon: the experience side must be a real title,
+    // the place side merely has to be named ("Raft - Game" is useful, and
+    // "Raft - Place1" is not).
+    if !is_placeholder_project_name(&game)
+        && !is_unnamed_placeholder(&place)
+        && !game.eq_ignore_ascii_case(&place)
+    {
+        return sanitize_folder_name(&format!("{game} - {place}"));
+    }
+    for candidate in [&place, &game] {
+        if !is_placeholder_project_name(candidate) {
+            return candidate.clone();
         }
     }
     format!("Roblox {game_id}")
+}
+
+/// Blank, or a Studio stand-in for a place that was never titled. Narrower than
+/// [`is_placeholder_project_name`], which also rejects "Game".
+fn is_unnamed_placeholder(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "untitled experience" {
+        return true;
+    }
+    normalized.strip_prefix("place").is_some_and(|suffix| {
+        suffix.is_empty() || suffix.chars().all(|value| value.is_ascii_digit())
+    })
 }
 
 fn is_placeholder_project_name(value: &str) -> bool {
@@ -627,8 +659,16 @@ fn find_or_create_project(
     projects_root: &storage::PhysicalDirectoryCapability,
     display_name: &str,
     game_id: &str,
+    place_id: &str,
 ) -> Result<(storage::PhysicalDirectoryCapability, bool), String> {
+    // One project per place, mirroring the daemon's project_init rules: a
+    // same-game directory claiming other places must not be reused — routing
+    // a second place into it merges the places, and the place-aware plugin
+    // then refuses the daemon and spins on "waiting for the matching daemon".
+    // Exact placeIds hit wins; a same-game directory with no recorded places
+    // (pre-placeId project) is adoptable; anything else forks a new project.
     let mut existing_names = HashSet::new();
+    let mut game_level: Option<storage::PhysicalDirectoryCapability> = None;
     for name in projects_root.entry_names(MAX_PROJECT_ROOT_ENTRIES)? {
         if let Some(name) = name.to_str() {
             existing_names.insert(name.to_ascii_lowercase());
@@ -636,9 +676,21 @@ fn find_or_create_project(
         let Some(project) = projects_root.optional_child_directory(&name)? else {
             continue;
         };
-        if config_game_id(&project).as_deref() == Some(game_id) {
+        let Some((cfg_game_id, cfg_place_ids)) = config_identity(&project) else {
+            continue;
+        };
+        if cfg_game_id.as_deref() != Some(game_id) {
+            continue;
+        }
+        if cfg_place_ids.iter().any(|id| id == place_id) {
             return Ok((project, true));
         }
+        if cfg_place_ids.is_empty() && game_level.is_none() {
+            game_level = Some(project);
+        }
+    }
+    if let Some(project) = game_level {
+        return Ok((project, true));
     }
 
     let base = if display_name.is_empty() {
@@ -650,7 +702,8 @@ fn find_or_create_project(
         let name = match attempt {
             0 => base.clone(),
             1 => format!("{base}-{game_id}"),
-            _ => format!("{base}-{game_id}-{attempt}"),
+            2 => format!("{base}-{game_id}-{place_id}"),
+            _ => format!("{base}-{game_id}-{place_id}-{attempt}"),
         };
         if existing_names.contains(&name.to_ascii_lowercase()) {
             continue;
@@ -664,15 +717,28 @@ fn find_or_create_project(
     Err("could not allocate a unique project folder name".into())
 }
 
-fn config_game_id(project: &storage::PhysicalDirectoryCapability) -> Option<String> {
+fn config_identity(
+    project: &storage::PhysicalDirectoryCapability,
+) -> Option<(Option<String>, Vec<String>)> {
     let text = project
         .read_optional_utf8(OsStr::new("ro-sync.json"), MAX_CONFIG_BYTES)
         .ok()??;
     let value: Value = serde_json::from_str(&text).ok()?;
-    value
+    let game_id = value
         .get("gameId")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(str::to_string);
+    let place_ids = value
+        .get("placeIds")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((game_id, place_ids))
 }
 
 struct ProjectConfigWrite<'a> {
@@ -835,7 +901,7 @@ mod tests {
         let shared = test_shared(data.path());
 
         let unavailable = broker_hello(&shared);
-        assert_eq!(unavailable["pluginProtocol"], 6);
+        assert_eq!(unavailable["pluginProtocol"], PLUGIN_PROTOCOL_VERSION);
         assert_eq!(unavailable["projectInit"]["available"], false);
         assert!(unavailable["projectInit"]["error"].is_string());
 
@@ -963,10 +1029,20 @@ mod tests {
     }
 
     #[test]
+    fn folder_names_carry_the_experience_and_the_place() {
+        assert_eq!(preferred_name("Raft", "Game", "123"), "Raft - Game");
+        assert_eq!(preferred_name("Raft", "Raft", "123"), "Raft");
+        assert_eq!(preferred_name("Raft", "Place1", "123"), "Raft");
+        assert_eq!(preferred_name("Place1", "Lobby", "123"), "Lobby");
+        assert_eq!(preferred_name("", "", "123"), "Roblox 123");
+    }
+
+    #[test]
     fn project_creation_is_idempotent_by_game_id() {
         let directory = tempfile::tempdir().unwrap();
         let projects = test_directory_capability(directory.path());
-        let (first, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        let (first, reused) =
+            find_or_create_project(&projects, "Race Stars", "123", "456").unwrap();
         assert!(!reused);
         write_project_config(
             &first,
@@ -981,7 +1057,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (second, reused) = find_or_create_project(&projects, "Renamed", "123").unwrap();
+        let (second, reused) = find_or_create_project(&projects, "Renamed", "123", "456").unwrap();
         assert!(reused);
         assert_eq!(first.path(), second.path());
     }
@@ -1051,7 +1127,8 @@ mod tests {
 
         fs::rename(&projects_path, &moved_projects).unwrap();
         symlink(&outside, &projects_path).unwrap();
-        let (project, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        let (project, reused) =
+            find_or_create_project(&projects, "Race Stars", "123", "456").unwrap();
         assert!(!reused);
 
         let original_project_path = moved_projects.join("Race Stars");
@@ -1087,7 +1164,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("Race Stars")).unwrap();
         let projects = test_directory_capability(directory.path());
-        let (created, reused) = find_or_create_project(&projects, "Race Stars", "123").unwrap();
+        let (created, reused) =
+            find_or_create_project(&projects, "Race Stars", "123", "456").unwrap();
         assert!(!reused);
         assert_eq!(created.path().file_name().unwrap(), "Race Stars-123");
     }
