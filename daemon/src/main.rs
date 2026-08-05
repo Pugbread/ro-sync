@@ -397,7 +397,10 @@ fn discover_project_daemon_port_in_range(
     // parallel bounds the sweep by one timeout instead of fourteen. Results
     // are still consumed in the original order below, so which daemon wins is
     // unchanged on every platform.
-    let scanned: Vec<u16> = ports.clone().filter(|port| *port != requested_port).collect();
+    let scanned: Vec<u16> = ports
+        .clone()
+        .filter(|port| *port != requested_port)
+        .collect();
     let mut hellos: std::collections::HashMap<u16, serde_json::Value> =
         std::collections::HashMap::new();
     std::thread::scope(|scope| {
