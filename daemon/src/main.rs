@@ -1023,26 +1023,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("serve: bind {requested_addr}: {error}"))?;
     let listen_port = listener.local_addr()?.port();
 
-    // Documentation/config merges are best-effort conveniences; keep them off
-    // the readiness path so the daemon can begin accepting Studio immediately.
-    {
-        let docs_project = canonical_project.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = snapshot::write_ro_sync_md_if_missing(&docs_project) {
-                eprintln!("rosync: failed to write ro-sync.md: {e}");
-            }
-            if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&docs_project) {
-                eprintln!("rosync: failed to write CLAUDE.md: {e}");
-            }
-            if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&docs_project) {
-                eprintln!("rosync: failed to write Codex context: {e}");
-            }
-            if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&docs_project) {
-                eprintln!("rosync: failed to write project tooling files: {e}");
-            }
-        });
-    }
-
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
     let mut cfg = project_config::load_or_create(&canonical_project).map_err(|error| {
         format!(
@@ -1073,6 +1053,30 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let watcher = Watch::new(canonical_project.clone())?;
     let canonical_project = watcher.root().to_path_buf();
+
+    // Documentation/config merges are best-effort conveniences; keep them off
+    // the readiness path so the daemon can begin accepting Studio immediately.
+    // Start them only after the watcher's initial projection is stable. Running
+    // these root writes in parallel with that scan makes Windows directory
+    // generation checks correctly reject the self-created race.
+    {
+        let docs_project = canonical_project.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = snapshot::write_ro_sync_md_if_missing(&docs_project) {
+                eprintln!("rosync: failed to write ro-sync.md: {e}");
+            }
+            if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write CLAUDE.md: {e}");
+            }
+            if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write Codex context: {e}");
+            }
+            if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write project tooling files: {e}");
+            }
+        });
+    }
+
     let conflict_engine = Arc::new(ConflictEngine::new());
     let push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let (request_tx, _) = broadcast::channel::<RequestEnvelope>(256);
