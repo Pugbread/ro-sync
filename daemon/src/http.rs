@@ -1336,10 +1336,10 @@ struct InitialCompareAccumulator {
 #[derive(Clone)]
 struct StudioTransferGrant {
     service_generations: Vec<crate::fs_safety::TreeGeneration>,
-    /// Generated comparison paths that may be overwritten by the bounded
-    /// initial Studio delta endpoint. An empty set means the grant is valid
-    /// only for the existing full streamed push.
-    delta_source_paths: std::collections::HashSet<String>,
+    /// Exact comparison rows authorized by Keep Studio. The bounded delta
+    /// endpoint validates every structural/source operation against this map;
+    /// an empty map leaves the existing full streamed push as the fallback.
+    delta_items: HashMap<String, InitialChoiceItem>,
     created_at: Instant,
 }
 
@@ -3438,15 +3438,9 @@ async fn initial_decision(
                     ),
                     StudioTransferGrant {
                         service_generations,
-                        delta_source_paths: details
+                        delta_items: details
                             .into_iter()
-                            .filter(|item| {
-                                item.action == InitialChoiceAction::Overwrite
-                                    && item.kind == "script"
-                                    && !item.class_changed
-                                    && item.source_changed
-                            })
-                            .map(|item| item.path)
+                            .map(|item| (item.path.clone(), item))
                             .collect(),
                         created_at: Instant::now(),
                     },
@@ -5786,7 +5780,7 @@ struct StreamCommitInput {
     state: AppState,
     service: String,
     service_node: Value,
-    source_dir: tempfile::TempDir,
+    source_bytes: HashMap<u64, Vec<u8>>,
     initial_fingerprint: ExactTreeFingerprint,
     strict: bool,
     force_prune: bool,
@@ -5804,7 +5798,7 @@ struct PushServiceStream {
     script_ids: Vec<u64>,
     next_script: usize,
     receiving_source: Option<ReceivingSource>,
-    source_dir: Option<tempfile::TempDir>,
+    source_bytes: HashMap<u64, Vec<u8>>,
     initial_fingerprint: Option<ExactTreeFingerprint>,
     fence_result: Option<std::sync::mpsc::Receiver<Result<ExactTreeFingerprint, String>>>,
     commit_result: Option<std::sync::mpsc::Receiver<Result<StreamCommitResult, String>>>,

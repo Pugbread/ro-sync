@@ -278,25 +278,39 @@ impl ConflictEngine {
         roots: &[PathBuf],
         entries: impl IntoIterator<Item = (PathBuf, Hash, u64)>,
     ) {
-        let roots = roots
+        let rooted = roots
             .iter()
-            .map(|root| stable_path(root))
+            .map(|root| (root, stable_path(root)))
             .collect::<Vec<_>>();
         let mut baselines = self.baselines.lock().unwrap();
         let mut conflicts = self.conflicts.lock().unwrap();
         baselines.retain(|candidate, _| {
-            !roots
+            !rooted
                 .iter()
-                .any(|root| candidate == root || candidate.starts_with(root))
+                .any(|(_, root)| candidate == root || candidate.starts_with(root))
         });
         conflicts.retain(|candidate, _| {
-            !roots
+            !rooted
                 .iter()
-                .any(|root| candidate == root || candidate.starts_with(root))
+                .any(|(_, root)| candidate == root || candidate.starts_with(root))
         });
         for (path, content_hash, fs_mtime) in entries {
+            // Every generation entry was captured below one of these already
+            // stabilized service roots. Translate its relative suffix instead
+            // of re-canonicalizing and re-validating the full ancestor chain
+            // once per file (the dominant Windows cold-bootstrap cost).
+            let key = rooted
+                .iter()
+                .find_map(|(input_root, stable_root)| {
+                    let relative = path.strip_prefix(input_root).ok()?;
+                    relative
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+                        .then(|| stable_root.join(relative))
+                })
+                .unwrap_or_else(|| stable_path(&path));
             baselines.insert(
-                stable_path(&path),
+                key,
                 Baseline {
                     fs_mtime,
                     last_plugin_push_hash: content_hash,

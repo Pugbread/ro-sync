@@ -10916,10 +10916,10 @@ runInitialCompare = function()
 	if scanBecameDirty("Studio changed during snapshot comparison") then
 		return
 	end
-	-- Delta fast path support: when the divergence is only changed script
-	-- sources (nothing created or removed), "Keep Studio" doesn't need a full
-	-- place push — the changed scripts replay through the live op channel
-	-- after connect. A 7-file drift used to cost a multi-minute re-push.
+	-- Delta fast path support: a bounded initial divergence should apply like
+	-- Argon's reconcile path, not re-export every watched service. The daemon
+	-- authorizes the exact comparison rows with the human's choiceId, so
+	-- changed Sources plus Studio/disk-only structural paths can use /push ops.
 	local function prefetchStudioDeltaItems(choiceId, comparison)
 		local summary = if type(comparison) == "table" then comparison.summary else nil
 		local newFiles, changedFiles, removedFiles
@@ -10934,7 +10934,8 @@ runInitialCompare = function()
 		else
 			return nil
 		end
-		if newFiles ~= 0 or removedFiles ~= 0 or changedFiles < 1 or changedFiles > 200 then
+		local totalFiles = newFiles + changedFiles + removedFiles
+		if totalFiles < 1 or totalFiles > 200 then
 			return nil
 		end
 		local items = {}
@@ -10967,7 +10968,7 @@ runInitialCompare = function()
 			end
 			cursor = decoded.nextCursor
 		end
-		if #items ~= changedFiles then
+		if #items ~= totalFiles then
 			return nil
 		end
 		return items
@@ -10979,31 +10980,90 @@ runInitialCompare = function()
 		end
 		local resolved = {}
 		local ops = {}
-		for _, item in ipairs(items) do
+		-- Seed daemon-authored identities before building operations. Existing
+		-- duplicate siblings retain the physical files that were compared, while
+		-- Studio-only paths allocate around those exact reservations.
+		for _, serviceName in ipairs(WATCHED_SERVICES) do
 			if
-				type(item) ~= "table"
-				or tostring(item.action) ~= "overwrite"
-				or item.classChanged == true
-				or item.sourceChanged ~= true
-				or type(item.path) ~= "string"
+				not comparedDiskIdentities
+				or not comparedDiskIdentityServices
+				or comparedDiskIdentityServices[serviceName] ~= true
 			then
 				return false
 			end
-			local inst = resolvePath(string.split(item.path, "/"))
-			if not inst or not inst:IsA("LuaSourceContainer") then
+			local serviceOk, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if serviceOk and service then
+				local seeded = pcall(function()
+					snapshotApplyState.seedDiskPathsForService(service, comparedDiskIdentities)
+				end)
+				if not seeded then
+					return false
+				end
+			end
+		end
+		for _, item in ipairs(items) do
+			if type(item) ~= "table" or type(item.path) ~= "string" then
 				return false
 			end
-			resolved[#resolved + 1] = inst
-			local source, sourceErr = tryReadScriptSource(inst)
-			if source == nil then
-				log("delta fast path could not read " .. tostring(item.path) .. ": " .. tostring(sourceErr))
+			local action = tostring(item.action)
+			local path = string.split(item.path, "/")
+			if action == "create" then
+				-- Comparison "create" means disk-only from the Disk → Studio
+				-- direction. Keeping Studio removes it from disk.
+				ops[#ops + 1] = { op = "delete", path = path }
+			elseif action == "overwrite" or action == "remove" then
+				local inst = resolvePath(path)
+				if not inst then
+					return false
+				end
+				resolved[#resolved + 1] = inst
+				if
+					action == "overwrite"
+					and item.classChanged ~= true
+					and item.sourceChanged == true
+					and inst:IsA("LuaSourceContainer")
+				then
+					local source, sourceErr = tryReadScriptSource(inst)
+					if source == nil then
+						log("delta fast path could not read " .. tostring(item.path) .. ": " .. tostring(sourceErr))
+						return false
+					end
+					local op = { op = "update", path = path, properties = { Source = source } }
+					local diskPath = snapshotApplyState.sourceDiskPathForInstance(inst)
+					if diskPath then
+						op.diskPath = diskPath
+					end
+					ops[#ops + 1] = op
+				elseif action == "remove" then
+					local node, serializeErr = serializeInstance(inst, function()
+						return scanGuard ~= nil and not scanGuard.cancelled
+					end)
+					if not node then
+						log(
+							"delta fast path could not serialize "
+								.. tostring(item.path)
+								.. ": "
+								.. tostring(serializeErr)
+						)
+						return false
+					end
+					local parent = inst.Parent
+					if not parent then
+						return false
+					end
+					local op = { op = "set", path = pathFromRoot(parent), node = node }
+					scaleState.decorateSetIdentity(inst, node, op)
+					ops[#ops + 1] = op
+				else
+					-- Class/shape transitions need exact from/to physical identities;
+					-- keep the transactional stream fallback until details carry both.
+					return false
+				end
+			else
 				return false
 			end
-			ops[#ops + 1] = {
-				op = "update",
-				path = string.split(item.path, "/"),
-				properties = { Source = source },
-			}
 		end
 		local ok, deltaResp = httpJson("/push", "POST", {
 			ops = ops,
@@ -11043,11 +11103,11 @@ runInitialCompare = function()
 		end
 		log(
 			string.format(
-				"decision studio → delta fast path: wrote %d changed script(s) instead of a full push",
-				#resolved
+				"decision studio → delta fast path: applied %d divergent path(s) instead of a full push",
+				#ops
 			)
 		)
-		setPill("connecting", string.format("Synced %d changed script(s). Starting live sync…", #resolved))
+		setPill("connecting", string.format("Synced %d changed path(s). Starting live sync…", #ops))
 		return true
 	end
 

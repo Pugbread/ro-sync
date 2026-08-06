@@ -66,6 +66,7 @@ fn harness<'a>(
         force_prune: false,
         project_root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
 }
@@ -83,6 +84,7 @@ fn force_harness<'a>(
         force_prune: false,
         project_root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
 }
@@ -100,6 +102,7 @@ fn strict_force_harness<'a>(
         force_prune: true,
         project_root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
 }
@@ -250,7 +253,7 @@ fn authorize_studio_push_test(state: &AppState, choice_id: &str) {
             ),
             StudioTransferGrant {
                 service_generations,
-                delta_source_paths: HashSet::new(),
+                delta_items: HashMap::new(),
                 created_at: Instant::now(),
             },
         );
@@ -270,7 +273,49 @@ fn authorize_studio_delta_test(state: &AppState, choice_id: &str, paths: &[&str]
             ),
             StudioTransferGrant {
                 service_generations,
-                delta_source_paths: paths.iter().map(|path| (*path).to_string()).collect(),
+                delta_items: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(id, path)| {
+                        (
+                            (*path).to_string(),
+                            InitialChoiceItem {
+                                id: id as u32,
+                                action: InitialChoiceAction::Overwrite,
+                                path: (*path).to_string(),
+                                kind: "script".into(),
+                                class: None,
+                                local_class: Some("ModuleScript".into()),
+                                studio_class: Some("ModuleScript".into()),
+                                class_changed: false,
+                                source_changed: true,
+                            },
+                        )
+                    })
+                    .collect(),
+                created_at: Instant::now(),
+            },
+        );
+}
+
+fn authorize_studio_items_test(state: &AppState, choice_id: &str, items: Vec<InitialChoiceItem>) {
+    let service_generations =
+        capture_initial_service_generations(state.canonical_project.as_path()).unwrap();
+    STUDIO_TRANSFER_GRANTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            (
+                state.canonical_project.as_ref().clone(),
+                choice_id.to_string(),
+            ),
+            StudioTransferGrant {
+                service_generations,
+                delta_items: items
+                    .into_iter()
+                    .map(|item| (item.path.clone(), item))
+                    .collect(),
                 created_at: Instant::now(),
             },
         );
@@ -4356,6 +4401,72 @@ fn initial_studio_delta_force_applies_exact_compared_sources() {
 }
 
 #[test]
+fn initial_studio_delta_applies_structural_create_and_remove_rows() {
+    let project = TempDir::new("initial-studio-structural-delta");
+    let workspace = project.path().join("Workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let disk_only = workspace.join("DiskOnly.luau");
+    std::fs::write(&disk_only, "return 'disk only'\n").unwrap();
+    let state = test_state(&project, None);
+    authorize_studio_items_test(
+        &state,
+        "delta-structure",
+        vec![
+            InitialChoiceItem {
+                id: 0,
+                action: InitialChoiceAction::Create,
+                path: "Workspace/DiskOnly".into(),
+                kind: "script".into(),
+                class: Some("ModuleScript".into()),
+                local_class: None,
+                studio_class: None,
+                class_changed: false,
+                source_changed: false,
+            },
+            InitialChoiceItem {
+                id: 1,
+                action: InitialChoiceAction::Remove,
+                path: "Workspace/StudioOnly".into(),
+                kind: "script".into(),
+                class: Some("ModuleScript".into()),
+                local_class: None,
+                studio_class: None,
+                class_changed: false,
+                source_changed: false,
+            },
+        ],
+    );
+
+    let response = push_blocking(
+        &state,
+        studio_delta_body(
+            "delta-structure",
+            vec![
+                json!({ "op": "delete", "path": ["Workspace", "DiskOnly"] }),
+                json!({
+                    "op": "set",
+                    "path": ["Workspace"],
+                    "node": {
+                        "name": "StudioOnly",
+                        "class": "ModuleScript",
+                        "properties": { "Source": "return 'studio only'\n" },
+                        "children": [],
+                    },
+                }),
+            ],
+        ),
+    )
+    .0;
+
+    assert_eq!(response["ok"], true, "{response}");
+    assert!(!disk_only.exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("StudioOnly.luau")).unwrap(),
+        "return 'studio only'\n"
+    );
+}
+
+#[test]
 fn initial_studio_delta_rejects_missing_or_extra_comparison_paths() {
     let project = TempDir::new("initial-studio-delta-scope");
     let workspace = project.path().join("Workspace");
@@ -4558,6 +4669,7 @@ async fn streamed_push_commits_services_atomically_and_rebases_live_sources() {
         force_prune: false,
         project_root: project.path(),
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let followup = json!({
@@ -4576,6 +4688,136 @@ async fn streamed_push_commits_services_atomically_and_rebases_live_sources() {
     );
 }
 
+#[tokio::test]
+#[ignore = "manual cold-bootstrap performance benchmark"]
+async fn benchmark_cold_bootstrap_2400_scripts() {
+    const SCRIPT_COUNT: usize = 2_400;
+    const SOURCE_BYTES: usize = 2_048;
+    const SOURCE_CHUNK: usize = 200;
+    let project = TempDir::new("cold-bootstrap-2400");
+    let state = test_state(&project, None);
+    let stream_id = "cold-bootstrap-2400";
+    authorize_studio_push_test(&state, stream_id);
+    let source = format!("--{}", "x".repeat(SOURCE_BYTES - 2));
+    let source_sha = hash(source.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let started = Instant::now();
+    let mut response = Value::Null;
+
+    for (service_index, service) in snapshot::SYNCED_SERVICES.iter().copied().enumerate() {
+        let mut records = vec![snapshot::FlatSnapshotRecord {
+            id: 0,
+            parent_id: None,
+            child_index: 0,
+            child_count: if service_index == 0 {
+                SCRIPT_COUNT as u32
+            } else {
+                0
+            },
+            has_children: service_index == 0,
+            name: service.to_string(),
+            class: service.to_string(),
+            avoid_sync: false,
+            avoid_sync_carrier: false,
+            disk_fragment: None,
+            disk_fragment_is_dir: None,
+            source_included: None,
+        }];
+        if service_index == 0 {
+            records.extend((0..SCRIPT_COUNT).map(|index| snapshot::FlatSnapshotRecord {
+                id: (index + 1) as u64,
+                parent_id: Some(0),
+                child_index: index as u32,
+                child_count: 0,
+                has_children: false,
+                name: format!("Script{index:04}"),
+                class: "ModuleScript".into(),
+                avoid_sync: false,
+                avoid_sync_carrier: false,
+                disk_fragment: None,
+                disk_fragment_is_dir: None,
+                source_included: None,
+            }));
+        }
+        for (chunk_index, chunk) in records.chunks(STREAM_STRUCTURE_CHUNK_NODES).enumerate() {
+            response = push(
+                State(state.clone()),
+                Json(streamed_push_test_body(
+                    stream_id,
+                    service,
+                    "structure",
+                    chunk_index as u64,
+                    (chunk_index + 1) * STREAM_STRUCTURE_CHUNK_NODES >= records.len(),
+                    chunk.to_vec(),
+                    Vec::new(),
+                )),
+            )
+            .await
+            .0;
+        }
+        response = advance_streamed_push_worker(&state, stream_id, service, response).await;
+        assert_eq!(response["phase"], "sources", "{response}");
+
+        if service_index == 0 {
+            for start in (0..SCRIPT_COUNT).step_by(SOURCE_CHUNK) {
+                let end = (start + SOURCE_CHUNK).min(SCRIPT_COUNT);
+                let parts = (start..end)
+                    .map(|index| StreamSourcePart {
+                        id: (index + 1) as u64,
+                        part_index: 0,
+                        offset: 0,
+                        total_bytes: source.len() as u64,
+                        data: source.clone(),
+                        final_part: true,
+                        sha256: source_sha.clone(),
+                    })
+                    .collect();
+                response = push(
+                    State(state.clone()),
+                    Json(streamed_push_test_body(
+                        stream_id,
+                        service,
+                        "sources",
+                        (start / SOURCE_CHUNK) as u64,
+                        end == SCRIPT_COUNT,
+                        Vec::new(),
+                        parts,
+                    )),
+                )
+                .await
+                .0;
+            }
+        } else {
+            response = push(
+                State(state.clone()),
+                Json(streamed_push_test_body(
+                    stream_id,
+                    service,
+                    "sources",
+                    0,
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+            )
+            .await
+            .0;
+        }
+        response = advance_streamed_push_worker(&state, stream_id, service, response).await;
+    }
+
+    assert_eq!(response["action"], "complete", "{response}");
+    assert_eq!(
+        std::fs::read_dir(project.path().join("ReplicatedStorage"))
+            .unwrap()
+            .count(),
+        SCRIPT_COUNT
+    );
+    eprintln!("cold bootstrap 2400 scripts: {:.3?}", started.elapsed());
+}
+
 #[test]
 fn streamed_commit_rechecks_the_tree_after_the_live_service_is_moved() {
     let project = TempDir::new("streamed-push-post-rename-fence");
@@ -4586,8 +4828,7 @@ fn streamed_commit_rechecks_the_tree_after_the_live_service_is_moved() {
     let initial_fingerprint =
         capture_exact_tree_fingerprint(state.canonical_project.as_path(), "ReplicatedStorage")
             .unwrap();
-    let source_dir = tempfile::tempdir().unwrap();
-    std::fs::write(source_dir.path().join("1.source"), "return 'studio'\n").unwrap();
+    let source_bytes = HashMap::from([(1, b"return 'studio'\n".to_vec())]);
     let service = json!({
         "name": "ReplicatedStorage",
         "class": "ReplicatedStorage",
@@ -4616,7 +4857,7 @@ fn streamed_commit_rechecks_the_tree_after_the_live_service_is_moved() {
         state,
         service: "ReplicatedStorage".into(),
         service_node: service,
-        source_dir,
+        source_bytes,
         initial_fingerprint,
         strict: true,
         force_prune: true,
@@ -4648,8 +4889,7 @@ fn streamed_commit_rolls_back_every_post_backup_failure_seam() {
         let initial_fingerprint =
             capture_exact_tree_fingerprint(state.canonical_project.as_path(), "ReplicatedStorage")
                 .unwrap();
-        let source_dir = tempfile::tempdir().unwrap();
-        std::fs::write(source_dir.path().join("1.source"), "return 'studio'\n").unwrap();
+        let source_bytes = HashMap::from([(1, b"return 'studio'\n".to_vec())]);
         let service = json!({
             "name": "ReplicatedStorage",
             "class": "ReplicatedStorage",
@@ -4674,7 +4914,7 @@ fn streamed_commit_rolls_back_every_post_backup_failure_seam() {
             state,
             service: "ReplicatedStorage".into(),
             service_node: service,
-            source_dir,
+            source_bytes,
             initial_fingerprint,
             strict: true,
             force_prune: true,
@@ -4711,8 +4951,7 @@ fn streamed_commit_cleans_empty_transaction_when_pre_rename_fails() {
     let initial_fingerprint =
         capture_exact_tree_fingerprint(state.canonical_project.as_path(), "ReplicatedStorage")
             .unwrap();
-    let source_dir = tempfile::tempdir().unwrap();
-    std::fs::write(source_dir.path().join("1.source"), "return 'studio'\n").unwrap();
+    let source_bytes = HashMap::from([(1, b"return 'studio'\n".to_vec())]);
     let control = Arc::new(Mutex::new(StreamCommitControl {
         test_hook: Some(Arc::new(|point, _, _, _| {
             if point == StreamCommitHookPoint::BeforeBackupRename {
@@ -4736,7 +4975,7 @@ fn streamed_commit_cleans_empty_transaction_when_pre_rename_fails() {
                 "children": [],
             }],
         }),
-        source_dir,
+        source_bytes,
         initial_fingerprint,
         strict: true,
         force_prune: true,
@@ -4767,8 +5006,7 @@ fn streamed_commit_surfaces_orphan_cleanup_warning_after_successful_rollback() {
     let initial_fingerprint =
         capture_exact_tree_fingerprint(state.canonical_project.as_path(), "ReplicatedStorage")
             .unwrap();
-    let source_dir = tempfile::tempdir().unwrap();
-    std::fs::write(source_dir.path().join("1.source"), "return 'studio'\n").unwrap();
+    let source_bytes = HashMap::from([(1, b"return 'studio'\n".to_vec())]);
     let control = Arc::new(Mutex::new(StreamCommitControl {
         test_hook: Some(Arc::new(|point, backup_service, _, _| {
             if point == StreamCommitHookPoint::AfterBackupRename {
@@ -4801,7 +5039,7 @@ fn streamed_commit_surfaces_orphan_cleanup_warning_after_successful_rollback() {
                 "children": [],
             }],
         }),
-        source_dir,
+        source_bytes,
         initial_fingerprint,
         strict: true,
         force_prune: true,
@@ -4842,8 +5080,7 @@ fn streamed_commit_retains_and_audits_backup_when_rollback_is_refused() {
     let initial_fingerprint =
         capture_exact_tree_fingerprint(state.canonical_project.as_path(), "ReplicatedStorage")
             .unwrap();
-    let source_dir = tempfile::tempdir().unwrap();
-    std::fs::write(source_dir.path().join("1.source"), "return 'studio'\n").unwrap();
+    let source_bytes = HashMap::from([(1, b"return 'studio'\n".to_vec())]);
     let service = json!({
         "name": "ReplicatedStorage",
         "class": "ReplicatedStorage",
@@ -4873,7 +5110,7 @@ fn streamed_commit_retains_and_audits_backup_when_rollback_is_refused() {
         state,
         service: "ReplicatedStorage".into(),
         service_node: service,
-        source_dir,
+        source_bytes,
         initial_fingerprint,
         strict: true,
         force_prune: true,
@@ -5252,9 +5489,6 @@ fn streamed_source_totals_charge_once_and_failed_chunks_do_not_charge() {
 
     let mut service = new_push_service_stream("ReplicatedStorage");
     service.script_ids = vec![1];
-    let source_dir = tempfile::tempdir().unwrap();
-    let source_path = source_dir.path().join("1.source");
-    service.source_dir = Some(source_dir);
     let mut session_bytes = 0;
     append_source_parts_atomically(
         &mut service,
@@ -5274,13 +5508,10 @@ fn streamed_source_totals_charge_once_and_failed_chunks_do_not_charge() {
     .unwrap();
     assert_eq!(service.accepted_source_bytes, 6);
     assert_eq!(session_bytes, 6);
-    assert_eq!(std::fs::read_to_string(source_path).unwrap(), "abcdef");
+    assert_eq!(service.source_bytes.get(&1).unwrap(), b"abcdef");
 
     let mut retry_service = new_push_service_stream("ReplicatedStorage");
     retry_service.script_ids = vec![1];
-    let retry_dir = tempfile::tempdir().unwrap();
-    let retry_path = retry_dir.path().join("1.source");
-    retry_service.source_dir = Some(retry_dir);
     let mut retry_session_bytes = 0;
     let mut stale = second;
     stale.part_index = 2;
@@ -5295,7 +5526,7 @@ fn streamed_source_totals_charge_once_and_failed_chunks_do_not_charge() {
     assert_eq!(retry_service.accepted_source_bytes, 0);
     assert_eq!(retry_session_bytes, 0);
     assert!(retry_service.receiving_source.is_none());
-    assert!(!retry_path.exists());
+    assert!(!retry_service.source_bytes.contains_key(&1));
 
     append_source_parts_atomically(
         &mut retry_service,
@@ -5306,7 +5537,7 @@ fn streamed_source_totals_charge_once_and_failed_chunks_do_not_charge() {
     .unwrap();
     assert_eq!(retry_service.accepted_source_bytes, 6);
     assert_eq!(retry_session_bytes, 6);
-    assert_eq!(std::fs::read_to_string(retry_path).unwrap(), "abc");
+    assert_eq!(retry_service.source_bytes.get(&1).unwrap(), b"abc");
 }
 
 #[test]
@@ -5328,9 +5559,6 @@ fn streamed_source_aggregate_limits_reject_before_writes() {
     let mut service = new_push_service_stream("ReplicatedStorage");
     service.script_ids = vec![1];
     service.accepted_source_bytes = MAX_STREAM_SERVICE_SOURCE_BYTES - 1;
-    let source_dir = tempfile::tempdir().unwrap();
-    let source_path = source_dir.path().join("1.source");
-    service.source_dir = Some(source_dir);
     let mut session_bytes = 0;
     let error = append_source_parts_atomically(
         &mut service,
@@ -5345,20 +5573,17 @@ fn streamed_source_aggregate_limits_reject_before_writes() {
         MAX_STREAM_SERVICE_SOURCE_BYTES - 1
     );
     assert_eq!(session_bytes, 0);
-    assert!(!source_path.exists());
+    assert!(!service.source_bytes.contains_key(&1));
 
     let mut service = new_push_service_stream("ReplicatedStorage");
     service.script_ids = vec![1];
-    let source_dir = tempfile::tempdir().unwrap();
-    let source_path = source_dir.path().join("1.source");
-    service.source_dir = Some(source_dir);
     let mut session_bytes = MAX_STREAM_SESSION_SOURCE_BYTES - 1;
     let error = append_source_parts_atomically(&mut service, &mut session_bytes, &[part], false)
         .unwrap_err();
     assert!(error.contains("session Sources exceed"), "{error}");
     assert_eq!(service.accepted_source_bytes, 0);
     assert_eq!(session_bytes, MAX_STREAM_SESSION_SOURCE_BYTES - 1);
-    assert!(!source_path.exists());
+    assert!(!service.source_bytes.contains_key(&1));
 }
 
 #[test]

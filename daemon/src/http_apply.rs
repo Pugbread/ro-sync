@@ -885,15 +885,12 @@ fn retain_stream_commit_backup(
 }
 
 fn prepare_stream_baselines(
-    stage_root: &Path,
     stage_service: &Path,
     live_service: &Path,
+    staged_generation: &crate::fs_safety::TreeGeneration,
 ) -> Result<Vec<PreparedStreamBaseline>, String> {
-    let Some(fence) = capture_synced_subtree(stage_root, stage_service)? else {
-        return Ok(Vec::new());
-    };
     let mut baselines = Vec::new();
-    for entry in &fence.entries {
+    for entry in staged_generation.entries() {
         if entry.kind != crate::fs_safety::SafeEntryKind::File {
             continue;
         }
@@ -909,11 +906,21 @@ fn prepare_stream_baselines(
                 entry.path.display()
             )
         })?;
-        let bytes = read_synced_file(stage_root, &entry.path)?;
+        // `staged_generation` was captured immediately before this pass from
+        // a randomly named, process-owned temporary tree. Re-validating every
+        // ancestor for every file here made cold bootstrap quadratic in path
+        // depth on Windows. The live tree still has its independent transfer
+        // fence and is atomically replaced below.
+        let bytes = std::fs::read(&entry.path)
+            .map_err(|error| format!("read staged baseline {}: {error}", entry.path.display()))?;
         baselines.push(PreparedStreamBaseline {
             path: live_service.join(relative),
             source_hash: hash(&normalize_line_endings(&bytes)),
-            fs_mtime: fs_mtime(&entry.path),
+            fs_mtime: entry
+                .generation
+                .modified_ns
+                .map(|value| u64::try_from(value).unwrap_or(u64::MAX))
+                .unwrap_or(0),
         });
     }
     Ok(baselines)
@@ -924,7 +931,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         state,
         service,
         service_node,
-        source_dir,
+        mut source_bytes,
         initial_fingerprint,
         strict,
         force_prune,
@@ -972,6 +979,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         force_prune,
         project_root: stage.path(),
         backup_forced_removals: false,
+        private_stage: true,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut source_provider = |node: &Value| {
@@ -979,10 +987,10 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
             .get("streamId")
             .and_then(Value::as_u64)
             .ok_or("streamed script is missing its source ID")?;
-        let path = source_dir.path().join(format!("{id}.source"));
-        crate::fs_safety::read_file_no_follow(&path)
+        source_bytes
+            .remove(&id)
             .map(Some)
-            .map_err(|error| format!("read staged Source {}: {error}", path.display()))
+            .ok_or_else(|| format!("streamed Source bytes are missing for ID {id}"))
     };
     let applied = match apply_service_node_with_sources(
         stage.path(),
@@ -996,7 +1004,11 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
 
     let staged_fingerprint = capture_exact_tree_fingerprint(stage.path(), &service)?;
     let live_service = root.join(&service);
-    let prepared_baselines = prepare_stream_baselines(stage.path(), &stage_service, &live_service)?;
+    let prepared_baselines = prepare_stream_baselines(
+        &stage_service,
+        &live_service,
+        &staged_fingerprint.metadata,
+    )?;
     // The staged copy already re-read and content-verified the live service;
     // a metadata generation fence is sufficient here and avoids hashing it a
     // second time immediately before commit.
@@ -1005,7 +1017,6 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
             "disk service {service} changed before atomic commit; no files were replaced"
         ));
     }
-
     let mut commit_control = commit_control.lock().unwrap();
     if commit_control.cancelled {
         return Err("streamed service commit was cancelled before disk replacement".into());
@@ -1253,6 +1264,7 @@ fn commit_streamed_service(input: StreamCommitInput) -> Result<StreamCommitResul
         force_prune,
         project_root: root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     live_ctx.mark_quiet(&live_service);
@@ -1277,7 +1289,7 @@ fn new_push_service_stream(service: &str) -> PushServiceStream {
         script_ids: Vec::new(),
         next_script: 0,
         receiving_source: None,
-        source_dir: None,
+        source_bytes: HashMap::new(),
         initial_fingerprint: None,
         fence_result: None,
         commit_result: None,
@@ -1395,8 +1407,6 @@ fn append_source_parts_atomically(
     parts: &[StreamSourcePart],
     final_chunk: bool,
 ) -> Result<(), String> {
-    use std::io::Write as _;
-
     let encoded =
         serde_json::to_vec(parts).map_err(|error| format!("encode streamed Sources: {error}"))?;
     if encoded.len() > STREAM_SOURCE_CHUNK_BYTES {
@@ -1414,11 +1424,7 @@ fn append_source_parts_atomically(
     let mut receiving = service.receiving_source.clone();
     let mut accepted_service_bytes = service.accepted_source_bytes;
     let mut accepted_session_bytes = *session_source_bytes;
-    let mut writes = Vec::<(PathBuf, Vec<u8>)>::with_capacity(parts.len());
-    let source_dir = service
-        .source_dir
-        .as_ref()
-        .ok_or("source stream has no temporary directory")?;
+    let mut writes = Vec::<(u64, Vec<u8>)>::with_capacity(parts.len());
     for part in parts {
         let bytes = part.data.as_bytes();
         if bytes.len() > STREAM_SOURCE_PART_BYTES {
@@ -1499,10 +1505,7 @@ fn append_source_parts_atomically(
         current.hasher.update(bytes);
         current.offset = new_offset;
         current.next_part += 1;
-        writes.push((
-            source_dir.path().join(format!("{}.source", part.id)),
-            bytes.to_vec(),
-        ));
+        writes.push((part.id, bytes.to_vec()));
         if part.final_part {
             let actual: crate::conflict::Hash = current.hasher.clone().finalize().into();
             if actual != current.sha256 {
@@ -1521,30 +1524,12 @@ fn append_source_parts_atomically(
         ));
     }
 
-    let mut original_lengths = HashMap::<PathBuf, u64>::new();
-    let write_result = (|| -> Result<(), String> {
-        for (path, bytes) in &writes {
-            let original = std::fs::metadata(path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            original_lengths.entry(path.clone()).or_insert(original);
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|error| format!("stage Source {}: {error}", path.display()))?;
-            file.write_all(bytes)
-                .map_err(|error| format!("stage Source {}: {error}", path.display()))?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        for (written_path, original_len) in &original_lengths {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(written_path) {
-                let _ = file.set_len(*original_len);
-            }
-        }
-        return Err(error);
+    // Keep the bounded transfer in memory until the service worker writes the
+    // final staged projection. The old implementation created one temporary
+    // file per script and immediately reread it, doubling file creation and
+    // metadata scans on the hottest Windows cold-connect path.
+    for (id, bytes) in writes {
+        service.source_bytes.entry(id).or_default().extend(bytes);
     }
     service.next_script = next_script;
     service.receiving_source = receiving;
@@ -1663,12 +1648,7 @@ fn process_streamed_push_chunk(
             session.service_stream.records.shrink_to_fit();
             session.service_stream.service_node = Some(validated.service);
             session.service_stream.script_ids = validated.script_ids;
-            session.service_stream.source_dir = Some(
-                tempfile::Builder::new()
-                    .prefix("rosync-push-sources-")
-                    .tempdir()
-                    .map_err(|error| format!("create Source staging directory: {error}"))?,
-            );
+            session.service_stream.source_bytes.clear();
             session.service_stream.fence_result = Some(spawn_exact_fingerprint(
                 state.canonical_project.as_ref().clone(),
                 service.to_string(),
@@ -1749,11 +1729,11 @@ fn process_streamed_push_chunk(
                 .service_node
                 .take()
                 .ok_or("streamed service structure is missing")?;
-            let source_dir = session
+            let source_bytes = std::mem::take(
+                &mut session
                 .service_stream
-                .source_dir
-                .take()
-                .ok_or("streamed Source stage is missing")?;
+                .source_bytes,
+            );
             let initial_fingerprint = session
                 .service_stream
                 .initial_fingerprint
@@ -1764,7 +1744,7 @@ fn process_streamed_push_chunk(
                 state: state.clone(),
                 service: service.to_string(),
                 service_node,
-                source_dir,
+                source_bytes,
                 initial_fingerprint,
                 strict: session.strict,
                 force_prune: session.force_prune,
@@ -1921,6 +1901,7 @@ fn rollback_created_stream_service(
         force_prune: false,
         project_root: root,
         backup_forced_removals: false,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     if !remove_synced_subtree(&live_service, &ctx, Some(&expected))? {
@@ -1987,6 +1968,7 @@ fn rollback_replaced_stream_service(
         force_prune: false,
         project_root: root,
         backup_forced_removals: false,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     }
     .mark_quiet(&live_service);
@@ -2577,6 +2559,7 @@ fn push_blocking(state: &AppState, body: PushBody) -> Json<Value> {
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut res = PushApplyResult::default();
@@ -2590,6 +2573,7 @@ fn push_blocking(state: &AppState, body: PushBody) -> Json<Value> {
             force_prune: body.force_prune,
             project_root: root,
             backup_forced_removals: true,
+            private_stage: false,
             dirty_parents: Mutex::new(std::collections::HashSet::new()),
         };
         for svc in &body.services {
@@ -2637,56 +2621,92 @@ fn initial_studio_delta(state: &AppState, body: PushBody) -> Json<Value> {
             return Json(json!({ "ok": false, "stale": true, "error": error }));
         }
     };
-    if grant.delta_source_paths.is_empty() {
+    if grant.delta_items.is_empty() {
         return Json(json!({
             "ok": false,
             "stale": true,
-            "error": "initial choice is not eligible for a Source-only delta",
+            "error": "initial choice has no bounded delta comparison rows",
         }));
     }
 
     let mut received = std::collections::HashSet::with_capacity(body.ops.len());
     for op in &body.ops {
-        if op.get("op").and_then(Value::as_str) != Some("update") {
-            return Json(json!({
-                "ok": false,
-                "stale": true,
-                "error": "initial Studio delta accepts only Source update operations",
-            }));
-        }
+        let op_kind = op.get("op").and_then(Value::as_str).unwrap_or("");
         let Some(path) = op.get("path").and_then(Value::as_array) else {
-            return Json(json!({ "ok": false, "stale": true, "error": "delta update is missing path" }));
+            return Json(json!({ "ok": false, "stale": true, "error": "delta operation is missing path" }));
         };
-        let mut segments = Vec::with_capacity(path.len());
+        let mut segments = Vec::with_capacity(path.len() + 1);
         for segment in path {
             let Some(segment) = segment.as_str() else {
                 return Json(json!({ "ok": false, "stale": true, "error": "delta path contains a non-string segment" }));
             };
             segments.push(segment);
         }
+        if op_kind == "set" {
+            let Some(name) = op
+                .get("node")
+                .and_then(Value::as_object)
+                .and_then(|node| node.get("name"))
+                .and_then(Value::as_str)
+            else {
+                return Json(json!({ "ok": false, "stale": true, "error": "delta set is missing its node name" }));
+            };
+            segments.push(name);
+        }
         let generated_path = segments.join("/");
+        let Some(expected) = grant.delta_items.get(&generated_path) else {
+            return Json(json!({
+                "ok": false,
+                "stale": true,
+                "error": "delta operation is outside the authorized comparison set",
+            }));
+        };
         let source_only = op
             .get("properties")
             .and_then(Value::as_object)
             .is_some_and(|properties| {
                 properties.len() == 1 && properties.get("Source").and_then(Value::as_str).is_some()
             });
-        if !source_only
-            || !grant.delta_source_paths.contains(&generated_path)
-            || !received.insert(generated_path)
-        {
+        let action_matches = match expected.action {
+            InitialChoiceAction::Create => op_kind == "delete",
+            InitialChoiceAction::Remove => op_kind == "set",
+            InitialChoiceAction::Overwrite => {
+                op_kind == "set"
+                    || (op_kind == "update"
+                        && expected.kind == "script"
+                        && !expected.class_changed
+                        && expected.source_changed
+                        && source_only)
+            }
+        };
+        let expected_class = match expected.action {
+            InitialChoiceAction::Remove => expected.class.as_deref(),
+            InitialChoiceAction::Overwrite => expected.studio_class.as_deref(),
+            InitialChoiceAction::Create => None,
+        };
+        let class_matches = op_kind != "set"
+            || expected_class.is_none()
+            || op
+                .get("node")
+                .and_then(Value::as_object)
+                .and_then(|node| node.get("class"))
+                .and_then(Value::as_str)
+                == expected_class;
+        if !action_matches || !class_matches || !received.insert(generated_path) {
             return Json(json!({
                 "ok": false,
                 "stale": true,
-                "error": "delta update is outside the authorized comparison set",
+                "error": "delta operation does not match its authorized comparison row",
             }));
         }
     }
-    if received != grant.delta_source_paths {
+    if received.len() != grant.delta_items.len()
+        || !grant.delta_items.keys().all(|path| received.contains(path))
+    {
         return Json(json!({
             "ok": false,
             "stale": true,
-            "error": "initial Studio delta did not include the complete changed-Source set",
+            "error": "initial Studio delta did not include the complete comparison set",
         }));
     }
 
@@ -2699,6 +2719,7 @@ fn initial_studio_delta(state: &AppState, body: PushBody) -> Json<Value> {
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut res = PushApplyResult::default();
@@ -2753,6 +2774,7 @@ pub(crate) fn apply_push_ops(state: &AppState, ops: &[Value]) -> PushApplyResult
         force_prune: false,
         project_root: root,
         backup_forced_removals: true,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
     let mut out = PushApplyResult::default();
@@ -2771,6 +2793,10 @@ pub(crate) struct PushCtx<'a> {
     pub force_prune: bool,
     pub project_root: &'a Path,
     pub backup_forced_removals: bool,
+    /// This is a fresh, randomly named, process-owned staging tree. Its files
+    /// can be written directly because the live service remains protected by
+    /// the outer generation fence and atomic service-directory rename.
+    pub private_stage: bool,
     /// Parents that received an atomic file replacement in this batch.
     pub dirty_parents: Mutex<std::collections::HashSet<PathBuf>>,
 }
@@ -2793,6 +2819,11 @@ impl<'a> PushCtx<'a> {
     }
 
     fn mark_quiet(&self, path: &Path) {
+        // The watcher cannot observe the process-owned staging tree. Quiet
+        // keys are published for the live service after the atomic install.
+        if self.private_stage {
+            return;
+        }
         // Every production path is constructed below the already-canonical
         // project root. Keep the watcher key lexical: canonicalizing a path
         // here would follow a link/reparse point that appeared concurrently
@@ -3615,6 +3646,7 @@ async fn resolve(
         force_prune: false,
         project_root: state.canonical_project.as_path(),
         backup_forced_removals: false,
+        private_stage: false,
         dirty_parents: Mutex::new(std::collections::HashSet::new()),
     };
 
@@ -4455,6 +4487,22 @@ fn apply_op(root: &Path, op: &Value, ctx: &PushCtx<'_>) -> Result<ApplyOutcome, 
 
 type StreamSourceProvider<'a> = dyn FnMut(&Value) -> Result<Option<Vec<u8>>, String> + 'a;
 
+fn ensure_push_directory(ctx: &PushCtx<'_>, target: &Path) -> Result<PathBuf, String> {
+    if ctx.private_stage {
+        if !target.starts_with(ctx.project_root) {
+            return Err(format!(
+                "private stage directory escapes its root: {}",
+                target.display()
+            ));
+        }
+        std::fs::create_dir_all(target)
+            .map_err(|error| format!("create private stage {}: {error}", target.display()))?;
+        Ok(target.to_path_buf())
+    } else {
+        ensure_synced_directory_chain(ctx.project_root, target)
+    }
+}
+
 fn apply_service_node(root: &Path, node: &Value, ctx: &PushCtx<'_>) -> Result<usize, String> {
     let mut source_provider = |node: &Value| {
         Ok(node
@@ -4477,7 +4525,7 @@ fn apply_service_node_with_sources(
         .and_then(|v| v.as_str())
         .ok_or("service: missing name")?;
     let svc_dir = root.join(encode_name(name));
-    ensure_synced_directory_chain(ctx.project_root, &svc_dir)?;
+    ensure_push_directory(ctx, &svc_dir)?;
     ctx.mark_quiet(&svc_dir);
     // Materialize children of the service node.
     let mut n = 0usize;
@@ -4559,7 +4607,7 @@ fn apply_set_in_dir_with_sources(
     if class == "Folder" && !has_children {
         return Ok(ApplyOutcome::Skipped);
     }
-    ensure_synced_directory_chain(ctx.project_root, parent_dir)?;
+    ensure_push_directory(ctx, parent_dir)?;
 
     // If a node with this name already exists on disk, reuse its path; otherwise
     // compute a fresh fragment.
@@ -4633,7 +4681,7 @@ fn apply_set_in_dir_with_sources(
         }
         (Some(sc), true) => {
             // Script-with-children directory.
-            ensure_synced_directory_chain(ctx.project_root, &target)?;
+            ensure_push_directory(ctx, &target)?;
             ctx.mark_quiet(&target);
             let init_name = portable_init_file_name(name, sc);
             let preferred_init_path = target.join(&init_name);
@@ -4659,7 +4707,7 @@ fn apply_set_in_dir_with_sources(
         }
         (None, _) => {
             // Folder (the only surviving non-script whitelisted class).
-            ensure_synced_directory_chain(ctx.project_root, &target)?;
+            ensure_push_directory(ctx, &target)?;
             ctx.mark_quiet(&target);
             let child_result =
                 apply_children_in_dir_with_sources(&target, children, ctx, source_provider)?;
@@ -5708,6 +5756,24 @@ where
 {
     use std::io::Write as _;
 
+    if ctx.private_stage {
+        if !target.starts_with(ctx.project_root) {
+            return Err(format!(
+                "private stage write escapes its root: {}",
+                target.display()
+            ));
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("write target has no parent: {}", target.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create private stage {}: {error}", parent.display()))?;
+        before_commit();
+        std::fs::write(target, bytes)
+            .map_err(|error| format!("write private stage source {}: {error}", target.display()))?;
+        return Ok(());
+    }
+
     let validated = crate::fs_safety::validate_synced_path(ctx.project_root, target, true)
         .map_err(|error| format!("validate write target {}: {error}", target.display()))?;
     let parent = validated
@@ -5825,6 +5891,14 @@ fn apply_source_bytes(
     bytes: &[u8],
     ctx: &PushCtx<'_>,
 ) -> Result<SourceWriteOutcome, String> {
+    // A private bootstrap stage has no competing local writer and is not
+    // watched. Recording a baseline here would validate/canonicalize the full
+    // ancestor chain once per script; live baselines are prepared in one pass
+    // immediately before the service directory is installed.
+    if ctx.private_stage {
+        write_synced_file_atomic(target, bytes, ctx)?;
+        return Ok(SourceWriteOutcome::Applied);
+    }
     let conflicts = ctx.conflicts;
     if ctx.force_overwrite {
         write_synced_file_atomic(target, bytes, ctx)?;
