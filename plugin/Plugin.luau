@@ -1549,7 +1549,7 @@ local function mountFallbackUi(reason)
 	cancelCorner.CornerRadius = UDim.new(0, 6)
 	cancelCorner.Parent = cancelBtn
 
-	cancelBtn.Activated:Connect(function()
+	cancelBtn.MouseButton1Click:Connect(function()
 		if cancelProjectInit then
 			cancelProjectInit()
 		end
@@ -1670,13 +1670,13 @@ local function mountFallbackUi(reason)
 
 	local logCount = 0
 
-	connectBtn.Activated:Connect(function()
+	connectBtn.MouseButton1Click:Connect(function()
 		if startConnect then
 			startConnect()
 		end
 	end)
 
-	settingsBtn.Activated:Connect(function()
+	settingsBtn.MouseButton1Click:Connect(function()
 		settingsFrame.Visible = not settingsFrame.Visible
 	end)
 

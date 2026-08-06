@@ -97,7 +97,11 @@ local function button(props)
 		Font = Enum.Font.SourceSansBold,
 		TextSize = 15,
 		ZIndex = props.ZIndex or 1,
-		[React.Event.Activated] = props.OnActivated,
+		-- Activated is not delivered for DockWidgetPluginGui buttons on some
+		-- current Windows Studio builds. MouseButton1Click is consistently
+		-- delivered in plugin widgets (and is the interaction this desktop-only
+		-- control actually needs).
+		[React.Event.MouseButton1Click] = props.OnActivated,
 	}, {
 		Corner = corner(6),
 		Stroke = props.StrokeColor and stroke(props.StrokeColor, 1, props.StrokeTransparency or 0.88) or nil,
