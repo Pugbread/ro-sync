@@ -2725,7 +2725,7 @@ fn initial_studio_delta(state: &AppState, body: PushBody) -> Json<Value> {
     let mut res = PushApplyResult::default();
     apply_ops_into(root, &body.ops, &ctx, &mut res);
     Json(json!({
-        "ok": res.errors.is_empty() && res.conflicts.is_empty(),
+        "ok": res.errors.is_empty() && res.conflicts.is_empty() && res.skipped == 0,
         "deltaApplied": res.applied,
         "skipped": res.skipped,
         "conflicts": res.conflicts,

@@ -4467,6 +4467,49 @@ fn initial_studio_delta_applies_structural_create_and_remove_rows() {
 }
 
 #[test]
+fn initial_studio_delta_does_not_report_skipped_rows_as_success() {
+    let project = TempDir::new("initial-studio-skipped-delta");
+    std::fs::create_dir_all(project.path().join("Workspace")).unwrap();
+    let state = test_state(&project, None);
+    authorize_studio_items_test(
+        &state,
+        "delta-skipped",
+        vec![InitialChoiceItem {
+            id: 0,
+            action: InitialChoiceAction::Remove,
+            path: "Workspace/EmptyStudioFolder".into(),
+            kind: "folder".into(),
+            class: Some("Folder".into()),
+            local_class: None,
+            studio_class: None,
+            class_changed: false,
+            source_changed: false,
+        }],
+    );
+
+    let response = push_blocking(
+        &state,
+        studio_delta_body(
+            "delta-skipped",
+            vec![json!({
+                "op": "set",
+                "path": ["Workspace"],
+                "node": {
+                    "name": "EmptyStudioFolder",
+                    "class": "Folder",
+                    "properties": {},
+                    "children": [],
+                },
+            })],
+        ),
+    )
+    .0;
+
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["skipped"], 1, "{response}");
+}
+
+#[test]
 fn initial_studio_delta_rejects_missing_or_extra_comparison_paths() {
     let project = TempDir::new("initial-studio-delta-scope");
     let workspace = project.path().join("Workspace");

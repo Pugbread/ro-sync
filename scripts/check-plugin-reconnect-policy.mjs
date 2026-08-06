@@ -294,6 +294,16 @@ assert.match(
 );
 assert.match(
   initialCompare,
+  /local studioSetPaths = \{\}[\s\S]*?table\.sort\(studioSetPaths\)[\s\S]*?parentPath \.\. "\/"[\s\S]*?nested Studio-only subtree; using transactional stream[\s\S]*?return nil/,
+  "nested Studio-only rows must use one atomic snapshot instead of overlapping subtree sets",
+);
+assert.match(
+  initialCompare,
+  /deltaResp\.ok ~= true[\s\S]*?tonumber\(deltaResp\.skipped\)[\s\S]*?> 0/,
+  "the initial delta must reject daemon responses that skipped any authorized row",
+);
+assert.match(
+  initialCompare,
   /local deltaResult = applyStudioDeltaFastPath[\s\S]*?deltaResult == true[\s\S]*?deltaResult == false[\s\S]*?unsupported row; using transactional stream[\s\S]*?doPushPath\(true, scanGuard, choiceId\)/,
   "a clean delta fallback must reuse the authorized choice in the full atomic push rather than loop comparison",
 );

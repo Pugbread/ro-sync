@@ -10978,6 +10978,26 @@ runInitialCompare = function()
 		if type(items) ~= "table" or #items == 0 or not scanGuard then
 			return false
 		end
+		-- A Studio-only parent serializes its complete subtree. Sending another
+		-- `set` for every compared descendant makes the batch overlap itself and
+		-- can leave only the directory carriers materialized on disk. Use the
+		-- atomic snapshot stream for this shape; it publishes the service once and
+		-- keeps the user's already-authorized Studio choice.
+		local studioSetPaths = {}
+		for _, item in ipairs(items) do
+			if type(item) == "table" and tostring(item.action) == "remove" and type(item.path) == "string" then
+				studioSetPaths[#studioSetPaths + 1] = item.path
+			end
+		end
+		table.sort(studioSetPaths)
+		for index = 1, #studioSetPaths - 1 do
+			local parentPath = studioSetPaths[index]
+			local nextPath = studioSetPaths[index + 1]
+			if string.sub(nextPath, 1, #parentPath + 1) == parentPath .. "/" then
+				log("decision studio delta: nested Studio-only subtree; using transactional stream")
+				return nil
+			end
+		end
 		local resolved = {}
 		local ops = {}
 		-- Seed daemon-authored identities before building operations. Existing
@@ -11073,7 +11093,12 @@ runInitialCompare = function()
 			choiceId = tostring(choiceId),
 			pluginProtocol = PLUGIN_PROTOCOL_VERSION,
 		})
-		if not ok or type(deltaResp) ~= "table" or deltaResp.ok ~= true then
+		if
+			not ok
+			or type(deltaResp) ~= "table"
+			or deltaResp.ok ~= true
+			or (tonumber(deltaResp.skipped) or 0) > 0
+		then
 			log(
 				"decision studio delta failed: "
 					.. tostring(type(deltaResp) == "table" and (deltaResp.error or deltaResp.errors) or deltaResp)
