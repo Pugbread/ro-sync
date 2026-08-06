@@ -7721,7 +7721,8 @@ local function wsLoop(gen)
 						local errorCount = if type(msg.errors) == "table"
 							then #msg.errors
 							else tonumber(msg.errors) or 0
-						if msg.ok == false or skipped > 0 or conflictCount > 0 or errorCount > 0 then
+						local incompleteWrite = msg.ok == false or skipped > 0 or errorCount > 0
+						if incompleteWrite or conflictCount > 0 then
 							log(
 								string.format(
 									"ws push-result incomplete: ok=%s applied=%s skipped=%d conflicts=%d errors=%d",
@@ -7732,16 +7733,28 @@ local function wsLoop(gen)
 									errorCount
 								)
 							)
-							recoveryContext = string.format(
-								"daemon did not fully apply a Studio update (%d skipped, %d conflict(s), %d error(s))",
-								skipped,
-								conflictCount,
-								errorCount
-							)
-							setBanner(
-								"A Studio update was not fully written to disk. Ro Sync is reconciling before continuing."
-							)
-							closeClient()
+							if incompleteWrite then
+								recoveryContext = string.format(
+									"daemon did not fully apply a Studio update (%d skipped, %d conflict(s), %d error(s))",
+									skipped,
+									conflictCount,
+									errorCount
+								)
+								setBanner(
+									"A Studio update was not fully written to disk. Ro Sync is reconciling before continuing."
+								)
+								closeClient()
+							else
+								-- A parked source conflict is already durable in the daemon.
+								-- Reconnecting cannot resolve it and turns every follow-up edit
+								-- into an expensive, misleading reconciliation loop.
+								setBanner(
+									string.format(
+										"%d Studio edit conflict(s) need a Keep Disk or Keep Studio decision. Live sync is still connected.",
+										conflictCount
+									)
+								)
+							end
 						end
 					elseif kind == "request" then
 						remoteState.handleRemoteRequest(client, msg)

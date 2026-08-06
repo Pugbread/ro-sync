@@ -162,13 +162,18 @@ const pushResultBranch = wsLoop.slice(
 );
 assert.match(
   pushResultBranch,
-  /skipped > 0 or conflictCount > 0 or errorCount > 0/,
-  "any partial live push result must be treated as a failure",
+  /local incompleteWrite = msg\.ok == false or skipped > 0 or errorCount > 0/,
+  "skipped or errored live pushes must be treated as incomplete writes",
 );
 assert.match(
   pushResultBranch,
-  /setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*closeClient\(\)/,
-  "partial push failure must be visible and start nonblocking close into full reconciliation",
+  /if incompleteWrite then[\s\S]*setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*closeClient\(\)/,
+  "incomplete push writes must be visible and start nonblocking close into full reconciliation",
+);
+assert.match(
+  pushResultBranch,
+  /else[\s\S]*Studio edit conflict\(s\)[\s\S]*Live sync is still connected/,
+  "parked conflicts must remain connected instead of entering a futile reconciliation loop",
 );
 
 const refreshHello = source.slice(
