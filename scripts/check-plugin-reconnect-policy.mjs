@@ -304,6 +304,16 @@ assert.match(
 );
 assert.match(
   initialCompare,
+  /local encodedOk, encodedBody = pcall[\s\S]*?HttpService:JSONEncode\(deltaBody\)[\s\S]*?#encodedBody > PROTOCOL_STREAM_MAX_BYTES[\s\S]*?payload exceeds[\s\S]*?using transactional stream[\s\S]*?return nil/,
+  "an oversized initial delta must fall back before the bounded HTTP request consumes the choice",
+);
+assert.match(
+  initialCompare,
+  /httpJson\([\s\S]*?"\/push"[\s\S]*?encodedBody[\s\S]*?"encoded"[\s\S]*?PROTOCOL_STREAM_MAX_BYTES/,
+  "the initial delta must send the exact preflighted JSON bytes under the protocol response bound",
+);
+assert.match(
+  initialCompare,
   /local deltaResult = applyStudioDeltaFastPath[\s\S]*?deltaResult == true[\s\S]*?deltaResult == false[\s\S]*?unsupported row; using transactional stream[\s\S]*?doPushPath\(true, scanGuard, choiceId\)/,
   "a clean delta fallback must reuse the authorized choice in the full atomic push rather than loop comparison",
 );

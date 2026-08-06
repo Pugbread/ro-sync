@@ -11087,12 +11087,36 @@ runInitialCompare = function()
 				return false
 			end
 		end
-		local ok, deltaResp = httpJson("/push", "POST", {
+		local deltaBody = {
 			ops = ops,
 			initialDelta = true,
 			choiceId = tostring(choiceId),
 			pluginProtocol = PLUGIN_PROTOCOL_VERSION,
-		})
+		}
+		local encodedOk, encodedBody = pcall(function()
+			return HttpService:JSONEncode(deltaBody)
+		end)
+		if not encodedOk then
+			log("decision studio delta: payload encoding failed; using transactional stream")
+			return nil
+		end
+		if #encodedBody > PROTOCOL_STREAM_MAX_BYTES then
+			log(
+				string.format(
+					"decision studio delta: %d-byte payload exceeds %d-byte request limit; using transactional stream",
+					#encodedBody,
+					PROTOCOL_STREAM_MAX_BYTES
+				)
+			)
+			return nil
+		end
+		local ok, deltaResp = httpJson(
+			"/push",
+			"POST",
+			encodedBody,
+			"encoded",
+			PROTOCOL_STREAM_MAX_BYTES
+		)
 		if
 			not ok
 			or type(deltaResp) ~= "table"
