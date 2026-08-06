@@ -355,6 +355,7 @@ pub enum ClientMsg {
         #[serde(default)]
         ops: Vec<Value>,
     },
+    Disconnect,
     Ping,
     Pong,
     Request {
@@ -763,6 +764,14 @@ async fn recv_loop(
                         peer_kind = classified_peer;
                         classified_peer.store(&peer.kind);
                     }
+                }
+                Ok(ClientMsg::Disconnect) => {
+                    out_tx.close(ConnectionClose::new(
+                        "Roblox Studio plugin disconnected",
+                        "plugin-disconnect",
+                        false,
+                    ));
+                    rejecting = true;
                 }
                 Ok(ClientMsg::Pong) => {}
                 Ok(ClientMsg::Ping) => {
@@ -2790,6 +2799,46 @@ mod tests {
             .await
             .expect("first plugin should remain connected");
         assert_eq!(pong["type"], "pong");
+    }
+
+    #[tokio::test]
+    async fn plugin_disconnect_message_releases_the_lease_for_immediate_reconnect() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        first.send(plugin_hello("studio-a")).await.unwrap();
+        wait_for_active_plugin(&h).await;
+        first
+            .send(tungstenite::Message::Text(
+                r#"{"type":"disconnect"}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        let shutdown = recv_until_type(&mut first, "shutdown", Duration::from_secs(3))
+            .await
+            .expect("daemon should acknowledge the plugin-requested disconnect");
+        assert_eq!(shutdown["code"], "plugin-disconnect");
+        assert_eq!(shutdown["retryable"], false);
+        for _ in 0..100 {
+            if h.state.active_plugin.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.state.active_plugin.lock().unwrap().is_none());
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        second.send(plugin_hello("studio-b")).await.unwrap();
+        wait_for_active_plugin(&h).await;
+        second
+            .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        assert!(recv_until_type(&mut second, "pong", Duration::from_secs(3))
+            .await
+            .is_some());
     }
 
     #[tokio::test]

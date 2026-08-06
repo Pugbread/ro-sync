@@ -7,8 +7,8 @@
 //! plugin's responsibility and should be inspected through live CLI reads.
 
 use crate::fs_map::{
-    parse_init_file, parse_plain_init_file, path_is_parent_init_source, path_to_instance_meta,
-    PathInstance, ScriptClass, META_FILE,
+    classify_script_file, parse_disambiguated, parse_init_file, parse_plain_init_file,
+    path_is_parent_init_source, path_to_instance_meta, PathInstance, ScriptClass, META_FILE,
 };
 use crate::fs_safety::{
     file_generation_no_follow, metadata_no_follow, read_to_string_no_follow,
@@ -2016,6 +2016,8 @@ struct FlatDiskCandidate {
     name: String,
     disk_fragment: String,
     disk_fragment_is_dir: bool,
+    disk_sort_base: String,
+    disk_sort_ordinal: usize,
 }
 
 struct PendingFlatDiskNode {
@@ -2073,13 +2075,39 @@ fn flat_disk_candidate(path: &Path) -> io::Result<Option<FlatDiskCandidate>> {
         return Ok(None);
     }
 
+    let (disk_sort_base, disk_sort_ordinal) =
+        allocator_fragment_order(&source_fragment, path_is_dir);
     Ok(Some(FlatDiskCandidate {
         effective_path,
         name: name_override.unwrap_or_else(|| instance.name.clone()),
         disk_fragment: source_fragment,
         disk_fragment_is_dir: path_is_dir,
+        disk_sort_base,
+        disk_sort_ordinal,
         instance,
     }))
+}
+
+/// Filesystem enumeration is lexical, which places `Name [10]` before
+/// `Name [1]`. Ro Sync's allocator assigns those fragments by numeric ordinal;
+/// restore that order before source-free bootstrap comparison so exact disk
+/// identities remain aligned with Studio when duplicate counts reach 10+.
+fn allocator_fragment_order(fragment: &str, is_dir: bool) -> (String, usize) {
+    let (stem, suffix) = if is_dir {
+        (fragment, "")
+    } else if let Some((_, stem)) = classify_script_file(fragment) {
+        let suffix = &fragment[stem.len()..];
+        return match parse_disambiguated(&stem) {
+            Some((base, ordinal)) => (format!("{base}{suffix}"), ordinal),
+            None => (fragment.to_string(), 0),
+        };
+    } else {
+        (fragment, "")
+    };
+    match parse_disambiguated(stem) {
+        Some((base, ordinal)) => (format!("{base}{suffix}"), ordinal),
+        None => (fragment.to_string(), 0),
+    }
 }
 
 fn collect_flat_disk_children(
@@ -2115,6 +2143,8 @@ fn collect_flat_disk_children(
     candidates.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
+            .then_with(|| left.disk_sort_base.cmp(&right.disk_sort_base))
+            .then_with(|| left.disk_sort_ordinal.cmp(&right.disk_sort_ordinal))
             .then_with(|| left.disk_fragment.cmp(&right.disk_fragment))
     });
     let mut nodes = Vec::with_capacity(candidates.len());
@@ -2241,7 +2271,20 @@ fn walk_children_at_depth(
         let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let af = a.get("diskFragment").and_then(Value::as_str).unwrap_or("");
         let bf = b.get("diskFragment").and_then(Value::as_str).unwrap_or("");
-        an.cmp(bn).then_with(|| af.cmp(bf))
+        let ad = a
+            .get("diskFragmentIsDir")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let bd = b
+            .get("diskFragmentIsDir")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (ab, ao) = allocator_fragment_order(af, ad);
+        let (bb, bo) = allocator_fragment_order(bf, bd);
+        an.cmp(bn)
+            .then_with(|| ab.cmp(&bb))
+            .then_with(|| ao.cmp(&bo))
+            .then_with(|| af.cmp(bf))
     });
     Ok(out)
 }
@@ -2407,6 +2450,33 @@ fn find_init_source_path(dir: &Path, sc: Option<ScriptClass>) -> io::Result<Path
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn allocator_fragment_order_is_numeric_for_double_digit_duplicates() {
+        let mut folders = vec!["Part [2]", "Part [11]", "Part", "Part [10]", "Part [1]"];
+        folders.sort_by_key(|fragment| allocator_fragment_order(fragment, true));
+        assert_eq!(
+            folders,
+            ["Part", "Part [1]", "Part [2]", "Part [10]", "Part [11]"]
+        );
+
+        let mut scripts = vec![
+            "Same [10].server.luau",
+            "Same.server.luau",
+            "Same [2].server.luau",
+            "Same [1].server.luau",
+        ];
+        scripts.sort_by_key(|fragment| allocator_fragment_order(fragment, false));
+        assert_eq!(
+            scripts,
+            [
+                "Same.server.luau",
+                "Same [1].server.luau",
+                "Same [2].server.luau",
+                "Same [10].server.luau",
+            ]
+        );
+    }
 
     struct TempDir(tempfile::TempDir);
     impl TempDir {
@@ -2983,11 +3053,11 @@ mod tests {
         let children = rs_node["children"].as_array().unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0]["name"], "Same");
-        assert_eq!(children[0]["diskFragment"], "Same [1].luau");
-        assert_eq!(children[0]["properties"]["Source"], "return 'second'");
+        assert_eq!(children[0]["diskFragment"], "Same.luau");
+        assert_eq!(children[0]["properties"]["Source"], "return 'first'");
         assert_eq!(children[1]["name"], "Same");
-        assert_eq!(children[1]["diskFragment"], "Same.luau");
-        assert_eq!(children[1]["properties"]["Source"], "return 'first'");
+        assert_eq!(children[1]["diskFragment"], "Same [1].luau");
+        assert_eq!(children[1]["properties"]["Source"], "return 'second'");
     }
 
     #[test]

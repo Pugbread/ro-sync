@@ -92,6 +92,36 @@ assert.ok(
   "a blocking WebSocket Close call must never delay local retry state",
 );
 
+const explicitDisconnect = source.slice(
+  source.indexOf("local function disconnect(reason)"),
+  source.indexOf("-- Initial-sync decision handshake"),
+);
+assert.match(
+  explicitDisconnect,
+  /ws = nil[\s\S]*?wsSend\(toClose, \{ type = "disconnect" \}\)/,
+  "an explicit disconnect must ask the daemon to close instead of blocking on WebStreamClient:Close()",
+);
+assert.doesNotMatch(
+  explicitDisconnect,
+  /toClose:Close\(\)/,
+  "an explicit disconnect must never call Roblox's blocking WebStreamClient:Close()",
+);
+assert.match(
+  explicitDisconnect,
+  /if reason == "unloading" then[\s\S]*?disconnectHooks\(\)[\s\S]*?table\.clear\(scaleState\.sourceHashMemo\)/,
+  "manual disconnect must retain the live hook index and valid Source hashes until plugin unload",
+);
+
+const installHooks = source.slice(
+  source.indexOf("local function installHooks(shouldContinue)"),
+  source.indexOf("-- Studio snapshot + stats"),
+);
+assert.match(
+  installHooks,
+  /if scaleState\.hooksInstalled then[\s\S]*?hooks reused:[\s\S]*?return not shouldContinue or shouldContinue\(\)/,
+  "reconnect must reuse the existing live hook index on large places",
+);
+
 const laggedBranch = wsLoop.slice(
   wsLoop.indexOf('elseif kind == "lagged"'),
   wsLoop.indexOf('elseif kind == "shutdown"'),
@@ -695,8 +725,23 @@ const streamedStructure = source.slice(
 );
 assert.match(
   streamedStructure,
-  /local orderingContext = snapshotApplyState\.newContext[\s\S]*?buildPhysicalSiblingIndex\(frame\.inst, orderingContext, \{\}\)[\s\S]*?order = placement\.order[\s\S]*?left\.order < right\.order/,
+  /local orderingContext = snapshotApplyState\.newContext[\s\S]*?contentAwareOrdering = true[\s\S]*?buildPhysicalSiblingIndex\(frame\.inst, orderingContext, \{\}\)[\s\S]*?order = placement\.order[\s\S]*?left\.order < right\.order/,
   "streamed structure IDs must follow the canonical physical sibling allocator with stale cache overlays disabled",
+);
+assert.match(
+  snapshotMatcher,
+  /ctx\.contentAwareOrdering and frame\.inst:IsA\("LuaSourceContainer"\)[\s\S]*?ctx\.sourceHashForOrdering\(frame\.inst\)[\s\S]*?ctx\.directSourceHashes\[frame\.inst\] = directSourceHash[\s\S]*?local contentParts = \{ "rosync-subtree-v1", directSourceHash \}[\s\S]*?ctx\.contentHashes\[frame\.inst\] = sha256Hex/,
+  "duplicate parent subtrees must inherit normalized descendant Source identity",
+);
+assert.match(
+  source,
+  /local sourceHash = sourceEntry\.sha256[\s\S]*?if sourceHash == nil then[\s\S]*?scaleState\.normalizedSourceHash/,
+  "content-aware structure hashes must be reused by the compare hash stream",
+);
+assert.match(
+  streamedStructure,
+  /sourceHashForOrdering = scaleState\.normalizedSourceHash/,
+  "reconnect ordering must reuse memoized normalized Studio Source hashes",
 );
 assert.match(
   streamedStructure,

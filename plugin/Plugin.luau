@@ -2697,8 +2697,12 @@ function snapshotApplyState.newContext(opts)
 		syncableInstances = {},
 		directoryInstances = {},
 		sortKeys = {},
+		contentHashes = {},
+		directSourceHashes = {},
 		indexedServices = {},
 		useAvoidSyncIndex = opts and opts.indexAvoidSyncCarriers == true,
+		contentAwareOrdering = opts and opts.contentAwareOrdering == true,
+		sourceHashForOrdering = opts and opts.sourceHashForOrdering,
 	}
 end
 
@@ -2840,11 +2844,15 @@ function snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
 					mappedClass,
 					mappedClass,
 				}, "\0")
+				ctx.contentHashes[frame.inst] = sha256Hex("rosync-subtree-v1\0")
 				table.remove(stack)
 				local ancestor = stack[#stack]
 				if ancestor then
 					ancestor.hasAvoidSyncChild = true
-					ancestor.projectionChildKeys[#ancestor.projectionChildKeys + 1] = ctx.sortKeys[frame.inst]
+					ancestor.projectionChildKeys[#ancestor.projectionChildKeys + 1] = {
+						key = ctx.sortKeys[frame.inst],
+						contentHash = ctx.contentHashes[frame.inst],
+					}
 				end
 			else
 				frame.entered = true
@@ -2878,18 +2886,51 @@ function snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
 					ctx.directoryInstances[frame.inst] = true
 				end
 				if frame.inst ~= service and (syncable or frame.hasAvoidSyncChild) then
-					table.sort(frame.projectionChildKeys)
+					table.sort(frame.projectionChildKeys, function(left, right)
+						if left.key ~= right.key then
+							return left.key < right.key
+						end
+						return left.contentHash < right.contentHash
+					end)
 					local mappedClass = PathHelpers.mappedSyncClass(frame.inst)
 					local signature = { mappedClass }
-					for _, key in ipairs(frame.projectionChildKeys) do
-						signature[#signature + 1] = key
+					for _, childKey in ipairs(frame.projectionChildKeys) do
+						signature[#signature + 1] = childKey.key
 					end
-					ctx.sortKeys[frame.inst] = table.concat({
+					local keyParts = {
 						string.lower(frame.inst.Name),
 						frame.inst.Name,
 						mappedClass,
 						table.concat(signature, "\0"),
-					}, "\0")
+					}
+					-- Bootstrap identities must not depend on GetChildren order
+					-- when duplicate parents have the same projected shape but
+					-- different script content deeper in the subtree. A separate
+					-- normalized subtree digest preserves structure-first ordering
+					-- and propagates a compact tie-break through duplicate parents.
+					local directSourceHash = ""
+					if ctx.contentAwareOrdering and frame.inst:IsA("LuaSourceContainer") then
+						if ctx.sourceHashForOrdering then
+							local sourceHash = ctx.sourceHashForOrdering(frame.inst)
+							if sourceHash ~= nil then
+								directSourceHash = sourceHash
+							end
+						else
+							local source = tryReadScriptSource(frame.inst)
+							if source ~= nil then
+								directSourceHash = sha256Hex((source:gsub("\r\n", "\n")))
+							end
+						end
+						if directSourceHash ~= "" then
+							ctx.directSourceHashes[frame.inst] = directSourceHash
+						end
+					end
+					ctx.sortKeys[frame.inst] = table.concat(keyParts, "\0")
+					local contentParts = { "rosync-subtree-v1", directSourceHash }
+					for _, childKey in ipairs(frame.projectionChildKeys) do
+						contentParts[#contentParts + 1] = childKey.contentHash
+					end
+					ctx.contentHashes[frame.inst] = sha256Hex(table.concat(contentParts, "\0"))
 				end
 				local carriesAvoidSync = frame.hasAvoidSyncChild
 				table.remove(stack)
@@ -2903,7 +2944,10 @@ function snapshotApplyState.indexAvoidSyncCarriers(parent, ctx)
 					end
 					local sortKey = ctx.sortKeys[frame.inst]
 					if sortKey then
-						ancestor.projectionChildKeys[#ancestor.projectionChildKeys + 1] = sortKey
+						ancestor.projectionChildKeys[#ancestor.projectionChildKeys + 1] = {
+							key = sortKey,
+							contentHash = ctx.contentHashes[frame.inst],
+						}
 					end
 				end
 			end
@@ -2981,12 +3025,19 @@ function snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx, override)
 			end
 		end
 	end
-	table.sort(projectionEntries, function(left, right)
+		table.sort(projectionEntries, function(left, right)
 		if left.reserved ~= right.reserved then
 			return left.reserved
 		end
 		if left.key ~= right.key then
 			return left.key < right.key
+		end
+		if ctx.contentAwareOrdering then
+			local leftContent = ctx.contentHashes[left.child]
+			local rightContent = ctx.contentHashes[right.child]
+			if leftContent ~= nil and rightContent ~= nil and leftContent ~= rightContent then
+				return leftContent < rightContent
+			end
 		end
 		-- Rust's stable sibling sort retains the Studio GetChildren order for
 		-- indistinguishable leaves. Lua's table.sort is not stable, so make the
@@ -4832,6 +4883,7 @@ local scaleState = {
 	maxStagedSourceBytesTotal = 128 * 1024 * 1024,
 	emptyConnectionBucket = table.freeze({}),
 	itemChangedAvailable = false,
+	hooksInstalled = false,
 	hookGeneration = 0,
 	liveResyncPending = false,
 	trackedInstanceCount = 0,
@@ -5990,6 +6042,7 @@ connectTree = function(inst, progress, shouldContinue): boolean
 end
 
 disconnectHooks = function()
+	scaleState.hooksInstalled = false
 	local previousPause = scaleState.avoidSyncTrackingPaused
 	scaleState.avoidSyncTrackingPaused = true
 	scaleState.hookGeneration += 1
@@ -6129,6 +6182,24 @@ end
 
 local function installHooks(shouldContinue): boolean
 	local hooksStarted = os.clock()
+	-- A deliberate Disconnect keeps these hooks alive. They continue updating
+	-- identity metadata while queueOp drops offline writes, so the next clean
+	-- compare can safely reuse them instead of walking a 460k-instance place a
+	-- second time merely to recreate the same listeners.
+	if scaleState.hooksInstalled then
+		scaleState.avoidSyncTrackingPaused = false
+		scaleState.startAvoidSyncFallbackScanner()
+		scaleState.markAvoidSyncPathsDirty()
+		log(
+			string.format(
+				"hooks reused: %d instance(s), %d property connection(s), %.3fs",
+				scaleState.trackedInstanceCount,
+				scaleState.trackedConnectionCount,
+				os.clock() - hooksStarted
+			)
+		)
+		return not shouldContinue or shouldContinue()
+	end
 	scaleState.resetYieldSlice()
 	scaleState.avoidSyncTrackingPaused = true
 	disconnectHooks()
@@ -6220,6 +6291,7 @@ local function installHooks(shouldContinue): boolean
 		)
 	end
 	scaleState.avoidSyncTrackingPaused = false
+	scaleState.hooksInstalled = true
 	scaleState.startAvoidSyncFallbackScanner()
 	scaleState.markAvoidSyncPathsDirty()
 	log(
@@ -6668,6 +6740,8 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 	end
 	local orderingContext = snapshotApplyState.newContext({
 		indexAvoidSyncCarriers = true,
+		contentAwareOrdering = true,
+		sourceHashForOrdering = scaleState.normalizedSourceHash,
 	})
 	-- The push path opts into surviving Source-only edits (they're recorded and
 	-- replayed after connect); the compare path stays strict.
@@ -6759,6 +6833,7 @@ scaleState.streamStudioServiceStructure = function(service: Instance, guard, sen
 				sourceInstances[#sourceInstances + 1] = {
 					id = frame.id,
 					inst = frame.inst,
+					sha256 = orderingContext.directSourceHashes[frame.inst],
 				}
 			end
 			frame.children = {}
@@ -7131,9 +7206,10 @@ reconnectState.stopTerminal = function(reason)
 	if ws then
 		local toClose = ws
 		ws = nil
-		pcall(function()
-			toClose:Close()
-		end)
+		-- Asking the daemon to close its end avoids Roblox's blocking
+		-- WebStreamClient:Close() implementation. The daemon responds with a close
+		-- frame and releases the active-plugin lease before the next Connect.
+		wsSend(toClose, { type = "disconnect" })
 	end
 	setPill("error", "update Ro Sync")
 	if message:lower():find("protocol", 1, true) then
@@ -9792,17 +9868,21 @@ local function disconnect(reason)
 	busy = false
 	wsGeneration += 1
 	decisionGeneration += 1
-	disconnectHooks()
-	-- Deliberate disconnects bound the memo's lifetime; transport-gap
-	-- reconnects keep it (the always-on listeners stay valid throughout).
-	table.clear(scaleState.sourceHashMemo)
+	-- Keep the expensive live-tree index and normalized Source hashes warm for
+	-- an ordinary user Disconnect. Their always-on invalidators cover edits
+	-- made while idle. Plugin unload is the true lifetime boundary.
+	if reason == "unloading" then
+		disconnectHooks()
+		table.clear(scaleState.sourceHashMemo)
+	end
 	remoteState.requestRemoteWriteCleanup()
 	if ws then
 		local toClose = ws
 		ws = nil
-		pcall(function()
-			toClose:Close()
-		end)
+		-- Asking the daemon to close its end avoids Roblox's blocking
+		-- WebStreamClient:Close() implementation. The daemon responds with a close
+		-- frame and releases the active-plugin lease before the next Connect.
+		wsSend(toClose, { type = "disconnect" })
 	end
 	setPill("idle")
 	setBanner(nil)
@@ -10701,7 +10781,11 @@ runInitialCompare = function()
 				local hashes = {}
 				while sourceIndex <= #sourceInstances and #hashes < scaleState.compareHashChunkRecords do
 					local sourceEntry = sourceInstances[sourceIndex]
-					local sourceHash, sourceErr = scaleState.normalizedSourceHash(sourceEntry.inst)
+					local sourceHash = sourceEntry.sha256
+					local sourceErr = nil
+					if sourceHash == nil then
+						sourceHash, sourceErr = scaleState.normalizedSourceHash(sourceEntry.inst)
+					end
 					if sourceHash == nil then
 						disposeScanGuard()
 						reconnectState.retryInitialCompare(
