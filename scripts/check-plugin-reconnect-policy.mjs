@@ -289,6 +289,16 @@ assert.match(
 );
 assert.match(
   initialCompare,
+  /Class\/shape transitions[\s\S]*?intentional clean fallback[\s\S]*?return nil/,
+  "unsupported mixed delta rows must request the transactional fallback instead of entering retry",
+);
+assert.match(
+  initialCompare,
+  /local deltaResult = applyStudioDeltaFastPath[\s\S]*?deltaResult == true[\s\S]*?deltaResult == false[\s\S]*?unsupported row; using transactional stream[\s\S]*?doPushPath\(true, scanGuard, choiceId\)/,
+  "a clean delta fallback must reuse the authorized choice in the full atomic push rather than loop comparison",
+);
+assert.match(
+  initialCompare,
   /resp\.phase ~= "identities"[\s\S]*?identityCount > scaleState\.maxStreamNodes[\s\S]*?postCompareChunk\([\s\S]*?"identities"[\s\S]*?PathHelpers\.isPortableDiskFragment\(fragment\)[\s\S]*?colliding sibling disk identities[\s\S]*?resp\.nextPhase ~= "hashes"/,
   "initial comparison must page, bound, and validate exact daemon-authored disk identity receipts",
 );

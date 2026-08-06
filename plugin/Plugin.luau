@@ -11059,7 +11059,9 @@ runInitialCompare = function()
 				else
 					-- Class/shape transitions need exact from/to physical identities;
 					-- keep the transactional stream fallback until details carry both.
-					return false
+					-- `nil` is an intentional clean fallback, distinct from a real
+					-- delta failure (`false`) that must restart comparison.
+					return nil
 				end
 			else
 				return false
@@ -11286,13 +11288,19 @@ runInitialCompare = function()
 				end
 			elseif choice == "studio" then
 				if deltaItems ~= nil then
-					if applyStudioDeltaFastPath(deltaItems, choiceId) then
+					local deltaResult = applyStudioDeltaFastPath(deltaItems, choiceId)
+					if deltaResult == true then
 						completeInitialCompare()
-					else
+						return
+					elseif deltaResult == false then
 						disposeScanGuard()
 						reconnectState.retryInitialCompare("authorized Studio delta failed")
+						return
 					end
-					return
+					-- A mixed/class-changing edit is valid but cannot be expressed by
+					-- the bounded delta protocol. Continue once through the existing
+					-- atomic full-service stream using the still-unconsumed choice.
+					log("decision studio delta: unsupported row; using transactional stream")
 				end
 				-- The guard keeps the tree coherent while the modal is open;
 				-- rescan and push one service at a time without retaining the
