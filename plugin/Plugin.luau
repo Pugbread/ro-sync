@@ -42,6 +42,8 @@ local DEFAULT_URL = "http://127.0.0.1:7878"
 local PORT_RANGE_START = 7878
 local PORT_RANGE_END = 7890
 local DAEMON_PROBE_CONCURRENCY = 4
+local DAEMON_STARTUP_GRACE_SECONDS = 30
+local DAEMON_DISCOVERY_RETRY_SECONDS = 1
 -- 4s, not 2: a loaded machine has answered /hello in 2.03s — a 2s timeout
 -- silently misses every daemon and the pill reads no_daemon while everything
 -- is actually up.
@@ -11976,6 +11978,7 @@ startConnect = function()
 	end
 
 	busy = true
+	setPill("connecting")
 	connectionAttempt += 1
 	local attempt = connectionAttempt
 

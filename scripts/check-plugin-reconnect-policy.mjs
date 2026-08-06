@@ -369,6 +369,16 @@ assert.match(
 );
 
 assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.1"/);
+assert.match(
+  source,
+  /local DAEMON_STARTUP_GRACE_SECONDS = \d+/,
+  "explicit Connect startup retry must declare its grace-period constant",
+);
+assert.match(
+  source,
+  /local DAEMON_DISCOVERY_RETRY_SECONDS = \d+/,
+  "explicit Connect startup retry must declare its retry-period constant",
+);
 assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 6/);
 assert.match(
   source,
