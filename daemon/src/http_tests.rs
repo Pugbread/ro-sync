@@ -226,6 +226,7 @@ fn streamed_push_test_body(
         plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
         stream_id: Some(stream_id.to_string()),
         choice_id: Some(stream_id.to_string()),
+        initial_delta: false,
         service: Some(service.to_string()),
         phase: Some(phase.to_string()),
         chunk_index: Some(chunk_index),
@@ -249,9 +250,50 @@ fn authorize_studio_push_test(state: &AppState, choice_id: &str) {
             ),
             StudioTransferGrant {
                 service_generations,
+                delta_source_paths: HashSet::new(),
                 created_at: Instant::now(),
             },
         );
+}
+
+fn authorize_studio_delta_test(state: &AppState, choice_id: &str, paths: &[&str]) {
+    let service_generations =
+        capture_initial_service_generations(state.canonical_project.as_path()).unwrap();
+    STUDIO_TRANSFER_GRANTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            (
+                state.canonical_project.as_ref().clone(),
+                choice_id.to_string(),
+            ),
+            StudioTransferGrant {
+                service_generations,
+                delta_source_paths: paths.iter().map(|path| (*path).to_string()).collect(),
+                created_at: Instant::now(),
+            },
+        );
+}
+
+fn studio_delta_body(choice_id: &str, ops: Vec<Value>) -> PushBody {
+    PushBody {
+        ops,
+        bootstrap: false,
+        strict: false,
+        force_prune: false,
+        services: Vec::new(),
+        plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
+        stream_id: None,
+        choice_id: Some(choice_id.to_string()),
+        initial_delta: true,
+        service: None,
+        phase: None,
+        chunk_index: None,
+        final_chunk: false,
+        records: Vec::new(),
+        sources: Vec::new(),
+    }
 }
 
 fn streamed_service_records(
@@ -4246,6 +4288,7 @@ async fn push_rejects_over_deep_bootstrap_before_touching_disk() {
         plugin_protocol: Some(crate::ws::PLUGIN_PROTOCOL_VERSION),
         stream_id: None,
         choice_id: None,
+        initial_delta: false,
         service: None,
         phase: None,
         chunk_index: None,
@@ -4262,6 +4305,125 @@ async fn push_rejects_over_deep_bootstrap_before_touching_disk() {
         .unwrap()
         .contains("tree depth exceeds"));
     assert!(!project.path().join("Workspace").exists());
+}
+
+#[test]
+fn initial_studio_delta_force_applies_exact_compared_sources() {
+    let project = TempDir::new("initial-studio-delta");
+    let workspace = project.path().join("Workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let first = workspace.join("First.luau");
+    let second = workspace.join("Second.server.luau");
+    std::fs::write(&first, "return 'disk first'\n").unwrap();
+    std::fs::write(&second, "return 'disk second'\n").unwrap();
+    let state = test_state(&project, None);
+    authorize_studio_delta_test(
+        &state,
+        "delta-exact",
+        &["Workspace/First", "Workspace/Second"],
+    );
+
+    let response = push_blocking(
+        &state,
+        studio_delta_body(
+            "delta-exact",
+            vec![
+                json!({
+                    "op": "update",
+                    "path": ["Workspace", "First"],
+                    "properties": { "Source": "return 'studio first'\n" },
+                }),
+                json!({
+                    "op": "update",
+                    "path": ["Workspace", "Second"],
+                    "properties": { "Source": "return 'studio second'\n" },
+                }),
+            ],
+        ),
+    )
+    .0;
+
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["deltaApplied"], 2);
+    assert_eq!(
+        std::fs::read_to_string(first).unwrap(),
+        "return 'studio first'\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second).unwrap(),
+        "return 'studio second'\n"
+    );
+}
+
+#[test]
+fn initial_studio_delta_rejects_missing_or_extra_comparison_paths() {
+    let project = TempDir::new("initial-studio-delta-scope");
+    let workspace = project.path().join("Workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let allowed = workspace.join("Allowed.luau");
+    let extra = workspace.join("Extra.luau");
+    std::fs::write(&allowed, "return 'allowed disk'\n").unwrap();
+    std::fs::write(&extra, "return 'extra disk'\n").unwrap();
+    let state = test_state(&project, None);
+    authorize_studio_delta_test(&state, "delta-scoped", &["Workspace/Allowed"]);
+
+    let response = push_blocking(
+        &state,
+        studio_delta_body(
+            "delta-scoped",
+            vec![json!({
+                "op": "update",
+                "path": ["Workspace", "Extra"],
+                "properties": { "Source": "return 'hijacked'\n" },
+            })],
+        ),
+    )
+    .0;
+
+    assert_eq!(response["ok"], false);
+    assert!(response["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("outside the authorized")));
+    assert_eq!(
+        std::fs::read_to_string(allowed).unwrap(),
+        "return 'allowed disk'\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(extra).unwrap(),
+        "return 'extra disk'\n"
+    );
+}
+
+#[test]
+fn initial_studio_delta_rejects_a_stale_disk_generation() {
+    let project = TempDir::new("initial-studio-delta-stale");
+    let workspace = project.path().join("Workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = workspace.join("Changed.luau");
+    std::fs::write(&source, "return 'compared'\n").unwrap();
+    let state = test_state(&project, None);
+    authorize_studio_delta_test(&state, "delta-stale", &["Workspace/Changed"]);
+    std::fs::write(&source, "return 'new disk edit'\n").unwrap();
+
+    let response = push_blocking(
+        &state,
+        studio_delta_body(
+            "delta-stale",
+            vec![json!({
+                "op": "update",
+                "path": ["Workspace", "Changed"],
+                "properties": { "Source": "return 'studio'\n" },
+            })],
+        ),
+    )
+    .0;
+
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["stale"], true);
+    assert_eq!(
+        std::fs::read_to_string(source).unwrap(),
+        "return 'new disk edit'\n"
+    );
 }
 
 #[tokio::test]

@@ -1336,6 +1336,10 @@ struct InitialCompareAccumulator {
 #[derive(Clone)]
 struct StudioTransferGrant {
     service_generations: Vec<crate::fs_safety::TreeGeneration>,
+    /// Generated comparison paths that may be overwritten by the bounded
+    /// initial Studio delta endpoint. An empty set means the grant is valid
+    /// only for the existing full streamed push.
+    delta_source_paths: std::collections::HashSet<String>,
     created_at: Instant,
 }
 
@@ -3390,6 +3394,7 @@ async fn initial_decision(
                         choice,
                         p.selected_disk_paths.clone(),
                         p.service_generations.clone(),
+                        p.details.clone(),
                     )
                 }),
                 _ => {
@@ -3402,7 +3407,7 @@ async fn initial_decision(
             }
         };
 
-        if let Some((choice, selected_disk_paths, service_generations)) = decision {
+        if let Some((choice, selected_disk_paths, service_generations, details)) = decision {
             if choice == Choice::Disk {
                 if let Some(paths) = selected_disk_paths.as_ref() {
                     let grants =
@@ -3433,6 +3438,16 @@ async fn initial_decision(
                     ),
                     StudioTransferGrant {
                         service_generations,
+                        delta_source_paths: details
+                            .into_iter()
+                            .filter(|item| {
+                                item.action == InitialChoiceAction::Overwrite
+                                    && item.kind == "script"
+                                    && !item.class_changed
+                                    && item.source_changed
+                            })
+                            .map(|item| item.path)
+                            .collect(),
                         created_at: Instant::now(),
                     },
                 );
@@ -5613,6 +5628,10 @@ struct PushBody {
     stream_id: Option<String>,
     #[serde(rename = "choiceId", default)]
     choice_id: Option<String>,
+    /// Apply the comparison-authorized changed-Source set without exporting
+    /// every watched service again.
+    #[serde(rename = "initialDelta", default)]
+    initial_delta: bool,
     #[serde(default)]
     service: Option<String>,
     #[serde(default)]

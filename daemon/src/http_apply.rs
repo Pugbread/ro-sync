@@ -2138,7 +2138,7 @@ fn audit_stream_push_complete(
 fn consume_studio_transfer_grant(
     project: &Path,
     choice_id: &str,
-) -> Result<Vec<crate::fs_safety::TreeGeneration>, String> {
+) -> Result<StudioTransferGrant, String> {
     if !valid_initial_choice_token(choice_id) {
         return Err("strict streamed push has an invalid choiceId".into());
     }
@@ -2151,7 +2151,7 @@ fn consume_studio_transfer_grant(
     }
     .ok_or("strict streamed push choiceId is stale, consumed, or unauthorized")?;
     revalidate_initial_service_generations(project, &grant.service_generations)?;
-    Ok(grant.service_generations)
+    Ok(grant)
 }
 
 fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
@@ -2224,7 +2224,7 @@ fn streamed_push(state: &AppState, body: PushBody) -> Json<Value> {
                             .as_deref()
                             .expect("strict push choiceId was validated above"),
                     ) {
-                        Ok(generations) => generations,
+                        Ok(grant) => grant.service_generations,
                         Err(error) => {
                             return Json(json!({
                                 "ok": false,
@@ -2540,6 +2540,9 @@ fn push_blocking(state: &AppState, body: PushBody) -> Json<Value> {
     if body.stream_id.is_some() || body.phase.is_some() {
         return streamed_push(state, body);
     }
+    if body.initial_delta {
+        return initial_studio_delta(state, body);
+    }
     if body.bootstrap && body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
         return Json(json!({
             "ok": false,
@@ -2602,6 +2605,107 @@ fn push_blocking(state: &AppState, body: PushBody) -> Json<Value> {
     Json(json!({
         "ok": res.errors.is_empty(),
         "applied": res.applied,
+        "skipped": res.skipped,
+        "conflicts": res.conflicts,
+        "errors": res.errors,
+    }))
+}
+
+fn initial_studio_delta(state: &AppState, body: PushBody) -> Json<Value> {
+    if body.bootstrap
+        || body.strict
+        || body.force_prune
+        || !body.services.is_empty()
+        || body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION)
+    {
+        return Json(json!({
+            "ok": false,
+            "stale": false,
+            "error": "initial Studio delta has incompatible transfer options",
+        }));
+    }
+    let Some(choice_id) = body.choice_id.as_deref() else {
+        return Json(json!({
+            "ok": false,
+            "stale": false,
+            "error": "initial Studio delta requires choiceId",
+        }));
+    };
+    let grant = match consume_studio_transfer_grant(state.canonical_project.as_path(), choice_id) {
+        Ok(grant) => grant,
+        Err(error) => {
+            return Json(json!({ "ok": false, "stale": true, "error": error }));
+        }
+    };
+    if grant.delta_source_paths.is_empty() {
+        return Json(json!({
+            "ok": false,
+            "stale": true,
+            "error": "initial choice is not eligible for a Source-only delta",
+        }));
+    }
+
+    let mut received = std::collections::HashSet::with_capacity(body.ops.len());
+    for op in &body.ops {
+        if op.get("op").and_then(Value::as_str) != Some("update") {
+            return Json(json!({
+                "ok": false,
+                "stale": true,
+                "error": "initial Studio delta accepts only Source update operations",
+            }));
+        }
+        let Some(path) = op.get("path").and_then(Value::as_array) else {
+            return Json(json!({ "ok": false, "stale": true, "error": "delta update is missing path" }));
+        };
+        let mut segments = Vec::with_capacity(path.len());
+        for segment in path {
+            let Some(segment) = segment.as_str() else {
+                return Json(json!({ "ok": false, "stale": true, "error": "delta path contains a non-string segment" }));
+            };
+            segments.push(segment);
+        }
+        let generated_path = segments.join("/");
+        let source_only = op
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| {
+                properties.len() == 1 && properties.get("Source").and_then(Value::as_str).is_some()
+            });
+        if !source_only
+            || !grant.delta_source_paths.contains(&generated_path)
+            || !received.insert(generated_path)
+        {
+            return Json(json!({
+                "ok": false,
+                "stale": true,
+                "error": "delta update is outside the authorized comparison set",
+            }));
+        }
+    }
+    if received != grant.delta_source_paths {
+        return Json(json!({
+            "ok": false,
+            "stale": true,
+            "error": "initial Studio delta did not include the complete changed-Source set",
+        }));
+    }
+
+    let root = state.canonical_project.as_path();
+    let ctx = PushCtx {
+        conflicts: state.conflict.as_ref(),
+        push_quiet: state.push_quiet.as_ref(),
+        force_overwrite: true,
+        strict: false,
+        force_prune: false,
+        project_root: root,
+        backup_forced_removals: true,
+        dirty_parents: Mutex::new(std::collections::HashSet::new()),
+    };
+    let mut res = PushApplyResult::default();
+    apply_ops_into(root, &body.ops, &ctx, &mut res);
+    Json(json!({
+        "ok": res.errors.is_empty() && res.conflicts.is_empty(),
+        "deltaApplied": res.applied,
         "skipped": res.skipped,
         "conflicts": res.conflicts,
         "errors": res.errors,

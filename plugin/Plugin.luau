@@ -3025,7 +3025,7 @@ function snapshotApplyState.buildPhysicalSiblingIndex(parent, ctx, override)
 			end
 		end
 	end
-		table.sort(projectionEntries, function(left, right)
+	table.sort(projectionEntries, function(left, right)
 		if left.reserved ~= right.reserved then
 			return left.reserved
 		end
@@ -5407,6 +5407,12 @@ scaleState.clearDiskPathCache = function(root: Instance)
 	snapshotApplyState.clearDiskPathSubtree(root)
 end
 
+scaleState.invalidateProjectionCache = function()
+	scaleState.cachedProjectionValid = false
+	scaleState.cachedProjectionInfo = nil
+	scaleState.cachedStudioStats = nil
+end
+
 scaleState.nearestScriptAncestor = function(parent: Instance?): Instance?
 	local current = parent
 	while current and current ~= game do
@@ -5452,6 +5458,7 @@ scaleState.serializeLiveInstance = function(inst: Instance)
 end
 
 onDescendantAdded = function(inst)
+	scaleState.invalidateProjectionCache()
 	if isEchoing() then
 		return
 	end
@@ -5516,6 +5523,7 @@ onDescendantAdded = function(inst)
 end
 
 onDescendantRemoving = function(inst)
+	scaleState.invalidateProjectionCache()
 	if isEchoing() then
 		return
 	end
@@ -5602,6 +5610,7 @@ scaleState.onParentChanged = function(inst: Instance)
 	if oldParent == newParent then
 		return
 	end
+	scaleState.invalidateProjectionCache()
 	if scaleState.avoidSyncPathAffectedBy(inst) then
 		scaleState.markAvoidSyncPathsDirty()
 	end
@@ -5719,6 +5728,9 @@ scaleState.onParentChanged = function(inst: Instance)
 end
 
 onChanged = function(inst, prop)
+	if prop == "Name" then
+		scaleState.invalidateProjectionCache()
+	end
 	local previousName = nil
 	if prop == "Name" then
 		previousName = lastKnownName[inst] or inst.Name
@@ -5794,6 +5806,7 @@ onChanged = function(inst, prop)
 end
 
 onAvoidSyncChanged = function(inst)
+	scaleState.invalidateProjectionCache()
 	local current = hasAvoidSyncAttribute(inst)
 	lastAvoidSyncValue[inst] = current
 	if isEchoing() then
@@ -6043,6 +6056,7 @@ end
 
 disconnectHooks = function()
 	scaleState.hooksInstalled = false
+	scaleState.invalidateProjectionCache()
 	local previousPause = scaleState.avoidSyncTrackingPaused
 	scaleState.avoidSyncTrackingPaused = true
 	scaleState.hookGeneration += 1
@@ -6701,6 +6715,24 @@ scaleState.scanStudioServiceStats = function(service: Instance, stats, progress,
 end
 
 scaleState.collectStudioStatsWithGuard = function(guard)
+	-- Once hooks cover the whole DataModel, structural projection is maintained
+	-- by their invalidation signals. A reconnect with only Source edits can reuse
+	-- the last projection instead of walking every descendant in a huge place.
+	-- Source content is deliberately absent from this cache and is re-hashed by
+	-- the comparison stream, so an edited script can never be hidden by it.
+	if
+		scaleState.cachedProjectionValid == true
+		and type(scaleState.cachedProjectionInfo) == "table"
+		and type(scaleState.cachedStudioStats) == "table"
+	then
+		if guard then
+			guard.projectionInfo = scaleState.cachedProjectionInfo
+		end
+		return {
+			scriptCount = scaleState.cachedStudioStats.scriptCount,
+			instanceCount = scaleState.cachedStudioStats.instanceCount,
+		}, { visited = 0, reused = true }
+	end
 	local stats = { scriptCount = 0, instanceCount = 0 }
 	local progress = { visited = 0 }
 	scaleState.resetYieldSlice()
@@ -6726,6 +6758,14 @@ scaleState.collectStudioStatsWithGuard = function(guard)
 		if scaleState.guardBlocksSnapshot(guard) then
 			break
 		end
+	end
+	if not scaleState.guardBlocksSnapshot(guard) then
+		scaleState.cachedProjectionInfo = projectionInfo
+		scaleState.cachedStudioStats = {
+			scriptCount = stats.scriptCount,
+			instanceCount = stats.instanceCount,
+		}
+		scaleState.cachedProjectionValid = true
 	end
 	return stats, progress
 end
@@ -10931,11 +10971,12 @@ runInitialCompare = function()
 		return items
 	end
 
-	local function applyStudioDeltaFastPath(items)
+	local function applyStudioDeltaFastPath(items, choiceId)
 		if type(items) ~= "table" or #items == 0 or not scanGuard then
 			return false
 		end
 		local resolved = {}
+		local ops = {}
 		for _, item in ipairs(items) do
 			if
 				type(item) ~= "table"
@@ -10951,20 +10992,60 @@ runInitialCompare = function()
 				return false
 			end
 			resolved[#resolved + 1] = inst
+			local source, sourceErr = tryReadScriptSource(inst)
+			if source == nil then
+				log("delta fast path could not read " .. tostring(item.path) .. ": " .. tostring(sourceErr))
+				return false
+			end
+			ops[#ops + 1] = {
+				op = "update",
+				path = string.split(item.path, "/"),
+				properties = { Source = source },
+			}
 		end
-		for _, inst in ipairs(resolved) do
-			if scanGuard.mutatedSources[inst] == nil then
-				scanGuard.mutatedSources[inst] = true
-				scanGuard.mutatedSourceCount += 1
+		local ok, deltaResp = httpJson("/push", "POST", {
+			ops = ops,
+			initialDelta = true,
+			choiceId = tostring(choiceId),
+			pluginProtocol = PLUGIN_PROTOCOL_VERSION,
+		})
+		if not ok or type(deltaResp) ~= "table" or deltaResp.ok ~= true then
+			log(
+				"decision studio delta failed: "
+					.. tostring(type(deltaResp) == "table" and (deltaResp.error or deltaResp.errors) or deltaResp)
+			)
+			return false
+		end
+		-- The comparison receipts describe the exact disk tree that the delta
+		-- just updated. Install those identities before live hooks start so
+		-- duplicate names and init carriers keep targeting the compared files.
+		for _, serviceName in ipairs(WATCHED_SERVICES) do
+			if
+				not comparedDiskIdentities
+				or not comparedDiskIdentityServices
+				or comparedDiskIdentityServices[serviceName] ~= true
+			then
+				return false
+			end
+			local serviceOk, service = pcall(function()
+				return game:GetService(serviceName)
+			end)
+			if serviceOk and service then
+				local seeded = pcall(function()
+					snapshotApplyState.seedDiskPathsForService(service, comparedDiskIdentities)
+				end)
+				if not seeded then
+					return false
+				end
 			end
 		end
 		log(
 			string.format(
-				"decision studio → delta fast path: replaying %d changed script(s) instead of a full push",
+				"decision studio → delta fast path: wrote %d changed script(s) instead of a full push",
 				#resolved
 			)
 		)
-		setPill("connecting", string.format("Syncing %d changed script(s)…", #resolved))
+		setPill("connecting", string.format("Synced %d changed script(s). Starting live sync…", #resolved))
 		return true
 	end
 
@@ -11142,8 +11223,13 @@ runInitialCompare = function()
 					reconnectState.retryInitialCompare("strict snapshot pull failed")
 				end
 			elseif choice == "studio" then
-				if deltaItems ~= nil and applyStudioDeltaFastPath(deltaItems) then
-					completeInitialCompare()
+				if deltaItems ~= nil then
+					if applyStudioDeltaFastPath(deltaItems, choiceId) then
+						completeInitialCompare()
+					else
+						disposeScanGuard()
+						reconnectState.retryInitialCompare("authorized Studio delta failed")
+					end
 					return
 				end
 				-- The guard keeps the tree coherent while the modal is open;
