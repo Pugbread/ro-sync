@@ -272,11 +272,15 @@ fn projection_entry_at(path: &Path) -> Result<Option<ProjectionEntry>, String> {
     if !metadata.is_file() && !metadata.is_dir() {
         return Ok(None);
     }
-    Ok(Some(ProjectionEntry {
-        generation: crate::fs_safety::file_generation_no_follow(path)
-            .map_err(|error| format!("capture projection entry {}: {error}", path.display()))?,
-        is_dir: metadata.is_dir(),
-    }))
+    let is_dir = metadata.is_dir();
+    let generation = if is_dir {
+        crate::fs_safety::directory_generation_no_follow(path)
+            .map_err(|error| format!("capture projection directory {}: {error}", path.display()))?
+    } else {
+        crate::fs_safety::file_generation_no_follow(path)
+            .map_err(|error| format!("capture projection entry {}: {error}", path.display()))?
+    };
+    Ok(Some(ProjectionEntry { generation, is_dir }))
 }
 
 fn scan_projection_service(root: &Path, service: &str) -> Result<ProjectionEntries, String> {
@@ -1622,6 +1626,16 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn published_directory_has_a_projection_generation() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("Workspace");
+        std::fs::create_dir(&directory).unwrap();
+
+        let entry = projection_entry_at(&directory).unwrap().unwrap();
+        assert!(entry.is_dir);
+    }
 
     fn debounced_event(kind: EventKind, paths: &[&Path]) -> DebouncedEvent {
         let event = paths.iter().fold(notify::Event::new(kind), |event, path| {

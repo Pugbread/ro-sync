@@ -922,6 +922,15 @@ struct Hello {
     plugin_protocol: u64,
     #[serde(rename = "pluginCapability")]
     plugin_capability: &'static str,
+    #[serde(rename = "hashChunkNodes")]
+    hash_chunk_nodes: usize,
+    #[serde(rename = "sourceChunkNodes")]
+    source_chunk_nodes: usize,
+    #[serde(
+        rename = "initialChoiceDefault",
+        skip_serializing_if = "Option::is_none"
+    )]
+    initial_choice_default: Option<String>,
     #[serde(rename = "projectInit")]
     project_init: ProjectInitHello,
 }
@@ -962,6 +971,9 @@ async fn hello(State(state): State<AppState>) -> Json<Hello> {
         plugin_connected,
         plugin_protocol: crate::ws::PLUGIN_PROTOCOL_VERSION,
         plugin_capability: crate::ws::plugin_capability(),
+        hash_chunk_nodes: STREAM_COMPARE_HASH_CHUNK_NODES,
+        source_chunk_nodes: STREAM_SOURCE_PART_CHUNK_NODES,
+        initial_choice_default: state.initial_choice_default.read().unwrap().clone(),
         project_init: ProjectInitHello {
             available: projects_root.is_some(),
             projects_root,
@@ -998,10 +1010,21 @@ struct ProjectInitBody {
 }
 
 async fn project_init(State(state): State<AppState>, body: Bytes) -> Json<Value> {
-    project_init_inner(&state, &body)
+    // Studio reports the place title for both names it sends, so ask the
+    // universe for the experience title before naming the project. Best-effort
+    // and bounded: a failed lookup just leaves Studio's own names in place.
+    let experience_name = match serde_json::from_slice::<ProjectInitBody>(&body) {
+        Ok(parsed) => crate::project_init::resolve_experience_name(&parsed.game_id).await,
+        Err(_) => None,
+    };
+    project_init_inner(&state, &body, experience_name)
 }
 
-fn project_init_inner(state: &AppState, body: &[u8]) -> Json<Value> {
+fn project_init_inner(
+    state: &AppState,
+    body: &[u8],
+    experience_name: Option<String>,
+) -> Json<Value> {
     let Some(projects_root) = state.projects_root.as_ref().as_ref() else {
         return Json(json!({
             "ok": false,
@@ -1039,7 +1062,7 @@ fn project_init_inner(state: &AppState, body: &[u8]) -> Json<Value> {
     let outcome = match crate::project_init::initialize_project(
         projects_root,
         crate::project_init::ProjectInitRequest {
-            game_name: body.game_name,
+            game_name: experience_name.unwrap_or(body.game_name),
             place_name: body.place_name,
             game_id: body.game_id,
             place_id: body.place_id,
@@ -1280,10 +1303,22 @@ fn initial_choice_action_rank(action: InitialChoiceAction) -> u8 {
     }
 }
 
+// A disk snapshot taken ahead of need. The initial compare walks and hashes
+// each service's disk tree only after the plugin finishes streaming that
+// service's Studio structure, which serializes disk IO behind Studio-side
+// streaming. The walk depends only on the service name, so the session spawns
+// one walker per service at creation and the prep step reuses the result when
+// the tree generation still matches (falling back to a fresh walk otherwise).
+struct PrewarmedDiskService {
+    generation: crate::fs_safety::TreeGeneration,
+    disk: snapshot::FlatDiskService,
+}
+
 struct InitialCompareAccumulator {
     compare_id: String,
     disk_stats: Stats,
     studio_stats: Stats,
+    disk_prewarm: HashMap<String, std::sync::mpsc::Receiver<Result<PrewarmedDiskService, String>>>,
     next_service: usize,
     comparison: InitialComparison,
     staged_baselines: Vec<StagedScriptBaseline>,
@@ -1301,6 +1336,10 @@ struct InitialCompareAccumulator {
 #[derive(Clone)]
 struct StudioTransferGrant {
     service_generations: Vec<crate::fs_safety::TreeGeneration>,
+    /// Exact comparison rows authorized by Keep Studio. The bounded delta
+    /// endpoint validates every structural/source operation against this map;
+    /// an empty map leaves the existing full streamed push as the fallback.
+    delta_items: HashMap<String, InitialChoiceItem>,
     created_at: Instant,
 }
 
@@ -1522,6 +1561,23 @@ fn initial_compare_error_value(prefix: &str, error: &str) -> Value {
     })
 }
 
+/// Run heavy synchronous handler work on the blocking pool instead of an
+/// async worker thread, while retaining the runtime context needed by cleanup
+/// timers spawned from the synchronous body.
+async fn run_handler_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _guard = handle.enter();
+        f()
+    })
+    .await
+    .map_err(|error| format!("blocking handler worker failed: {error}"))
+}
+
 async fn initial_compare(
     State(state): State<AppState>,
     Json(body): Json<InitialCompareBody>,
@@ -1536,7 +1592,13 @@ async fn initial_compare(
         }));
     }
     if body.compare_id.is_some() || body.service.is_some() {
-        return initial_compare_service_chunk(&state, body);
+        // Chunk processing (validation, disk hashing, bounded worker waits)
+        // is synchronous; keep it off the async worker threads.
+        return match run_handler_blocking(move || initial_compare_service_chunk(&state, body)).await
+        {
+            Ok(response) => response,
+            Err(error) => Json(json!({ "ok": false, "error": error })),
+        };
     }
 
     let stats_root = state.canonical_project.clone();
@@ -1586,10 +1648,39 @@ async fn initial_compare(
             .lock()
             .unwrap();
         prune_initial_compare_sessions(&mut sessions);
+        // Start every service's disk walk now, in parallel, so it overlaps
+        // the plugin's Studio-side structure streaming instead of running
+        // serially after it. Consumed (and generation-checked) in
+        // prepare_streamed_initial_service_comparison.
+        let mut disk_prewarm = HashMap::new();
+        for service in snapshot::SYNCED_SERVICES {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let root = project.clone();
+            let service_name = (*service).to_string();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let generation = crate::fs_safety::capture_tree_metadata(&root, &service_name)?;
+                    let disk =
+                        snapshot::emit_flat_service(&root, &service_name).map_err(|error| {
+                            format!("scan {}: {error}", root.join(&service_name).display())
+                        })?;
+                    if crate::fs_safety::capture_tree_metadata(&root, &service_name)? != generation
+                    {
+                        return Err(format!(
+                            "disk service {service_name} changed during prewarm; rescan required"
+                        ));
+                    }
+                    Ok(PrewarmedDiskService { generation, disk })
+                })();
+                let _ = send.send(result);
+            });
+            disk_prewarm.insert((*service).to_string(), receive);
+        }
         let session = Arc::new(Mutex::new(InitialCompareAccumulator {
             compare_id: compare_id.clone(),
             disk_stats,
             studio_stats: body.studio_stats,
+            disk_prewarm,
             next_service: 0,
             comparison: InitialComparison::default(),
             staged_baselines: Vec::new(),
@@ -1623,11 +1714,19 @@ async fn initial_compare(
     // Protocol 6 is mandatory above. Retain the monolithic shape only for
     // early bounded-stream clients that already supplied it; current clients are
     // always instructed to use bounded service/chunk streaming.
-    match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot) {
-        Ok(comparison) => {
-            finish_initial_comparison(&state, disk_stats, body.studio_stats, comparison, None)
+    match run_handler_blocking(move || {
+        match initial_snapshot_comparison(state.canonical_project.as_path(), &body.studio_snapshot)
+        {
+            Ok(comparison) => {
+                finish_initial_comparison(&state, disk_stats, body.studio_stats, comparison, None)
+            }
+            Err(error) => Json(initial_compare_error_value("snapshot compare", &error)),
         }
-        Err(error) => Json(initial_compare_error_value("snapshot compare", &error)),
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => Json(json!({ "ok": false, "error": error })),
     }
 }
 
@@ -1864,6 +1963,13 @@ fn process_streamed_initial_compare_chunk(
     let chunk_index = body
         .chunk_index
         .ok_or("streamed comparison chunk is missing chunkIndex")?;
+    // Detach this service's prewarmed disk walk before the stream borrow
+    // below; it is consumed exactly once, by the final structure chunk.
+    let disk_prewarm = if phase == "structure" && body.final_chunk {
+        session.disk_prewarm.remove(service)
+    } else {
+        None
+    };
     if session.service_stream.is_none() {
         if phase != "structure" || chunk_index != 0 {
             return Err("a service stream must begin with structure chunk 0".into());
@@ -1967,7 +2073,7 @@ fn process_streamed_initial_compare_chunk(
             std::thread::spawn(move || {
                 let prepared = (|| {
                     let validated = validate_flat_snapshot(&records, &service_name, false)?;
-                    prepare_streamed_initial_service_comparison(&root, validated)
+                    prepare_streamed_initial_service_comparison(&root, validated, disk_prewarm)
                 })();
                 let _ = send.send((records, prepared));
             });
@@ -1995,13 +2101,17 @@ fn process_streamed_initial_compare_chunk(
             {
                 return Err("diskPrepare accepts only empty continuation ticks".into());
             }
+            // Bounded server-side wait: one request absorbs several plugin
+            // polling ticks (each otherwise a full HTTP round trip + client
+            // delay). This handler runs on the blocking pool, so a short
+            // blocking wait cannot stall an async worker thread.
             let result = stream
                 .prepare_result
                 .as_ref()
                 .ok_or("diskPrepare worker is missing")?
-                .try_recv();
+                .recv_timeout(STREAM_WORKER_POLL_BUDGET);
             match result {
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     stream.next_chunk += 1;
                     session.started_at = Instant::now();
                     Ok(json!({
@@ -2012,7 +2122,7 @@ fn process_streamed_initial_compare_chunk(
                         "nextChunk": stream.next_chunk,
                     }))
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     Err("diskPrepare worker disconnected".into())
                 }
                 Ok((mut records, Err(error))) => {
@@ -2163,27 +2273,12 @@ fn process_streamed_initial_compare_chunk(
             // Source IO is deliberately deferred until the matching Studio
             // hash chunk arrives. This keeps the final structure request
             // metadata-only and bounds daemon work to one small hash batch.
+            let mut local_baselines = prepare_staged_script_baselines(project, &validated_hashes)?;
             let mut prepared_hashes = Vec::with_capacity(validated_hashes.len());
-            for (id, path, studio_hash, local_source_path) in validated_hashes {
-                let local_baseline = if let Some(source_path) = local_source_path {
-                    let generation = crate::fs_safety::file_generation_no_follow(&source_path)?;
-                    let source_hash = normalized_file_hash(project, &source_path)?;
-                    if crate::fs_safety::file_generation_no_follow(&source_path)? != generation {
-                        return Err(format!(
-                            "disk script {} changed while it was hashed; restart the comparison",
-                            source_path.display()
-                        ));
-                    }
-                    Some(StagedScriptBaseline {
-                        fs_mtime: fs_mtime(&source_path),
-                        path: source_path,
-                        source_hash,
-                        generation,
-                    })
-                } else {
-                    None
-                };
-                prepared_hashes.push((id, path, studio_hash, local_baseline));
+            for ((id, path, studio_hash, _), local_baseline) in
+                validated_hashes.into_iter().zip(local_baselines.iter_mut())
+            {
+                prepared_hashes.push((id, path, studio_hash, local_baseline.take()));
             }
 
             // Commit only after every ID, path, digest, and disk read in the
@@ -2283,6 +2378,7 @@ struct PreparedStreamedComparison {
 fn prepare_streamed_initial_service_comparison(
     root: &Path,
     studio: ValidatedFlatSnapshot,
+    disk_prewarm: Option<std::sync::mpsc::Receiver<Result<PrewarmedDiskService, String>>>,
 ) -> Result<PreparedStreamedComparison, String> {
     let service = studio
         .service
@@ -2291,14 +2387,30 @@ fn prepare_streamed_initial_service_comparison(
         .ok_or("flat Studio service is missing its name")?
         .to_string();
     reject_legacy_reserved_init_leafs(root, std::slice::from_ref(&service))?;
-    let service_generation = crate::fs_safety::capture_tree_metadata(root, &service)?;
-    let disk = snapshot::emit_flat_service(root, &service)
-        .map_err(|error| format!("scan {}: {error}", root.join(&service).display()))?;
-    if crate::fs_safety::capture_tree_metadata(root, &service)? != service_generation {
-        return Err(format!(
-            "disk service {service} changed during initial comparison; restart the scan"
-        ));
+    // Prefer the walk prewarmed at session creation, but only while its exact
+    // tree generation remains current. Drift falls back to capture/walk/verify.
+    let mut prewarmed = None;
+    if let Some(receiver) = disk_prewarm {
+        if let Ok(Ok(candidate)) = receiver.recv() {
+            if crate::fs_safety::capture_tree_metadata(root, &service)? == candidate.generation {
+                prewarmed = Some(candidate);
+            }
+        }
     }
+    let (service_generation, disk) = match prewarmed {
+        Some(candidate) => (candidate.generation, candidate.disk),
+        None => {
+            let generation = crate::fs_safety::capture_tree_metadata(root, &service)?;
+            let disk = snapshot::emit_flat_service(root, &service)
+                .map_err(|error| format!("scan {}: {error}", root.join(&service).display()))?;
+            if crate::fs_safety::capture_tree_metadata(root, &service)? != generation {
+                return Err(format!(
+                    "disk service {service} changed during initial comparison; restart the scan"
+                ));
+            }
+            (generation, disk)
+        }
+    };
     let disk_source_paths = disk.source_paths;
     let disk = validate_flat_snapshot(&disk.records, &service, true)?;
     let mut local_services = vec![disk.service];
@@ -2484,17 +2596,178 @@ fn parse_sha256_hex(value: &str) -> Result<crate::conflict::Hash, String> {
     Ok(out)
 }
 
+fn prepare_one_staged_script_baseline(
+    source_path: &Path,
+    validation: &mut crate::fs_safety::SyncedPathValidationCache,
+) -> Result<StagedScriptBaseline, String> {
+    let generation = crate::fs_safety::file_generation_no_follow(source_path)?;
+    let source_hash = normalized_file_hash_cached(source_path, validation)?;
+    if crate::fs_safety::file_generation_no_follow(source_path)? != generation {
+        return Err(format!(
+            "disk script {} changed while it was hashed; restart the comparison",
+            source_path.display()
+        ));
+    }
+    Ok(StagedScriptBaseline {
+        fs_mtime: fs_mtime(source_path),
+        path: source_path.to_path_buf(),
+        source_hash,
+        generation,
+    })
+}
+
+/// Hash every disk script referenced by one compare hash chunk.
+///
+/// Each worker owns one batch-scoped `SyncedPathValidationCache` so a chunk
+/// validates stable ancestors once instead of once per file, and independent
+/// per-file hashing is spread across up to `available_parallelism` scoped
+/// threads. Returned baselines are positionally aligned with
+/// `validated_hashes`; entries without a disk source stay `None`.
+fn prepare_staged_script_baselines(
+    project: &Path,
+    validated_hashes: &[(u64, String, crate::conflict::Hash, Option<PathBuf>)],
+) -> Result<Vec<Option<StagedScriptBaseline>>, String> {
+    let jobs: Vec<(usize, &Path)> = validated_hashes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, _, _, source_path))| {
+            source_path.as_deref().map(|path| (index, path))
+        })
+        .collect();
+    let mut baselines: Vec<Option<StagedScriptBaseline>> = std::iter::repeat_with(|| None)
+        .take(validated_hashes.len())
+        .collect();
+    if jobs.is_empty() {
+        return Ok(baselines);
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(jobs.len());
+    if workers <= 1 {
+        let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project)
+            .map_err(|error| format!("validate compare batch: {error}"))?;
+        for (index, path) in jobs {
+            baselines[index] = Some(prepare_one_staged_script_baseline(path, &mut validation)?);
+        }
+        return Ok(baselines);
+    }
+    let chunk_len = jobs.len().div_ceil(workers);
+    let results = std::thread::scope(|scope| {
+        let handles = jobs
+            .chunks(chunk_len)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project)
+                        .map_err(|error| format!("validate compare batch: {error}"))?;
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (index, path) in chunk {
+                        out.push((
+                            *index,
+                            prepare_one_staged_script_baseline(path, &mut validation)?,
+                        ));
+                    }
+                    Ok::<_, String>(out)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "compare hash worker panicked".to_string())?
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    for chunk in results {
+        for (index, baseline) in chunk {
+            baselines[index] = Some(baseline);
+        }
+    }
+    Ok(baselines)
+}
+
+/// In-memory cache of normalized (CRLF-folded) content hashes keyed by the
+/// validated canonical path. Every lookup re-stats the file and returns the
+/// cached digest only when the full [`FileGeneration`] (length, mtime ns,
+/// physical identity) still matches, so a stale entry can never satisfy a
+/// lookup — it merely costs one rehash. Entries are additionally invalidated
+/// on watcher events and on daemon writes.
+static CONTENT_HASH_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (crate::fs_safety::FileGeneration, crate::conflict::Hash)>>,
+> = OnceLock::new();
+const CONTENT_HASH_CACHE_MAX_ENTRIES: usize = 65_536;
+
+fn content_hash_cache(
+) -> &'static Mutex<HashMap<PathBuf, (crate::fs_safety::FileGeneration, crate::conflict::Hash)>> {
+    CONTENT_HASH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_cached_content_hash(
+    validated: &Path,
+    generation: &crate::fs_safety::FileGeneration,
+) -> Option<crate::conflict::Hash> {
+    let cache = content_hash_cache().lock().unwrap();
+    cache
+        .get(validated)
+        .filter(|(cached_generation, _)| cached_generation == generation)
+        .map(|(_, hash)| *hash)
+}
+
+fn store_cached_content_hash(
+    validated: PathBuf,
+    generation: crate::fs_safety::FileGeneration,
+    hash: crate::conflict::Hash,
+) {
+    let mut cache = content_hash_cache().lock().unwrap();
+    if cache.len() >= CONTENT_HASH_CACHE_MAX_ENTRIES && !cache.contains_key(&validated) {
+        cache.clear();
+    }
+    cache.insert(validated, (generation, hash));
+}
+
+/// Drop any cached content hash for `path`. Called for daemon writes and
+/// watcher events; correctness never depends on this (every hit re-checks the
+/// file generation), it only keeps the map small and current.
+pub(crate) fn invalidate_cached_content_hash(path: &Path) {
+    if let Some(cache) = CONTENT_HASH_CACHE.get() {
+        cache.lock().unwrap().remove(path);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn normalized_file_hash(project_root: &Path, path: &Path) -> Result<crate::conflict::Hash, String> {
+    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
+        .map_err(|error| format!("validate source {}: {error}", path.display()))?;
+    normalized_file_hash_cached(path, &mut validation)
+}
+
+/// Batch variant of [`normalized_file_hash`] which reuses one
+/// [`SyncedPathValidationCache`] across many files (avoiding a fresh
+/// canonicalize + ancestor re-scan per file) and consults the content-hash
+/// cache before re-reading unchanged sources.
+fn normalized_file_hash_cached(
+    path: &Path,
+    validation: &mut crate::fs_safety::SyncedPathValidationCache,
+) -> Result<crate::conflict::Hash, String> {
     use std::io::Read as _;
 
-    let validated = crate::fs_safety::validate_synced_path(project_root, path, false)
+    let validated = validation
+        .validate(path, false)
         .map_err(|error| format!("validate source {}: {error}", path.display()))?;
-    let guard = crate::fs_safety::guard_synced_parent_chain(project_root, &validated, false)
+    let guard = crate::fs_safety::guard_synced_parent_chain_cached(validation, &validated, false)
         .map_err(|error| format!("guard source {}: {error}", path.display()))?;
     guard
         .verify()
         .map_err(|error| format!("verify source parent {}: {error}", path.display()))?;
     let before = crate::fs_safety::file_generation_no_follow(&validated)?;
+    if let Some(cached) = lookup_cached_content_hash(&validated, &before) {
+        guard
+            .verify()
+            .map_err(|error| format!("source parent changed {}: {error}", path.display()))?;
+        return Ok(cached);
+    }
     let file = crate::fs_safety::open_regular_file_no_follow(&validated)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
@@ -2545,7 +2818,9 @@ fn normalized_file_hash(project_root: &Path, path: &Path) -> Result<crate::confl
     guard
         .verify()
         .map_err(|error| format!("source parent changed {}: {error}", path.display()))?;
-    Ok(hasher.finalize().into())
+    let digest: crate::conflict::Hash = hasher.finalize().into();
+    store_cached_content_hash(validated, before, digest);
+    Ok(digest)
 }
 
 fn capture_initial_service_generations(
@@ -3091,6 +3366,25 @@ async fn initial_decision(
     Query(params): Query<InitialDecisionParams>,
 ) -> impl IntoResponse {
     let started = Instant::now();
+    // Each poll is proof the plugin's decision picker is still alive. Refresh
+    // the compare session's expiry clocks so a human who takes longer than the
+    // TTLs (15 min pending / 2 min completed) to answer doesn't have the
+    // session pruned out from under the picker — that silently orphaned the
+    // eventual choice and wedged the initial sync.
+    {
+        let sessions = INITIAL_COMPARE_ACCUMULATORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        if let Some(session) = sessions.get(state.canonical_project.as_ref()) {
+            if let Ok(mut session) = session.try_lock() {
+                session.started_at = Instant::now();
+                if session.completed_at.is_some() {
+                    session.completed_at = Some(Instant::now());
+                }
+            }
+        }
+    }
     loop {
         let decision = {
             let slot = state.pending_initial.lock().unwrap();
@@ -3100,6 +3394,7 @@ async fn initial_decision(
                         choice,
                         p.selected_disk_paths.clone(),
                         p.service_generations.clone(),
+                        p.details.clone(),
                     )
                 }),
                 _ => {
@@ -3112,7 +3407,7 @@ async fn initial_decision(
             }
         };
 
-        if let Some((choice, selected_disk_paths, service_generations)) = decision {
+        if let Some((choice, selected_disk_paths, service_generations, details)) = decision {
             if choice == Choice::Disk {
                 if let Some(paths) = selected_disk_paths.as_ref() {
                     let grants =
@@ -3143,6 +3438,10 @@ async fn initial_decision(
                     ),
                     StudioTransferGrant {
                         service_generations,
+                        delta_items: details
+                            .into_iter()
+                            .map(|item| (item.path.clone(), item))
+                            .collect(),
                         created_at: Instant::now(),
                     },
                 );
@@ -3455,8 +3754,38 @@ async fn initial_choice(
 
     if newly_chosen {
         finalize_initial_choice(&state, &body.choice_id, choice);
+        persist_initial_choice_default(&state, choice);
     }
     initial_choice_ok(json!({ "ok": true }))
+}
+
+/// Record a full studio/disk decision in `ro-sync.json` so future compares
+/// can auto-answer. Cancel means "ask me again" and clears nothing; the
+/// selective-disk path never reaches here (one-off pulls are not a default).
+fn persist_initial_choice_default(state: &AppState, choice: Choice) {
+    let value = match choice {
+        Choice::Studio => "studio",
+        Choice::Disk => "disk",
+        Choice::Cancel => return,
+    };
+    {
+        let mut slot = state.initial_choice_default.write().unwrap();
+        if slot.as_deref() == Some(value) {
+            return;
+        }
+        *slot = Some(value.to_string());
+    }
+    let root = state.canonical_project.as_ref().clone();
+    match crate::project_config::read_from_disk(&root) {
+        Ok(Some(mut cfg)) => {
+            cfg.initial_choice_default = Some(value.to_string());
+            if let Err(error) = crate::project_config::write(&root, &cfg) {
+                eprintln!("failed to persist initialChoiceDefault: {error}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("failed to reread project config: {error}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -4363,10 +4692,10 @@ fn poll_initial_pull_fingerprint(stream: &mut SnapshotServiceStream) -> Result<b
         .initial_fingerprint_result
         .as_ref()
         .ok_or("snapshot service fingerprint worker is missing")?
-        .try_recv();
+        .recv_timeout(STREAM_WORKER_POLL_BUDGET);
     match result {
-        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err("snapshot service fingerprint worker disconnected".into())
         }
         Ok(Err(error)) => Err(error),
@@ -4399,10 +4728,10 @@ fn poll_revalidated_pull_fingerprint(
         .revalidate_result
         .as_ref()
         .expect("revalidation worker was initialized")
-        .try_recv();
+        .recv_timeout(STREAM_WORKER_POLL_BUDGET);
     match result {
-        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err("snapshot revalidation worker disconnected".into())
         }
         Ok(Err(error)) => Err(error),
@@ -4502,30 +4831,50 @@ fn produce_structure_response(
     stream: &mut SnapshotServiceStream,
 ) -> Result<Value, String> {
     let chunk_index = stream.next_chunk;
-    let mut chunk = Vec::new();
-    while stream.record_offset + chunk.len() < stream.records.len()
-        && chunk.len() < STREAM_STRUCTURE_CHUNK_NODES
+    // Incremental size accounting: measure the envelope once, then charge
+    // each record its own encoded length plus one separator byte. This is a
+    // conservative overestimate of the real encoding (the envelope is
+    // measured with the longer `finalChunk: false` variant and the first
+    // array element has no separator), so nothing the old re-encode-per-
+    // element loop would have rejected is accepted; the exact final check
+    // below is unchanged.
+    let envelope = encoded_stream_response_len(&structure_stream_response(
+        stream_id,
+        &stream.service,
+        chunk_index,
+        false,
+        &[],
+    ))?;
+    let mut encoded = envelope;
+    let mut count = 0usize;
+    while stream.record_offset + count < stream.records.len()
+        && count < STREAM_STRUCTURE_CHUNK_NODES
     {
-        let next = stream.records[stream.record_offset + chunk.len()].clone();
-        chunk.push(next);
-        let final_chunk = stream.record_offset + chunk.len() == stream.records.len();
-        let candidate =
-            structure_stream_response(stream_id, &stream.service, chunk_index, final_chunk, &chunk);
-        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
-            chunk.pop();
+        let record = &stream.records[stream.record_offset + count];
+        let record_bytes = serde_json::to_vec(record)
+            .map_err(|error| format!("encode structure record: {error}"))?
+            .len();
+        let candidate = encoded
+            .checked_add(record_bytes)
+            .and_then(|total| total.checked_add(1))
+            .ok_or("encoded structure response size overflowed")?;
+        if candidate > STREAM_RESPONSE_PACK_TARGET {
             break;
         }
+        encoded = candidate;
+        count += 1;
     }
-    if chunk.is_empty() {
+    if count == 0 {
         return Err(format!(
             "one structure record for {} exceeds the encoded response limit",
             stream.service
         ));
     }
-    stream.record_offset += chunk.len();
-    let final_chunk = stream.record_offset == stream.records.len();
+    let chunk = &stream.records[stream.record_offset..stream.record_offset + count];
+    let final_chunk = stream.record_offset + count == stream.records.len();
     let response =
-        structure_stream_response(stream_id, &stream.service, chunk_index, final_chunk, &chunk);
+        structure_stream_response(stream_id, &stream.service, chunk_index, final_chunk, chunk);
+    stream.record_offset += count;
     if encoded_stream_response_len(&response)? > STREAM_SOURCE_CHUNK_BYTES {
         return Err("encoded structure response exceeds 512 KiB".into());
     }
@@ -4582,6 +4931,18 @@ fn produce_source_response(
         return Ok((response, false));
     }
 
+    // Incremental size accounting mirroring produce_structure_response: the
+    // envelope is measured once and each part charges its encoded length plus
+    // one separator byte, a conservative overestimate of the real encoding.
+    let envelope = encoded_stream_response_len(&source_stream_response(
+        stream_id,
+        &stream.service,
+        chunk_index,
+        false,
+        &[],
+        false,
+    ))?;
+    let mut encoded = envelope;
     let mut parts = Vec::new();
     while parts.len() < STREAM_SOURCE_PART_CHUNK_NODES
         && stream.source_index < stream.source_ids.len()
@@ -4593,17 +4954,14 @@ fn produce_source_response(
                 .as_ref()
                 .expect("source loader initialized the active Source"),
         );
-        let mut candidate_parts = parts.clone();
-        candidate_parts.push(part.clone());
-        let candidate = source_stream_response(
-            stream_id,
-            &stream.service,
-            chunk_index,
-            false,
-            &candidate_parts,
-            false,
-        );
-        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
+        let part_bytes = serde_json::to_vec(&part)
+            .map_err(|error| format!("encode Source part: {error}"))?
+            .len();
+        let candidate = encoded
+            .checked_add(part_bytes)
+            .and_then(|total| total.checked_add(1))
+            .ok_or("encoded Source response size overflowed")?;
+        if candidate > STREAM_RESPONSE_PACK_TARGET {
             if parts.is_empty() {
                 return Err(format!(
                     "one Source part for stream ID {} exceeds the encoded response limit",
@@ -4612,6 +4970,7 @@ fn produce_source_response(
             }
             break;
         }
+        encoded = candidate;
         commit_pull_source_part(stream, &part)?;
         parts.push(part);
     }
@@ -4657,31 +5016,44 @@ fn produce_delete_response(
     final_service: bool,
 ) -> Result<(Value, bool), String> {
     let chunk_index = stream.next_chunk;
-    let mut chunk = Vec::new();
-    while stream.delete_offset + chunk.len() < stream.deletes.len()
-        && chunk.len() < STREAM_STRUCTURE_CHUNK_NODES
+    // Incremental size accounting mirroring produce_structure_response: the
+    // envelope is measured once and each delete record charges its encoded
+    // length plus one separator byte (a conservative overestimate).
+    let envelope = encoded_stream_response_len(&delete_stream_response(
+        stream_id,
+        &stream.service,
+        chunk_index,
+        false,
+        &[],
+        false,
+    ))?;
+    let mut encoded = envelope;
+    let mut count = 0usize;
+    while stream.delete_offset + count < stream.deletes.len()
+        && count < STREAM_STRUCTURE_CHUNK_NODES
     {
-        chunk.push(stream.deletes[stream.delete_offset + chunk.len()].clone());
-        let candidate = delete_stream_response(
-            stream_id,
-            &stream.service,
-            chunk_index,
-            false,
-            &chunk,
-            false,
-        );
-        if encoded_stream_response_len(&candidate)? > STREAM_RESPONSE_PACK_TARGET {
-            chunk.pop();
+        let path = &stream.deletes[stream.delete_offset + count];
+        let record_bytes = serde_json::to_vec(&json!({ "path": path, "pathMode": "generated" }))
+            .map_err(|error| format!("encode delete record: {error}"))?
+            .len();
+        let candidate = encoded
+            .checked_add(record_bytes)
+            .and_then(|total| total.checked_add(1))
+            .ok_or("encoded delete response size overflowed")?;
+        if candidate > STREAM_RESPONSE_PACK_TARGET {
             break;
         }
+        encoded = candidate;
+        count += 1;
     }
-    if chunk.is_empty() && stream.delete_offset < stream.deletes.len() {
+    if count == 0 && stream.delete_offset < stream.deletes.len() {
         return Err(format!(
             "one delete record for {} exceeds the encoded response limit",
             stream.service
         ));
     }
-    stream.delete_offset += chunk.len();
+    let chunk = stream.deletes[stream.delete_offset..stream.delete_offset + count].to_vec();
+    stream.delete_offset += count;
     let deletes_complete = stream.delete_offset == stream.deletes.len();
     let revalidated = if deletes_complete {
         poll_revalidated_pull_fingerprint(root, stream)?
@@ -4738,6 +5110,15 @@ async fn snapshot_stream(
     State(state): State<AppState>,
     Json(body): Json<SnapshotStreamBody>,
 ) -> Json<Value> {
+    // Snapshot streaming continuations do synchronous disk reads, packing,
+    // and bounded worker waits; keep them off the async worker threads.
+    match run_handler_blocking(move || snapshot_stream_blocking(&state, body)).await {
+        Ok(response) => response,
+        Err(error) => Json(json!({ "ok": false, "error": error })),
+    }
+}
+
+fn snapshot_stream_blocking(state: &AppState, body: SnapshotStreamBody) -> Json<Value> {
     if body.plugin_protocol != Some(crate::ws::PLUGIN_PROTOCOL_VERSION) {
         return Json(json!({
             "ok": false,
@@ -5241,6 +5622,10 @@ struct PushBody {
     stream_id: Option<String>,
     #[serde(rename = "choiceId", default)]
     choice_id: Option<String>,
+    /// Apply the comparison-authorized changed-Source set without exporting
+    /// every watched service again.
+    #[serde(rename = "initialDelta", default)]
+    initial_delta: bool,
     #[serde(default)]
     service: Option<String>,
     #[serde(default)]
@@ -5279,7 +5664,10 @@ const MAX_BOOTSTRAP_NODES: usize = 1_000_000;
 const STREAM_REQUEST_BODY_BYTES: usize = 512 * 1024;
 const STREAM_STRUCTURE_CHUNK_NODES: usize = 512;
 const STREAM_COMPARE_HASH_CHUNK_NODES: usize = 512;
-const STREAM_SOURCE_PART_CHUNK_NODES: usize = 64;
+const STREAM_SOURCE_PART_CHUNK_NODES: usize = 512;
+// One request absorbs several worker polling ticks. These handlers execute on
+// the blocking pool, so this wait does not stall an async runtime worker.
+const STREAM_WORKER_POLL_BUDGET: Duration = Duration::from_millis(200);
 const STREAM_SOURCE_CHUNK_BYTES: usize = 512 * 1024;
 const STREAM_SOURCE_PART_BYTES: usize = 64 * 1024;
 const MAX_STREAM_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
@@ -5392,7 +5780,7 @@ struct StreamCommitInput {
     state: AppState,
     service: String,
     service_node: Value,
-    source_dir: tempfile::TempDir,
+    source_bytes: HashMap<u64, Vec<u8>>,
     initial_fingerprint: ExactTreeFingerprint,
     strict: bool,
     force_prune: bool,
@@ -5410,7 +5798,7 @@ struct PushServiceStream {
     script_ids: Vec<u64>,
     next_script: usize,
     receiving_source: Option<ReceivingSource>,
-    source_dir: Option<tempfile::TempDir>,
+    source_bytes: HashMap<u64, Vec<u8>>,
     initial_fingerprint: Option<ExactTreeFingerprint>,
     fence_result: Option<std::sync::mpsc::Receiver<Result<ExactTreeFingerprint, String>>>,
     commit_result: Option<std::sync::mpsc::Receiver<Result<StreamCommitResult, String>>>,
@@ -5876,6 +6264,10 @@ fn hash_tree_contents(
     generation: &crate::fs_safety::TreeGeneration,
 ) -> Result<crate::conflict::Hash, String> {
     let mut hasher = Sha256::new();
+    // One batch-scoped validation cache for the whole tree walk; every reuse
+    // is still fenced by the per-directory generation check inside the cache.
+    let mut validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
+        .map_err(|error| format!("validate fingerprint root: {error}"))?;
     for entry in generation.entries() {
         if entry.kind != crate::fs_safety::SafeEntryKind::File {
             continue;
@@ -5895,7 +6287,7 @@ fn hash_tree_contents(
                 entry.path.display()
             ));
         }
-        let bytes = read_synced_file(project_root, &entry.path)?;
+        let bytes = read_synced_file_cached(&entry.path, &mut validation)?;
         hasher.update(&bytes);
         if crate::fs_safety::file_generation_no_follow(&entry.path)? != entry.generation {
             return Err(format!(
@@ -5969,6 +6361,8 @@ fn copy_fenced_service_to_stage(
 
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut source_validation = crate::fs_safety::SyncedPathValidationCache::new(project_root)
+        .map_err(|error| format!("validate staging source root: {error}"))?;
     for entry in generation.entries() {
         if entry.kind != crate::fs_safety::SafeEntryKind::File {
             continue;
@@ -5991,10 +6385,12 @@ fn copy_fenced_service_to_stage(
             .parent()
             .ok_or_else(|| format!("staged source has no parent: {}", target.display()))?;
         ensure_descendant_directory_chain(stage_root, parent)?;
-        let source_guard =
-            crate::fs_safety::guard_synced_parent_chain(project_root, &entry.path, false).map_err(
-                |error| format!("guard staged source {}: {error}", entry.path.display()),
-            )?;
+        let source_guard = crate::fs_safety::guard_synced_parent_chain_cached(
+            &mut source_validation,
+            &entry.path,
+            false,
+        )
+        .map_err(|error| format!("guard staged source {}: {error}", entry.path.display()))?;
         let target_guard =
             crate::fs_safety::guard_descendant_parent_chain(stage_root, &target, true)
                 .map_err(|error| format!("guard staged target {}: {error}", target.display()))?;
@@ -6026,9 +6422,10 @@ fn copy_fenced_service_to_stage(
                 .write_all(&buffer[..count])
                 .map_err(|error| format!("write {}: {error}", target.display()))?;
         }
-        destination
-            .sync_all()
-            .map_err(|error| format!("sync {}: {error}", target.display()))?;
+        // No per-file fsync here: the stage is a scratch tree whose crash
+        // semantics come from the atomic rename at commit; the whole stage is
+        // flushed once below.
+        drop(destination);
         let permissions = crate::fs_safety::require_metadata_no_follow(&entry.path)
             .map_err(|error| format!("inspect {}: {error}", entry.path.display()))?
             .permissions();
@@ -6050,7 +6447,24 @@ fn copy_fenced_service_to_stage(
             format!("staged target parent changed {}: {error}", target.display())
         })?;
     }
+    // One flush for the whole staged service replaces the removed per-file
+    // fsyncs. Best effort: rename atomicity, the staging transaction, and the
+    // metadata fences provide the crash/consistency guarantees.
+    sync_directory_best_effort(&stage_service);
     Ok(hasher.finalize().into())
+}
+
+/// Best-effort directory flush used after batch writes replaced their
+/// per-file `sync_all` calls. Opening a directory for read is Unix-only;
+/// elsewhere (and on failure) this is a no-op because correctness comes from
+/// atomic renames and generation fences, not from durability of scratch trees.
+fn sync_directory_best_effort(directory: &Path) {
+    #[cfg(unix)]
+    if let Ok(handle) = std::fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
 }
 
 fn create_stream_backup_destination(

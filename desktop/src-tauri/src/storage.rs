@@ -38,7 +38,7 @@ fn metadata_is_link(metadata: &Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        return attributes_have_reparse_point(metadata.file_attributes());
+        attributes_have_reparse_point(metadata.file_attributes())
     }
     #[cfg(not(windows))]
     false
@@ -172,6 +172,21 @@ impl PhysicalDirectory {
 
     fn open_regular_file(&self, fragment: &OsStr) -> io::Result<fs::File> {
         let file = platform::open_regular_file(&self.file, fragment)?;
+        let metadata = reject_linked_handle(&file)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem entry is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Same validation as [`Self::open_regular_file`], but the handle also
+    /// carries whatever right the platform needs to delete through it. Kept
+    /// separate so the read-only callers do not silently gain DELETE.
+    fn open_regular_file_for_removal(&self, fragment: &OsStr) -> io::Result<fs::File> {
+        let file = platform::open_regular_file_for_removal(&self.file, fragment)?;
         let metadata = reject_linked_handle(&file)?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -351,6 +366,15 @@ mod platform {
     }
 
     pub(super) fn open_regular_file(parent: &fs::File, fragment: &OsStr) -> io::Result<fs::File> {
+        open_entry(parent, fragment)
+    }
+
+    /// unlinkat operates on the directory, not the file handle, so removal
+    /// needs no extra right here — this exists to match the Windows shape.
+    pub(super) fn open_regular_file_for_removal(
+        parent: &fs::File,
+        fragment: &OsStr,
+    ) -> io::Result<fs::File> {
         open_entry(parent, fragment)
     }
 
@@ -562,7 +586,10 @@ mod platform {
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const FILE_RENAME_INFO_CLASS: u32 = 3;
+    /// NT FileInformationClass for FILE_RENAME_INFORMATION. Note this is not
+    /// the Win32 FILE_RENAME_INFO value (3) — the two enumerations differ, and
+    /// the rename below goes through the NT entry point.
+    const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
     const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
     const FILE_NAMES_INFORMATION_CLASS: u32 = 12;
     const STATUS_NO_MORE_FILES: NtStatus = 0x8000_0006_u32 as NtStatus;
@@ -621,6 +648,13 @@ mod platform {
             ea_length: u32,
         ) -> NtStatus;
         fn RtlNtStatusToDosError(status: NtStatus) -> u32;
+        fn NtSetInformationFile(
+            file_handle: Handle,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> NtStatus;
         fn NtQueryDirectoryFile(
             file_handle: Handle,
             event: Handle,
@@ -723,10 +757,7 @@ mod platform {
             return Err(nt_error(status));
         }
         if handle.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "NtCreateFile returned an empty handle",
-            ));
+            return Err(io::Error::other("NtCreateFile returned an empty handle"));
         }
         // SAFETY: a successful NtCreateFile returned one newly owned handle.
         Ok(unsafe { fs::File::from_raw_handle(handle) })
@@ -823,6 +854,25 @@ mod platform {
         )
     }
 
+    /// Deletion here marks the open handle via FILE_DISPOSITION_INFO rather
+    /// than unlinking a path, and that requires DELETE on the handle itself.
+    /// Opening with FILE_GENERIC_READ alone fails the disposition call with
+    /// ERROR_ACCESS_DENIED, so removal gets its own opener instead of widening
+    /// the read path.
+    pub(super) fn open_regular_file_for_removal(
+        parent: &fs::File,
+        fragment: &OsStr,
+    ) -> io::Result<fs::File> {
+        open_relative(
+            parent,
+            fragment,
+            FILE_GENERIC_READ | DELETE,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        )
+    }
+
     pub(super) fn create_new_file(
         parent: &fs::File,
         fragment: &OsStr,
@@ -831,7 +881,16 @@ mod platform {
         open_relative(
             parent,
             fragment,
-            FILE_GENERIC_WRITE | DELETE,
+            // FILE_READ_ATTRIBUTES is required, not incidental: every caller
+            // hands the new handle straight to reject_linked_handle, which
+            // queries it with GetFileInformationByHandle to prove the object
+            // is not a reparse point. Win32's FILE_GENERIC_WRITE does not
+            // include that right (see its definition above), so without this
+            // the query fails ERROR_ACCESS_DENIED and the create appears to
+            // fail even though the file was made — leaving an orphaned
+            // zero-byte temp behind, because the error returns before the
+            // caller's cleanup path.
+            FILE_GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
             FILE_ATTRIBUTE_NORMAL,
             FILE_CREATE,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
@@ -854,18 +913,37 @@ mod platform {
         information.file_name[..destination.len()].copy_from_slice(&destination);
         let header_size = std::mem::offset_of!(FileRenameInfoBuffer, file_name);
         let buffer_size = header_size + destination.len() * std::mem::size_of::<u16>();
-        // SAFETY: the buffer has the documented FILE_RENAME_INFO layout and
-        // contains buffer_size initialized bytes.
-        let result = unsafe {
-            SetFileInformationByHandle(
+        // Renaming through the NT entry point rather than Win32's
+        // SetFileInformationByHandle is what makes RootDirectory mean what
+        // this code needs. A directory HANDLE in RootDirectory is an NT-layer
+        // concept; the Win32 wrapper does not resolve names against it, so it
+        // parsed our bare component as a path and failed ERROR_INVALID_NAME
+        // (123) — every atomic write died at the rename, leaving the
+        // zero-byte temp behind and the real file never created.
+        //
+        // Keeping the rename directory-relative is deliberate: every other
+        // operation here resolves against an owned parent handle so a
+        // concurrently swapped path component cannot redirect the write. The
+        // alternative Win32 fix — passing a fully-qualified destination —
+        // would reintroduce exactly the path re-resolution this module avoids.
+        let mut io_status = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        // SAFETY: the buffer has the documented FILE_RENAME_INFORMATION
+        // layout (identical to FILE_RENAME_INFO) and contains buffer_size
+        // initialized bytes; both handles remain live across the call.
+        let status = unsafe {
+            NtSetInformationFile(
                 temporary.as_raw_handle() as Handle,
-                FILE_RENAME_INFO_CLASS,
+                &mut io_status as *mut IoStatusBlock,
                 (&mut information as *mut FileRenameInfoBuffer).cast(),
                 buffer_size as u32,
+                FILE_RENAME_INFORMATION_CLASS,
             )
         };
-        if result == 0 {
-            Err(io::Error::last_os_error())
+        if status < 0 {
+            Err(nt_error(status))
         } else {
             Ok(())
         }
@@ -1867,7 +1945,7 @@ pub(crate) fn atomic_write_authorized(
 
 pub(crate) fn remove_authorized_regular_file(store: &Path, path: &Path) -> Result<bool, String> {
     let (parent, _, name) = authorized_parent_for_path(store, path, false)?;
-    let file = match parent.open_regular_file(&name) {
+    let file = match parent.open_regular_file_for_removal(&name) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {

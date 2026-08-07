@@ -44,6 +44,14 @@ allocation, and generated Studio-path lookup. The builder packages it as
 `RoSync.PathHelpers`; snapshot application state is injected through a lazy
 getter so the existing initialization order and identity caches are preserved.
 
+`RemoteControl.luau` is the whole remote-control (CLI op) surface: the JSON
+codec, the playtest coordinator, the read/transmit/photo/capture ops, and the
+serialized write lane. The builder packages it as `RoSync.RemoteControl`;
+`Plugin.luau` requires it and injects the services, helpers and constants it
+needs through `RemoteControl.create(deps)`. It lives outside `Plugin.luau`
+because Luau caps every function — including a script's top-level chunk — at
+200 local registers, and the main chunk had run out.
+
 ## Build
 
 ```sh

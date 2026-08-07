@@ -17,6 +17,7 @@ const pluginChildModules = [
   "Playscript",
   "Reflection",
   "RemoteCodec",
+  "RemoteControl",
 ];
 
 function run(command, args) {

@@ -51,7 +51,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Check Luau formatting
-        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/PathHelpers.luau plugin/Reflection.luau plugin/RemoteCodec.luau plugin/Playscript.luau plugin/Photo.luau plugin-src/src/App.luau plugin-src/src/BuildInfo.luau
+        run: npx --yes @johnnymorganz/stylua-bin@2.5.2 --check plugin/Plugin.luau plugin/Clipboard.luau plugin/PathHelpers.luau plugin/Reflection.luau plugin/RemoteCodec.luau plugin/Playscript.luau plugin/Photo.luau plugin/RemoteControl.luau plugin-src/src/App.luau plugin-src/src/BuildInfo.luau
 
       - name: Install pinned Luau compiler
         run: |
@@ -92,6 +92,7 @@ jobs:
           node scripts/check-luau-bytecode.mjs plugin/RemoteCodec.luau
           node scripts/check-luau-bytecode.mjs plugin/Playscript.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
+          node scripts/check-luau-bytecode.mjs plugin/RemoteControl.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/BuildInfo.luau
 
@@ -182,6 +183,7 @@ jobs:
           node scripts/check-project-path-policy.mjs
           node scripts/check-project-init-policy.mjs
           node scripts/check-initial-selection.mjs
+          node scripts/check-plugin-folder-identity.mjs
           node scripts/check-plugin-reconnect-policy.mjs
           node scripts/check-activity-format.mjs
           node scripts/check-project-error-ux.mjs

@@ -573,6 +573,7 @@ async fn conflict_and_initial_decision_mutations_use_only_fixture_http_state() {
         &[json!({
             "choiceId": "fixture-choice",
             "choice": "disk",
+            "mode": "all",
         })],
     );
 }

@@ -282,6 +282,7 @@ jobs:
           node scripts/check-luau-bytecode.mjs plugin/RemoteCodec.luau
           node scripts/check-luau-bytecode.mjs plugin/Playscript.luau
           node scripts/check-luau-bytecode.mjs plugin/Photo.luau
+          node scripts/check-luau-bytecode.mjs plugin/RemoteControl.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/App.luau
           node scripts/check-luau-bytecode.mjs plugin-src/src/BuildInfo.luau
       - name: Install plugin build tools

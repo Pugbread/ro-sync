@@ -91,6 +91,9 @@ pub struct AppState {
     pub place_ids: Arc<RwLock<Vec<String>>>,
     pub wally_enabled: Arc<RwLock<bool>>,
     pub wally_folder: Arc<RwLock<Option<String>>>,
+    /// Saved full overwrite decision, mirrored from `ro-sync.json` and
+    /// advertised via `/hello` for plugin auto-answer.
+    pub initial_choice_default: Arc<RwLock<Option<String>>>,
     pub pending_initial: Arc<Mutex<Option<PendingInitial>>>,
     /// Paths that we've written via `/push` within the last ~200ms.
     /// `spawn_watch_bridge` drops watcher ops for paths whose deadline hasn't
@@ -385,7 +388,37 @@ fn discover_project_daemon_port_in_range(
     ports: std::ops::RangeInclusive<u16>,
 ) -> Result<Option<u16>, Box<dyn std::error::Error>> {
     let canonical_project = canonicalize_project_path(project);
-    let requested_hello = fetch_daemon_hello(requested_port).ok();
+
+    // Probe every candidate concurrently rather than one at a time. A closed
+    // port only costs nothing when the OS refuses it immediately; where it
+    // does not, each miss burns the probe's full connect timeout and the
+    // sweep costs their sum. Windows is the case that matters here — a closed
+    // loopback port was measured taking ~2s to refuse on a normal desktop,
+    // far past the 750ms probe timeout, so discovering a daemon across this
+    // 13-port range cost ~10s on every command that had to find its own port
+    // (enough to blow the desktop packaging step's 10s budget). Probing in
+    // parallel bounds the sweep by one timeout instead of fourteen. Results
+    // are still consumed in the original order below, so which daemon wins is
+    // unchanged on every platform.
+    let scanned: Vec<u16> = ports
+        .clone()
+        .filter(|port| *port != requested_port)
+        .collect();
+    let mut hellos: std::collections::HashMap<u16, serde_json::Value> =
+        std::collections::HashMap::new();
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = std::iter::once(requested_port)
+            .chain(scanned.iter().copied())
+            .map(|port| scope.spawn(move || (port, fetch_daemon_hello(port).ok())))
+            .collect();
+        for probe in probes {
+            if let Ok((port, Some(hello))) = probe.join() {
+                hellos.insert(port, hello);
+            }
+        }
+    });
+
+    let requested_hello = hellos.get(&requested_port).cloned();
     if requested_hello
         .as_ref()
         .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
@@ -393,14 +426,9 @@ fn discover_project_daemon_port_in_range(
         return Ok(Some(requested_port));
     }
 
-    for port in ports {
-        if port == requested_port {
-            continue;
-        }
-
-        if fetch_daemon_hello(port)
-            .ok()
-            .as_ref()
+    for port in scanned {
+        if hellos
+            .get(&port)
             .is_some_and(|hello| daemon_hello_matches_project(hello, &canonical_project))
         {
             return Ok(Some(port));
@@ -995,19 +1023,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("serve: bind {requested_addr}: {error}"))?;
     let listen_port = listener.local_addr()?.port();
 
-    if let Err(e) = snapshot::write_ro_sync_md_if_missing(&canonical_project) {
-        eprintln!("rosync: failed to write ro-sync.md: {e}");
-    }
-    if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write CLAUDE.md: {e}");
-    }
-    if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write Codex context: {e}");
-    }
-    if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&canonical_project) {
-        eprintln!("rosync: failed to write project tooling files: {e}");
-    }
-
     // Project config: load or create, then apply CLI overrides (persist if anything changed).
     let mut cfg = project_config::load_or_create(&canonical_project).map_err(|error| {
         format!(
@@ -1038,6 +1053,30 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let watcher = Watch::new(canonical_project.clone())?;
     let canonical_project = watcher.root().to_path_buf();
+
+    // Documentation/config merges are best-effort conveniences; keep them off
+    // the readiness path so the daemon can begin accepting Studio immediately.
+    // Start them only after the watcher's initial projection is stable. Running
+    // these root writes in parallel with that scan makes Windows directory
+    // generation checks correctly reject the self-created race.
+    {
+        let docs_project = canonical_project.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = snapshot::write_ro_sync_md_if_missing(&docs_project) {
+                eprintln!("rosync: failed to write ro-sync.md: {e}");
+            }
+            if let Err(e) = snapshot::write_claude_md_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write CLAUDE.md: {e}");
+            }
+            if let Err(e) = snapshot::write_codex_context_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write Codex context: {e}");
+            }
+            if let Err(e) = snapshot::write_project_tooling_if_missing_or_merge(&docs_project) {
+                eprintln!("rosync: failed to write project tooling files: {e}");
+            }
+        });
+    }
+
     let conflict_engine = Arc::new(ConflictEngine::new());
     let push_quiet: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let (request_tx, _) = broadcast::channel::<RequestEnvelope>(256);
@@ -1092,6 +1131,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         place_ids: Arc::new(RwLock::new(cfg.place_ids.clone())),
         wally_enabled: Arc::new(RwLock::new(cfg.wally_enabled)),
         wally_folder: Arc::new(RwLock::new(cfg.wally_folder.clone())),
+        initial_choice_default: Arc::new(RwLock::new(cfg.initial_choice_default.clone())),
         pending_initial: Arc::new(Mutex::new(None)),
         push_quiet: push_quiet.clone(),
         request_tx,
@@ -2653,13 +2693,14 @@ async fn run_decision(args: DecisionArgs) -> Result<(), Box<dyn std::error::Erro
                 .map(str::to_string)
         })
         .ok_or("decision: pending choice has no choiceId")?;
-    let value = http_post_json(
-        args.port,
-        "/initial-choice",
-        &serde_json::json!({ "choiceId": choice_id, "choice": choice }),
-    )
-    .await
-    .map_err(|e| format!("decision: {e}"))?;
+    let body = if choice == "disk" {
+        serde_json::json!({ "choiceId": choice_id, "choice": choice, "mode": "all" })
+    } else {
+        serde_json::json!({ "choiceId": choice_id, "choice": choice })
+    };
+    let value = http_post_json(args.port, "/initial-choice", &body)
+        .await
+        .map_err(|e| format!("decision: {e}"))?;
     if args.raw {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if value

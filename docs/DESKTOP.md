@@ -63,6 +63,10 @@ Prerequisites:
 - Node.js 22
 - the stable Rust toolchain
 - Xcode command-line tools on macOS, or Visual Studio Build Tools on Windows
+- [Aftman](https://github.com/LPGhatguy/aftman), only if you also intend to
+  rebuild the Studio plugin — `aftman install` fetches the versions pinned in
+  `aftman.toml` (Rojo, Wally, StyLua, luau-lsp). The desktop app bundles the
+  checked-in `plugin/Plugin.rbxm`, so packaging Desktop alone does not need it.
 
 Build the sidecar first so the desktop packager can verify its CLI contract:
 
@@ -77,9 +81,43 @@ npm run test
 npm run dev
 ```
 
-On Windows, run `daemon\build.ps1` before the desktop commands. `npm run sync`
-only stages and verifies files; its sidecar probes use `--help` and never start
-a daemon or bind a port.
+The equivalent from a clean checkout on Windows:
+
+```powershell
+.\daemon\build.ps1                  # writes daemon\rosync-windows-x86_64.exe
+
+cd desktop
+npm ci
+npm run sync                        # stages the sidecar and resources
+npm run build                       # produces the MSI and NSIS installers
+```
+
+`npm run sync` fails if `daemon\rosync-windows-x86_64.exe` is absent, so build
+the sidecar first. Note that `build.ps1` sets `$ErrorActionPreference = 'Stop'`;
+invoking it from a shell that redirects native stderr (for example a wrapper
+using `2>&1`) can turn Cargo's ordinary progress output into a terminating
+error under Windows PowerShell 5.1. Run it directly, or use `cargo build
+--release --locked --target x86_64-pc-windows-msvc` and stage the binary
+yourself.
+
+Rebuilding the Studio plugin is a separate step and is only needed when
+`plugin/` changes:
+
+```sh
+aftman install                      # once, to get the pinned Rojo and Wally
+node plugin/build-plugin.mjs        # wally install, then rojo build
+```
+
+That regenerates `plugin/Plugin.rbxm` reproducibly: a clean build reproduces
+the checked-in artifact byte for byte, and `plugin/Plugin.build.json` records
+the SHA-256 to check against.
+
+`npm run sync` stages and verifies files; it never starts a daemon. It does
+reach the loopback interface, though: alongside the `--help` contract probes it
+reads the staged sidecar's build identity with `version --port 1 --raw`, and
+`version` without `--project` falls back to scanning 7878-7890 for a matching
+daemon. That scan is bounded by a 10s budget, so a host where closed ports are
+slow to refuse can fail the step outright rather than merely running slowly.
 
 Create a local unsigned installer with:
 

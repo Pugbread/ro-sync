@@ -167,6 +167,78 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
 static PLUGIN_CAPABILITY: OnceLock<String> = OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// Op journal: a bounded ring of every disk-side op event published this daemon
+// boot, keyed by a monotonic sequence number. A plugin that loses its
+// transport can resume by presenting the last sequence it applied — the
+// daemon replays the gap instead of forcing a multi-minute full re-compare.
+// The per-boot plugin capability doubles as the journal's identity: a
+// capability match guarantees the seq space is the same daemon boot.
+// ---------------------------------------------------------------------------
+const OP_JOURNAL_CAP: usize = 4096;
+
+struct OpJournal {
+    next_seq: u64,
+    entries: std::collections::VecDeque<(u64, String)>,
+}
+
+static OP_JOURNAL: OnceLock<Mutex<OpJournal>> = OnceLock::new();
+
+fn op_journal() -> &'static Mutex<OpJournal> {
+    OP_JOURNAL.get_or_init(|| {
+        Mutex::new(OpJournal {
+            next_seq: 1,
+            entries: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// Serialize an op event with the next journal sequence, retain it for
+/// resume replay, and return the payload to broadcast.
+pub(crate) fn journal_op_event(op: &serde_json::Value) -> Option<String> {
+    let mut journal = op_journal().lock().unwrap();
+    let seq = journal.next_seq;
+    let payload =
+        serde_json::to_string(&serde_json::json!({ "type": "op", "seq": seq, "op": op })).ok()?;
+    journal.next_seq += 1;
+    if journal.entries.len() >= OP_JOURNAL_CAP {
+        journal.entries.pop_front();
+    }
+    journal.entries.push_back((seq, payload.clone()));
+    Some(payload)
+}
+
+/// Sequence of the most recently journaled op (0 when none this boot).
+pub(crate) fn journal_head() -> u64 {
+    op_journal().lock().unwrap().next_seq - 1
+}
+
+/// Raw event payloads the resuming plugin missed, oldest first — or None when
+/// continuity can't be proven (gap fell off the ring, or the claim is ahead
+/// of the journal) and the caller must fall back to a full compare.
+fn journal_replay_after(last_seq: u64) -> Option<Vec<String>> {
+    let journal = op_journal().lock().unwrap();
+    let head = journal.next_seq - 1;
+    if last_seq > head {
+        return None;
+    }
+    if last_seq == head {
+        return Some(Vec::new());
+    }
+    let first_retained = journal.entries.front().map(|(seq, _)| *seq)?;
+    if last_seq + 1 < first_retained {
+        return None;
+    }
+    Some(
+        journal
+            .entries
+            .iter()
+            .filter(|(seq, _)| *seq > last_seq)
+            .map(|(_, payload)| payload.clone())
+            .collect(),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum PeerKind {
@@ -267,11 +339,23 @@ pub enum ClientMsg {
         protocol: Option<u64>,
         #[serde(rename = "pluginCapability", alias = "capability", default)]
         plugin_capability: Option<String>,
+        /// Last op-journal sequence the plugin applied before losing its
+        /// transport. When continuity holds, the daemon replays the gap and
+        /// the plugin skips the full initial compare.
+        #[serde(rename = "resumeFrom", default)]
+        resume_from: Option<u64>,
+        /// The connecting window's PlaceId. Server-side backstop for the
+        /// one-project-per-place rule: every client-side path (discovery,
+        /// reconnect, init) has independently gotten this wrong at least
+        /// once, so the daemon refuses wrong-place plugins itself.
+        #[serde(rename = "placeId", default)]
+        place_id: Option<String>,
     },
     Push {
         #[serde(default)]
         ops: Vec<Value>,
     },
+    Disconnect,
     Ping,
     Pong,
     Request {
@@ -298,15 +382,27 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     Op {
         op: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     Ops {
         ops: Vec<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     Lagged {
         reason: String,
     },
     Ping,
     Pong,
+    /// Resume accepted: `missed` journaled op frames follow immediately.
+    ResumeOk {
+        missed: usize,
+        #[serde(rename = "seqHead")]
+        seq_head: u64,
+    },
+    /// Resume impossible (journal gap / unknown seq); run a full compare.
+    ResumeReject,
     Shutdown {
         reason: String,
         code: &'static str,
@@ -486,6 +582,8 @@ async fn recv_loop(
                     role,
                     protocol,
                     plugin_capability: presented_capability,
+                    resume_from,
+                    place_id,
                 }) => {
                     if peer_kind != PeerKind::Unidentified {
                         let _ = send_server_msg(
@@ -544,6 +642,30 @@ async fn recv_loop(
                         continue;
                     }
                     if plugin_peer {
+                        let claimed_place = place_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty() && *value != "0");
+                        if let Some(claimed_place) = claimed_place {
+                            let allowed = state.place_ids.read().unwrap().clone();
+                            if !allowed.is_empty() && !allowed.iter().any(|id| id == claimed_place)
+                            {
+                                let _ = send_server_msg(
+                                    &out_tx,
+                                    &ServerMsg::Shutdown {
+                                        reason: format!(
+                                            "this project serves PlaceId {}, not PlaceId {claimed_place}; create a separate Ro Sync project for this place",
+                                            allowed.join(", "),
+                                        ),
+                                        code: "wrong-place",
+                                        retryable: false,
+                                    },
+                                );
+                                let _ = out_tx.send(Message::Close(None));
+                                rejecting = true;
+                                continue;
+                            }
+                        }
                         if !constant_time_capability_matches(presented_capability.as_deref()) {
                             let _ = send_server_msg(
                                 &out_tx,
@@ -591,10 +713,65 @@ async fn recv_loop(
                             publish_plugin_state(&state, true);
                         }
                         peer_kind = PeerKind::Plugin;
+                        // Resume handshake. With a provable journal gap the
+                        // missed op frames replay immediately; without a
+                        // resume claim the plugin still learns the current
+                        // seq head so its NEXT drop can resume. A broken
+                        // claim gets an explicit reject → full compare.
+                        match resume_from {
+                            Some(last_seq) => match journal_replay_after(last_seq) {
+                                Some(missed) => {
+                                    let _ = send_server_msg(
+                                        &out_tx,
+                                        &ServerMsg::ResumeOk {
+                                            missed: missed.len(),
+                                            seq_head: journal_head(),
+                                        },
+                                    );
+                                    for payload in missed {
+                                        let seq = event_sequence(&payload);
+                                        let ops = event_to_plugin_ops(
+                                            state.canonical_project.as_path(),
+                                            &payload,
+                                        );
+                                        let last = ops.len().saturating_sub(1);
+                                        for (index, op) in ops.into_iter().enumerate() {
+                                            let _ = send_server_msg(
+                                                &out_tx,
+                                                &ServerMsg::Op {
+                                                    op,
+                                                    seq: (index == last).then_some(seq).flatten(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let _ = send_server_msg(&out_tx, &ServerMsg::ResumeReject);
+                                }
+                            },
+                            None => {
+                                let _ = send_server_msg(
+                                    &out_tx,
+                                    &ServerMsg::ResumeOk {
+                                        missed: 0,
+                                        seq_head: journal_head(),
+                                    },
+                                );
+                            }
+                        }
                     } else {
                         peer_kind = classified_peer;
                         classified_peer.store(&peer.kind);
                     }
+                }
+                Ok(ClientMsg::Disconnect) => {
+                    out_tx.close(ConnectionClose::new(
+                        "Roblox Studio plugin disconnected",
+                        "plugin-disconnect",
+                        false,
+                    ));
+                    rejecting = true;
                 }
                 Ok(ClientMsg::Pong) => {}
                 Ok(ClientMsg::Ping) => {
@@ -610,7 +787,17 @@ async fn recv_loop(
                         );
                         continue;
                     }
-                    let res = apply_push_ops(&state, &ops);
+                    // Push application is synchronous filesystem work; run it
+                    // on the blocking pool so this receive loop's runtime
+                    // worker keeps serving other connections.
+                    let push_state = state.clone();
+                    let res =
+                        tokio::task::spawn_blocking(move || apply_push_ops(&push_state, &ops))
+                            .await
+                            .unwrap_or_else(|error| crate::http::PushApplyResult {
+                                errors: vec![format!("push worker failed: {error}")],
+                                ..Default::default()
+                            });
                     let _ = send_server_msg(
                         &out_tx,
                         &ServerMsg::PushResult {
@@ -887,12 +1074,13 @@ async fn send_loop(
                     Ok(s) => {
                         let plugin_ops = event_to_plugin_ops(state.canonical_project.as_path(), &s);
                         if !plugin_ops.is_empty() {
+                            let event_seq = event_sequence(&s);
                             let current_peer = PeerKind::load(&peer.kind);
                             if current_peer == PeerKind::Plugin {
                                 let is_active = *state.active_plugin.lock().unwrap() == Some(conn_id);
                                 let mut failed = false;
                                 if is_active {
-                                    let mut coalesced = plugin_ops;
+                                    let mut coalesced = sequence_event_ops(plugin_ops, event_seq);
                                     // Match Azul's useful transport pattern: preserve a
                                     // short idle-window burst as one bounded batch instead
                                     // of forcing Studio through one callback and queue
@@ -934,7 +1122,10 @@ async fn send_loop(
                                                     }
                                                     continue;
                                                 }
-                                                coalesced.extend(next_ops);
+                                                coalesced.extend(sequence_event_ops(
+                                                    next_ops,
+                                                    event_sequence(&next),
+                                                ));
                                             }
                                             Err(broadcast::error::TryRecvError::Empty) => break,
                                             Err(broadcast::error::TryRecvError::Closed) => {
@@ -1664,12 +1855,13 @@ async fn send_ws_msg(
 
 async fn send_plugin_ops(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    ops: Vec<Value>,
+    ops: Vec<(Value, Option<u64>)>,
     conn_id: u64,
 ) -> bool {
     let mut batch = Vec::new();
+    let mut batch_seq = None;
     let mut batch_bytes = 32usize;
-    for op in ops {
+    for (op, seq) in ops {
         let op_bytes = serde_json::to_vec(&op)
             .map(|encoded| encoded.len().saturating_add(1))
             .unwrap_or(PLUGIN_OP_BATCH_MAX_BYTES);
@@ -1696,19 +1888,25 @@ async fn send_plugin_ops(
             let message = if batch.len() == 1 {
                 ServerMsg::Op {
                     op: batch.pop().expect("single operation"),
+                    seq: batch_seq,
                 }
             } else {
                 ServerMsg::Ops {
                     ops: std::mem::take(&mut batch),
+                    seq: batch_seq,
                 }
             };
             if !send_ws_msg(sender, &message, conn_id).await {
                 return false;
             }
             batch_bytes = 32;
+            batch_seq = None;
         }
         batch_bytes = batch_bytes.saturating_add(op_bytes);
         batch.push(op);
+        if seq.is_some() {
+            batch_seq = seq;
+        }
     }
     if batch.is_empty() {
         return true;
@@ -1716,11 +1914,29 @@ async fn send_plugin_ops(
     let message = if batch.len() == 1 {
         ServerMsg::Op {
             op: batch.pop().expect("single operation"),
+            seq: batch_seq,
         }
     } else {
-        ServerMsg::Ops { ops: batch }
+        ServerMsg::Ops {
+            ops: batch,
+            seq: batch_seq,
+        }
     };
     send_ws_msg(sender, &message, conn_id).await
+}
+
+fn event_sequence(event: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(event)
+        .ok()
+        .and_then(|value| value.get("seq").and_then(Value::as_u64))
+}
+
+fn sequence_event_ops(ops: Vec<Value>, seq: Option<u64>) -> Vec<(Value, Option<u64>)> {
+    let last = ops.len().saturating_sub(1);
+    ops.into_iter()
+        .enumerate()
+        .map(|(index, op)| (op, (index == last).then_some(seq).flatten()))
+        .collect()
 }
 
 async fn send_ws_frame(
@@ -1812,10 +2028,25 @@ mod tests {
                 serde_json::json!({ "op": "delete", "path": ["Workspace", "Old"] }),
                 serde_json::json!({ "op": "set", "path": ["Workspace", "New"] }),
             ],
+            seq: Some(42),
         };
         let value = serde_json::to_value(message).unwrap();
         assert_eq!(value["type"], "ops");
         assert_eq!(value["ops"].as_array().map(Vec::len), Some(2));
+        assert_eq!(value["seq"], 42);
+    }
+
+    #[test]
+    fn only_the_last_operation_in_one_journal_event_advances_resume_sequence() {
+        let sequenced = sequence_event_ops(
+            vec![
+                serde_json::json!({ "op": "delete" }),
+                serde_json::json!({ "op": "set" }),
+            ],
+            Some(42),
+        );
+        assert_eq!(sequenced[0].1, None);
+        assert_eq!(sequenced[1].1, Some(42));
     }
 
     #[test]
@@ -2066,6 +2297,7 @@ mod tests {
             place_ids: Arc::new(RwLock::new(Vec::new())),
             wally_enabled: Arc::new(RwLock::new(false)),
             wally_folder: Arc::new(RwLock::new(None)),
+            initial_choice_default: Arc::new(RwLock::new(None)),
             pending_initial: Arc::new(Mutex::new(None)),
             push_quiet: Arc::new(Mutex::new(HashMap::<PathBuf, std::time::Instant>::new())),
             request_tx,
@@ -2567,6 +2799,46 @@ mod tests {
             .await
             .expect("first plugin should remain connected");
         assert_eq!(pong["type"], "pong");
+    }
+
+    #[tokio::test]
+    async fn plugin_disconnect_message_releases_the_lease_for_immediate_reconnect() {
+        let h = start_server().await;
+        let url = format!("ws://{}/ws", h.addr);
+
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        first.send(plugin_hello("studio-a")).await.unwrap();
+        wait_for_active_plugin(&h).await;
+        first
+            .send(tungstenite::Message::Text(
+                r#"{"type":"disconnect"}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        let shutdown = recv_until_type(&mut first, "shutdown", Duration::from_secs(3))
+            .await
+            .expect("daemon should acknowledge the plugin-requested disconnect");
+        assert_eq!(shutdown["code"], "plugin-disconnect");
+        assert_eq!(shutdown["retryable"], false);
+        for _ in 0..100 {
+            if h.state.active_plugin.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.state.active_plugin.lock().unwrap().is_none());
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        second.send(plugin_hello("studio-b")).await.unwrap();
+        wait_for_active_plugin(&h).await;
+        second
+            .send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        assert!(recv_until_type(&mut second, "pong", Duration::from_secs(3))
+            .await
+            .is_some());
     }
 
     #[tokio::test]

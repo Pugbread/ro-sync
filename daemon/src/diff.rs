@@ -24,11 +24,10 @@ struct CachedTreeNode {
     diff_relevant: bool,
     mapped_class: Option<String>,
     sibling_sort_signature: Option<CachedSortSignature>,
-    /// Content is deliberately only a final tiebreaker for structurally
-    /// indistinguishable script siblings. This mirrors the Studio allocator:
-    /// ordinary nodes keep the stable structural ordering, while duplicate
-    /// leaves no longer depend on GetChildren()/directory enumeration order.
-    source_sort_hash: Option<Hash>,
+    /// Digest of script content throughout this projected subtree. It is
+    /// compared only after the complete structural rope ties, so content can
+    /// stabilize duplicate parents without changing leaf/directory ordering.
+    subtree_content_sort_hash: Option<Hash>,
 }
 
 /// A compact rope for the legacy recursive sibling key.
@@ -281,6 +280,9 @@ impl ComparisonCache {
             .as_deref()
             .filter(|class| SCRIPT_CLASSES.contains(class))
             .map(|_| source_hash_from_node(node));
+        let subtree_content_sort_hash = sibling_sort_signature
+            .as_ref()
+            .map(|signature| self.build_subtree_content_sort_hash(source_sort_hash, signature));
 
         self.nodes.insert(
             node_id,
@@ -288,9 +290,28 @@ impl ComparisonCache {
                 diff_relevant,
                 mapped_class,
                 sibling_sort_signature,
-                source_sort_hash,
+                subtree_content_sort_hash,
             },
         );
+    }
+
+    fn build_subtree_content_sort_hash(
+        &self,
+        source_sort_hash: Option<Hash>,
+        signature: &CachedSortSignature,
+    ) -> Hash {
+        let mut parts = Vec::with_capacity(signature.child_ids.len() + 2);
+        parts.push("rosync-subtree-v1".to_string());
+        parts.push(source_sort_hash.as_ref().map(hash_hex).unwrap_or_default());
+        for child_id in &signature.child_ids {
+            let child_hash = self
+                .cached_by_id(*child_id)
+                .subtree_content_sort_hash
+                .as_ref()
+                .expect("projected children have content digests");
+            parts.push(hash_hex(child_hash));
+        }
+        hash(parts.join("\0").as_bytes())
     }
 
     fn build_sibling_sort_signature(&self, node: &Value) -> CachedSortSignature {
@@ -365,8 +386,8 @@ impl ComparisonCache {
         }
 
         match (
-            self.cached_by_id(left).source_sort_hash.as_ref(),
-            self.cached_by_id(right).source_sort_hash.as_ref(),
+            self.cached_by_id(left).subtree_content_sort_hash.as_ref(),
+            self.cached_by_id(right).subtree_content_sort_hash.as_ref(),
         ) {
             (Some(left), Some(right)) => left.cmp(right),
             _ => Ordering::Equal,
@@ -424,6 +445,15 @@ impl ComparisonCache {
     fn stats(&self) -> CacheStats {
         self.stats
     }
+}
+
+fn hash_hex(value: &Hash) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value {
+        use std::fmt::Write;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1299,19 +1329,17 @@ mod tests {
             "children": [
                 { "class": "Workspace", "name": "Workspace", "children": [
                     { "class": "Model", "name": "SellNPC", "children": [
-                        { "class": "LocalScript", "name": "Animate", "children": [] }
+                        { "class": "LocalScript", "name": "Animate", "properties": { "Source": "simple" }, "children": [] }
                     ] },
                     { "class": "Model", "name": "SellNPC", "children": [
-                        { "class": "LocalScript", "name": "Animate", "children": [] }
+                        { "class": "LocalScript", "name": "Animate", "properties": { "Source": "r15" }, "children": [] }
                     ] }
                 ] }
             ]
         });
 
         let local = collect_local_nodes(&local_services);
-        let mut studio = collect_studio_tree_nodes(&studio_tree);
-        set_node_source(&mut studio, "Workspace/SellNPC/Animate", "simple".into());
-        set_node_source(&mut studio, "Workspace/SellNPC [1]/Animate", "r15".into());
+        let studio = collect_studio_tree_nodes(&studio_tree);
 
         assert!(local.contains_key("Workspace/SellNPC/Animate"));
         assert!(local.contains_key("Workspace/SellNPC [1]/Animate"));
@@ -1365,6 +1393,87 @@ mod tests {
         assert_eq!(studio.len(), 2);
         assert!(local.contains_key("ReplicatedStorage/Same"));
         assert!(local.contains_key("ReplicatedStorage/Same [1]"));
+        assert!(compare(&local, &studio).is_clean());
+    }
+
+    #[test]
+    fn duplicate_parents_pair_by_descendant_source_not_enumeration_order() {
+        let local_services = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [{
+                "class": "Folder",
+                "name": "Part",
+                "properties": {},
+                "children": [{
+                    "class": "Folder",
+                    "name": "SurfaceGui",
+                    "properties": {},
+                    "children": [{
+                        "class": "Script",
+                        "name": "Script",
+                        "properties": { "Source": "return 'alpha'" },
+                        "children": []
+                    }]
+                }]
+            }, {
+                "class": "Folder",
+                "name": "Part",
+                "properties": {},
+                "children": [{
+                    "class": "Folder",
+                    "name": "SurfaceGui",
+                    "properties": {},
+                    "children": [{
+                        "class": "Script",
+                        "name": "Script",
+                        "properties": { "Source": "return 'beta'" },
+                        "children": []
+                    }]
+                }]
+            }]
+        })];
+        let studio_services = vec![json!({
+            "class": "Workspace",
+            "name": "Workspace",
+            "properties": {},
+            "children": [{
+                "class": "Folder",
+                "name": "Part",
+                "properties": {},
+                "children": [{
+                    "class": "Folder",
+                    "name": "SurfaceGui",
+                    "properties": {},
+                    "children": [{
+                        "class": "Script",
+                        "name": "Script",
+                        "properties": { "Source": "return 'beta'" },
+                        "children": []
+                    }]
+                }]
+            }, {
+                "class": "Folder",
+                "name": "Part",
+                "properties": {},
+                "children": [{
+                    "class": "Folder",
+                    "name": "SurfaceGui",
+                    "properties": {},
+                    "children": [{
+                        "class": "Script",
+                        "name": "Script",
+                        "properties": { "Source": "return 'alpha'" },
+                        "children": []
+                    }]
+                }]
+            }]
+        })];
+
+        let local = collect_local_nodes(&local_services);
+        let studio = collect_local_nodes(&studio_services);
+
         assert!(compare(&local, &studio).is_clean());
     }
 

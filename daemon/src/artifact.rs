@@ -1118,10 +1118,9 @@ fn fill_secure_random(bytes: &mut [u8]) -> Result<(), ArtifactError> {
         )
     };
     if status != 0 {
-        return Err(ArtifactError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            format!("BCryptGenRandom failed with NTSTATUS {status:#x}"),
-        )));
+        return Err(ArtifactError::Io(io::Error::other(format!(
+            "BCryptGenRandom failed with NTSTATUS {status:#x}"
+        ))));
     }
     Ok(())
 }
@@ -1528,6 +1527,7 @@ mod tests {
             32,
         )
         .unwrap();
+        let _ = &store;
         assert!(!partial.exists());
         assert!(!finalized.exists());
         assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");

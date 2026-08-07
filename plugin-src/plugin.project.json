@@ -24,6 +24,9 @@
       },
       "RemoteCodec": {
         "$path": "src/RemoteCodec.luau"
+      },
+      "RemoteControl": {
+        "$path": "src/RemoteControl.luau"
       }
     },
     "App": {

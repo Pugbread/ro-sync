@@ -92,6 +92,36 @@ assert.ok(
   "a blocking WebSocket Close call must never delay local retry state",
 );
 
+const explicitDisconnect = source.slice(
+  source.indexOf("local function disconnect(reason)"),
+  source.indexOf("-- Initial-sync decision handshake"),
+);
+assert.match(
+  explicitDisconnect,
+  /ws = nil[\s\S]*?wsSend\(toClose, \{ type = "disconnect" \}\)/,
+  "an explicit disconnect must ask the daemon to close instead of blocking on WebStreamClient:Close()",
+);
+assert.doesNotMatch(
+  explicitDisconnect,
+  /toClose:Close\(\)/,
+  "an explicit disconnect must never call Roblox's blocking WebStreamClient:Close()",
+);
+assert.match(
+  explicitDisconnect,
+  /if reason == "unloading" then[\s\S]*?disconnectHooks\(\)[\s\S]*?table\.clear\(scaleState\.sourceHashMemo\)/,
+  "manual disconnect must retain the live hook index and valid Source hashes until plugin unload",
+);
+
+const installHooks = source.slice(
+  source.indexOf("local function installHooks(shouldContinue)"),
+  source.indexOf("-- Studio snapshot + stats"),
+);
+assert.match(
+  installHooks,
+  /if scaleState\.hooksInstalled then[\s\S]*?hooks reused:[\s\S]*?return not shouldContinue or shouldContinue\(\)/,
+  "reconnect must reuse the existing live hook index on large places",
+);
+
 const laggedBranch = wsLoop.slice(
   wsLoop.indexOf('elseif kind == "lagged"'),
   wsLoop.indexOf('elseif kind == "shutdown"'),
@@ -132,13 +162,18 @@ const pushResultBranch = wsLoop.slice(
 );
 assert.match(
   pushResultBranch,
-  /skipped > 0 or conflictCount > 0 or errorCount > 0/,
-  "any partial live push result must be treated as a failure",
+  /local incompleteWrite = msg\.ok == false or skipped > 0 or errorCount > 0/,
+  "skipped or errored live pushes must be treated as incomplete writes",
 );
 assert.match(
   pushResultBranch,
-  /setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*closeClient\(\)/,
-  "partial push failure must be visible and start nonblocking close into full reconciliation",
+  /if incompleteWrite then[\s\S]*setBanner\s*\(\s*"[\s\S]*not fully written to disk[\s\S]*closeClient\(\)/,
+  "incomplete push writes must be visible and start nonblocking close into full reconciliation",
+);
+assert.match(
+  pushResultBranch,
+  /else[\s\S]*Studio edit conflict\(s\)[\s\S]*Live sync is still connected/,
+  "parked conflicts must remain connected instead of entering a futile reconciliation loop",
 );
 
 const refreshHello = source.slice(
@@ -177,13 +212,20 @@ const daemonDiscovery = source.slice(
 );
 assert.match(
   daemonDiscovery,
-  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?for port = firstPort, lastPort do[\s\S]*?not shouldContinue\(\)[\s\S]*?result\.cancelled = true[\s\S]*?probePort\(port, gameId\)/,
-  "daemon discovery must stop between deterministic port probes when its connection attempt is cancelled",
+  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?outstanding < DAEMON_PROBE_CONCURRENCY[\s\S]*?not isCurrentAttempt\(\)[\s\S]*?result\.cancelled = true[\s\S]*?acceptingResults = false[\s\S]*?task\.spawn/,
+  "daemon discovery must use bounded workers and stop launching probes when its connection attempt is cancelled",
 );
-assert.doesNotMatch(
+assert.match(
   daemonDiscovery,
-  /for port = firstPort, lastPort do[\s\S]{0,160}?task\.spawn/,
-  "daemon discovery must not launch an uncancellable RequestAsync burst across every port",
+  /task\.spawn[\s\S]*?probePort\(port, gameId, currentPlaceId\)[\s\S]*?if acceptingResults and isCurrentAttempt\(\) then[\s\S]*?probes\[port\]/,
+  "completed daemon probes must be ignored after cancellation",
+);
+const daemonProbeConcurrency = Number(
+  source.match(/local DAEMON_PROBE_CONCURRENCY = (\d+)/)?.[1],
+);
+assert.ok(
+  Number.isInteger(daemonProbeConcurrency) && daemonProbeConcurrency >= 2 && daemonProbeConcurrency <= 4,
+  "daemon discovery concurrency must remain bounded between two and four requests",
 );
 assert.match(
   daemonDiscovery,
@@ -192,7 +234,7 @@ assert.match(
 );
 assert.match(
   daemonDiscovery,
-  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local currentPlaceId/,
+  /function\(gameId, quiet, includeInitializer, expectedProject, shouldContinue\)[\s\S]*?local currentPlaceId[\s\S]*?probe\.hello\.project == expectedProjectIdentity[\s\S]*?candidate\.hello\.project == expectedProjectIdentity[\s\S]*?gameMatches = projectMatches[\s\S]*?local exactPlaceMatches/,
   "automatic discovery must restrict candidates by canonical project before applying PlaceId preference",
 );
 assert.match(
@@ -244,6 +286,36 @@ assert.match(
   initialCompare,
   /action == "in-sync"[\s\S]*?comparedDiskIdentityServices\[serviceName\] ~= true[\s\S]*?snapshotApplyState\.seedDiskPathsForService\(service, comparedDiskIdentities\)[\s\S]*?completeInitialCompare\(\)/,
   "the in-sync fast path must install complete daemon-authored physical identities before live hooks start",
+);
+assert.match(
+  initialCompare,
+  /Class\/shape transitions[\s\S]*?intentional clean fallback[\s\S]*?return nil/,
+  "unsupported mixed delta rows must request the transactional fallback instead of entering retry",
+);
+assert.match(
+  initialCompare,
+  /local studioSetPaths = \{\}[\s\S]*?table\.sort\(studioSetPaths\)[\s\S]*?parentPath \.\. "\/"[\s\S]*?nested Studio-only subtree; using transactional stream[\s\S]*?return nil/,
+  "nested Studio-only rows must use one atomic snapshot instead of overlapping subtree sets",
+);
+assert.match(
+  initialCompare,
+  /deltaResp\.ok ~= true[\s\S]*?tonumber\(deltaResp\.skipped\)[\s\S]*?> 0/,
+  "the initial delta must reject daemon responses that skipped any authorized row",
+);
+assert.match(
+  initialCompare,
+  /local encodedOk, encodedBody = pcall[\s\S]*?HttpService:JSONEncode\(deltaBody\)[\s\S]*?#encodedBody > PROTOCOL_STREAM_MAX_BYTES[\s\S]*?payload exceeds[\s\S]*?using transactional stream[\s\S]*?return nil/,
+  "an oversized initial delta must fall back before the bounded HTTP request consumes the choice",
+);
+assert.match(
+  initialCompare,
+  /httpJson\([\s\S]*?"\/push"[\s\S]*?encodedBody[\s\S]*?"encoded"[\s\S]*?PROTOCOL_STREAM_MAX_BYTES/,
+  "the initial delta must send the exact preflighted JSON bytes under the protocol response bound",
+);
+assert.match(
+  initialCompare,
+  /local deltaResult = applyStudioDeltaFastPath[\s\S]*?deltaResult == true[\s\S]*?deltaResult == false[\s\S]*?unsupported row; using transactional stream[\s\S]*?doPushPath\(true, scanGuard, choiceId\)/,
+  "a clean delta fallback must reuse the authorized choice in the full atomic push rather than loop comparison",
 );
 assert.match(
   initialCompare,
@@ -327,6 +399,16 @@ assert.match(
 );
 
 assert.match(source, /local PLUGIN_VERSION_STRING = "2\.4\.1"/);
+assert.match(
+  source,
+  /local DAEMON_STARTUP_GRACE_SECONDS = \d+/,
+  "explicit Connect startup retry must declare its grace-period constant",
+);
+assert.match(
+  source,
+  /local DAEMON_DISCOVERY_RETRY_SECONDS = \d+/,
+  "explicit Connect startup retry must declare its retry-period constant",
+);
 assert.match(source, /local PLUGIN_PROTOCOL_VERSION = 6/);
 assert.match(
   source,
@@ -673,7 +755,7 @@ assert.match(
 );
 assert.match(
   snapshotMatcher,
-  /takeCandidate\(bucket\.boundaries, used, ctx\.claimedInstances\)/,
+  /takeExactFallbackCandidate\([\s\S]*?bucket\.boundaries[\s\S]*?ctx\.claimedInstances[\s\S]*?false[\s\S]*?\)/,
   "a changed-shape AvoidSync boundary must still consume one same-name disk node",
 );
 assert.equal(
@@ -688,8 +770,23 @@ const streamedStructure = source.slice(
 );
 assert.match(
   streamedStructure,
-  /local orderingContext = snapshotApplyState\.newContext[\s\S]*?buildPhysicalSiblingIndex\(frame\.inst, orderingContext, \{\}\)[\s\S]*?order = placement\.order[\s\S]*?left\.order < right\.order/,
+  /local orderingContext = snapshotApplyState\.newContext[\s\S]*?contentAwareOrdering = true[\s\S]*?buildPhysicalSiblingIndex\(frame\.inst, orderingContext, \{\}\)[\s\S]*?order = placement\.order[\s\S]*?left\.order < right\.order/,
   "streamed structure IDs must follow the canonical physical sibling allocator with stale cache overlays disabled",
+);
+assert.match(
+  snapshotMatcher,
+  /ctx\.contentAwareOrdering and frame\.inst:IsA\("LuaSourceContainer"\)[\s\S]*?ctx\.sourceHashForOrdering\(frame\.inst\)[\s\S]*?ctx\.directSourceHashes\[frame\.inst\] = directSourceHash[\s\S]*?local contentParts = \{ "rosync-subtree-v1", directSourceHash \}[\s\S]*?ctx\.contentHashes\[frame\.inst\] = sha256Hex/,
+  "duplicate parent subtrees must inherit normalized descendant Source identity",
+);
+assert.match(
+  source,
+  /local sourceHash = sourceEntry\.sha256[\s\S]*?if sourceHash == nil then[\s\S]*?scaleState\.normalizedSourceHash/,
+  "content-aware structure hashes must be reused by the compare hash stream",
+);
+assert.match(
+  streamedStructure,
+  /sourceHashForOrdering = scaleState\.normalizedSourceHash/,
+  "reconnect ordering must reuse memoized normalized Studio Source hashes",
 );
 assert.match(
   streamedStructure,
@@ -965,7 +1062,7 @@ const pullPath = source.slice(
 );
 assert.match(
   pullPath,
-  /httpRequest\("\/snapshot\/stream", "POST", body, true\)/,
+  /httpRequest\("\/snapshot\/stream", "POST", encoded, "encoded"\)/,
   "full initial pulls must use the protocol-6 bounded snapshot stream",
 );
 assert.match(
@@ -1599,12 +1696,12 @@ assert.match(
 );
 assert.match(
   initialCompareFlow,
-  /compareId = compareId,[\s\S]*?service = serviceName,[\s\S]*?for attempt = 1, 2 do[\s\S]*?httpJson\("\/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  /compareId = compareId,[\s\S]*?service = serviceName,[\s\S]*?for attempt = 1, 2 do[\s\S]*?httpJson\("\/initial-compare", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES\)/,
   "streamed comparison must use the trusted JSON path with bounded idempotent retries",
 );
 assert.match(
   initialCompareFlow,
-  /encodedCompareBodySize[\s\S]*?HttpService:JSONEncode\(requestBody\)[\s\S]*?bodyBytes > scaleState\.maxStreamRequestBytes/,
+  /encodedCompareBodySize[\s\S]*?HttpService:JSONEncode\(requestBody\)[\s\S]*?#encodedBody > scaleState\.maxStreamRequestBytes/,
   "every streamed comparison request must enforce its actual encoded 512 KiB wire size",
 );
 assert.match(
@@ -1814,7 +1911,7 @@ assert.match(
 );
 assert.ok(
   pushPostExact.indexOf("return nil, stopForPartialReceipt(response, label)")
-    < pushPostExact.indexOf("if attempt < 2 then"),
+    < pushPostExact.indexOf("if attempt >= maxAttempts then"),
   "a valid partial receipt must terminally return before the exact-chunk retry branch",
 );
 assert.match(
@@ -2116,12 +2213,12 @@ assert.match(
 );
 assert.match(
   pushPath,
-  /for attempt = 1, 2 do[\s\S]*?httpJson\("\/push", "POST", body, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  /local attempt = 0[\s\S]*?while true do[\s\S]*?httpJson\("\/push", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES\)[\s\S]*?maxAttempts/,
   "push chunks must use exact bounded idempotent retries",
 );
 assert.match(
   initialCompareFlow,
-  /httpJson\("\/initial-compare", "POST", requestBody, true, PROTOCOL_STREAM_MAX_BYTES\)/,
+  /httpJson\("\/initial-compare", "POST", encodedBody, "encoded", PROTOCOL_STREAM_MAX_BYTES\)/,
   "every streamed comparison response must be capped before decode",
 );
 assert.match(
@@ -2131,7 +2228,7 @@ assert.match(
 );
 assert.match(
   pushPath,
-  /bodyBytes > scaleState\.maxStreamRequestBytes/,
+  /#encodedBody > scaleState\.maxStreamRequestBytes/,
   "push must enforce actual encoded request size before every send",
 );
 assert.match(
@@ -2141,7 +2238,7 @@ assert.match(
 );
 assert.match(
   pushPath,
-  /#source > scaleState\.maxScriptSourceBytes[\s\S]*?#part\.data/,
+  /#source > scaleState\.maxScriptSourceBytes[\s\S]*?local budget = math\.min\(scaleState\.sourceChunkBytes[\s\S]*?data = data[\s\S]*?batchBytes \+= #data/,
   "push must cap one script and advance offsets using raw Source bytes",
 );
 assert.match(
@@ -2198,12 +2295,12 @@ assert.match(
 );
 assert.match(
   projectBroker,
-  /"pluginProtocol": 6,/,
+  /const PLUGIN_PROTOCOL_VERSION: u64 = 6;[\s\S]*?"pluginProtocol": PLUGIN_PROTOCOL_VERSION,/,
   "the Desktop project broker must advertise the same current protocol",
 );
 assert.match(
   projectBroker,
-  /assert_eq!\(unavailable\["pluginProtocol"\], 6\);/,
+  /assert_eq!\(unavailable\["pluginProtocol"\], PLUGIN_PROTOCOL_VERSION\);/,
   "the Desktop project broker compatibility test must pin the current protocol",
 );
 assert.match(readme, /plugin_protocol-6-/);

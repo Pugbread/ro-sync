@@ -9,6 +9,7 @@ plugin-src/src/Photo.luau
 plugin-src/src/Playscript.luau
 plugin-src/src/Reflection.luau
 plugin-src/src/RemoteCodec.luau
+plugin-src/src/RemoteControl.luau
 
 # Runtime state & logs (contain absolute paths / project-specific data)
 state.json

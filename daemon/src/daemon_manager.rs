@@ -930,6 +930,18 @@ pub(super) async fn spawn_managed_daemon(
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        // Redirecting any stdio makes std spawn through CreateProcess with
+        // bInheritHandles = TRUE, which hands the child EVERY inheritable
+        // handle in this process — including the stdout/stderr pipe our own
+        // caller gave us. The daemon outlives this process, so it would hold
+        // that pipe open forever and the caller would never observe EOF: every
+        // piped or captured `rosync daemon start` hangs indefinitely even
+        // though the daemon itself started correctly. Unix is immune because
+        // std marks its descriptors CLOEXEC, so only the log files below
+        // survive exec. Drop the inherit flag from our standard handles to get
+        // the same effect here; the log handles are passed explicitly and std
+        // marks those inheritable itself, so daemon logging is unaffected.
+        detach_standard_handles_from_children();
     }
 
     let mut child = command.spawn().map_err(|error| {
@@ -1001,6 +1013,43 @@ pub(super) async fn spawn_managed_daemon(
             .into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Clear `HANDLE_FLAG_INHERIT` on this process's standard handles so a detached
+/// child cannot capture the caller's pipes. Called immediately before spawning
+/// the managed daemon; see the comment at that call site for why this is
+/// required on Windows. Writing to our own stdout/stderr is unaffected — the
+/// flag governs inheritance only, not access.
+#[cfg(windows)]
+fn detach_standard_handles_from_children() {
+    use std::io::{stderr, stdin, stdout};
+    use std::os::windows::io::AsRawHandle;
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    extern "system" {
+        fn SetHandleInformation(
+            handle: *mut std::ffi::c_void,
+            mask: u32,
+            flags: u32,
+        ) -> std::ffi::c_int;
+    }
+
+    let handles = [
+        stdout().as_raw_handle(),
+        stderr().as_raw_handle(),
+        stdin().as_raw_handle(),
+    ];
+    for handle in handles {
+        if handle.is_null() {
+            continue;
+        }
+        // Best effort: a handle that refuses the flag change (a console handle
+        // on some shells) is not inheritable in the way that strands a caller,
+        // and failing the start over it would be worse than the leak it guards.
+        unsafe {
+            SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, 0);
+        }
     }
 }
 
